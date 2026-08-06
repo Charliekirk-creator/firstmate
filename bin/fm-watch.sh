@@ -233,6 +233,21 @@ _event_cap_fails=0
 # digest/injection layer would never see the wake.
 afk_present() { [ -e "$STATE/.afk" ]; }
 
+# Pi's optional Claude-style footer rerenders its HH:MM clock every 30 seconds,
+# changing once per minute even while the agent and transcript remain idle.
+# Normalize only that proven dynamic field: the recorded harness must be Pi or
+# pi-signed, and the clock must sit on the structured context line immediately
+# above Pi's ready/working state line. Other timestamps, harnesses, and every
+# other pane byte remain significant to stale detection.
+normalize_pane_for_stale_hash() {  # <harness>, pane bytes on stdin
+  case "$1" in
+    pi|pi-signed)
+      perl -0pe 's{(^|\n)([^\n]*ctx:(?:\?|[0-9]+%)[^\n]*\([0-9]+(?:\.[0-9]+)?[kM]? context\)[^\n]*  )([0-9][0-9]:[0-9][0-9])(?=[^\n]*\n[[:space:]]*▶▶ agent (?:ready|working)(?:[[:space:]][^\n]*)?\z)}{$1$2<clock>}g'
+      ;;
+    *) cat ;;
+  esac
+}
+
 hash_pane() {
   if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi
 }
@@ -1354,7 +1369,7 @@ EOF
       continue
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
-    h=$(printf '%s' "$tail40" | hash_pane)
+    h=$(printf '%s' "$tail40" | normalize_pane_for_stale_hash "$(window_harness "$w")" | hash_pane)
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"
