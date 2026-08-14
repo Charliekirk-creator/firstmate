@@ -257,6 +257,10 @@ WORK_IDENTITY_LIMITS=$(
   FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
     FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" limits
 ) || { echo "fm-fleet-snapshot: work identity limits unavailable" >&2; exit 1; }
+WORK_IDENTITY_HOME_ID=$(
+  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" home-id
+) || { echo "fm-fleet-snapshot: work identity home binding unavailable" >&2; exit "$IDENTITY_INTEGRITY_EXIT"; }
 WORK_IDENTITY_RECORD_MAX_BYTES=$(printf '%s' "$WORK_IDENTITY_LIMITS" | jq -er '.record_max_bytes') \
   || { echo "fm-fleet-snapshot: invalid work identity record limit" >&2; exit 1; }
 WORK_IDENTITY_PROJECTION_MAX_BYTES=$(printf '%s' "$WORK_IDENTITY_LIMITS" | jq -er '.projection_max_bytes') \
@@ -534,8 +538,8 @@ secondmate_home_identities_json() {
     printf '%s\n' "$identity" | jq -c --arg task_id "$id" \
       '{task_id:$task_id,work_identity:.}' >> "$tmp" || { rm -f -- "$tmp"; return 1; }
   done
-  jq -s -c --arg generated "$SNAPSHOT_NOW" --arg home "$FM_HOME" \
-    '{schema:"fm-secondmate-home-identities.v1",generated:$generated,home:$home,records:.}' "$tmp"
+  jq -s -c --arg generated "$SNAPSHOT_NOW" --arg home "$FM_HOME" --arg home_id "$WORK_IDENTITY_HOME_ID" \
+    '{schema:"fm-secondmate-home-identities.v1",generated:$generated,home:$home,home_id:$home_id,records:.}' "$tmp"
   rc=$?
   rm -f -- "$tmp"
   return "$rc"
@@ -818,6 +822,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
     --arg generated "$SNAPSHOT_NOW" \
     --argjson generated_epoch "$SNAPSHOT_EPOCH" \
     --arg home "$FM_HOME" \
+    --arg home_id "$WORK_IDENTITY_HOME_ID" \
     --argjson child_n "$FM_SNAPSHOT_SECONDMATE_CHILDREN" \
     --argjson queued_n "$FM_SNAPSHOT_SECONDMATE_QUEUED" \
     --argjson decisions_n "$FM_SNAPSHOT_SECONDMATE_DECISIONS" \
@@ -965,6 +970,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
         generated:$generated,
         generated_epoch:$generated_epoch,
         home:$home,
+        home_id:$home_id,
         valid:$valid,
         reason:$reason,
         invalidity:$invalidity,
@@ -995,7 +1001,8 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
 }
 
 fetch_secondmate_work_identities_json() {  # <id> <home> <remote> <summary-json>
-  local id=$1 home=$2 remote=$3 summary=$4 index ids_raw rc tmp result bytes records expected
+  local id=$1 home=$2 remote=$3 summary=$4 home_id index ids_raw rc tmp result bytes records expected
+  home_id="secondmate:$id"
   local offset end task
   local -a task_ids batch
   index=$(printf '%s' "$summary" | jq -c '.work_identity_index') \
@@ -1063,9 +1070,9 @@ EOF
       rm -f -- "$tmp"
       return 3
     fi
-    printf '%s' "$result" | jq -e --arg home "$home" '
+    printf '%s' "$result" | jq -e --arg home "$home" --arg home_id "$home_id" '
       .schema == "fm-secondmate-home-identities.v1"
-      and .home == $home and (.records | type) == "array"
+      and .home == $home and .home_id == $home_id and (.records | type) == "array"
     ' >/dev/null 2>&1 || {
       rm -f -- "$tmp"
       echo "fm-fleet-snapshot: secondmate work identity batch envelope is mismatched for $id" >&2
@@ -1095,7 +1102,7 @@ EOF
     printf '%s\n' "$records" \
       | FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
           FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
-          validate-projections --home "$home" --file - >/dev/null || rc=$?
+          validate-projections --home "$home" --home-id "$home_id" --file - >/dev/null || rc=$?
     if [ "$rc" -ne 0 ]; then
       rm -f -- "$tmp"
       return "$IDENTITY_INTEGRITY_EXIT"
@@ -1726,7 +1733,14 @@ secondmate_current_json() {  # <parent-tasks-json>
           *) seen_homes="$seen_homes $host:$home" ;;
         esac
       elif ! validate_secondmate_home "$id" "$home" 2>/dev/null; then
-        reason="invalid home: $VALIDATION_ERROR"
+        case "$VALIDATION_ERROR" in
+          'secondmate marker must not be a symlink'|'marked for secondmate '*)
+            rm -f -- "$records_file"
+            echo "fm-fleet-snapshot: work identity home binding mismatch in secondmate $id" >&2
+            return "$IDENTITY_INTEGRITY_EXIT"
+            ;;
+          *) reason="invalid home: $VALIDATION_ERROR" ;;
+        esac
       else
         home=$VALIDATED_HOME
         case " $seen_homes " in
@@ -1746,7 +1760,6 @@ secondmate_current_json() {  # <parent-tasks-json>
         collection_status=$(cat "$SNAPSHOT_COLLECT_DIR/$collection_slot.status" 2>/dev/null || true)
         if summary=$(summary_file_read "$SNAPSHOT_COLLECT_DIR/$collection_slot.fetch" "$home"); then
           summary_source='remote-ledger'
-          [ -z "$cache_path" ] || snapshot_cache_store "$summary" "$cache_path" || true
         elif [ -n "$cache_path" ] && summary=$(summary_file_read "$cache_path" "$home"); then
           summary_source='remote-ledger-cache'
           summary_freshness=cached
@@ -1763,6 +1776,15 @@ secondmate_current_json() {  # <parent-tasks-json>
         reason="structured home ledger exceeded byte limit"
       else
         reason="structured home ledger is missing, unreadable, or invalid"
+      fi
+      if [ -z "$reason" ] && ! printf '%s' "$summary" | jq -e --arg home_id "secondmate:$id" \
+        '.home_id == $home_id' >/dev/null 2>&1; then
+        rm -f -- "$records_file"
+        echo "fm-fleet-snapshot: work identity home binding mismatch in secondmate $id" >&2
+        return "$IDENTITY_INTEGRITY_EXIT"
+      fi
+      if [ -z "$reason" ] && [ "$summary_source" = remote-ledger ] && [ -n "$cache_path" ]; then
+        snapshot_cache_store "$summary" "$cache_path" || true
       fi
       if [ -z "$reason" ]; then
         summary_age=$(snapshot_summary_age "$summary")

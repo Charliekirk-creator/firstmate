@@ -379,13 +379,15 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   | ([ (.secondmate_current.records // [])[]
        | ([.decisions_open[]? | select(.source == "backlog" and .verb == "captain-hold"
             and .deferred_marker != true)]) as $captain_holds
+       | ([.decisions_open[]? | select(.source == "status" and .verb == "needs-decision")]) as $status_decisions
        | ([.holds[]? | select(.source == "backlog")]) as $backlog_holds
        | . + {
            bearings_captain_holds:$captain_holds,
+           bearings_decisions:($captain_holds + $status_decisions),
            bearings_holds:(if .current.state == "captain_decision" then $backlog_holds else .holds end),
            bearings_state:(
              if .current.state == "captain_decision" then
-               if ($captain_holds | length) > 0 then "captain_decision"
+               if (($captain_holds + $status_decisions) | length) > 0 then "captain_decision"
                elif (.active_children | length) > 0 then "active_child_work"
                elif ($backlog_holds | length) > 0 then "externally_held"
                else "unknown" end
@@ -402,7 +404,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
           doing:((if .bearings_state == "active_child_work" then
                     ([.active_children[] | .id + ": " + (.doing // .state)] | join("; "))
                   elif .bearings_state == "captain_decision" then
-                    ([.bearings_captain_holds[] | .summary] | join("; "))
+                    ([.bearings_decisions[] | .summary] | join("; "))
                   elif .bearings_state == "externally_held" then
                     ([.bearings_holds[] | .id + ": " + (.reason // "held")] | join("; "))
                   elif .bearings_state == "no_active_work" then "No active child work"
@@ -439,11 +441,17 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          | ({id,key:.id,verb:"captain-hold",
              summary:((.title + ": " + .hold_reason) | trunc(90)),owner:"(main)"}
             + work_fields(.work_identity)) ]
+     + [ .tasks[] as $t | ($t.hints.open_decisions // [])[]
+         | ({id:$t.id,key,verb,summary:(.summary | trunc(90)),owner:"(main)"}
+            + work_fields($t.work_identity)) ]
      + [ (.secondmate_current.records // [])[] as $m | $m.decisions_open[]?
-         | select(.source == "backlog" and .verb == "captain-hold")
-         | select(($all_decisions == 1) or (.deferred_marker != true))
+         | select((.source == "backlog" and .verb == "captain-hold")
+                  or (.source == "status" and .verb == "needs-decision"))
+         | select(($all_decisions == 1) or (.source != "backlog") or (.deferred_marker != true))
          | ({id:($m.id + "/" + .id),key,verb,
-             summary:(((.summary // .id) + ": " + (.reason // "captain decision pending")) | trunc(90)),owner:$m.id}
+             summary:((if .source == "backlog" then
+                         ((.summary // .id) + ": " + (.reason // "captain decision pending"))
+                       else (.summary // .id) end) | trunc(90)),owner:$m.id}
             + work_fields(mate_work($m; .work_identity_ref))) ]) as $decisions_all
   | ([ .backlog.records[]
          | select(.structured and .captain_actionable == true and .deferred_marker == true) ]

@@ -12,6 +12,7 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 SNAPSHOT="$ROOT/bin/fm-fleet-snapshot.sh"
 BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
 TMP_ROOT=$(fm_test_tmproot fm-work-identity)
+TMP_ROOT=$(cd "$TMP_ROOT" && pwd -P)
 
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 
@@ -66,14 +67,33 @@ make_fakebin() {  # <dir>
 set -u
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_HOME:?}}"; exit 0 ;;
-  *"#{pane_current_command}"*) printf 'codex\n'; exit 0 ;;
+  *"#{pane_current_command}"*) printf '%s\n' "${FM_FAKE_PANE_COMMAND:-codex}"; exit 0 ;;
 esac
 case "${1:-}" in
   list-windows) exit 0 ;;
   display-message) printf 'firstmate\n'; exit 0 ;;
   capture-pane) printf 'worker ready\n> \n'; exit 0 ;;
-  has-session|new-session|new-window|kill-window|send-keys) exit 0 ;;
+  new-window)
+    if [ -n "${FM_TEST_MUTATE_BRIEF:-}" ]; then
+      printf 'MUTATED_SOURCE_BRIEF\n' > "$FM_TEST_MUTATE_BRIEF"
+    fi
+    exit 0
+    ;;
+  send-keys)
+    literal=0
+    for arg in "$@"; do [ "$arg" != -l ] || literal=1; done
+    if [ "$literal" -eq 1 ] && [ -n "${FM_TEST_LAUNCH_COMMAND:-}" ]; then
+      printf '%s\n' "${!#}" > "$FM_TEST_LAUNCH_COMMAND"
+    fi
+    exit 0
+    ;;
+  has-session|new-session|kill-window) exit 0 ;;
 esac
+exit 0
+SH
+  cat > "$fakebin/codex" <<'SH'
+#!/usr/bin/env bash
+[ -z "${FM_TEST_DELIVERED_BRIEF:-}" ] || printf '%s\n' "${!#}" > "$FM_TEST_DELIVERED_BRIEF"
 exit 0
 SH
   cat > "$fakebin/treehouse" <<'SH'
@@ -84,7 +104,7 @@ SH
 #!/usr/bin/env bash
 exit 0
 SH
-  chmod +x "$fakebin/tmux" "$fakebin/treehouse" "$fakebin/no-mistakes"
+  chmod +x "$fakebin/tmux" "$fakebin/codex" "$fakebin/treehouse" "$fakebin/no-mistakes"
   printf '%s\n' "$fakebin"
 }
 
@@ -192,6 +212,45 @@ test_intake_through_fleet_projection() {
   pass "exact multi-work-unit intake survives instructions, metadata, snapshot, and Bearings once per worker"
 }
 
+test_spawn_delivers_validated_brief_snapshot() {
+  local home task manifest project wt fakebin out delivered snapshot
+  home=$(make_home immutable-delivery)
+  task=immutable-delivery-worker
+  manifest="$home/manifest.json"
+  project="$home/project"
+  wt="$home/worker-copy"
+  delivered="$home/delivered.txt"
+  make_manifest "$home" "$task" "$manifest" multi
+  record_and_brief "$home" "$task" "$manifest"
+  fm_git_worktree "$project" "$wt" immutable-delivery-copy
+  fakebin=$(make_fakebin "$home/fakes")
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_TEST_MUTATE_BRIEF="$home/data/$task/brief.md" \
+    FM_TEST_LAUNCH_COMMAND="$home/launch.command" FM_TEST_DELIVERED_BRIEF="$delivered" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off --harness codex 2>&1)
+  assert_contains "$out" "spawned $task" "spawn with a concurrently replaced source brief failed"
+  assert_present "$home/launch.command" "spawn emitted no worker launch command"
+  (cd "$wt" && FM_TEST_DELIVERED_BRIEF="$delivered" PATH="$fakebin:$PATH" \
+    /bin/bash -c "$(cat "$home/launch.command")") \
+    || fail "emitted worker launch command could not consume its brief snapshot"
+  assert_grep 'MUTATED_SOURCE_BRIEF' "$home/data/$task/brief.md" \
+    "delivery fixture did not replace the source brief after validation"
+  assert_present "$delivered" "fake worker received no launch instructions"
+  assert_grep 'Work identity contract: fm-work-identity.v1 sha256=' "$delivered" \
+    "worker did not receive the identity contract from the validated snapshot"
+  assert_grep '"id":"wu-fleet-projection"' "$delivered" \
+    "worker received changed instructions instead of the validated identity payload"
+  assert_no_grep 'MUTATED_SOURCE_BRIEF' "$delivered" \
+    "worker reread the replaced source brief after validation"
+  snapshot="$home/state/$task.launch-brief.md"
+  assert_grep "launch_brief=$snapshot" "$home/state/$task.meta" \
+    "task metadata did not bind the delivered launch snapshot"
+  assert_grep '"id":"wu-fleet-projection"' "$snapshot" \
+    "durable launch snapshot lost the validated identity payload"
+  pass "spawn delivers one validated brief snapshot despite source replacement"
+}
+
 sha256_file_for_test() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print $1}'
@@ -295,9 +354,11 @@ test_namespace_separation_and_contract_rejections() {
 # Unsafe inputs and stored records refuse. Labels are display-only but still must
 # be safe to embed in generated instructions.
 test_unsafe_files_labels_and_exact_binding() {
-  local home other task manifest out rc sidecar
+  local home home_real other other_real task manifest out rc sidecar transfer projection projection_set
   home=$(make_home safety-a)
+  home_real=$(cd "$home" && pwd -P)
   other=$(make_home safety-b)
+  other_real=$(cd "$other" && pwd -P)
   task=safe-worker
   manifest="$home/manifest.json"
   make_manifest "$home" "$task" "$manifest"
@@ -316,6 +377,12 @@ test_unsafe_files_labels_and_exact_binding() {
   jq '.work_units[0].label="Unsafe ` label"' "$manifest" > "$home/bad-label.json"
   out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/bad-label.json" 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "instruction-breaking label was accepted"
+  jq '.work_units[0].label="unsafe\u009b2Kcontrol"' "$manifest" > "$home/bad-label.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/bad-label.json" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "C1 terminal-control label was accepted"
+  jq '.work_units[0].label="safe-id\u202Edi-efas"' "$manifest" > "$home/bad-label.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/bad-label.json" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "Unicode bidi-format label was accepted"
   assert_absent "$home/data/$task/work-identity.json" "unsafe label refusal partially published a record"
 
   FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
@@ -324,6 +391,25 @@ test_unsafe_files_labels_and_exact_binding() {
   cp "$sidecar" "$other/data/$task/work-identity.json"
   out=$(FM_HOME="$other" "$WORK_IDENTITY" verify "$task" 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "cross-home copied relation was accepted"
+  printf 'other\n' > "$other/.fm-secondmate-home"
+  jq -S -c --arg home "$other_real" '.binding.home=$home' "$sidecar" \
+    > "$other/data/$task/work-identity.json"
+  out=$(FM_HOME="$other" "$WORK_IDENTITY" verify "$task" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "path-rebound record with another stable home identity was accepted"
+  transfer=$(FM_HOME="$home" "$WORK_IDENTITY" handoff-prepare "$task" \
+    --to-home "$home_real" --to-home-id secondmate:same-path)
+  printf '%s' "$transfer" | jq -e '
+    .source.home == .target.home and .source.home_id == "main"
+      and .target.home_id == "secondmate:same-path"
+  ' >/dev/null || fail "same-path remote handoff did not bind distinct stable home identities"
+  printf '%s\n' "$transfer" | FM_HOME="$home" "$WORK_IDENTITY" \
+    handoff-cancel "$task" --file - >/dev/null || fail "same-path handoff preparation did not cancel"
+  projection=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task")
+  projection_set=$(jq -n -c --arg task "$task" --argjson identity "$projection" \
+    '[{task_id:$task,work_identity:$identity}]')
+  out=$(printf '%s\n' "$projection_set" | FM_HOME="$home" "$WORK_IDENTITY" \
+    validate-projections --home "$home_real" --home-id secondmate:same-path --file - 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "cross-home projection with the same absolute path was accepted"
   mkdir -p "$home/data/other-task"
   cp "$sidecar" "$home/data/other-task/work-identity.json"
   out=$(FM_HOME="$home" "$WORK_IDENTITY" verify other-task 2>&1); rc=$?
@@ -369,9 +455,10 @@ test_stale_and_changed_relations_refuse() {
 # ignored, including title, repository, branch/worktree, pane, worker, time, and
 # status prose.
 test_legacy_and_fuzzy_fallbacks_are_unlinked() {
-  local home task wt fakebin json bearings
+  local home task long_task wt fakebin json bearings
   home=$(make_home fuzzy)
   task=wa-plan-2026-q3
+  long_task=legacy-task-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-0123456789
   wt="$home/projects/dtm-project-17/wu-exact-intake"
   mkdir -p "$wt" "$home/data/$task"
   printf 'legacy brief names Work Aligner wu-fleet-projection\n' > "$home/data/$task/brief.md"
@@ -380,6 +467,7 @@ test_legacy_and_fuzzy_fallbacks_are_unlinked() {
 - [ ] $task - Work Aligner wu-exact-intake (repo: wa-project-42) (kind: ship) (since 2026-08-14)
 
 ## Queued
+- [ ] $long_task - path-safe overlong legacy task (repo: legacy)
 
 ## Done
 EOF
@@ -393,8 +481,11 @@ EOF
     "yolo=off"
   printf 'working: DTM-431 implements Work Aligner plan wa-plan-2026-q3\n' > "$home/state/$task.status"
   fakebin=$(make_fakebin "$home/fakes")
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$long_task" | jq -e '
+    .status == "unlinked" and .reason == "legacy-no-record"
+  ' >/dev/null || fail "path-safe overlong legacy task did not verify as unlinked"
   json=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
-  printf '%s' "$json" | jq -e '
+  printf '%s' "$json" | jq -e --arg long "$long_task" '
     (.tasks[] | select(.id == "wa-plan-2026-q3")
       | .work_identity.status == "unlinked"
         and .work_identity.reason == "legacy-no-record"
@@ -403,6 +494,8 @@ EOF
         and .work_identity.sources == [])
       and (.backlog.records[] | select(.id == "wa-plan-2026-q3")
         | .work_identity.status == "unlinked")
+      and (.backlog.records[] | select(.id == $long)
+        | .work_identity.status == "unlinked" and .work_identity.reason == "legacy-no-record")
   ' >/dev/null || fail "a fuzzy title/repo/branch/pane/status relation leaked into snapshot: $json"
   bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
   printf '%s' "$bearings" | jq -e '
@@ -460,7 +553,7 @@ EOF
       and ([.endpoints[] | select(.id == "delegated-child" and .work_identity_ref == "delegated-child")] | length) == 1
       and ([.work_identities[] | select(.task_id == "delegated-child")] | length) == 1
       and (.work_identities[] | select(.task_id == "delegated-child") | .work_identity
-        | .status == "linked"
+        | .status == "linked" and .binding.home_id == "secondmate:roadmap"
           and (.work_units | map(.id)) == ["wu-exact-intake","wu-fleet-projection"]
           and (.sources | any(.namespace == "dtm" and .kind == "issue" and .id == "DTM-431")))
       and (all(.active_children[]; has("work_identity") | not))
@@ -479,7 +572,7 @@ EOF
 }
 
 test_handoff_rebinds_identity_and_decision_surfaces() {
-  local parent mate mate_real task manifest decision decision_manifest wt fakebin canonical bearings hash gen
+  local parent mate mate_real task manifest decision main_decision decision_manifest wt fakebin canonical bearings hash gen out rc
   command -v tasks-axi >/dev/null 2>&1 || { pass "linked handoff coverage skipped without tasks-axi"; return; }
   parent=$(make_home handoff-parent)
   mate="$TMP_ROOT/handoff-mate"
@@ -505,8 +598,17 @@ EOF
     || fail "linked local backlog handoff failed"
   mate_real=$(cd "$mate" && pwd -P)
   FM_HOME="$mate" "$WORK_IDENTITY" verify "$task" | jq -e \
-    --arg home "$mate_real" '.status == "linked" and .binding.home == $home and .binding.task_id == "linked-captain-hold"' >/dev/null \
+    --arg home "$mate_real" '.status == "linked" and .binding.home == $home
+      and .binding.home_id == "secondmate:planning" and .binding.task_id == "linked-captain-hold"' >/dev/null \
     || fail "linked handoff did not atomically stage a destination-bound identity"
+  jq -e '.role == "source" and .state == "completed"
+      and .transfer.target.home_id == "secondmate:planning"' \
+    "$parent/data/$task/work-identity-handoff-source.json" >/dev/null \
+    || fail "successful handoff did not retain an exact source ownership tombstone"
+  assert_absent "$mate/data/$task/work-identity-handoff-target.json" \
+    "successful handoff retained a pending destination identity"
+  out=$(FM_HOME="$parent" "$WORK_IDENTITY" record "$task" --file "$manifest" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "source intake published again after completed ownership transfer"
 
   decision_manifest="$mate/$decision.json"
   wt="$mate/projects/$decision"
@@ -522,6 +624,30 @@ EOF
   "$ROOT/bin/fm-busy-event.sh" apply "$mate/state" "$decision" idle --gen "$gen" \
     --source claude-hook --event stop
   printf 'needs-decision [key=exact-choice]: choose the exact linked option\n' > "$mate/state/$decision.status"
+
+  main_decision=linked-main-status-decision
+  decision_manifest="$parent/$main_decision.json"
+  wt="$parent/projects/$main_decision"
+  mkdir -p "$wt"
+  make_manifest "$parent" "$main_decision" "$decision_manifest"
+  record_and_brief "$parent" "$main_decision" "$decision_manifest"
+  write_bound_meta "$parent" "$main_decision" "$wt"
+  sed 's/^harness=codex$/harness=claude/' "$parent/state/$main_decision.meta" \
+    > "$parent/state/$main_decision.meta.tmp"
+  mv "$parent/state/$main_decision.meta.tmp" "$parent/state/$main_decision.meta"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$parent/state" "$main_decision")
+  "$ROOT/bin/fm-busy-event.sh" apply "$parent/state" "$main_decision" idle --gen "$gen" \
+    --source claude-hook --event stop
+  printf 'needs-decision [key=main-exact-choice]: choose the main linked option\n' \
+    > "$parent/state/$main_decision.status"
+  cat > "$parent/data/backlog.md" <<EOF
+## In flight
+- [ ] $main_decision - Main linked worker awaiting a decision (repo: firstmate) (kind: ship) (since 2026-08-14)
+
+## Queued
+
+## Done
+EOF
   cat > "$mate/data/backlog.md" <<EOF
 ## In flight
 - [ ] $decision - Linked worker awaiting a decision (repo: firstmate) (kind: ship) (since 2026-08-14)
@@ -532,7 +658,8 @@ EOF
 ## Done
 EOF
   fakebin=$(make_fakebin "$parent/fakes")
-  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
+  canonical=$(PATH="$fakebin:$PATH" FM_FAKE_PANE_COMMAND=claude FM_HOME="$parent" \
+    FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
   printf '%s' "$canonical" | jq -e '
     .secondmate_current.records[] | select(.id == "planning")
     | . as $mate
@@ -543,16 +670,83 @@ EOF
       and ([.work_identities[] | select(.task_id == "linked-captain-hold" and .work_identity.status == "linked")] | length) == 1
       and ([.work_identities[] | select(.task_id == "linked-status-decision" and .work_identity.status == "linked")] | length) == 1
   ' >/dev/null || fail "delegated decision surfaces lost their source work identities: $canonical"
-  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
+  bearings=$(PATH="$fakebin:$PATH" FM_FAKE_PANE_COMMAND=claude FM_HOME="$parent" \
+    FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
   printf '%s' "$bearings" | jq -e '
-    .decisions_open[] | select(.id == "planning/linked-captain-hold")
-    | .work_identity == "linked"
-      and (.work_units | contains("wu-exact-intake"))
-      and (.sources | contains("dtm:issue:DTM-431"))
-  ' >/dev/null || fail "Bearings decision projection lost exact identity: $bearings"
+    ([.secondmates[] | select(.id == "planning" and .state == "captain_decision"
+        and (.doing | contains("choose the exact linked option")))] | length) == 1
+      and ([.decisions_open[] | select(.id == "planning/linked-captain-hold"
+        and .work_identity == "linked" and (.work_units | contains("wu-exact-intake"))
+        and (.sources | contains("dtm:issue:DTM-431")))] | length) == 1
+      and ([.decisions_open[] | select(.id == "planning/linked-status-decision"
+        and .verb == "needs-decision" and .work_identity == "linked"
+        and (.work_units | contains("wu-exact-intake")))] | length) == 1
+      and ([.decisions_open[] | select(.id == "linked-main-status-decision"
+        and .owner == "(main)" and .verb == "needs-decision"
+        and .work_identity == "linked" and (.sources | contains("DTM-431")))] | length) == 1
+  ' >/dev/null || fail "Bearings decision projection lost a canonical linked decision: $bearings"
   hash=$(sha256_file_for_test "$parent/data/$task/work-identity.json")
   [ -n "$hash" ] || fail "source handoff identity was not retained as immutable provenance"
   pass "linked handoff rebinds identity for delegated decision summaries and Bearings"
+}
+
+test_handoff_preparation_is_durable_and_rollback_safe() {
+  local parent mate task_a task_b race manifest transfer out rc
+  command -v tasks-axi >/dev/null 2>&1 || { pass "handoff transaction coverage skipped without tasks-axi"; return; }
+  parent=$(make_home handoff-transaction-parent)
+  mate="$TMP_ROOT/handoff-transaction-mate"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'transaction\n' > "$mate/.fm-secondmate-home"
+  printf -- '- transaction - transaction domain (home: %s; scope: exact work; projects: firstmate; added 2026-08-14)\n' \
+    "$mate" > "$parent/data/secondmates.md"
+  task_a=transaction-a
+  task_b=transaction-b
+  for task in "$task_a" "$task_b"; do
+    manifest="$parent/$task.json"
+    make_manifest "$parent" "$task" "$manifest"
+    FM_HOME="$parent" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  done
+  mkdir -p "$mate/data/$task_b"
+  printf 'pre-existing destination instructions\n' > "$mate/data/$task_b/brief.md"
+  cat > "$parent/data/backlog.md" <<EOF
+## In flight
+
+## Queued
+- [ ] $task_a - first transactional identity (repo: firstmate)
+- [ ] $task_b - second transactional identity (repo: firstmate)
+
+## Done
+EOF
+  out=$(FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" transaction "$task_a" "$task_b" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "multi-item handoff ignored a later destination identity conflict"
+  assert_grep "$task_a" "$parent/data/backlog.md" "failed handoff moved the first backlog item"
+  assert_grep "$task_b" "$parent/data/backlog.md" "failed handoff moved the second backlog item"
+  assert_absent "$mate/data/$task_a/work-identity.json" "failed staging published an immutable first sidecar"
+  assert_absent "$mate/data/$task_a/work-identity-handoff-target.json" "failed staging retained the first target prepare"
+  assert_absent "$parent/data/$task_a/work-identity-handoff-source.json" "failed staging retained the first source prepare"
+  assert_absent "$parent/data/$task_b/work-identity-handoff-source.json" "failed staging retained the second source prepare"
+  FM_HOME="$parent" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
+    || fail "failed multi-item staging damaged the source identity"
+
+  race=record-during-handoff
+  manifest="$parent/$race.json"
+  make_manifest "$parent" "$race" "$manifest"
+  transfer=$(FM_HOME="$parent" "$WORK_IDENTITY" handoff-prepare "$race" \
+    --to-home "$mate" --to-home-id secondmate:transaction)
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" handoff-stage "$race" --file - >/dev/null \
+    || fail "unlinked handoff preparation did not reach the target"
+  out=$(FM_HOME="$parent" "$WORK_IDENTITY" record "$race" --file "$manifest" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "concurrent intake published after handoff preparation froze ownership"
+  out=$(FM_HOME="$mate" "$WORK_IDENTITY" verify "$race" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "target projection published while identity handoff was only prepared"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" handoff-abort "$race" --file - >/dev/null \
+    || fail "prepared target identity could not abort"
+  printf '%s\n' "$transfer" | FM_HOME="$parent" "$WORK_IDENTITY" handoff-cancel "$race" --file - >/dev/null \
+    || fail "prepared source identity could not cancel"
+  FM_HOME="$parent" "$WORK_IDENTITY" record "$race" --file "$manifest" >/dev/null \
+    || fail "intake did not resume after an exact handoff cancellation"
+  pass "handoff preparation freezes intake and failed batches leave no immutable target sidecars"
 }
 
 test_delegated_integrity_failure_stops_parent_publication() {
@@ -667,6 +861,7 @@ EOF
 }
 
 test_intake_through_fleet_projection
+test_spawn_delivers_validated_brief_snapshot
 test_concurrent_idempotence_and_explicit_unlinked
 test_namespace_separation_and_contract_rejections
 test_unsafe_files_labels_and_exact_binding
@@ -674,6 +869,7 @@ test_stale_and_changed_relations_refuse
 test_legacy_and_fuzzy_fallbacks_are_unlinked
 test_delegated_secondmate_projection
 test_handoff_rebinds_identity_and_decision_surfaces
+test_handoff_preparation_is_durable_and_rollback_safe
 test_delegated_integrity_failure_stops_parent_publication
 test_schema_maximum_delegated_identities_are_batched_once
 test_bearings_preserves_complete_identity_references

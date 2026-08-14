@@ -14,10 +14,15 @@
 # Internal consumers:
 #   fm-work-identity.sh brief-block <task-id>
 #   fm-work-identity.sh project <task-id> [--brief <brief.md>] [--meta <task.meta>]
-#   fm-work-identity.sh handoff-export <task-id> --to-home <absolute-home>
-#   fm-work-identity.sh handoff-import <task-id> --file <manifest.json|->
+#   fm-work-identity.sh home-id
+#   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id>
+#   fm-work-identity.sh handoff-stage <task-id> --file <transfer.json|->
+#   fm-work-identity.sh handoff-commit <task-id> --file <transfer.json|->
+#   fm-work-identity.sh handoff-abort <task-id> --file <transfer.json|->
+#   fm-work-identity.sh handoff-complete <task-id> --file <transfer.json|->
+#   fm-work-identity.sh handoff-cancel <task-id> --file <transfer.json|->
 #   fm-work-identity.sh validate-index --file <index.json|->
-#   fm-work-identity.sh validate-projections --home <absolute-home> --file <records.json|->
+#   fm-work-identity.sh validate-projections --home <absolute-home> --home-id <home-id> --file <records.json|->
 #   fm-work-identity.sh limits
 #   fm-work-identity.sh record-max-bytes
 #
@@ -31,7 +36,7 @@
 # Complete schema `fm-work-identity.v1`:
 # {
 #   "schema": "fm-work-identity.v1",
-#   "binding": {"home": "<physical absolute FM_HOME>", "task_id": "<task-id>"},
+#   "binding": {"home": "<physical absolute FM_HOME>", "home_id": "<stable-home-id>", "task_id": "<task-id>"},
 #   "initiative": {"namespace": "...", "kind": "...", "id": "...", "label": "..."},
 #   "plan_id":    {"namespace": "...", "kind": "plan", "id": "...", "label": "..."},
 #   "stage":      {"namespace": "...", "kind": "stage", "id": "...", "label": "..."},
@@ -58,21 +63,26 @@
 # of those units, so several units never multiply the worker count.
 #
 # Syntax and safety:
-#   - task ids use Firstmate's canonical creation grammar and are at most 64 bytes;
+#   - new intake task ids use Firstmate's canonical creation grammar and are at most 64 bytes;
+#     lifecycle reads retain Firstmate's path-safe legacy task grammar;
 #   - ids are 1..240 ASCII bytes, begin alphanumeric, and use only
 #     A-Z a-z 0-9 . _ : @ / # ~ -; path-like '.', '..', empty, leading, or
 #     trailing slash segments are refused;
 #   - labels are 1..160 characters, have no leading/trailing whitespace,
-#     controls, Unicode line separators, or Markdown table/HTML/backslash
-#     metacharacters, and are never paths;
+#     Unicode control or format characters, Unicode line separators, or Markdown
+#     table/HTML/backslash metacharacters, and are never paths;
 #   - work_units and sources each contain 1..20 identities;
 #   - no exact identity tuple may occur twice anywhere in one record;
 #   - the manifest and sidecar are bounded regular, non-symlink, single-link
 #     files; task directories are direct non-symlink children of the configured
 #     data directory;
-#   - binding.home and binding.task_id must exactly match the physical active
-#     home and command task id, so copied cross-home or task-mismatched records
-#     are refused;
+#   - binding.home, binding.home_id, and binding.task_id must exactly match the
+#     physical active home, its stable `main` or `secondmate:<id>` identity, and
+#     command task id, so same-path remote copies, other cross-home copies, and
+#     task-mismatched records are refused;
+#   - backlog handoff uses durable source and target prepare records. New intake
+#     and projection stop while ownership is prepared; destination publication,
+#     source completion, and cancellation are exact-transfer idempotent steps;
 #   - linked live tasks require matching schema/status/digest fields in metadata
 #     and byte-matching digest and payload markers in generated instructions;
 #   - absent records remain compatible and project explicitly as unlinked.
@@ -87,11 +97,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME_INPUT="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 SCHEMA=fm-work-identity.v1
+HANDOFF_SCHEMA=fm-work-identity-handoff.v1
+HANDOFF_STATE_SCHEMA=fm-work-identity-handoff-state.v1
 MAX_BYTES=65536
+HANDOFF_MAX_BYTES=$((MAX_BYTES + 8192))
 MAX_ARRAY=20
 MAX_PROJECTION_BYTES=$((MAX_BYTES + 2048))
 MAX_PROJECTION_BATCH_BYTES=1048576
 DIE_STATUS=1
+FM_HOME_ID=
+ACTIVE_IDENTITY_LOCK=
+ACTIVE_IDENTITY_LOCK_HELD=0
+CONTRACT_INPUT_TMP=
+VALIDATION_TMP=
+TMP=
+
+work_identity_cleanup() {
+  local status=$?
+  [ -z "${TMP:-}" ] || rm -f -- "$TMP" 2>/dev/null || true
+  [ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP" 2>/dev/null || true
+  [ -z "${VALIDATION_TMP:-}" ] || rm -f -- "$VALIDATION_TMP" 2>/dev/null || true
+  if [ "${ACTIVE_IDENTITY_LOCK_HELD:-0}" -eq 1 ]; then
+    ACTIVE_IDENTITY_LOCK_HELD=0
+    fm_lock_release "$ACTIVE_IDENTITY_LOCK" 2>/dev/null || true
+  fi
+  return "$status"
+}
+trap work_identity_cleanup EXIT
 
 # shellcheck source=bin/fm-pr-lib.sh
 # shellcheck disable=SC1091
@@ -164,6 +196,16 @@ sha256_file() {  # <path>
   fi
 }
 
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum 2>/dev/null | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
 safe_regular_file() {  # <path> <label> [max-bytes]
   local path=$1 label=$2 max=${3:-$MAX_BYTES} links bytes
   [ ! -L "$path" ] || die "$label is symlinked: $path"
@@ -173,6 +215,31 @@ safe_regular_file() {  # <path> <label> [max-bytes]
   bytes=$(file_size "$path") || die "cannot inspect $label size: $path"
   case "$bytes" in ''|*[!0-9]*) die "$label has an invalid size: $path" ;; esac
   [ "$bytes" -le "$max" ] || die "$label exceeds $max bytes: $path"
+}
+
+home_id_literal_valid() {  # <main|secondmate:id>
+  local value=$1 id
+  [ "$value" = main ] && return 0
+  case "$value" in secondmate:*) id=${value#secondmate:} ;; *) return 1 ;; esac
+  [ "${#id}" -le 128 ] || return 1
+  case "$id" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+}
+
+ensure_home_identity() {
+  local marker id
+  [ -z "$FM_HOME_ID" ] || return 0
+  marker="$FM_HOME_REAL/.fm-secondmate-home"
+  if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+    FM_HOME_ID=main
+    return 0
+  fi
+  safe_regular_file "$marker" "secondmate home identity marker" 256
+  id=$(cat "$marker") || die "cannot read secondmate home identity marker: $marker"
+  printf '%s\n' "$id" | cmp -s "$marker" - \
+    || die "secondmate home identity marker is not one exact line: $marker"
+  home_id_literal_valid "secondmate:$id" \
+    || die "secondmate home identity marker is malformed: $marker"
+  FM_HOME_ID="secondmate:$id"
 }
 
 ensure_data_dir() {
@@ -204,6 +271,8 @@ locate_task_dir() {  # <task-id>, read-only
   fi
   SIDECAR="$TASK_DIR/work-identity.json"
   BRIEF_DEFAULT="$TASK_DIR/brief.md"
+  SOURCE_HANDOFF="$TASK_DIR/work-identity-handoff-source.json"
+  TARGET_HANDOFF="$TASK_DIR/work-identity-handoff-target.json"
 }
 
 ensure_task_dir() {  # <task-id>
@@ -219,11 +288,17 @@ ensure_task_dir() {  # <task-id>
   fi
 }
 
-canonicalize_manifest() {  # <path> <task-id> [expected-home]
-  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} out
-  out=$(jq -e -S -c \
+canonicalize_manifest() {  # <path> <task-id> [expected-home] [expected-home-id]
+  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} expected_home_id=${4:-} out
+  if [ -z "$expected_home_id" ]; then
+    ensure_home_identity
+    expected_home_id=$FM_HOME_ID
+  fi
+  home_id_literal_valid "$expected_home_id" || die "work identity home id is malformed: $expected_home_id"
+  out=$(jq -e -S -c -s \
     --arg schema "$SCHEMA" \
     --arg home "$expected_home" \
+    --arg home_id "$expected_home_id" \
     --arg task "$task" \
     --argjson max_array "$MAX_ARRAY" '
       def exact_keys($ks): (keys | sort) == ($ks | sort);
@@ -236,9 +311,10 @@ canonicalize_manifest() {  # <path> <task-id> [expected-home]
       def safe_label:
         type == "string" and (length >= 1 and length <= 160)
         and . == (gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+        and (test("[\\p{Cc}\\p{Cf}]") | not)
         and (([explode[] | select(
-          . < 32 or . == 60 or . == 62 or . == 92 or . == 96 or . == 124
-          or . == 127 or . == 8232 or . == 8233)] | length) == 0)
+          . == 60 or . == 62 or . == 92 or . == 96 or . == 124
+          or . == 8232 or . == 8233)] | length) == 0)
         and . != "." and . != "..";
       def identity:
         type == "object" and exact_keys(["namespace","kind","id","label"])
@@ -248,10 +324,11 @@ canonicalize_manifest() {  # <path> <task-id> [expected-home]
         and (.label | safe_label);
       def key: [.namespace,.kind,.id] | join("\u001f");
       def allowed($pairs): . as $i | identity and ($pairs | index($i.namespace + ":" + $i.kind) != null);
+      select(length == 1) | .[0] | . as $manifest | select(
       exact_keys(["schema","binding","initiative","plan_id","stage","work_units","sources"])
       and .schema == $schema
-      and (.binding | type == "object" and exact_keys(["home","task_id"])
-        and .home == $home and .task_id == $task)
+      and (.binding | type == "object" and exact_keys(["home","home_id","task_id"])
+        and .home == $home and .home_id == $home_id and .task_id == $task)
       and (.initiative | allowed([
         "work-aligner:project","work-aligner:initiative","dtm:project",
         "firstmate:project","firstmate:initiative"]))
@@ -268,16 +345,16 @@ canonicalize_manifest() {  # <path> <task-id> [expected-home]
           "firstmate:stage","firstmate:work-unit"])))
       and (([.initiative,.plan_id,.stage] + .work_units + .sources) as $all
         | ($all | map(key) | unique | length) == ($all | length))
+      ) | $manifest
     ' "$path" 2>/dev/null) || die "manifest does not satisfy $SCHEMA"
-  [ "$out" = true ] || die "manifest does not satisfy $SCHEMA"
-  jq -S -c . "$path" 2>/dev/null || die "manifest is not valid JSON"
+  printf '%s\n' "$out"
 }
 
-validate_sidecar() {  # <path> <task-id> [expected-home]; sets WORK_CANONICAL/WORK_HASH
-  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} before after canonical
+validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; sets WORK_CANONICAL/WORK_HASH
+  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} expected_home_id=${4:-} before after canonical
   safe_regular_file "$path" "work identity record"
   before=$(file_identity "$path") || die "cannot inspect work identity record: $path"
-  canonical=$(canonicalize_manifest "$path" "$task" "$expected_home")
+  canonical=$(canonicalize_manifest "$path" "$task" "$expected_home" "$expected_home_id")
   if ! printf '%s\n' "$canonical" | cmp -s "$path" -; then
     die "work identity record is not canonical or has trailing data: $path"
   fi
@@ -403,14 +480,15 @@ validate_projection_index() {  # <path>
   ' "$path" >/dev/null 2>&1 || die "projection index does not satisfy $SCHEMA"
   while IFS= read -r row; do
     task=$(printf '%s' "$row" | jq -er '.task_id') || die "projection index task id is malformed"
-    fm_task_id_creation_valid "$task" || die "projection index has an invalid task id"
+    fm_pr_task_id_valid "$task" || die "projection index has an invalid task id"
     printf '%s\n' "$task"
   done < <(jq -c '.[]' "$path")
 }
 
-validate_projection_set() {  # <path> <expected-home>
-  local path=$1 expected_home=$2 row task status recorded_hash canonical tmp
+validate_projection_set() {  # <path> <expected-home> <expected-home-id>
+  local path=$1 expected_home=$2 expected_home_id=$3 row task status recorded_hash canonical tmp
   validate_home_literal "$expected_home"
+  home_id_literal_valid "$expected_home_id" || die "projection home id is malformed"
   safe_regular_file "$path" "work identity projection set" "$MAX_PROJECTION_BATCH_BYTES"
   jq -e '
     . as $entries
@@ -427,18 +505,18 @@ validate_projection_set() {  # <path> <expected-home>
   while IFS= read -r row; do
     task=$(printf '%s' "$row" | jq -er '.task_id') \
       || { rm -f -- "$tmp"; die "projection task id is malformed"; }
-    fm_task_id_creation_valid "$task" \
+    fm_pr_task_id_valid "$task" \
       || { rm -f -- "$tmp"; die "projection has an invalid task id"; }
     status=$(printf '%s' "$row" | jq -er '.work_identity.status') \
       || { rm -f -- "$tmp"; die "projection status is malformed"; }
     case "$status" in
       linked)
         printf '%s' "$row" | jq -e -S -c \
-          --arg schema "$SCHEMA" --arg home "$expected_home" --arg task "$task" '
+          --arg schema "$SCHEMA" --arg home "$expected_home" --arg home_id "$expected_home_id" --arg task "$task" '
           .work_identity as $w
           | select(($w | keys | sort) == (["binding","initiative","plan_id","provenance","schema","sha256","sources","stage","status","work_units"] | sort))
           | select($w.status == "linked" and $w.schema == $schema)
-          | select($w.binding == {home:$home,task_id:$task})
+          | select($w.binding == {home:$home,home_id:$home_id,task_id:$task})
           | select(($w.sha256 | type) == "string" and ($w.sha256 | test("^[0-9a-f]{64}$")))
           | select(($w.provenance | type) == "object"
               and ($w.provenance | keys | sort) == (["instructions","metadata","record"] | sort)
@@ -449,7 +527,7 @@ validate_projection_set() {  # <path> <expected-home>
              stage:$w.stage,work_units:$w.work_units,sources:$w.sources}
         ' > "$tmp" 2>/dev/null \
           || { rm -f -- "$tmp"; die "linked projection does not satisfy $SCHEMA"; }
-        canonical=$(canonicalize_manifest "$tmp" "$task" "$expected_home")
+        canonical=$(canonicalize_manifest "$tmp" "$task" "$expected_home" "$expected_home_id")
         printf '%s\n' "$canonical" | cmp -s "$tmp" - \
           || { rm -f -- "$tmp"; die "linked projection is not canonical"; }
         WORK_HASH=$(sha256_file "$tmp") || { rm -f -- "$tmp"; die "SHA-256 is unavailable for linked projection"; }
@@ -460,11 +538,11 @@ validate_projection_set() {  # <path> <expected-home>
         ;;
       unlinked)
         printf '%s' "$row" | jq -e \
-          --arg schema "$SCHEMA" --arg home "$expected_home" --arg task "$task" '
+          --arg schema "$SCHEMA" --arg home "$expected_home" --arg home_id "$expected_home_id" --arg task "$task" '
           .work_identity as $w
           | ($w | keys | sort) == (["binding","initiative","plan_id","provenance","reason","schema","sha256","sources","stage","status","work_units"] | sort)
           and $w.status == "unlinked" and $w.schema == $schema and $w.sha256 == null
-          and $w.binding == {home:$home,task_id:$task}
+          and $w.binding == {home:$home,home_id:$home_id,task_id:$task}
           and $w.initiative == null and $w.plan_id == null and $w.stage == null
           and $w.work_units == [] and $w.sources == []
           and (["explicitly-unlinked","legacy-no-record"] | index($w.reason)) != null
@@ -481,34 +559,387 @@ validate_projection_set() {  # <path> <expected-home>
   rm -f -- "$tmp"
 }
 
-handoff_export() {  # <task-id> <target-home>
-  local task=$1 target_home=$2 meta rebound tmp
-  validate_home_literal "$target_home"
-  [ "$target_home" != "$FM_HOME_REAL" ] || die "work identity handoff target matches the active home"
-  locate_task_dir "$task"
+identity_lock_acquire() {  # <task-id>
+  local task=$1
+  ensure_task_dir "$task"
+  if ! type fm_lock_acquire_wait >/dev/null 2>&1; then
+    STATE=$STATE_REAL
+    # shellcheck source=bin/fm-wake-lib.sh
+    # shellcheck disable=SC1091
+    . "$SCRIPT_DIR/fm-wake-lib.sh"
+  fi
+  ACTIVE_IDENTITY_LOCK="$TASK_DIR/.work-identity.lock"
+  fm_lock_acquire_wait "$ACTIVE_IDENTITY_LOCK"
+  ACTIVE_IDENTITY_LOCK_HELD=1
+}
+
+validate_handoff_envelope() {  # <path> <task-id>; sets HANDOFF_*
+  local path=$1 task=$2 canonical source_task target_task material computed record validated_record record_hash
+  canonical=$(jq -e -S -c -s --arg schema "$HANDOFF_SCHEMA" '
+    def exact_keys($ks): (keys | sort) == ($ks | sort);
+    select(length == 1) | .[0] | . as $transfer | select(
+    type == "object" and exact_keys(["schema","transfer_id","source","target","identity"])
+    and .schema == $schema
+    and (.transfer_id | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.source | type == "object" and exact_keys(["home","home_id","task_id"])
+      and (.home | type) == "string" and (.home_id | type) == "string" and (.task_id | type) == "string")
+    and (.target | type == "object" and exact_keys(["home","home_id","task_id"])
+      and (.home | type) == "string" and (.home_id | type) == "string" and (.task_id | type) == "string")
+    and (.identity | type == "object" and exact_keys(["status","source_sha256","target_sha256","record"])
+      and ((.status == "linked"
+            and (.source_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+            and (.target_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+            and (.record | type) == "object")
+        or (.status == "unlinked" and .source_sha256 == null
+            and .target_sha256 == null and .record == null)))
+    ) | $transfer
+  ' "$path" 2>/dev/null) || die "handoff transfer does not satisfy $HANDOFF_SCHEMA"
+  printf '%s\n' "$canonical" | cmp -s "$path" - \
+    || die "handoff transfer is not canonical or has trailing data"
+  HANDOFF_TRANSFER_ID=$(printf '%s' "$canonical" | jq -r '.transfer_id')
+  HANDOFF_SOURCE_HOME=$(printf '%s' "$canonical" | jq -r '.source.home')
+  HANDOFF_SOURCE_HOME_ID=$(printf '%s' "$canonical" | jq -r '.source.home_id')
+  HANDOFF_TARGET_HOME=$(printf '%s' "$canonical" | jq -r '.target.home')
+  HANDOFF_TARGET_HOME_ID=$(printf '%s' "$canonical" | jq -r '.target.home_id')
+  source_task=$(printf '%s' "$canonical" | jq -r '.source.task_id')
+  target_task=$(printf '%s' "$canonical" | jq -r '.target.task_id')
+  [ "$source_task" = "$task" ] && [ "$target_task" = "$task" ] \
+    || die "handoff transfer task binding is mismatched"
+  fm_pr_task_id_valid "$task" || die "handoff transfer task id is invalid"
+  validate_home_literal "$HANDOFF_SOURCE_HOME"
+  validate_home_literal "$HANDOFF_TARGET_HOME"
+  home_id_literal_valid "$HANDOFF_SOURCE_HOME_ID" || die "handoff source home id is malformed"
+  home_id_literal_valid "$HANDOFF_TARGET_HOME_ID" || die "handoff target home id is malformed"
+  [ "$HANDOFF_SOURCE_HOME" != "$HANDOFF_TARGET_HOME" ] \
+    || [ "$HANDOFF_SOURCE_HOME_ID" != "$HANDOFF_TARGET_HOME_ID" ] \
+    || die "handoff source and target identities match"
+  HANDOFF_STATUS=$(printf '%s' "$canonical" | jq -r '.identity.status')
+  HANDOFF_SOURCE_SHA=$(printf '%s' "$canonical" | jq -r '.identity.source_sha256 // ""')
+  HANDOFF_TARGET_SHA=$(printf '%s' "$canonical" | jq -r '.identity.target_sha256 // ""')
+  HANDOFF_RECORD=
+  if [ "$HANDOFF_STATUS" = linked ]; then
+    record=$(printf '%s' "$canonical" | jq -S -c '.identity.record') \
+      || die "handoff linked record is malformed"
+    validated_record=$(canonicalize_manifest <(printf '%s\n' "$record") "$task" \
+      "$HANDOFF_TARGET_HOME" "$HANDOFF_TARGET_HOME_ID")
+    [ "$validated_record" = "$record" ] || die "handoff linked record is not canonical"
+    record_hash=$(printf '%s\n' "$record" | sha256_stream) \
+      || die "SHA-256 is unavailable for handoff linked record"
+    [ "$record_hash" = "$HANDOFF_TARGET_SHA" ] \
+      || die "handoff target digest is stale or mismatched"
+    HANDOFF_RECORD=$record
+  fi
+  material=$(printf '%s' "$canonical" | jq -S -c 'del(.transfer_id)') \
+    || die "cannot canonicalize handoff transfer commitment"
+  computed=$(printf '%s\n' "$material" | sha256_stream) \
+    || die "SHA-256 is unavailable for handoff transfer"
+  [ "$computed" = "$HANDOFF_TRANSFER_ID" ] || die "handoff transfer commitment is mismatched"
+  HANDOFF_CANONICAL=$canonical
+}
+
+validate_handoff_text() {  # <canonical-transfer> <task-id>
+  local text=$1 task=$2
+  VALIDATION_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-transfer.XXXXXX") \
+    || die "cannot create handoff transfer validation file"
+  printf '%s\n' "$text" > "$VALIDATION_TMP" || die "cannot write handoff transfer validation file"
+  validate_handoff_envelope "$VALIDATION_TMP" "$task"
+  rm -f -- "$VALIDATION_TMP"
+  VALIDATION_TMP=
+}
+
+handoff_state_json() {  # <source|target> <prepared|completed> <transfer>
+  jq -n -S -c --arg schema "$HANDOFF_STATE_SCHEMA" --arg role "$1" --arg state "$2" \
+    --argjson transfer "$3" '{schema:$schema,role:$role,state:$state,transfer:$transfer}'
+}
+
+read_handoff_state() {  # <path> <source|target>; sets HANDOFF_STATE/HANDOFF_TRANSFER
+  local path=$1 role=$2 wrapper transfer task
+  safe_regular_file "$path" "work identity handoff state" "$HANDOFF_MAX_BYTES"
+  wrapper=$(jq -e -S -c -s --arg schema "$HANDOFF_STATE_SCHEMA" --arg role "$role" '
+    def exact_keys($ks): (keys | sort) == ($ks | sort);
+    select(length == 1) | .[0] | . as $wrapper | select(
+    type == "object" and exact_keys(["schema","role","state","transfer"])
+    and .schema == $schema and .role == $role
+    and (if $role == "source" then (.state == "prepared" or .state == "completed")
+         else .state == "prepared" end)
+    and (.transfer | type) == "object"
+    ) | $wrapper
+  ' "$path" 2>/dev/null) || die "work identity handoff state is malformed: $path"
+  printf '%s\n' "$wrapper" | cmp -s "$path" - \
+    || die "work identity handoff state is not canonical: $path"
+  transfer=$(printf '%s' "$wrapper" | jq -S -c '.transfer')
+  task=$(printf '%s' "$transfer" | jq -r '.source.task_id')
+  validate_handoff_text "$transfer" "$task"
+  HANDOFF_STATE=$(printf '%s' "$wrapper" | jq -r '.state')
+  HANDOFF_TRANSFER=$HANDOFF_CANONICAL
+}
+
+write_handoff_state() {  # <path> <source|target> <prepared|completed> <transfer>
+  local path=$1 role=$2 state=$3 transfer=$4 payload
+  payload=$(handoff_state_json "$role" "$state" "$transfer") \
+    || die "cannot build work identity handoff state"
+  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-handoff.XXXXXX") \
+    || die "cannot create work identity handoff state"
+  printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity handoff state"
+  chmod 600 "$TMP" || die "cannot protect work identity handoff state"
+  mv -f -- "$TMP" "$path" || die "cannot publish work identity handoff state"
+  TMP=
+}
+
+reject_handoff_guard() {  # <task-id>
+  local task=$1
+  if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
+    read_handoff_state "$SOURCE_HANDOFF" source
+    die "work identity ownership was handed off for task $task"
+  fi
+  if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
+    read_handoff_state "$TARGET_HANDOFF" target
+    die "work identity ownership handoff is incomplete for task $task"
+  fi
+}
+
+validate_source_transfer() {  # <task-id>; HANDOFF_* already loaded
+  local task=$1 meta rebound rebound_hash
+  ensure_home_identity
+  [ "$HANDOFF_SOURCE_HOME" = "$FM_HOME_REAL" ] && [ "$HANDOFF_SOURCE_HOME_ID" = "$FM_HOME_ID" ] \
+    || die "handoff source binding does not match the active home"
   meta="$STATE_REAL/$task.meta"
-  if [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ]; then
-    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] || validate_brief_binding "$BRIEF_DEFAULT" unlinked
+  if [ "$HANDOFF_STATUS" = linked ]; then
+    [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ] || die "linked handoff source record is absent"
+    validate_sidecar "$SIDECAR" "$task"
+    [ "$WORK_HASH" = "$HANDOFF_SOURCE_SHA" ] || die "handoff source digest is stale or mismatched"
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+    rebound=$(printf '%s' "$WORK_CANONICAL" | jq -S -c \
+      --arg home "$HANDOFF_TARGET_HOME" --arg home_id "$HANDOFF_TARGET_HOME_ID" \
+      '.binding.home = $home | .binding.home_id = $home_id') \
+      || die "cannot rebind work identity for handoff"
+    [ "$rebound" = "$HANDOFF_RECORD" ] || die "handoff target record no longer matches its source"
+    rebound_hash=$(printf '%s\n' "$rebound" | sha256_stream) \
+      || die "SHA-256 is unavailable for rebound work identity"
+    [ "$rebound_hash" = "$HANDOFF_TARGET_SHA" ] || die "handoff target digest is mismatched"
+  else
+    [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || die "unlinked handoff source gained a linked record"
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" unlinked
     [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" unlinked
-    return 3
+  fi
+}
+
+build_handoff_transfer() {  # <task-id> <target-home> <target-home-id>; sets HANDOFF_CANONICAL
+  local task=$1 target_home=$2 target_home_id=$3 meta status source_hash target_hash record material transfer_id
+  ensure_home_identity
+  meta="$STATE_REAL/$task.meta"
+  if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+    validate_sidecar "$SIDECAR" "$task"
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+    status=linked
+    source_hash=$WORK_HASH
+    record=$(printf '%s' "$WORK_CANONICAL" | jq -S -c \
+      --arg home "$target_home" --arg home_id "$target_home_id" \
+      '.binding.home = $home | .binding.home_id = $home_id') \
+      || die "cannot rebind work identity for handoff"
+    canonicalize_manifest <(printf '%s\n' "$record") "$task" "$target_home" "$target_home_id" >/dev/null
+    target_hash=$(printf '%s\n' "$record" | sha256_stream) \
+      || die "SHA-256 is unavailable for handoff target record"
+  else
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" unlinked
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" unlinked
+    status=unlinked
+    source_hash=
+    target_hash=
+    record=null
+  fi
+  material=$(jq -n -S -c \
+    --arg schema "$HANDOFF_SCHEMA" --arg source_home "$FM_HOME_REAL" --arg source_home_id "$FM_HOME_ID" \
+    --arg target_home "$target_home" --arg target_home_id "$target_home_id" --arg task "$task" \
+    --arg status "$status" --arg source_hash "$source_hash" --arg target_hash "$target_hash" \
+    --argjson record "$record" '
+      {schema:$schema,
+       source:{home:$source_home,home_id:$source_home_id,task_id:$task},
+       target:{home:$target_home,home_id:$target_home_id,task_id:$task},
+       identity:{status:$status,
+         source_sha256:(if $status == "linked" then $source_hash else null end),
+         target_sha256:(if $status == "linked" then $target_hash else null end),
+         record:(if $status == "linked" then $record else null end)}}') \
+    || die "cannot build work identity handoff transfer"
+  transfer_id=$(printf '%s\n' "$material" | sha256_stream) \
+    || die "SHA-256 is unavailable for work identity handoff"
+  HANDOFF_CANONICAL=$(printf '%s' "$material" | jq -S -c --arg transfer_id "$transfer_id" '. + {transfer_id:$transfer_id}') \
+    || die "cannot finalize work identity handoff transfer"
+  validate_handoff_text "$HANDOFF_CANONICAL" "$task"
+}
+
+handoff_prepare() {  # <task-id> <target-home> <target-home-id>
+  local task=$1 target_home=$2 target_home_id=$3
+  validate_home_literal "$target_home"
+  home_id_literal_valid "$target_home_id" || die "work identity handoff target home id is malformed"
+  ensure_home_identity
+  [ "$target_home" != "$FM_HOME_REAL" ] || [ "$target_home_id" != "$FM_HOME_ID" ] \
+    || die "work identity handoff target matches the active home"
+  identity_lock_acquire "$task"
+  if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
+    read_handoff_state "$TARGET_HANDOFF" target
+    die "task $task has an incomplete incoming work identity handoff"
+  fi
+  if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
+    read_handoff_state "$SOURCE_HANDOFF" source
+    [ "$HANDOFF_TARGET_HOME" = "$target_home" ] && [ "$HANDOFF_TARGET_HOME_ID" = "$target_home_id" ] \
+      || die "task $task is already prepared for a different handoff target"
+    validate_source_transfer "$task"
+    printf '%s\n' "$HANDOFF_TRANSFER"
+    return 0
+  fi
+  build_handoff_transfer "$task" "$target_home" "$target_home_id"
+  write_handoff_state "$SOURCE_HANDOFF" source prepared "$HANDOFF_CANONICAL"
+  printf '%s\n' "$HANDOFF_CANONICAL"
+}
+
+handoff_target_matches_current() {
+  ensure_home_identity
+  [ "$HANDOFF_TARGET_HOME" = "$FM_HOME_REAL" ] && [ "$HANDOFF_TARGET_HOME_ID" = "$FM_HOME_ID" ] \
+    || die "handoff target binding does not match the active home"
+}
+
+handoff_stage() {  # <task-id> <transfer-path>
+  local task=$1 path=$2 requested meta
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  handoff_target_matches_current
+  identity_lock_acquire "$task"
+  if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
+    read_handoff_state "$SOURCE_HANDOFF" source
+    die "handoff target task $task is already owned by an outgoing transfer"
+  fi
+  if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
+    read_handoff_state "$TARGET_HANDOFF" target
+    [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task has a different prepared incoming handoff"
+    return 0
+  fi
+  validate_handoff_text "$requested" "$task"
+  meta="$STATE_REAL/$task.meta"
+  if [ "$HANDOFF_STATUS" = linked ]; then
+    if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+      validate_sidecar "$SIDECAR" "$task"
+      [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
+        || die "handoff target already has a different linked record"
+      [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+        || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
+      [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+    elif [ -e "$BRIEF_DEFAULT" ] || [ -L "$BRIEF_DEFAULT" ] || [ -e "$meta" ] || [ -L "$meta" ]; then
+      die "linked handoff identity must arrive before destination instructions and metadata"
+    fi
+  else
+    [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || die "unlinked handoff target already has a linked record"
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" unlinked
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" unlinked
+  fi
+  write_handoff_state "$TARGET_HANDOFF" target prepared "$requested"
+}
+
+publish_handoff_sidecar() {  # <task-id>; HANDOFF_RECORD/HANDOFF_TARGET_SHA loaded, lock held
+  local task=$1
+  if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+    validate_sidecar "$SIDECAR" "$task"
+    [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
+      || die "handoff target linked record is conflicting"
+    return 0
+  fi
+  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity.XXXXXX") \
+    || die "cannot create handoff work identity record"
+  printf '%s\n' "$HANDOFF_RECORD" > "$TMP" || die "cannot write handoff work identity record"
+  validate_sidecar "$TMP" "$task"
+  if ln "$TMP" "$SIDECAR" 2>/dev/null; then
+    rm -f -- "$TMP"
+    TMP=
+  else
+    rm -f -- "$TMP"
+    TMP=
+    [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ] || die "cannot publish handoff work identity record"
   fi
   validate_sidecar "$SIDECAR" "$task"
-  [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
-    || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
-  [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
-  rebound=$(printf '%s' "$WORK_CANONICAL" | jq -S -c --arg home "$target_home" '.binding.home = $home') \
-    || die "cannot rebind work identity for handoff"
-  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-handoff.XXXXXX") \
-    || die "cannot create work identity handoff file"
-  printf '%s\n' "$rebound" > "$tmp" || { rm -f -- "$tmp"; die "cannot write work identity handoff file"; }
-  validate_sidecar "$tmp" "$task" "$target_home"
-  cat "$tmp"
-  rm -f -- "$tmp"
+  [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
+    || die "published handoff work identity record is conflicting"
+}
+
+handoff_commit() {  # <task-id> <transfer-path>
+  local task=$1 path=$2 requested meta
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  handoff_target_matches_current
+  identity_lock_acquire "$task"
+  [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ] \
+    || die "task $task has no prepared incoming handoff"
+  read_handoff_state "$TARGET_HANDOFF" target
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
+  meta="$STATE_REAL/$task.meta"
+  if [ "$HANDOFF_STATUS" = linked ]; then
+    publish_handoff_sidecar "$task"
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+  else
+    [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || die "unlinked handoff target gained a linked record"
+  fi
+  rm -f -- "$TARGET_HANDOFF" || die "cannot clear committed handoff target state"
+}
+
+handoff_abort() {  # <task-id> <transfer-path>; 4 means target may already be committed
+  local task=$1 path=$2 requested
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  handoff_target_matches_current
+  identity_lock_acquire "$task"
+  if [ ! -e "$TARGET_HANDOFF" ] && [ ! -L "$TARGET_HANDOFF" ]; then
+    [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || return 4
+    return 0
+  fi
+  read_handoff_state "$TARGET_HANDOFF" target
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
+  [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || return 4
+  rm -f -- "$TARGET_HANDOFF" || die "cannot abort handoff target state"
+}
+
+handoff_complete() {  # <task-id> <transfer-path>
+  local task=$1 path=$2 requested
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  ensure_home_identity
+  [ "$HANDOFF_SOURCE_HOME" = "$FM_HOME_REAL" ] && [ "$HANDOFF_SOURCE_HOME_ID" = "$FM_HOME_ID" ] \
+    || die "handoff completion source does not match the active home"
+  identity_lock_acquire "$task"
+  [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ] || die "task $task has no prepared source handoff"
+  read_handoff_state "$SOURCE_HANDOFF" source
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different source handoff"
+  validate_source_transfer "$task"
+  [ "$HANDOFF_STATE" = completed ] || write_handoff_state "$SOURCE_HANDOFF" source completed "$requested"
+}
+
+handoff_cancel() {  # <task-id> <transfer-path>; 4 means source is already completed
+  local task=$1 path=$2 requested
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  ensure_home_identity
+  [ "$HANDOFF_SOURCE_HOME" = "$FM_HOME_REAL" ] && [ "$HANDOFF_SOURCE_HOME_ID" = "$FM_HOME_ID" ] \
+    || die "handoff cancellation source does not match the active home"
+  identity_lock_acquire "$task"
+  if [ ! -e "$SOURCE_HANDOFF" ] && [ ! -L "$SOURCE_HANDOFF" ]; then return 0; fi
+  read_handoff_state "$SOURCE_HANDOFF" source
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different source handoff"
+  [ "$HANDOFF_STATE" != completed ] || return 4
+  rm -f -- "$SOURCE_HANDOFF" || die "cannot cancel handoff source state"
 }
 
 project_identity() {  # <task-id> [brief] [meta]
   local task=$1 brief=${2:-} meta=${3:-} reason
   locate_task_dir "$task"
+  reject_handoff_guard "$task"
+  ensure_home_identity
   META_PROVENANCE=absent
   BRIEF_PROVENANCE=absent
   if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
@@ -536,11 +967,12 @@ project_identity() {  # <task-id> [brief] [meta]
   jq -n -S -c \
     --arg schema "$SCHEMA" \
     --arg home "$FM_HOME_REAL" \
+    --arg home_id "$FM_HOME_ID" \
     --arg task "$task" \
     --arg reason "$reason" \
     --arg brief_provenance "$BRIEF_PROVENANCE" \
     --arg meta_provenance "$META_PROVENANCE" '
-      {status:"unlinked",schema:$schema,sha256:null,binding:{home:$home,task_id:$task},
+      {status:"unlinked",schema:$schema,sha256:null,binding:{home:$home,home_id:$home_id,task_id:$task},
        initiative:null,plan_id:null,stage:null,work_units:[],sources:[],reason:$reason,
        provenance:{record:"absent",instructions:$brief_provenance,metadata:$meta_provenance}}'
 }
@@ -549,13 +981,19 @@ command -v jq >/dev/null 2>&1 || die "jq not found"
 COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
-  limits|record-max-bytes|validate-index|validate-projections) ;;
-  template|record|verify|brief-block|project|handoff-export|handoff-import) ;;
+  home-id|limits|record-max-bytes|validate-index|validate-projections) ;;
+  template|record|verify|brief-block|project|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
 
 case "$COMMAND" in
+  home-id)
+    [ "$#" -eq 0 ] || die "home-id accepts no arguments"
+    ensure_home_identity
+    printf '%s\n' "$FM_HOME_ID"
+    exit 0
+    ;;
   limits)
     [ "$#" -eq 0 ] || die "limits accepts no arguments"
     jq -n -c --argjson record "$MAX_BYTES" --argjson projection "$MAX_PROJECTION_BYTES" \
@@ -570,7 +1008,6 @@ case "$COMMAND" in
   validate-index)
     [ "$#" -eq 2 ] && [ "$1" = --file ] || die "validate-index usage: fm-work-identity.sh validate-index --file <index.json|->"
     DIE_STATUS=42
-    trap '[ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP"' EXIT
     capture_contract_input "$2" "work identity projection index" "$MAX_PROJECTION_BATCH_BYTES"
     validate_projection_index "$CONTRACT_INPUT"
     [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
@@ -578,21 +1015,22 @@ case "$COMMAND" in
     ;;
   validate-projections)
     EXPECTED_HOME=
+    EXPECTED_HOME_ID=
     INPUT_PATH=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --home) shift; [ "$#" -gt 0 ] || die "--home requires a path"; EXPECTED_HOME=$1 ;;
+        --home-id) shift; [ "$#" -gt 0 ] || die "--home-id requires an id"; EXPECTED_HOME_ID=$1 ;;
         --file) shift; [ "$#" -gt 0 ] || die "--file requires a path"; INPUT_PATH=$1 ;;
         *) die "unknown validate-projections argument: $1" ;;
       esac
       shift
     done
-    [ -n "$EXPECTED_HOME" ] && [ -n "$INPUT_PATH" ] \
-      || die "validate-projections requires --home and --file"
+    [ -n "$EXPECTED_HOME" ] && [ -n "$EXPECTED_HOME_ID" ] && [ -n "$INPUT_PATH" ] \
+      || die "validate-projections requires --home, --home-id, and --file"
     DIE_STATUS=42
-    trap '[ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP"' EXIT
     capture_contract_input "$INPUT_PATH" "work identity projection set" "$MAX_PROJECTION_BATCH_BYTES"
-    validate_projection_set "$CONTRACT_INPUT" "$EXPECTED_HOME"
+    validate_projection_set "$CONTRACT_INPUT" "$EXPECTED_HOME" "$EXPECTED_HOME_ID"
     [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
     exit 0
     ;;
@@ -601,14 +1039,18 @@ esac
 TASK=${1:-}
 [ -n "$TASK" ] || die "$COMMAND requires a task id"
 shift
-fm_task_id_creation_valid "$TASK" || die "invalid task id"
+case "$COMMAND" in
+  template|record) fm_task_id_creation_valid "$TASK" || die "invalid task id" ;;
+  *) fm_pr_task_id_valid "$TASK" || die "invalid task id" ;;
+esac
 
 case "$COMMAND" in
   template)
     [ "$#" -eq 0 ] || die "template accepts only a task id"
+    ensure_home_identity
     jq -n -S \
-      --arg schema "$SCHEMA" --arg home "$FM_HOME_REAL" --arg task "$TASK" '
-      {schema:$schema,binding:{home:$home,task_id:$task},
+      --arg schema "$SCHEMA" --arg home "$FM_HOME_REAL" --arg home_id "$FM_HOME_ID" --arg task "$TASK" '
+      {schema:$schema,binding:{home:$home,home_id:$home_id,task_id:$task},
        initiative:{namespace:"work-aligner",kind:"project",id:"replace-project-id",label:"Replace project label"},
        plan_id:{namespace:"work-aligner",kind:"plan",id:"replace-plan-id",label:"Replace plan label"},
        stage:{namespace:"work-aligner",kind:"stage",id:"replace-stage-id",label:"Replace stage label"},
@@ -623,25 +1065,8 @@ case "$COMMAND" in
     CANONICAL=$(canonicalize_manifest "$MANIFEST" "$TASK")
     MANIFEST_AFTER=$(file_identity "$MANIFEST") || die "cannot reinspect work identity manifest"
     [ "$MANIFEST_BEFORE" = "$MANIFEST_AFTER" ] || die "work identity manifest changed while it was read"
-    ensure_task_dir "$TASK"
-    STATE=$STATE_REAL
-    # shellcheck source=bin/fm-wake-lib.sh
-    # shellcheck disable=SC1091
-    . "$SCRIPT_DIR/fm-wake-lib.sh"
-    RECORD_LOCK="$TASK_DIR/.work-identity.lock"
-    fm_lock_acquire_wait "$RECORD_LOCK"
-    RECORD_LOCK_HELD=1
-    TMP=
-    record_cleanup() {
-      local status=$?
-      [ -z "${TMP:-}" ] || rm -f -- "$TMP"
-      if [ "${RECORD_LOCK_HELD:-0}" = 1 ]; then
-        RECORD_LOCK_HELD=0
-        fm_lock_release "$RECORD_LOCK" || true
-      fi
-      return "$status"
-    }
-    trap record_cleanup EXIT
+    identity_lock_acquire "$TASK"
+    reject_handoff_guard "$TASK"
     META="$STATE_REAL/$TASK.meta"
     if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
       validate_sidecar "$SIDECAR" "$TASK"
@@ -675,23 +1100,24 @@ case "$COMMAND" in
       printf 'recorded %s task=%s sha256=%s (unchanged)\n' "$SCHEMA" "$TASK" "$WORK_HASH"
     fi
     ;;
-  handoff-export)
-    [ "$#" -eq 2 ] && [ "$1" = --to-home ] \
-      || die "handoff-export usage: fm-work-identity.sh handoff-export <task-id> --to-home <absolute-home>"
-    handoff_export "$TASK" "$2"
+  handoff-prepare)
+    [ "$#" -eq 4 ] && [ "$1" = --to-home ] && [ "$3" = --to-home-id ] \
+      || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id>"
+    handoff_prepare "$TASK" "$2" "$4"
     ;;
-  handoff-import)
+  handoff-stage|handoff-commit|handoff-abort|handoff-complete|handoff-cancel)
     [ "$#" -eq 2 ] && [ "$1" = --file ] \
-      || die "handoff-import usage: fm-work-identity.sh handoff-import <task-id> --file <manifest.json|->"
-    trap '[ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP"' EXIT
-    capture_contract_input "$2" "work identity handoff manifest" "$MAX_BYTES"
-    if "$SCRIPT_DIR/fm-work-identity.sh" record "$TASK" --file "$CONTRACT_INPUT"; then
-      IMPORT_RC=0
-    else
-      IMPORT_RC=$?
-    fi
+      || die "$COMMAND usage: fm-work-identity.sh $COMMAND <task-id> --file <transfer.json|->"
+    capture_contract_input "$2" "work identity handoff transfer" "$HANDOFF_MAX_BYTES"
+    case "$COMMAND" in
+      handoff-stage) handoff_stage "$TASK" "$CONTRACT_INPUT" ;;
+      handoff-commit) handoff_commit "$TASK" "$CONTRACT_INPUT" ;;
+      handoff-abort) handoff_abort "$TASK" "$CONTRACT_INPUT" ;;
+      handoff-complete) handoff_complete "$TASK" "$CONTRACT_INPUT" ;;
+      handoff-cancel) handoff_cancel "$TASK" "$CONTRACT_INPUT" ;;
+    esac
     [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
-    exit "$IMPORT_RC"
+    CONTRACT_INPUT_TMP=
     ;;
   verify)
     [ "$#" -eq 0 ] || die "verify accepts only a task id"
@@ -705,6 +1131,8 @@ case "$COMMAND" in
   brief-block)
     [ "$#" -eq 0 ] || die "brief-block accepts only a task id"
     locate_task_dir "$TASK"
+    reject_handoff_guard "$TASK"
+    ensure_home_identity
     if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
       validate_sidecar "$SIDECAR" "$TASK"
       cat <<EOF

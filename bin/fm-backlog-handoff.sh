@@ -22,8 +22,9 @@
 #   - moving only `## Queued` items, refusing `## In flight` and historical
 #     `## Done` records, which must stay with their home for pruning or
 #     archiving;
-#   - staging any exact linked work identity in the destination home before its
-#     backlog row can move, through the contract owner's rebind interface;
+#   - durably preparing any exact linked or legacy-unlinked source before its
+#     row leaves the dispatch backlog, preparing the target before destination
+#     receipt, then committing target ownership and a source tombstone;
 #   - the multi-key classification and idempotent per-key reporting: a key
 #     already present in the secondmate backlog is reported and skipped, and if
 #     any key matches neither backlog nothing is moved;
@@ -52,16 +53,16 @@
 # Remote routes use an outbox handoff: one atomic local tasks-axi mv removes the
 # selected set from the dispatchable backlog into data/handoff/<id>.outbox.md,
 # then an idempotent confined transfer and fm-backlog-receive.sh deliver it.
-# A present outbox remains the remote retry trigger until backlog receipt and
-# receiver wake are both confirmed; a companion pending-reply correlation makes
-# crash recovery reconcile an attempted or confirmed wake instead of blindly
-# resending it. A prepared local wake is bound to the exact sorted
-# requested-key batch; an unrelated handoff to that mate refuses until the
-# original batch is retried, so it cannot discard wake intent for work that
-# already moved. No two-phase journal exists.
-# Every newly durable backlog delivery also sends one marked wake to the
-# receiving endpoint. A missing endpoint or a live endpoint that rejects the
-# wake makes the handoff fail with the delivered backlog intact.
+# A present outbox remains the remote retry trigger until backlog receipt,
+# identity prepare/commit/tombstone convergence, and receiver wake are confirmed;
+# a companion pending-reply correlation makes crash recovery reconcile an attempted
+# or confirmed wake instead of blindly resending it. A prepared local wake is bound
+# to the exact sorted requested-key batch; an unrelated handoff to that mate refuses
+# until the original batch is retried, so it cannot discard wake intent for work
+# that already moved. No two-phase backlog journal exists.
+# Every newly durable backlog delivery also sends one marked wake to the receiving
+# endpoint. A missing endpoint or a live endpoint that rejects the wake makes the
+# handoff fail with the delivered backlog and identity recovery state intact.
 # Usage: fm-backlog-handoff.sh <secondmate-id> <item-key>...
 #        fm-backlog-handoff.sh --resume-pending
 set -eu
@@ -532,59 +533,160 @@ outbox_keys() { # <path>
   ' "$1"
 }
 
-export_handoff_identity() { # <task-id> <target-home>; 0 linked, 3 unlinked
-  local task=$1 target_home=$2 payload rc
-  rc=0
-  payload=$(
-    FM_HOME="$FM_HOME" \
-      FM_DATA_OVERRIDE="$DATA" \
-      FM_STATE_OVERRIDE="$STATE" \
-      FM_ROOT_OVERRIDE="$FM_ROOT" \
-      "$SCRIPT_DIR/fm-work-identity.sh" handoff-export "$task" --to-home "$target_home"
-  ) || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    HANDOFF_IDENTITY_PAYLOAD=$payload
-    return 0
-  fi
-  HANDOFF_IDENTITY_PAYLOAD=
-  [ "$rc" -eq 3 ] && return 3
-  return "$rc"
+HANDOFF_IDENTITY_TASKS=()
+HANDOFF_IDENTITY_PAYLOADS=()
+
+prepare_handoff_identity() { # <task-id> <target-home> <target-home-id>
+  local task=$1 target_home=$2 target_home_id=$3
+  HANDOFF_IDENTITY_PAYLOAD=$(
+    FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+      handoff-prepare "$task" --to-home "$target_home" --to-home-id "$target_home_id"
+  ) || return $?
 }
 
-stage_local_handoff_identities() { # <target-home> <task-id>...
-  local target_home=$1 task rc
-  shift
+source_handoff_action() { # <complete|cancel> <task-id> <payload>
+  local action=$1 task=$2 payload=$3
+  printf '%s\n' "$payload" \
+    | FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+        FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+        "handoff-$action" "$task" --file - >/dev/null
+}
+
+local_target_handoff_action() { # <target-home> <stage|commit|abort> <task-id> <payload>
+  local target_home=$1 action=$2 task=$3 payload=$4
+  printf '%s\n' "$payload" \
+    | FM_HOME="$target_home" FM_DATA_OVERRIDE="$target_home/data" \
+        FM_STATE_OVERRIDE="$target_home/state" FM_ROOT_OVERRIDE="$FM_ROOT" \
+        "$SCRIPT_DIR/fm-work-identity.sh" "handoff-$action" "$task" --file - >/dev/null
+}
+
+remote_target_handoff_action() { # <secondmate-id> <stage|commit|abort> <task-id> <payload>
+  local id=$1 action=$2 task=$3 payload=$4
+  printf '%s\n' "$payload" \
+    | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh \
+        "handoff-$action" "$task" --file - >/dev/null
+}
+
+rollback_local_handoff_identities() { # <target-home>
+  local target_home=$1 i task payload failed=0
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    local_target_handoff_action "$target_home" abort "$task" "$payload" || failed=1
+    i=$((i + 1))
+  done
+  [ "$failed" -eq 0 ] || return 1
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    source_handoff_action cancel "$task" "$payload" || failed=1
+    i=$((i + 1))
+  done
+  return "$failed"
+}
+
+stage_local_handoff_identities() { # <target-home> <target-home-id> <task-id>...
+  local target_home=$1 target_home_id=$2 task
+  shift 2
+  HANDOFF_IDENTITY_TASKS=()
+  HANDOFF_IDENTITY_PAYLOADS=()
   for task in "$@"; do
-    rc=0
-    export_handoff_identity "$task" "$target_home" || rc=$?
-    [ "$rc" -eq 3 ] && continue
-    [ "$rc" -eq 0 ] || return "$rc"
-    printf '%s\n' "$HANDOFF_IDENTITY_PAYLOAD" \
-      | FM_HOME="$target_home" \
-          FM_DATA_OVERRIDE="$target_home/data" \
-          FM_STATE_OVERRIDE="$target_home/state" \
-          FM_ROOT_OVERRIDE="$FM_ROOT" \
-          "$SCRIPT_DIR/fm-work-identity.sh" handoff-import "$task" --file - >/dev/null \
-      || return $?
+    if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id"; then
+      rollback_local_handoff_identities "$target_home" || true
+      return 1
+    fi
+    HANDOFF_IDENTITY_TASKS+=("$task")
+    HANDOFF_IDENTITY_PAYLOADS+=("$HANDOFF_IDENTITY_PAYLOAD")
+    if ! local_target_handoff_action "$target_home" stage "$task" "$HANDOFF_IDENTITY_PAYLOAD"; then
+      rollback_local_handoff_identities "$target_home" || true
+      return 1
+    fi
   done
 }
 
-stage_remote_handoff_identities() { # <secondmate-id> <target-home> <task-id>...
-  local id=$1 target_home=$2 task rc
+cancel_source_handoff_identities() {
+  local i task payload failed=0
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    source_handoff_action cancel "$task" "$payload" || failed=1
+    i=$((i + 1))
+  done
+  return "$failed"
+}
+
+prepare_remote_handoff_identities() { # <target-home> <target-home-id> <task-id>...
+  local target_home=$1 target_home_id=$2 task
   shift 2
+  HANDOFF_IDENTITY_TASKS=()
+  HANDOFF_IDENTITY_PAYLOADS=()
   for task in "$@"; do
-    rc=0
-    export_handoff_identity "$task" "$target_home" || rc=$?
-    [ "$rc" -eq 3 ] && continue
-    [ "$rc" -eq 0 ] || return "$rc"
-    printf '%s\n' "$HANDOFF_IDENTITY_PAYLOAD" \
-      | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh handoff-import "$task" --file - >/dev/null \
-      || return $?
+    if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id"; then
+      cancel_source_handoff_identities || true
+      return 1
+    fi
+    HANDOFF_IDENTITY_TASKS+=("$task")
+    HANDOFF_IDENTITY_PAYLOADS+=("$HANDOFF_IDENTITY_PAYLOAD")
+  done
+}
+
+stage_prepared_remote_handoff_identities() { # <secondmate-id>
+  local id=$1 i task payload
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    remote_target_handoff_action "$id" stage "$task" "$payload" || return 1
+    i=$((i + 1))
+  done
+}
+
+stage_remote_handoff_identities() { # <secondmate-id> <target-home> <target-home-id> <task-id>...
+  local id=$1 target_home=$2 target_home_id=$3
+  shift 3
+  prepare_remote_handoff_identities "$target_home" "$target_home_id" "$@" || return 1
+  stage_prepared_remote_handoff_identities "$id"
+}
+
+commit_local_handoff_identities() { # <target-home>
+  local target_home=$1 i task payload
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    local_target_handoff_action "$target_home" commit "$task" "$payload" || return 1
+    i=$((i + 1))
+  done
+}
+
+commit_remote_handoff_identities() { # <secondmate-id>
+  local id=$1 i task payload
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    remote_target_handoff_action "$id" commit "$task" "$payload" || return 1
+    i=$((i + 1))
+  done
+}
+
+complete_source_handoff_identities() {
+  local i task payload
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    source_handoff_action complete "$task" "$payload" || return 1
+    i=$((i + 1))
   done
 }
 
 remote_deliver_outbox() { # <secondmate-id> <outbox-path>
-  local id=$1 outbox=$2 remote_rel receive_out snapshot bytes hash generation counter counter_tmp current marker
+  local id=$1 outbox=$2 remote_rel receive_out snapshot bytes hash generation counter counter_tmp current
   [ -f "$outbox" ] && [ ! -L "$outbox" ] || {
     echo "error: pending outbox is unavailable or unsafe: $outbox" >&2
     return 1
@@ -627,27 +729,38 @@ remote_deliver_outbox() { # <secondmate-id> <outbox-path>
     echo "error: handoff receipt by $id was unavailable or completion is unknown; outbox preserved at $outbox" >&2
     return 1
   fi
-  marker="$STATE/.backlog-handoff-$id.wake-pending"
+  printf '%s\n' "$receive_out"
+}
+
+finish_remote_handoff() { # <secondmate-id> <outbox-path>
+  local id=$1 outbox=$2 marker="$STATE/.backlog-handoff-$1.wake-pending"
+  commit_remote_handoff_identities "$id" || {
+    echo "error: remote backlog arrived but exact work identity commit is incomplete; outbox preserved at $outbox" >&2
+    return 1
+  }
+  complete_source_handoff_identities || {
+    echo "error: remote work identity arrived but source ownership completion is incomplete; outbox preserved at $outbox" >&2
+    return 1
+  }
   case "$(cat "$marker" 2>/dev/null || true)" in
     pending:*|confirmed|confirmed:*) ;;
     *) receiver_wake_mark_pending "$id" || {
-      echo "error: remote backlog is durable at $id, but receiver wake state could not be recorded; outbox preserved at $outbox" >&2
+      echo "error: remote backlog and identity are durable at $id, but receiver wake state could not be recorded; outbox preserved at $outbox" >&2
       return 1
     } ;;
   esac
   if ! wake_pending_secondmate_receiver "$id" 1; then
-    echo "error: remote backlog is durable at $id; outbox preserved at $outbox for wake retry" >&2
+    echo "error: remote backlog and identity are durable at $id; outbox preserved at $outbox for wake retry" >&2
     return 1
   fi
   rm -f -- "$outbox" || {
-    echo "error: receiver wake was confirmed but local outbox cleanup failed: $outbox" >&2
+    echo "error: remote receipt, identity commit, and receiver wake were confirmed but local outbox cleanup failed: $outbox" >&2
     return 1
   }
   rm -f -- "$marker" || {
     echo "error: remote outbox cleanup succeeded but confirmed receiver wake state could not be cleared: $marker" >&2
     return 1
   }
-  printf '%s\n' "$receive_out"
 }
 
 remove_interrupted_source_duplicates() { # <outbox> <keys...>
@@ -667,7 +780,7 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
     done
     [ "$remaining" -gt 0 ] || return 0
     [ "$progress" -gt 0 ] || {
-      echo "error: could not complete interrupted source removal; outbox remains authoritative at $outbox" >&2
+      echo "error: could not complete interrupted source removal; handoff destination remains authoritative at $outbox" >&2
       return 1
     }
     pass=$((pass + 1))
@@ -676,7 +789,7 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
 }
 
 remote_handoff() { # <secondmate-id> <keys...>
-  local id=$1 outbox section main_section out_section key mv_out target_home
+  local id=$1 outbox section main_section out_section key mv_out target_home persisted
   local -a requested to_move already missing in_flight done_items not_queued
   shift
   requested=("$@")
@@ -737,7 +850,7 @@ remote_handoff() { # <secondmate-id> <keys...>
   # batch first. A failure leaves the fresh items dispatchable in main.
   if [ "${#to_move[@]}" -gt 0 ] && [ -f "$outbox" ] \
     && [ "$(outbox_item_count "$outbox")" -gt 0 ]; then
-    remote_deliver_outbox "$id" "$outbox" || {
+    resume_remote_outbox "$id" "$outbox" || {
       echo "error: previous remote handoff for secondmate $id could not be completed; nothing new was staged" >&2
       return 1
     }
@@ -747,15 +860,25 @@ remote_handoff() { # <secondmate-id> <keys...>
     echo "error: remote secondmate $id has no target home for work identity handoff" >&2
     return 1
   }
-  stage_remote_handoff_identities "$id" "$target_home" "${requested[@]}" || {
-    echo "error: exact work identity staging failed; nothing new was handed off" >&2
+  prepare_remote_handoff_identities "$target_home" "secondmate:$id" "${requested[@]}" || {
+    echo "error: exact work identity preparation failed; nothing new was handed off" >&2
     return 1
   }
   seed_backlog_scaffold "$outbox"
   if [ "${#to_move[@]}" -gt 0 ]; then
     if ! mv_out=$(tasks-axi mv "${to_move[@]}" --file "$MAIN_BACKLOG" --to "$outbox" 2>&1); then
       [ -z "$mv_out" ] || printf '%s\n' "$mv_out" >&2
-      echo "error: atomic outbox staging failed; nothing new was handed off" >&2
+      persisted=0
+      for key in "${to_move[@]}"; do
+        backlog_key_section "$outbox" "$key" >/dev/null 2>&1 && persisted=1
+      done
+      if [ "$persisted" -eq 1 ]; then
+        echo "error: atomic outbox staging completion is uncertain; identity preparation and outbox are preserved" >&2
+      elif ! cancel_source_handoff_identities; then
+        echo "error: atomic outbox staging failed and identity preparation needs recovery" >&2
+      else
+        echo "error: atomic outbox staging failed; nothing new was handed off" >&2
+      fi
       return 1
     fi
   fi
@@ -763,7 +886,12 @@ remote_handoff() { # <secondmate-id> <keys...>
   # persist. The outbox is already authoritative in that state, so converge by
   # deleting only duplicates that tasks-axi itself confirms are dependency-safe.
   remove_interrupted_source_duplicates "$outbox" "${requested[@]}" || return 1
+  stage_prepared_remote_handoff_identities "$id" || {
+    echo "error: remote exact work identity preparation is unavailable; outbox preserved at $outbox" >&2
+    return 1
+  }
   remote_deliver_outbox "$id" "$outbox" || return 1
+  finish_remote_handoff "$id" "$outbox" || return 1
   echo "handed off ${#requested[@]} item(s) to remote secondmate $id: ${requested[*]}"
   [ "${#already[@]}" -eq 0 ] || echo "  already staged (recovered): ${already[*]}"
   warn_stale_public_commitments "$id" "${requested[@]}"
@@ -804,11 +932,12 @@ resume_remote_outbox() { # <secondmate-id> <outbox-path>
   while IFS= read -r key; do
     [ -n "$key" ] && keys+=("$key")
   done < <(outbox_keys "$outbox")
-  stage_remote_handoff_identities "$id" "$target_home" "${keys[@]}" || {
+  stage_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "${keys[@]}" || {
     echo "error: pending exact work identity staging failed; outbox preserved at $outbox" >&2
     return 1
   }
-  remote_deliver_outbox "$id" "$outbox"
+  remote_deliver_outbox "$id" "$outbox" || return 1
+  finish_remote_handoff "$id" "$outbox"
 }
 
 resume_pending_outboxes() {
@@ -900,23 +1029,6 @@ REQUESTED_BATCH=$(receiver_wake_batch_id "$@") || {
   exit 1
 }
 
-if [ "${#TO_MOVE[@]}" -eq 0 ]; then
-  stage_local_handoff_identities "$SUB_HOME" "$@" || {
-    echo "error: exact work identity staging failed; nothing was moved." >&2
-    exit 1
-  }
-  WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
-  case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
-    prepared:*:"$REQUESTED_BATCH") receiver_wake_promote_prepared "$ID" "$REQUESTED_BATCH" || exit 1 ;;
-    prepared:*)
-      echo "error: a prepared receiver wake for secondmate $ID belongs to a different routed batch; retry that original handoff before handling ${ALREADY[*]}" >&2
-      exit 1
-      ;;
-  esac
-  echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
-  wake_pending_secondmate_receiver "$ID" || exit 1
-  exit 0
-fi
 FAILED=0
 for key in "${TO_MOVE[@]}"; do
   while IFS= read -r line; do
@@ -938,9 +1050,11 @@ fi
 WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
 if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
   case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
-    prepared:*:"$REQUESTED_BATCH") receiver_wake_discard_prepared "$ID" || exit 1 ;;
+    prepared:*:"$REQUESTED_BATCH")
+      [ "${#TO_MOVE[@]}" -eq 0 ] || receiver_wake_discard_prepared "$ID" || exit 1
+      ;;
     prepared:*)
-      echo "error: a prepared receiver wake for secondmate $ID belongs to a different routed batch; retry that original handoff before moving ${TO_MOVE[*]}" >&2
+      echo "error: a prepared receiver wake for secondmate $ID belongs to a different routed batch; retry that original handoff before handling ${ALREADY[*]}${TO_MOVE[*]}" >&2
       exit 1
       ;;
     *)
@@ -951,11 +1065,31 @@ if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
       ;;
   esac
 fi
-stage_local_handoff_identities "$SUB_HOME" "$@" || {
-  echo "error: exact work identity staging failed; nothing was moved." >&2
+stage_local_handoff_identities "$SUB_HOME" "secondmate:$ID" "$@" || {
+  echo "error: exact work identity preparation failed; nothing was moved." >&2
   exit 1
 }
+
+if [ "${#TO_MOVE[@]}" -eq 0 ]; then
+  remove_interrupted_source_duplicates "$SUB_BACKLOG" "$@" || exit 1
+  commit_local_handoff_identities "$SUB_HOME" || {
+    echo "error: backlog is already present but exact work identity commit is incomplete." >&2
+    exit 1
+  }
+  complete_source_handoff_identities || {
+    echo "error: destination identity is committed but source ownership completion is incomplete." >&2
+    exit 1
+  }
+  case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
+    prepared:*:"$REQUESTED_BATCH") receiver_wake_promote_prepared "$ID" "$REQUESTED_BATCH" || exit 1 ;;
+  esac
+  echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
+  wake_pending_secondmate_receiver "$ID" || exit 1
+  exit 0
+fi
+
 receiver_wake_mark_prepared "$ID" "$REQUESTED_BATCH" || {
+  rollback_local_handoff_identities "$SUB_HOME" || true
   echo "error: receiver wake state for secondmate $ID could not be recorded; nothing was moved" >&2
   exit 1
 }
@@ -976,7 +1110,11 @@ fi
 # cleanup is a scaffold we just created. tasks-axi writes both its success and
 # error output to stdout, so capture it and surface it only on failure.
 if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" 2>&1); then
-  if [ "$SUB_CREATED" -eq 1 ]; then
+  PERSISTED=0
+  for key in "${TO_MOVE[@]}"; do
+    backlog_key_section "$SUB_BACKLOG" "$key" >/dev/null 2>&1 && PERSISTED=1
+  done
+  if [ "$SUB_CREATED" -eq 1 ] && [ "$PERSISTED" -eq 0 ]; then
     rm -f "$SUB_BACKLOG"
   fi
   receiver_wake_discard_prepared "$ID" || {
@@ -986,9 +1124,25 @@ if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BAC
   if [ -n "$MV_OUT" ]; then
     printf '%s\n' "$MV_OUT" >&2
   fi
-  echo "error: tasks-axi mv failed; nothing was moved." >&2
+  if [ "$PERSISTED" -eq 1 ]; then
+    echo "error: tasks-axi mv completion is uncertain; identity preparation is preserved for recovery." >&2
+  elif ! rollback_local_handoff_identities "$SUB_HOME"; then
+    echo "error: tasks-axi mv failed and identity preparation needs recovery." >&2
+  else
+    echo "error: tasks-axi mv failed; nothing was moved." >&2
+  fi
   exit 1
 fi
+
+remove_interrupted_source_duplicates "$SUB_BACKLOG" "$@" || exit 1
+commit_local_handoff_identities "$SUB_HOME" || {
+  echo "error: backlog moved but exact work identity commit is incomplete; rerun the handoff." >&2
+  exit 1
+}
+complete_source_handoff_identities || {
+  echo "error: destination identity is committed but source ownership completion is incomplete; rerun the handoff." >&2
+  exit 1
+}
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"

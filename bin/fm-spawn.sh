@@ -163,7 +163,7 @@
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
 #   $vars and silently breaks ad-hoc `for ... in $pairs` loops).
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
-#     __BRIEF__    absolute path to data/<task-id>/brief.md
+#     __BRIEF__    absolute path to the validated state/<task-id>.launch-brief.md snapshot
 #     __PIBIN__    quoted concrete Pi-family executable path resolved from PATH
 #     __PITUIMODE__ optional --tui-mode regular when that executable advertises it
 #     __TURNEND__  absolute path to state/<task-id>.turn-ended (for harnesses whose
@@ -719,6 +719,7 @@ SPAWN_CONTROL_LOCK=
 SPAWN_CONTROL_LOCK_HELD=0
 SPAWN_CONTROL_PARENT=0
 SPAWN_META_TMP=
+SPAWN_BRIEF_TMP=
 SPAWN_META_LOCK=
 SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
@@ -826,6 +827,7 @@ spawn_abort_cleanup() {
             echo "cleanup_recovery=orca"
             echo "worktree=${WT:-}"
             echo "project=$PROJ_ABS"
+            echo "launch_brief=${BRIEF:-}"
             echo "harness=$HARNESS"
             echo "kind=$KIND"
             [ -z "${MODE:-}" ] || echo "mode=$MODE"
@@ -870,6 +872,7 @@ spawn_abort_cleanup() {
     fm_lock_release "$SPAWN_CONTROL_LOCK" || true
   fi
   [ -z "$SPAWN_META_TMP" ] || rm -f "$SPAWN_META_TMP" 2>/dev/null || true
+  [ -z "$SPAWN_BRIEF_TMP" ] || rm -f "$SPAWN_BRIEF_TMP" 2>/dev/null || true
   if [ "$CONFIG_INHERIT_LOCK_HELD" = 1 ]; then
     CONFIG_INHERIT_LOCK_HELD=0
     fm_lock_release "$CONFIG_INHERIT_LOCK" || true
@@ -1776,6 +1779,23 @@ else
   BRIEF="$DATA/$ID/brief.md"
 fi
 [ -f "$BRIEF" ] || { echo "error: task $ID has no brief at inaccessible data path $BRIEF" >&2; exit 1; }
+BRIEF_SOURCE=$BRIEF
+mkdir -p "$STATE" || { echo "error: could not create state directory for launch brief" >&2; exit 1; }
+BRIEF_SNAPSHOT="$STATE/$ID.launch-brief.md"
+if [ -e "$BRIEF_SNAPSHOT" ] || [ -L "$BRIEF_SNAPSHOT" ]; then
+  [ -f "$BRIEF_SNAPSHOT" ] && [ ! -L "$BRIEF_SNAPSHOT" ] \
+    || { echo "error: launch brief snapshot path is unsafe: $BRIEF_SNAPSHOT" >&2; exit 1; }
+fi
+SPAWN_BRIEF_TMP=$(umask 077; mktemp "$STATE/.$ID.launch-brief.XXXXXX") \
+  || { echo "error: could not create launch brief snapshot" >&2; exit 1; }
+cp "$BRIEF_SOURCE" "$SPAWN_BRIEF_TMP" \
+  || { echo "error: could not snapshot launch brief at $BRIEF_SOURCE" >&2; exit 1; }
+chmod 400 "$SPAWN_BRIEF_TMP" \
+  || { echo "error: could not protect launch brief snapshot" >&2; exit 1; }
+mv -f "$SPAWN_BRIEF_TMP" "$BRIEF_SNAPSHOT" \
+  || { echo "error: could not publish launch brief snapshot" >&2; exit 1; }
+SPAWN_BRIEF_TMP=
+BRIEF=$BRIEF_SNAPSHOT
 
 # Exact project/plan/work-unit identity is frozen before any endpoint exists.
 # The contract owner validates the sidecar, generated payload, exact home/task
@@ -2882,7 +2902,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent work_identity_schema work_identity_status work_identity_sha256 backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project launch_brief harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent work_identity_schema work_identity_status work_identity_sha256 backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2893,6 +2913,7 @@ preserve_relaunch_meta() {
   echo "endpoint_task_id=$ID"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
+  echo "launch_brief=$BRIEF"
   echo "harness=$HARNESS"
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"

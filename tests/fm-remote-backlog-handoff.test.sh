@@ -217,8 +217,8 @@ EOF
 }
 
 # Completion can become unknown after the remote atomic move. The local outbox
-# remains the whole recovery record, the primary dispatch queue is already
-# empty, and a blind retry is not performed inside the transport call.
+# remains the backlog recovery record alongside the source identity prepare.
+# The primary dispatch queue is already empty, and the transport does not retry blindly.
 write_backlog $'- [ ] ios-a - first iOS task (repo: alpha)\n- [ ] ios-b - dependent iOS task (repo: alpha) blocked-by: ios-a - waits'
 : > "$SSH_COUNT"
 set +e
@@ -239,7 +239,7 @@ if ! grep -F ios-a "$REMOTE/data/backlog.md" >/dev/null; then
   fail "remote atomic receipt did not deliver ios-a before the dropped acknowledgement"
 fi
 assert_grep 'ios-b' "$REMOTE/data/backlog.md" "remote atomic receipt did not deliver ios-b before the dropped acknowledgement"
-[ "$(cat "$SSH_COUNT")" -eq 2 ] || fail "transport retried an ambiguously completed command"
+[ "$(cat "$SSH_COUNT")" -eq 4 ] || fail "transport retried an ambiguously completed command"
 pass "ambiguous receipt leaves one durable outbox and no duplicate dispatchable source"
 
 out=$(handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending)
@@ -321,11 +321,17 @@ handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios linked-remote >/dev/null \
   || fail "linked remote handoff failed"
 FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-work-identity.sh" verify linked-remote \
   | jq -e --arg home "$REMOTE" '
-      .status == "linked" and .binding.home == $home and .binding.task_id == "linked-remote"
+      .status == "linked" and .binding.home == $home
+        and .binding.home_id == "secondmate:ios" and .binding.task_id == "linked-remote"
         and .work_units[0].id == "remote-unit" and .sources[0].id == "DTM-REMOTE-1"
     ' >/dev/null || fail "remote receipt lost or misbound the exact work identity"
 assert_grep 'linked-remote' "$REMOTE/data/backlog.md" "linked remote backlog row did not arrive"
-pass "remote handoff stages an exact destination-bound identity before receipt"
+assert_absent "$REMOTE/data/linked-remote/work-identity-handoff-target.json" \
+  "remote handoff retained an uncommitted target identity"
+jq -e '.state == "completed" and .transfer.target.home_id == "secondmate:ios"' \
+  "$PARENT/data/linked-remote/work-identity-handoff-source.json" >/dev/null \
+  || fail "remote handoff did not retain a completed source ownership tombstone"
+pass "remote handoff commits an exact destination identity and source tombstone"
 
 # A stale tasks-axi lock is removed only on the destination host after the first
 # move refusal proves a retry is needed. The dead pid and age satisfy the same
@@ -357,7 +363,7 @@ assert_contains "$bootstrap_out" 'SECONDMATE_HANDOFF: secondmate ios: pending de
   "bootstrap did not surface the pending outbox count"
 handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending >/dev/null \
   || fail "pending bootstrap-visible outbox did not later converge"
-pass "bootstrap detects pending outbox handoffs without a journal"
+pass "bootstrap detects pending outbox handoffs without transport retries"
 
 write_backlog '- [ ] remote-wake-fail - receiver failure stays recoverable (repo: alpha)'
 set +e
