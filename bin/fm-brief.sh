@@ -287,7 +287,36 @@ fi
 exit 0
 fi
 
+# Serialize exact-identity recording with ship/scout instruction generation.
+# bin/fm-work-identity.sh owns the relation; this shared lock only closes the
+# record-vs-brief race so an unlinked brief and linked sidecar cannot both win.
+# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+WORK_IDENTITY_LOCK="$DATA/$ID/.work-identity.lock"
+fm_lock_acquire_wait "$WORK_IDENTITY_LOCK"
+WORK_IDENTITY_LOCK_HELD=1
+brief_identity_lock_cleanup() {
+  local status=$?
+  if [ "$WORK_IDENTITY_LOCK_HELD" = 1 ]; then
+    WORK_IDENTITY_LOCK_HELD=0
+    fm_lock_release "$WORK_IDENTITY_LOCK" || true
+  fi
+  return "$status"
+}
+trap brief_identity_lock_cleanup EXIT
+[ ! -e "$BRIEF" ] && [ ! -L "$BRIEF" ] \
+  || { echo "error: $BRIEF already exists" >&2; exit 1; }
+
 REPO=${POS[1]}
+
+WORK_IDENTITY_SECTION=$(
+  FM_HOME="$FM_HOME" \
+    FM_DATA_OVERRIDE="$DATA" \
+    FM_STATE_OVERRIDE="$STATE" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-work-identity.sh" brief-block "$ID"
+) || exit 1
 
 if [ "$HERDR_LAB" -eq 1 ]; then
 HERDR_LAB_HELPER=$(shell_quote "$FM_ROOT/bin/fm-herdr-lab.sh")
@@ -327,6 +356,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$WORK_IDENTITY_SECTION
 
 $HERDR_SECTION
 
@@ -400,6 +431,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$WORK_IDENTITY_SECTION
 
 $HERDR_SECTION
 

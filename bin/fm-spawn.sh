@@ -130,6 +130,11 @@
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
+#   Ship and scout spawns validate the optional exact work identity through
+#   bin/fm-work-identity.sh before creating an endpoint. A linked intake record
+#   must match the generated instructions byte-for-byte and is bound into meta by
+#   schema/status/SHA-256 fields; an absent record is recorded explicitly as
+#   unlinked. Relaunch validates and preserves the same binding.
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
@@ -828,6 +833,11 @@ spawn_abort_cleanup() {
             echo "tasktmp=${TASK_TMP:-}"
             echo "model=${MODEL:-default}"
             echo "effort=${EFFORT:-default}"
+            if [ -n "${WORK_IDENTITY_STATUS:-}" ]; then
+              echo "work_identity_schema=$WORK_IDENTITY_SCHEMA"
+              echo "work_identity_status=$WORK_IDENTITY_STATUS"
+              [ "$WORK_IDENTITY_STATUS" != linked ] || echo "work_identity_sha256=$WORK_IDENTITY_HASH"
+            fi
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
@@ -1766,6 +1776,32 @@ else
   BRIEF="$DATA/$ID/brief.md"
 fi
 [ -f "$BRIEF" ] || { echo "error: task $ID has no brief at inaccessible data path $BRIEF" >&2; exit 1; }
+
+# Exact project/plan/work-unit identity is frozen before any endpoint exists.
+# The contract owner validates the sidecar, generated payload, exact home/task
+# binding, and any prior metadata binding. Every harness and backend receives the
+# same generated brief, so this preflight is deliberately above both adapter axes.
+WORK_IDENTITY_STATUS=
+WORK_IDENTITY_SCHEMA=
+WORK_IDENTITY_HASH=
+if [ "$KIND" != secondmate ]; then
+  WORK_IDENTITY_ARGS=(project "$ID" --brief "$BRIEF")
+  if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+    WORK_IDENTITY_ARGS+=(--meta "$STATE/$ID.meta")
+  fi
+  WORK_IDENTITY_JSON=$(
+    FM_HOME="$FM_HOME" \
+      FM_DATA_OVERRIDE="$DATA" \
+      FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" "${WORK_IDENTITY_ARGS[@]}"
+  ) || exit 1
+  WORK_IDENTITY_STATUS=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.status') \
+    || { echo "error: work identity projection has no status for $ID" >&2; exit 1; }
+  WORK_IDENTITY_SCHEMA=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.schema') \
+    || { echo "error: work identity projection has no schema for $ID" >&2; exit 1; }
+  WORK_IDENTITY_HASH=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -r '.sha256 // ""')
+fi
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
@@ -2846,7 +2882,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent work_identity_schema work_identity_status work_identity_sha256 backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2866,6 +2902,11 @@ preserve_relaunch_meta() {
   echo "effort=${EFFORT:-default}"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
+  if [ -n "$WORK_IDENTITY_STATUS" ]; then
+    echo "work_identity_schema=$WORK_IDENTITY_SCHEMA"
+    echo "work_identity_status=$WORK_IDENTITY_STATUS"
+    [ "$WORK_IDENTITY_STATUS" != linked ] || echo "work_identity_sha256=$WORK_IDENTITY_HASH"
+  fi
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;

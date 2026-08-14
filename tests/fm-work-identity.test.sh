@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# Public-interface coverage for exact project/plan/work-unit intake and fleet projection.
+set -u
+
+# shellcheck source=tests/lib.sh
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+WORK_IDENTITY="$ROOT/bin/fm-work-identity.sh"
+BRIEF="$ROOT/bin/fm-brief.sh"
+SPAWN="$ROOT/bin/fm-spawn.sh"
+SNAPSHOT="$ROOT/bin/fm-fleet-snapshot.sh"
+BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
+TMP_ROOT=$(fm_test_tmproot fm-work-identity)
+
+command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
+
+make_home() {  # <name>
+  local home="$TMP_ROOT/$1"
+  mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
+  printf '%s\n' "$home"
+}
+
+make_manifest() {  # <home> <task> <path> [multi]
+  local home=$1 task=$2 path=$3 multi=${4:-single}
+  FM_HOME="$home" "$WORK_IDENTITY" template "$task" \
+    | jq --argjson multi "$([ "$multi" = multi ] && printf true || printf false)" '
+      .initiative = {namespace:"work-aligner",kind:"project",id:"wa-project-42",label:"Roadmap Accuracy"}
+      | .plan_id = {namespace:"work-aligner",kind:"plan",id:"wa-plan-2026-q3",label:"Identity Plan"}
+      | .stage = {namespace:"work-aligner",kind:"stage",id:"implementation",label:"Implementation"}
+      | .work_units = (
+          if $multi then [
+            {namespace:"work-aligner",kind:"work-unit",id:"wu-exact-intake",label:"Exact Intake"},
+            {namespace:"work-aligner",kind:"work-unit",id:"wu-fleet-projection",label:"Fleet Projection"}
+          ] else [
+            {namespace:"work-aligner",kind:"work-unit",id:"wu-exact-intake",label:"Exact Intake"}
+          ] end)
+      | .sources = [
+          {namespace:"dtm",kind:"project",id:"dtm-project-17",label:"Delivery Tracking"},
+          {namespace:"dtm",kind:"issue",id:"DTM-431",label:"Worker Relation Gap"},
+          {namespace:"data-team-ticket",kind:"ticket",id:"DTT-88",label:"Dashboard Tracking"}
+        ]' > "$path"
+}
+
+make_fakebin() {  # <dir>
+  local fakebin
+  fakebin=$(fm_fakebin "$1")
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_HOME:?}}"; exit 0 ;;
+  *"#{pane_current_command}"*) printf 'codex\n'; exit 0 ;;
+esac
+case "${1:-}" in
+  list-windows) exit 0 ;;
+  display-message) printf 'firstmate\n'; exit 0 ;;
+  capture-pane) printf 'worker ready\n> \n'; exit 0 ;;
+  has-session|new-session|new-window|kill-window|send-keys) exit 0 ;;
+esac
+exit 0
+SH
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$fakebin/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fakebin/tmux" "$fakebin/treehouse" "$fakebin/no-mistakes"
+  printf '%s\n' "$fakebin"
+}
+
+record_and_brief() {  # <home> <task> <manifest> [mode]
+  local home=$1 task=$2 manifest=$3 mode=${4:-no-mistakes}
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode "$mode" >/dev/null
+}
+
+write_bound_meta() {  # <home> <task> <worktree> [window]
+  local home=$1 task=$2 worktree=$3 window=${4:-firstmate:fm-$2} projection hash
+  projection=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task") || fail "could not verify linked fixture $task"
+  hash=$(printf '%s' "$projection" | jq -r '.sha256')
+  fm_write_meta "$home/state/$task.meta" \
+    "window=$window" \
+    "endpoint_task_id=$task" \
+    "worktree=$worktree" \
+    "project=firstmate" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" \
+    "work_identity_status=linked" \
+    "work_identity_sha256=$hash"
+}
+
+# Record, generated instructions, spawn metadata, canonical fleet snapshot, and
+# Bearings all carry one exact multi-work-unit relation without multiplying the worker.
+test_intake_through_fleet_projection() {
+  local home task manifest project wt fakebin out first second projection before_state after_state
+  home=$(make_home end-to-end)
+  task=exact-worker
+  manifest="$home/manifest.json"
+  project="$home/project"
+  wt="$home/worker-copy"
+  make_manifest "$home" "$task" "$manifest" multi
+  before_state=$(find "$home/state" -mindepth 1 -print | sort)
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest") \
+    || fail "valid multi-work-unit intake was refused: $out"
+  after_state=$(find "$home/state" -mindepth 1 -print | sort)
+  [ "$before_state" = "$after_state" ] || fail "recording identity changed runtime task state"
+  first=$(sha256_file_for_test "$home/data/$task/work-identity.json")
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest") \
+    || fail "idempotent record was refused: $out"
+  second=$(sha256_file_for_test "$home/data/$task/work-identity.json")
+  [ "$first" = "$second" ] || fail "idempotent record changed canonical bytes"
+  assert_contains "$out" "(unchanged)" "idempotent intake did not report convergence"
+
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "linked brief did not scaffold"
+  assert_grep "Work identity contract: fm-work-identity.v1 sha256=$first" "$home/data/$task/brief.md" \
+    "generated instructions did not bind the canonical digest"
+  assert_grep '"id":"wu-exact-intake"' "$home/data/$task/brief.md" \
+    "generated instructions lost the first exact work unit"
+  assert_grep '"id":"wu-fleet-projection"' "$home/data/$task/brief.md" \
+    "generated instructions lost the second exact work unit"
+
+  fm_git_worktree "$project" "$wt" exact-worker-copy
+  fakebin=$(make_fakebin "$home/fakes")
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" PATH="$fakebin:$PATH" \
+    "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off 2>&1)
+  assert_contains "$out" "spawned $task" "linked task did not spawn"
+  assert_grep 'work_identity_schema=fm-work-identity.v1' "$home/state/$task.meta" \
+    "spawn metadata lost the identity schema"
+  assert_grep 'work_identity_status=linked' "$home/state/$task.meta" \
+    "spawn metadata lost linked status"
+  assert_grep "work_identity_sha256=$first" "$home/state/$task.meta" \
+    "spawn metadata lost the exact sidecar digest"
+
+  projection=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z \
+    "$SNAPSHOT" --json)
+  printf '%s' "$projection" | jq -e '
+    ([.tasks[] | select(.id == "exact-worker")] | length) == 1
+      and (.tasks[] | select(.id == "exact-worker")
+        | .work_identity.status == "linked"
+          and .work_identity.initiative == {namespace:"work-aligner",kind:"project",id:"wa-project-42",label:"Roadmap Accuracy"}
+          and .work_identity.plan_id.id == "wa-plan-2026-q3"
+          and .work_identity.stage.id == "implementation"
+          and (.work_identity.work_units | map(.id)) == ["wu-exact-intake","wu-fleet-projection"]
+          and (.work_identity.sources | map([.namespace,.kind,.id])) == [
+            ["dtm","project","dtm-project-17"],
+            ["dtm","issue","DTM-431"],
+            ["data-team-ticket","ticket","DTT-88"]])
+  ' >/dev/null || fail "canonical snapshot changed or multiplied exact task identity: $projection"
+  first=$(printf '%s' "$projection" | jq -S -c .)
+  second=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z \
+    "$SNAPSHOT" --json | jq -S -c .)
+  [ "$first" = "$second" ] || fail "same exact state produced unstable canonical snapshot output"
+
+  projection=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-08-14T12:00:00Z \
+    "$BEARINGS" --json)
+  printf '%s' "$projection" | jq -e '
+    ([.in_flight[] | select(.id == "exact-worker")] | length) == 1
+      and (.in_flight[] | select(.id == "exact-worker")
+        | .work_identity == "linked"
+          and (.initiative | contains("work-aligner:project:wa-project-42 [Roadmap Accuracy]"))
+          and (.plan | contains("work-aligner:plan:wa-plan-2026-q3 [Identity Plan]"))
+          and (.stage | contains("work-aligner:stage:implementation [Implementation]"))
+          and (.work_units | contains("work-aligner:work-unit:wu-exact-intake [Exact Intake]"))
+          and (.work_units | contains("work-aligner:work-unit:wu-fleet-projection [Fleet Projection]"))
+          and (.sources | contains("dtm:issue:DTM-431 [Worker Relation Gap]")))
+  ' >/dev/null || fail "Bearings lost exact ids paired with display labels: $projection"
+  pass "exact multi-work-unit intake survives instructions, metadata, snapshot, and Bearings once per worker"
+}
+
+sha256_file_for_test() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+test_concurrent_idempotence_and_explicit_unlinked() {
+  local home task manifest p1 p2 rc1 rc2 links out
+  home=$(make_home idempotent)
+  task=concurrent-worker
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" > "$home/record-1.out" 2>&1 &
+  p1=$!
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" > "$home/record-2.out" 2>&1 &
+  p2=$!
+  wait "$p1"; rc1=$?
+  wait "$p2"; rc2=$?
+  [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] \
+    || fail "concurrent byte-identical intake did not converge idempotently"
+  if [ "$(uname)" = Darwin ]; then
+    links=$(stat -f '%l' "$home/data/$task/work-identity.json")
+  else
+    links=$(stat -c '%h' "$home/data/$task/work-identity.json")
+  fi
+  [ "$links" = 1 ] || fail "concurrent intake left a hardlinked publication"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e '.status == "linked"' >/dev/null \
+    || fail "concurrent intake did not leave one valid linked record"
+
+  task=intentionally-unlinked
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null
+  assert_grep 'Work identity contract: fm-work-identity.v1 unlinked' "$home/data/$task/brief.md" \
+    "unlinked intake was not explicit in generated instructions"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task")
+  printf '%s' "$out" | jq -e '
+    .status == "unlinked" and .reason == "explicitly-unlinked"
+      and .initiative == null and .plan_id == null and .work_units == [] and .sources == []
+  ' >/dev/null || fail "intentional unlinked intake was not explicit: $out"
+  pass "concurrent identical records converge and intentional unlinked intake stays explicit"
+}
+
+# Namespace is part of identity: identical opaque ids in separate systems stay
+# distinct, while duplicate exact tuples and invalid namespace-role pairs refuse.
+test_namespace_separation_and_contract_rejections() {
+  local home task manifest out rc case_name
+  home=$(make_home namespaces)
+  task=namespace-worker
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  jq '.sources = [
+        {namespace:"dtm",kind:"issue",id:"shared-7",label:"DTM Seven"},
+        {namespace:"data-team-ticket",kind:"ticket",id:"shared-7",label:"Ticket Seven"}
+      ]
+      | .plan_id.id = "shared-7"
+      | .work_units[0].id = "shared-7"' "$manifest" > "$home/separate.json"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/separate.json" >/dev/null \
+    || fail "separate namespaces/kinds with the same opaque id were conflated"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task")
+  printf '%s' "$out" | jq -e '
+    .plan_id == {namespace:"work-aligner",kind:"plan",id:"shared-7",label:"Identity Plan"}
+      and .work_units[0] == {namespace:"work-aligner",kind:"work-unit",id:"shared-7",label:"Exact Intake"}
+      and (.sources | map([.namespace,.kind,.id])) == [
+        ["dtm","issue","shared-7"],["data-team-ticket","ticket","shared-7"]]
+  ' >/dev/null || fail "namespace-separated exact identities did not survive"
+
+  task=local-plan-worker
+  make_manifest "$home" "$task" "$manifest"
+  jq '.initiative={namespace:"firstmate",kind:"initiative",id:"local-initiative",label:"Local Initiative"}
+      | .plan_id={namespace:"firstmate",kind:"plan",id:"local-plan",label:"Local Plan"}
+      | .stage={namespace:"firstmate",kind:"stage",id:"local-stage",label:"Local Stage"}
+      | .work_units=[{namespace:"firstmate",kind:"work-unit",id:"local-unit",label:"Local Unit"}]
+      | .sources=[{namespace:"dtm",kind:"issue",id:"DTM-LOCAL-1",label:"Local Source"}]' \
+    "$manifest" > "$home/local.json"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/local.json" >/dev/null \
+    || fail "local Firstmate plan identity was refused"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e '
+    .initiative.namespace == "firstmate" and .plan_id.id == "local-plan"
+      and .stage.id == "local-stage" and .work_units[0].id == "local-unit"
+  ' >/dev/null || fail "local Firstmate plan identity did not survive"
+
+  for case_name in version bad-role duplicate unsafe-id no-source contradictory; do
+    task="reject-$case_name"
+    make_manifest "$home" "$task" "$manifest" multi
+    case "$case_name" in
+      version) jq '.schema="fm-work-identity.v2"' "$manifest" > "$home/bad.json" ;;
+      bad-role) jq '.plan_id.namespace="dtm"' "$manifest" > "$home/bad.json" ;;
+      duplicate) jq '.work_units[1]=.work_units[0]' "$manifest" > "$home/bad.json" ;;
+      unsafe-id) jq '.work_units[0].id="../fuzzy"' "$manifest" > "$home/bad.json" ;;
+      no-source) jq '.sources=[]' "$manifest" > "$home/bad.json" ;;
+      contradictory) jq '.sources[0]=.work_units[0]' "$manifest" > "$home/bad.json" ;;
+    esac
+    out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/bad.json" 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "$case_name malformed contract was accepted"
+    assert_absent "$home/data/$task/work-identity.json" "$case_name refusal partially published a sidecar"
+  done
+  pass "namespaces remain distinct and version, role, duplicate, contradiction, and id syntax are closed"
+}
+
+# Unsafe inputs and stored records refuse. Labels are display-only but still must
+# be safe to embed in generated instructions.
+test_unsafe_files_labels_and_exact_binding() {
+  local home other task manifest out rc sidecar
+  home=$(make_home safety-a)
+  other=$(make_home safety-b)
+  task=safe-worker
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+
+  ln -s "$manifest" "$home/manifest-link.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/manifest-link.json" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "symlinked manifest was accepted"
+  ln "$manifest" "$home/manifest-hard.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/manifest-hard.json" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "hardlinked manifest was accepted"
+  rm "$home/manifest-hard.json"
+
+  jq '.work_units[0].label=" Unsafe label"' "$manifest" > "$home/bad-label.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/bad-label.json" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "leading-space label was accepted"
+  jq '.work_units[0].label="Unsafe ` label"' "$manifest" > "$home/bad-label.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/bad-label.json" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "instruction-breaking label was accepted"
+  assert_absent "$home/data/$task/work-identity.json" "unsafe label refusal partially published a record"
+
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  sidecar="$home/data/$task/work-identity.json"
+  mkdir -p "$other/data/$task"
+  cp "$sidecar" "$other/data/$task/work-identity.json"
+  out=$(FM_HOME="$other" "$WORK_IDENTITY" verify "$task" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "cross-home copied relation was accepted"
+  mkdir -p "$home/data/other-task"
+  cp "$sidecar" "$home/data/other-task/work-identity.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify other-task 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "task-mismatched relation was accepted"
+
+  ln "$sidecar" "$home/data/$task/work-identity-hard.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "hardlinked stored relation was accepted"
+  rm "$home/data/$task/work-identity-hard.json"
+  mv "$sidecar" "$home/data/$task/work-identity-real.json"
+  ln -s work-identity-real.json "$sidecar"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "symlinked stored relation was accepted"
+  pass "unsafe manifests, labels, stored files, cross-home copies, and task mismatches refuse"
+}
+
+# Linked records are frozen by both generated instructions and metadata. Manual
+# post-dispatch edits become stale and cannot publish through any read surface.
+test_stale_and_changed_relations_refuse() {
+  local home task manifest wt sidecar out rc canonical
+  home=$(make_home stale)
+  task=stale-worker
+  manifest="$home/manifest.json"
+  wt="$home/worktree"
+  mkdir -p "$wt"
+  make_manifest "$home" "$task" "$manifest"
+  record_and_brief "$home" "$task" "$manifest"
+  write_bound_meta "$home" "$task" "$wt"
+  jq '.work_units[0].id="wu-manually-changed"' "$manifest" > "$home/changed.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$home/changed.json" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "public intake changed a frozen relation"
+  sidecar="$home/data/$task/work-identity.json"
+  canonical=$(jq -S -c '.work_units[0].id="wu-manually-changed"' "$sidecar")
+  printf '%s\n' "$canonical" > "$sidecar"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "stale sidecar digest was accepted against brief/meta bindings"
+  out=$(FM_HOME="$home" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "authoritative snapshot partially published a stale linked relation"
+  pass "generated instructions and metadata freeze the exact relation against stale edits"
+}
+
+# Legacy tasks are explicitly unlinked. Every tempting fuzzy signal remains
+# ignored, including title, repository, branch/worktree, pane, worker, time, and
+# status prose.
+test_legacy_and_fuzzy_fallbacks_are_unlinked() {
+  local home task wt fakebin json bearings
+  home=$(make_home fuzzy)
+  task=wa-plan-2026-q3
+  wt="$home/projects/dtm-project-17/wu-exact-intake"
+  mkdir -p "$wt" "$home/data/$task"
+  printf 'legacy brief names Work Aligner wu-fleet-projection\n' > "$home/data/$task/brief.md"
+  cat > "$home/data/backlog.md" <<EOF
+## In flight
+- [ ] $task - Work Aligner wu-exact-intake (repo: wa-project-42) (kind: ship) (since 2026-08-14)
+
+## Queued
+
+## Done
+EOF
+  fm_write_meta "$home/state/$task.meta" \
+    "window=firstmate:fm-wu-fleet-projection" \
+    "worktree=$wt" \
+    "project=wa-project-42" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off"
+  printf 'working: DTM-431 implements Work Aligner plan wa-plan-2026-q3\n' > "$home/state/$task.status"
+  fakebin=$(make_fakebin "$home/fakes")
+  json=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
+  printf '%s' "$json" | jq -e '
+    (.tasks[] | select(.id == "wa-plan-2026-q3")
+      | .work_identity.status == "unlinked"
+        and .work_identity.reason == "legacy-no-record"
+        and .work_identity.initiative == null
+        and .work_identity.work_units == []
+        and .work_identity.sources == [])
+      and (.backlog.records[] | select(.id == "wa-plan-2026-q3")
+        | .work_identity.status == "unlinked")
+  ' >/dev/null || fail "a fuzzy title/repo/branch/pane/status relation leaked into snapshot: $json"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
+  printf '%s' "$bearings" | jq -e '
+    .in_flight[] | select(.id == "wa-plan-2026-q3")
+    | .work_identity == "unlinked" and .initiative == "-" and .plan == "-"
+      and .stage == "-" and .work_units == "-" and .sources == "-"
+  ' >/dev/null || fail "Bearings invented a fuzzy relation: $bearings"
+  pass "legacy tasks stay explicitly unlinked despite every fuzzy fallback signal"
+}
+
+# A secondmate home projects its own linked child through the bounded structured
+# summary. The parent consumes that projection and never scans or rebuilds the
+# child tree itself; Bearings exposes one delegated child row with all exact ids.
+test_delegated_secondmate_projection() {
+  local parent mate task manifest wt fakebin hash canonical bearings gen
+  parent=$(make_home delegated-parent)
+  mate="$TMP_ROOT/delegated-mate"
+  task=delegated-child
+  wt="$mate/projects/$task"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin" "$wt"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'roadmap\n' > "$mate/.fm-secondmate-home"
+  printf -- '- roadmap - roadmap domain (home: %s; scope: roadmap work; projects: firstmate; added 2026-08-14)\n' \
+    "$mate" > "$parent/data/secondmates.md"
+  fm_write_secondmate_meta "$parent/state/roadmap.meta" "$mate" "firstmate:fm-roadmap" firstmate codex
+  printf 'working [key=delegated]: delegated child active\n' > "$parent/state/roadmap.status"
+
+  manifest="$mate/manifest.json"
+  make_manifest "$mate" "$task" "$manifest" multi
+  record_and_brief "$mate" "$task" "$manifest"
+  hash=$(FM_HOME="$mate" "$WORK_IDENTITY" verify "$task" | jq -r '.sha256')
+  fm_write_meta "$mate/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" "worktree=$wt" "project=firstmate" \
+    "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=linked" "work_identity_sha256=$hash"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$mate/state" "$task")
+  "$ROOT/bin/fm-busy-event.sh" apply "$mate/state" "$task" busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  printf 'working: exact delegated work\n' > "$mate/state/$task.status"
+  cat > "$mate/data/backlog.md" <<EOF
+## In flight
+- [ ] $task - Exact delegated child (repo: firstmate) (kind: ship) (since 2026-08-14)
+
+## Queued
+
+## Done
+EOF
+  fakebin=$(make_fakebin "$parent/fakes")
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
+  printf '%s' "$canonical" | jq -e '
+    .secondmate_current.records[] | select(.id == "roadmap")
+    | .provenance.selected == "structured-home"
+      and ([.active_children[] | select(.id == "delegated-child")] | length) == 1
+      and (.active_children[] | select(.id == "delegated-child")
+        | .work_identity.status == "linked"
+          and (.work_identity.work_units | map(.id)) == ["wu-exact-intake","wu-fleet-projection"]
+          and (.work_identity.sources | any(.namespace == "dtm" and .kind == "issue" and .id == "DTM-431")))
+  ' >/dev/null || fail "authoritative delegated-child projection lost exact identity: $canonical"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
+  printf '%s' "$bearings" | jq -e '
+    ([.delegated_work[] | select(.owner == "roadmap" and .id == "delegated-child")] | length) == 1
+      and (.delegated_work[] | select(.owner == "roadmap" and .id == "delegated-child")
+        | .work_identity == "linked"
+          and (.work_units | contains("wu-exact-intake"))
+          and (.work_units | contains("wu-fleet-projection"))
+          and (.sources | contains("dtm:issue:DTM-431")))
+  ' >/dev/null || fail "Bearings delegated-work projection lost exact identities: $bearings"
+  pass "secondmate structured summary and Bearings expose one exact delegated-child worker"
+}
+
+test_intake_through_fleet_projection
+test_concurrent_idempotence_and_explicit_unlinked
+test_namespace_separation_and_contract_rejections
+test_unsafe_files_labels_and_exact_binding
+test_stale_and_changed_relations_refuse
+test_legacy_and_fuzzy_fallbacks_are_unlinked
+test_delegated_secondmate_projection

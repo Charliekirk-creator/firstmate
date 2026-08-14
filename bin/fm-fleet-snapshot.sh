@@ -34,6 +34,10 @@
 #     It never changes captain_actionable; renderers may use it to keep
 #     prose-deferred rows out of default views.
 #   tasks[]: one row per state/<id>.meta, sorted by id.
+#     work_identity is the exact `fm-work-identity.v1` projection owned by
+#     bin/fm-work-identity.sh. It is explicitly linked or unlinked; malformed,
+#     unsafe, stale, cross-home, or task-mismatched linked records refuse the
+#     whole snapshot rather than disappearing or falling back to fuzzy fields.
 #     Local current_state is parsed from bin/fm-crew-state.sh <id> and preserves
 #     state, source, detail, and raw line separately. Remote secondmate rows use
 #     an explicit unknown value because their endpoint liveness belongs to
@@ -113,7 +117,10 @@ FM_SNAPSHOT_SECONDMATES=${FM_SNAPSHOT_SECONDMATES:-20}
 FM_SNAPSHOT_CREW_STATE_TIMEOUT=${FM_SNAPSHOT_CREW_STATE_TIMEOUT:-10}
 FM_SNAPSHOT_BUDGET=${FM_SNAPSHOT_BUDGET:-5}
 FM_SNAPSHOT_CACHE_DIR=${FM_SNAPSHOT_CACHE_DIR:-$STATE/secondmate-summary-cache}
-FM_SNAPSHOT_SECONDMATE_MAX_BYTES=${FM_SNAPSHOT_SECONDMATE_MAX_BYTES:-262144}
+# One summary may carry the complete exact-identity arrays for every bounded
+# active, queued, and landed child, so the byte cap covers that schema's valid
+# worst case while remaining a hard one-megabyte cross-home bound.
+FM_SNAPSHOT_SECONDMATE_MAX_BYTES=${FM_SNAPSHOT_SECONDMATE_MAX_BYTES:-1048576}
 FM_SNAPSHOT_SECONDMATE_CHILDREN=${FM_SNAPSHOT_SECONDMATE_CHILDREN:-20}
 FM_SNAPSHOT_SECONDMATE_QUEUED=${FM_SNAPSHOT_SECONDMATE_QUEUED:-20}
 FM_SNAPSHOT_SECONDMATE_DECISIONS=${FM_SNAPSHOT_SECONDMATE_DECISIONS:-20}
@@ -457,10 +464,10 @@ backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
   ' < "$backlog"
 }
 
-task_json_lines() {
+task_json_lines_raw() {
   local meta id kind harness mode yolo project worktree home projects spawn_gen backend target status_log report_path
   local remote_host remote_root
-  local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
+  local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json work_identity_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
 
@@ -479,6 +486,14 @@ task_json_lines() {
     spawn_gen=$(meta_value "$meta" spawn_gen)
     remote_host=$(meta_value "$meta" remote_host)
     remote_root=$(meta_value "$meta" remote_root)
+    work_identity_json=$(
+      FM_HOME="$FM_HOME" \
+        FM_DATA_OVERRIDE="$DATA" \
+        FM_STATE_OVERRIDE="$STATE" \
+        FM_ROOT_OVERRIDE="$FM_ROOT" \
+        "$SCRIPT_DIR/fm-work-identity.sh" project "$id" \
+          --brief "$DATA/$id/brief.md" --meta "$meta"
+    ) || return 1
     if [ -n "$remote_host" ]; then
       backend=$(meta_value "$meta" remote_backend)
       [ -n "$backend" ] || backend=unknown
@@ -604,6 +619,7 @@ task_json_lines() {
       --argjson pending_decision "$(bool_json "$pending_decision")" \
       --argjson blocked_event "$(bool_json "$blocked_event")" \
       --argjson report_present "$(bool_json "$report_present")" \
+      --argjson work_identity "$work_identity_json" \
       '{
         id:$id,
         kind:$kind,
@@ -612,6 +628,7 @@ task_json_lines() {
         yolo:($yolo // ""),
         project:($project // ""),
         spawn_gen:($spawn_gen | if . == "" then null else . end),
+        work_identity:$work_identity,
         backend:$backend,
         remote:(if $remote_host == "" then null else {host:$remote_host,root:$remote_root} end),
         paths:{
@@ -647,13 +664,54 @@ task_json_lines() {
              return_channel_note:null}
           end)
       }'
-  done | jq -s 'sort_by(.id)'
+  done
+}
+
+task_json_lines() {
+  local raw
+  raw=$(task_json_lines_raw) || return 1
+  printf '%s\n' "$raw" | jq -s 'sort_by(.id)'
 }
 
 # Main-home current-inventory validity: same orphan / unstructured-current checks
 # used by secondmate_home_summary_json, without inventing live task rows.
 # Meta inventory remains the sole source of live workers; this object only
 # discloses backlog↔task inconsistency for renderers (Bearings omitted/gates).
+backlog_work_identities_json() {  # <backlog-json>
+  local backlog=$1 id meta args identity
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    args=(project "$id" --brief "$DATA/$id/brief.md")
+    meta="$STATE/$id.meta"
+    if [ -e "$meta" ] || [ -L "$meta" ]; then
+      args+=(--meta "$meta")
+    fi
+    identity=$(
+      FM_HOME="$FM_HOME" \
+        FM_DATA_OVERRIDE="$DATA" \
+        FM_STATE_OVERRIDE="$STATE" \
+        FM_ROOT_OVERRIDE="$FM_ROOT" \
+        "$SCRIPT_DIR/fm-work-identity.sh" "${args[@]}"
+    ) || return 1
+    jq -n --arg id "$id" --argjson work_identity "$identity" \
+      '{id:$id,work_identity:$work_identity}'
+  done <<EOF
+$(printf '%s' "$backlog" | jq -r '[.records[]? | select(.structured and .id != null) | .id] | unique[]')
+EOF
+}
+
+# Add explicit exact-or-unlinked identity to every structured backlog record.
+# This includes queued and landed records whose live task metadata is absent.
+enrich_backlog_work_identities_json() {  # <backlog-json>
+  local backlog=$1 identities raw
+  raw=$(backlog_work_identities_json "$backlog") || return 1
+  identities=$(printf '%s\n' "$raw" | jq -s 'sort_by(.id)') || return 1
+  jq -n --argjson backlog "$backlog" --argjson identities "$identities" '
+    def work_by_id($id): ($identities[]? | select(.id == $id) | .work_identity) // null;
+    $backlog
+    | .records |= map(if .structured and .id != null then . + {work_identity:work_by_id(.id)} else . end)'
+}
+
 main_inventory_json() {  # <backlog-json> <tasks-json>
   jq -n \
     --argjson backlog "$1" \
@@ -715,7 +773,8 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
          | {id:(.id | trunc(120)),title:(.title | trunc(120)),
             pr_url:((.pr_url // null) | if . == null then null else trunc(500) end),
             report_path:((.report_path // null) | if . == null then null else trunc(500) end),
-            local_note:((.local_note // null) | if . == null then null else trunc(120) end),completion} ]
+            local_note:((.local_note // null) | if . == null then null else trunc(120) end),
+            work_identity,completion} ]
        | sort_by([(.completion.date // ""), .id]) | reverse) as $landed_all
     | ([ $tasks[] | select(.current_state.state == "unknown") ]) as $unknown_children
     | ([ $owned_in_flight[]
@@ -757,7 +816,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
          | {id,kind,state:.current_state.state,
             repo:(($work.repo // .project // null) | if . == null then null else trunc(120) end),
             source:.current_state.source,
-            doing:((.current_state.detail // "") | trunc(120))} ]) as $active_all
+            doing:((.current_state.detail // "") | trunc(120)),work_identity} ]) as $active_all
     | ($captain_holds_all
        + ([ $tasks[] as $t | ($t.hints.open_decisions // [])[]
             | {id:$t.id,key,verb,summary:(.summary | trunc(160)),reason:null,source:"status"} ])) as $decisions_all
@@ -767,14 +826,14 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
             blocked_by:((.unresolved_blocker_ids | join(",")) | if . == "" then null else trunc(120) end),
             blocked_by_ids:(.blocked_by_ids | map(trunc(120))),
             unresolved_blocker_ids:(.unresolved_blocker_ids | map(trunc(120))),
-            reason:((.hold_reason // .blocked_reason // "blocked") | trunc(120)),source:"backlog"} ]
+            reason:((.hold_reason // .blocked_reason // "blocked") | trunc(120)),source:"backlog",work_identity} ]
        + [ $owned_in_flight[] as $work
            | $tasks[]
            | select(.id == $work.id and (.current_state.state == "parked" or .current_state.state == "paused" or .current_state.state == "blocked"))
            | select(($work.hold_reason != null and $work.hold_kind != null) | not)
            | {id,title:((.backlog.title // .id) | trunc(90)),blocked_by:null,
               blocked_by_ids:[],unresolved_blocker_ids:[],
-              reason:((.current_state.detail // .current_state.state) | trunc(120)),source:"child-state"} ]) as $holds_all
+              reason:((.current_state.detail // .current_state.state) | trunc(120)),source:"child-state",work_identity} ]) as $holds_all
     | ($backlog.present == true
        and ($unstructured_current | length) == 0
        and ($unknown_children | length) == 0
@@ -819,10 +878,11 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
           hold_until:((.hold_until // null) | if . == null then null else trunc(40) end),
           deferred_marker:(.deferred_marker // false),
           captain_actionable:(.captain_actionable // false),
+          work_identity,
           repo:((.repo // null) | if . == null then null else trunc(120) end),
           kind:((.kind // null) | if . == null then null else trunc(40) end)}][:$queued_n]),
         landed:(if $landed_n == 0 then $landed_all else $landed_all[:$landed_n] end),
-        endpoints:([$tasks[] | {id,state:.current_state.state,source:.current_state.source,
+        endpoints:([$tasks[] | {id,state:.current_state.state,source:.current_state.source,work_identity,
           endpoint:(.endpoint + {target:((.endpoint.target // null) | if . == null then null else trunc(240) end)})}][:$child_n]),
         counts:{
           active_children:($active_all | length),
@@ -1631,6 +1691,8 @@ scout_report_lines() {
 
 BACKLOG_JSON=$(backlog_json) || { echo "fm-fleet-snapshot: backlog read failed" >&2; exit 1; }
 TASKS_JSON=$(task_json_lines) || { echo "fm-fleet-snapshot: task snapshot failed" >&2; exit 1; }
+BACKLOG_JSON=$(enrich_backlog_work_identities_json "$BACKLOG_JSON") \
+  || { echo "fm-fleet-snapshot: backlog work identity validation failed" >&2; exit 1; }
 
 if [ "$OUTPUT_MODE" = secondmate-home-summary ]; then
   secondmate_home_summary_json "$BACKLOG_JSON" "$TASKS_JSON" \

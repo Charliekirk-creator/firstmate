@@ -50,14 +50,19 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   def action_of($t):
     if $t.kind == "secondmate" then "\($t.actions.send) - \($t.actions.watch)"
     else $t.actions.watch end;
+  def exact_ref($i):
+    if $i == null then "-" else "\($i.namespace):\($i.kind):\($i.id) [\($i.label)]" end;
+  def work_of($w):
+    if ($w.status // "unlinked") != "linked" then "unlinked"
+    else "initiative=\(exact_ref($w.initiative)); plan=\(exact_ref($w.plan_id)); stage=\(exact_ref($w.stage)); units=\(($w.work_units | map(exact_ref(.))) | join("; ")); sources=\(($w.sources | map(exact_ref(.))) | join("; "))" end;
   def task_row($t):
-    "| \($t.id) | \($t.current_state.state) / \($t.current_state.source) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) |";
+    "| \($t.id) | \($t.current_state.state) / \($t.current_state.source) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) | \(work_of($t.work_identity)) |";
   def blocker($r):
     if ($r.blocked_by // "") == "" then "-"
     elif ($r.blocked_reason // "") == "" then $r.blocked_by
     else "\($r.blocked_by) - \($r.blocked_reason)" end;
   def backlog_row($r):
-    "| \($r.id // "-") | \(dash($r.title // $r.raw)) | \(dash($r.repo)) | \(dash($r.kind)) | \(blocker($r)) | \(dash($r.pr_url // $r.report_path // $r.local_note)) |";
+    "| \($r.id // "-") | \(dash($r.title // $r.raw)) | \(dash($r.repo)) | \(dash($r.kind)) | \(blocker($r)) | \(dash($r.pr_url // $r.report_path // $r.local_note)) | \(work_of($r.work_identity // {status:"unlinked"})) |";
 
   "# Fleet View",
   "",
@@ -68,8 +73,8 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   (if (.tasks | length) == 0 then
     "No live task metadata found."
    else
-    "| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel | Exact work identity |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     (.tasks[] | task_row(.))
    end),
   "",
@@ -77,8 +82,8 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   (if ([.backlog.records[]? | select(.state == "queued")] | length) == 0 then
     "No queued backlog records found."
    else
-    "| ID | Title | Repo | Kind | Blocked By | Artifact |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| ID | Title | Repo | Kind | Blocked By | Artifact | Exact work identity |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
     (.backlog.records[] | select(.state == "queued") | backlog_row(.))
    end),
   "",
@@ -86,8 +91,8 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   (if ([.backlog.records[]? | select(.state == "done")] | length) == 0 then
     "No done backlog records found."
    else
-    "| ID | Title | Repo | Kind | Blocked By | Artifact |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| ID | Title | Repo | Kind | Blocked By | Artifact | Exact work identity |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
     (.backlog.records[] | select(.state == "done") | backlog_row(.))
    end),
   "",
