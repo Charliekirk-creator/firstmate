@@ -39,10 +39,12 @@ Firstmate never constructs a relation from a task title, repository, branch, end
 ## Read-only projections
 
 The authoritative fleet snapshot exposes the structured identity on task rows, backlog rows, and validated secondmate child summaries.
-Bearings keeps one row per worker and renders exact IDs beside their labels, including a separate delegated-child projection for work running inside a secondmate home.
-The primary consumes each secondmate home's bounded structured summary and does not reconstruct remote child trees.
+A child summary carries one normalized task reference index, and the primary resolves each exact projection once through schema-sized bounded batches before publishing any delegated surface.
+Bearings keeps one row per worker and renders every complete exact ID beside its label, including a separate delegated-child projection for work running inside a secondmate home.
+The primary does not reconstruct local or remote child trees, and an identity-integrity failure in a readable child home stops the parent snapshot instead of becoming an unknown transport result.
 
-Reading or recording this local relation does not change task lifecycle state, assignment, GitHub, DTM, Data Team Ticket, or a Work Aligner plan.
+A local or remote backlog handoff stages a destination-home binding through the same contract owner before the backlog row can move, so linked queued work never arrives as a legacy unlinked item.
+Reading, recording, or rebinding this local relation does not change task lifecycle state, assignment, GitHub, DTM, Data Team Ticket, or a Work Aligner plan.
 Malformed, stale, unsafe, cross-home, or task-mismatched linked records stop publication instead of being shown as unlinked.
 
 Maintainer coverage and the backend and worker-tool applicability review are recorded in [`verification/work-identity.md`](verification/work-identity.md).

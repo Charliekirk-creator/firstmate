@@ -21,6 +21,22 @@ make_home() {  # <name>
   printf '%s\n' "$home"
 }
 
+make_max_manifest() {  # <home> <task> <path>
+  local home=$1 task=$2 path=$3
+  FM_HOME="$home" "$WORK_IDENTITY" template "$task" \
+    | jq '
+      def padded($prefix): $prefix + ("x" * (240 - ($prefix | length)));
+      def display: "🚢" * 160;
+      .initiative = {namespace:"work-aligner",kind:"project",id:padded("initiative-"),label:display}
+      | .plan_id = {namespace:"work-aligner",kind:"plan",id:padded("plan-"),label:display}
+      | .stage = {namespace:"work-aligner",kind:"stage",id:padded("stage-"),label:display}
+      | .work_units = [range(0;20) as $n
+          | {namespace:"work-aligner",kind:"work-unit",id:padded("unit-\($n)-"),label:display}]
+      | .sources = [range(0;20) as $n
+          | {namespace:"dtm",kind:"issue",id:padded("source-\($n)-"),label:display}]
+    ' > "$path"
+}
+
 make_manifest() {  # <home> <task> <path> [multi]
   local home=$1 task=$2 path=$3 multi=${4:-single}
   FM_HOME="$home" "$WORK_IDENTITY" template "$task" \
@@ -438,12 +454,17 @@ EOF
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
   printf '%s' "$canonical" | jq -e '
     .secondmate_current.records[] | select(.id == "roadmap")
+    | . as $mate
     | .provenance.selected == "structured-home"
-      and ([.active_children[] | select(.id == "delegated-child")] | length) == 1
-      and (.active_children[] | select(.id == "delegated-child")
-        | .work_identity.status == "linked"
-          and (.work_identity.work_units | map(.id)) == ["wu-exact-intake","wu-fleet-projection"]
-          and (.work_identity.sources | any(.namespace == "dtm" and .kind == "issue" and .id == "DTM-431")))
+      and ([.active_children[] | select(.id == "delegated-child" and .work_identity_ref == "delegated-child")] | length) == 1
+      and ([.endpoints[] | select(.id == "delegated-child" and .work_identity_ref == "delegated-child")] | length) == 1
+      and ([.work_identities[] | select(.task_id == "delegated-child")] | length) == 1
+      and (.work_identities[] | select(.task_id == "delegated-child") | .work_identity
+        | .status == "linked"
+          and (.work_units | map(.id)) == ["wu-exact-intake","wu-fleet-projection"]
+          and (.sources | any(.namespace == "dtm" and .kind == "issue" and .id == "DTM-431")))
+      and (all(.active_children[]; has("work_identity") | not))
+      and (all(.endpoints[]; has("work_identity") | not))
   ' >/dev/null || fail "authoritative delegated-child projection lost exact identity: $canonical"
   bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
   printf '%s' "$bearings" | jq -e '
@@ -457,6 +478,194 @@ EOF
   pass "secondmate structured summary and Bearings expose one exact delegated-child worker"
 }
 
+test_handoff_rebinds_identity_and_decision_surfaces() {
+  local parent mate mate_real task manifest decision decision_manifest wt fakebin canonical bearings hash gen
+  command -v tasks-axi >/dev/null 2>&1 || { pass "linked handoff coverage skipped without tasks-axi"; return; }
+  parent=$(make_home handoff-parent)
+  mate="$TMP_ROOT/handoff-mate"
+  task=linked-captain-hold
+  decision=linked-status-decision
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'planning\n' > "$mate/.fm-secondmate-home"
+  printf -- '- planning - planning domain (home: %s; scope: planning work; projects: firstmate; added 2026-08-14)\n' \
+    "$mate" > "$parent/data/secondmates.md"
+  cat > "$parent/data/backlog.md" <<EOF
+## In flight
+
+## Queued
+- [ ] $task - Choose linked release (repo: firstmate) (kind: captain) (hold: exact release choice pending) (hold-kind: captain)
+
+## Done
+EOF
+  manifest="$parent/$task.json"
+  make_manifest "$parent" "$task" "$manifest" multi
+  FM_HOME="$parent" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" planning "$task" >/dev/null \
+    || fail "linked local backlog handoff failed"
+  mate_real=$(cd "$mate" && pwd -P)
+  FM_HOME="$mate" "$WORK_IDENTITY" verify "$task" | jq -e \
+    --arg home "$mate_real" '.status == "linked" and .binding.home == $home and .binding.task_id == "linked-captain-hold"' >/dev/null \
+    || fail "linked handoff did not atomically stage a destination-bound identity"
+
+  decision_manifest="$mate/$decision.json"
+  wt="$mate/projects/$decision"
+  mkdir -p "$wt"
+  make_manifest "$mate" "$decision" "$decision_manifest"
+  record_and_brief "$mate" "$decision" "$decision_manifest"
+  hash=$(FM_HOME="$mate" "$WORK_IDENTITY" verify "$decision" | jq -r '.sha256')
+  fm_write_meta "$mate/state/$decision.meta" \
+    "window=firstmate:fm-$decision" "endpoint_task_id=$decision" "worktree=$wt" "project=firstmate" \
+    "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=linked" "work_identity_sha256=$hash"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$mate/state" "$decision")
+  "$ROOT/bin/fm-busy-event.sh" apply "$mate/state" "$decision" idle --gen "$gen" \
+    --source claude-hook --event stop
+  printf 'needs-decision [key=exact-choice]: choose the exact linked option\n' > "$mate/state/$decision.status"
+  cat > "$mate/data/backlog.md" <<EOF
+## In flight
+- [ ] $decision - Linked worker awaiting a decision (repo: firstmate) (kind: ship) (since 2026-08-14)
+
+## Queued
+- [ ] $task - Choose linked release (repo: firstmate) (kind: captain) (hold: exact release choice pending) (hold-kind: captain)
+
+## Done
+EOF
+  fakebin=$(make_fakebin "$parent/fakes")
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
+  printf '%s' "$canonical" | jq -e '
+    .secondmate_current.records[] | select(.id == "planning")
+    | . as $mate
+    | ([.decisions_open[] | select(.id == "linked-captain-hold" and .source == "backlog"
+        and .work_identity_ref == "linked-captain-hold")] | length) == 1
+      and ([.decisions_open[] | select(.id == "linked-status-decision" and .source == "status"
+        and .work_identity_ref == "linked-status-decision")] | length) == 1
+      and ([.work_identities[] | select(.task_id == "linked-captain-hold" and .work_identity.status == "linked")] | length) == 1
+      and ([.work_identities[] | select(.task_id == "linked-status-decision" and .work_identity.status == "linked")] | length) == 1
+  ' >/dev/null || fail "delegated decision surfaces lost their source work identities: $canonical"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
+  printf '%s' "$bearings" | jq -e '
+    .decisions_open[] | select(.id == "planning/linked-captain-hold")
+    | .work_identity == "linked"
+      and (.work_units | contains("wu-exact-intake"))
+      and (.sources | contains("dtm:issue:DTM-431"))
+  ' >/dev/null || fail "Bearings decision projection lost exact identity: $bearings"
+  hash=$(sha256_file_for_test "$parent/data/$task/work-identity.json")
+  [ -n "$hash" ] || fail "source handoff identity was not retained as immutable provenance"
+  pass "linked handoff rebinds identity for delegated decision summaries and Bearings"
+}
+
+test_delegated_integrity_failure_stops_parent_publication() {
+  local parent mate task manifest out rc=0 sidecar
+  parent=$(make_home integrity-parent)
+  mate="$TMP_ROOT/integrity-mate"
+  task=stale-delegated
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'integrity\n' > "$mate/.fm-secondmate-home"
+  printf -- '- integrity - integrity domain (home: %s; scope: integrity work; projects: firstmate; added 2026-08-14)\n' \
+    "$mate" > "$parent/data/secondmates.md"
+  manifest="$mate/manifest.json"
+  make_manifest "$mate" "$task" "$manifest"
+  record_and_brief "$mate" "$task" "$manifest"
+  cat > "$mate/data/backlog.md" <<EOF
+## In flight
+
+## Queued
+- [ ] $task - Stale delegated relation (repo: firstmate) (kind: ship)
+
+## Done
+EOF
+  sidecar="$mate/data/$task/work-identity.json"
+  jq -S -c '.work_units[0].id="stale-delegated-unit"' "$sidecar" > "$mate/changed.json"
+  mv "$mate/changed.json" "$sidecar"
+  out=$(FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "parent published a fallback snapshot for stale delegated identity state"
+  assert_contains "$out" "work identity integrity failure in secondmate integrity" \
+    "parent did not propagate the delegated identity integrity failure"
+  pass "delegated linked integrity failures stop parent publication"
+}
+
+test_schema_maximum_delegated_identities_are_batched_once() {
+  local parent mate fakebin canonical task manifest i
+  parent=$(make_home maximum-parent)
+  mate="$TMP_ROOT/maximum-mate"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'maximum\n' > "$mate/.fm-secondmate-home"
+  printf -- '- maximum - maximum identity domain (home: %s; scope: maximum work; projects: firstmate; added 2026-08-14)\n' \
+    "$mate" > "$parent/data/secondmates.md"
+  printf '## In flight\n\n## Queued\n' > "$mate/data/backlog.md"
+  i=1
+  while [ "$i" -le 20 ]; do
+    task=$(printf 'maximum-child-%02d' "$i")
+    manifest="$mate/$task.json"
+    make_max_manifest "$mate" "$task" "$manifest"
+    FM_HOME="$mate" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+    printf -- '- [ ] %s - Maximum identity decision (repo: firstmate) (kind: captain) (hold: maximum exact choice pending) (hold-kind: captain)\n' "$task" \
+      >> "$mate/data/backlog.md"
+    i=$((i + 1))
+  done
+  printf '\n## Done\n' >> "$mate/data/backlog.md"
+  fakebin=$(make_fakebin "$parent/fakes")
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
+  printf '%s' "$canonical" | jq -e '
+    .secondmate_current.records[] | select(.id == "maximum")
+    | .provenance.selected == "structured-home"
+      and (.decisions_open | length) == 20
+      and (.holds | length) == 20
+      and (.queued | length) == 20
+      and (.work_identities | length) == 20
+      and ([.work_identities[].task_id] | unique | length) == 20
+      and all(.decisions_open[]; has("work_identity") | not)
+      and all(.holds[]; has("work_identity") | not)
+      and all(.queued[]; has("work_identity") | not)
+      and (.work_identities[] | select(.task_id == "maximum-child-20") | .work_identity
+        | (.work_units | length) == 20 and (.sources | length) == 20
+          and (.work_units[-1].label | length) == 160
+          and (.sources[-1].id | length) == 240)
+  ' >/dev/null || fail "schema-maximum delegated identities were repeated, truncated, or suppressed: $(printf '%s' "$canonical" | jq -c '.secondmate_current.records[] | select(.id == "maximum") | {current,provenance,decisions:(.decisions_open|length),holds:(.holds|length),queued:(.queued|length),identities:(.work_identities|length),counts,omitted}')"
+  pass "schema-maximum delegated identities stream in bounded normalized batches"
+}
+
+test_bearings_preserves_complete_identity_references() {
+  local home task manifest wt fakebin bearings hash gen last_unit last_source
+  home=$(make_home complete-refs)
+  task=complete-reference-worker
+  manifest="$home/manifest.json"
+  wt="$home/worktree"
+  mkdir -p "$wt"
+  make_max_manifest "$home" "$task" "$manifest"
+  record_and_brief "$home" "$task" "$manifest"
+  write_bound_meta "$home" "$task" "$wt"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" "$task")
+  "$ROOT/bin/fm-busy-event.sh" apply "$home/state" "$task" busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  cat > "$home/data/backlog.md" <<EOF
+## In flight
+- [ ] $task - Complete reference worker (repo: firstmate) (kind: ship) (since 2026-08-14)
+
+## Queued
+
+## Done
+EOF
+  fakebin=$(make_fakebin "$home/fakes")
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
+  last_unit=$(jq -r '.work_units[-1].id' "$manifest")
+  last_source=$(jq -r '.sources[-1].id' "$manifest")
+  printf '%s' "$bearings" | jq -e --arg unit "$last_unit" --arg source "$last_source" '
+    .in_flight[] | select(.id == "complete-reference-worker")
+    | .work_identity == "linked"
+      and (.work_units | contains($unit))
+      and (.sources | contains($source))
+      and (.work_units | length) > 600
+      and (.sources | length) > 600
+  ' >/dev/null || fail "Bearings truncated later exact work-unit or source references: $bearings"
+  hash=$(sha256_file_for_test "$home/data/$task/work-identity.json")
+  [ -n "$hash" ] || fail "complete reference fixture lost its canonical sidecar"
+  pass "Bearings preserves complete IDs and labels for every bounded worker row"
+}
+
 test_intake_through_fleet_projection
 test_concurrent_idempotence_and_explicit_unlinked
 test_namespace_separation_and_contract_rejections
@@ -464,3 +673,7 @@ test_unsafe_files_labels_and_exact_binding
 test_stale_and_changed_relations_refuse
 test_legacy_and_fuzzy_fallbacks_are_unlinked
 test_delegated_secondmate_projection
+test_handoff_rebinds_identity_and_decision_surfaces
+test_delegated_integrity_failure_stops_parent_publication
+test_schema_maximum_delegated_identities_are_batched_once
+test_bearings_preserves_complete_identity_references

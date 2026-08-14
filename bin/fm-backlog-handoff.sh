@@ -22,6 +22,8 @@
 #   - moving only `## Queued` items, refusing `## In flight` and historical
 #     `## Done` records, which must stay with their home for pruning or
 #     archiving;
+#   - staging any exact linked work identity in the destination home before its
+#     backlog row can move, through the contract owner's rebind interface;
 #   - the multi-key classification and idempotent per-key reporting: a key
 #     already present in the secondmate backlog is reported and skipped, and if
 #     any key matches neither backlog nothing is moved;
@@ -518,6 +520,69 @@ outbox_item_count() { # <path>
   awk '/^- \[[ x]\] / { count++ } END { print count + 0 }' "$1"
 }
 
+outbox_keys() { # <path>
+  awk '
+    /^- \[[ x]\] / {
+      rest=$0
+      sub(/^- \[[ x]\] +/, "", rest)
+      id=rest
+      sub(/[ \t].*/, "", id)
+      if (id != "" && !seen[id]++) print id
+    }
+  ' "$1"
+}
+
+export_handoff_identity() { # <task-id> <target-home>; 0 linked, 3 unlinked
+  local task=$1 target_home=$2 payload rc
+  rc=0
+  payload=$(
+    FM_HOME="$FM_HOME" \
+      FM_DATA_OVERRIDE="$DATA" \
+      FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" handoff-export "$task" --to-home "$target_home"
+  ) || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    HANDOFF_IDENTITY_PAYLOAD=$payload
+    return 0
+  fi
+  HANDOFF_IDENTITY_PAYLOAD=
+  [ "$rc" -eq 3 ] && return 3
+  return "$rc"
+}
+
+stage_local_handoff_identities() { # <target-home> <task-id>...
+  local target_home=$1 task rc
+  shift
+  for task in "$@"; do
+    rc=0
+    export_handoff_identity "$task" "$target_home" || rc=$?
+    [ "$rc" -eq 3 ] && continue
+    [ "$rc" -eq 0 ] || return "$rc"
+    printf '%s\n' "$HANDOFF_IDENTITY_PAYLOAD" \
+      | FM_HOME="$target_home" \
+          FM_DATA_OVERRIDE="$target_home/data" \
+          FM_STATE_OVERRIDE="$target_home/state" \
+          FM_ROOT_OVERRIDE="$FM_ROOT" \
+          "$SCRIPT_DIR/fm-work-identity.sh" handoff-import "$task" --file - >/dev/null \
+      || return $?
+  done
+}
+
+stage_remote_handoff_identities() { # <secondmate-id> <target-home> <task-id>...
+  local id=$1 target_home=$2 task rc
+  shift 2
+  for task in "$@"; do
+    rc=0
+    export_handoff_identity "$task" "$target_home" || rc=$?
+    [ "$rc" -eq 3 ] && continue
+    [ "$rc" -eq 0 ] || return "$rc"
+    printf '%s\n' "$HANDOFF_IDENTITY_PAYLOAD" \
+      | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh handoff-import "$task" --file - >/dev/null \
+      || return $?
+  done
+}
+
 remote_deliver_outbox() { # <secondmate-id> <outbox-path>
   local id=$1 outbox=$2 remote_rel receive_out snapshot bytes hash generation counter counter_tmp current marker
   [ -f "$outbox" ] && [ ! -L "$outbox" ] || {
@@ -611,7 +676,7 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
 }
 
 remote_handoff() { # <secondmate-id> <keys...>
-  local id=$1 outbox section main_section out_section key mv_out
+  local id=$1 outbox section main_section out_section key mv_out target_home
   local -a requested to_move already missing in_flight done_items not_queued
   shift
   requested=("$@")
@@ -677,6 +742,15 @@ remote_handoff() { # <secondmate-id> <keys...>
       return 1
     }
   fi
+  target_home=$(secondmate_registry_field "$REG" "$id" home 2>/dev/null || true)
+  [ -n "$target_home" ] || {
+    echo "error: remote secondmate $id has no target home for work identity handoff" >&2
+    return 1
+  }
+  stage_remote_handoff_identities "$id" "$target_home" "${requested[@]}" || {
+    echo "error: exact work identity staging failed; nothing new was handed off" >&2
+    return 1
+  }
   seed_backlog_scaffold "$outbox"
   if [ "${#to_move[@]}" -gt 0 ]; then
     if ! mv_out=$(tasks-axi mv "${to_move[@]}" --file "$MAIN_BACKLOG" --to "$outbox" 2>&1); then
@@ -714,12 +788,26 @@ with_remote_route_locks() { # <secondmate-id> <function> <args...>
 }
 
 resume_remote_outbox() { # <secondmate-id> <outbox-path>
-  local id=$1 outbox=$2
+  local id=$1 outbox=$2 target_home key
+  local -a keys
   [ -e "$outbox" ] || [ -L "$outbox" ] || return 0
   if [ ! -f "$outbox" ] || [ -L "$outbox" ]; then
     echo "error: unsafe pending handoff outbox: $outbox" >&2
     return 1
   fi
+  target_home=$(secondmate_registry_field "$REG" "$id" home 2>/dev/null || true)
+  [ -n "$target_home" ] || {
+    echo "error: pending outbox has no target home for work identity handoff: $id" >&2
+    return 1
+  }
+  keys=()
+  while IFS= read -r key; do
+    [ -n "$key" ] && keys+=("$key")
+  done < <(outbox_keys "$outbox")
+  stage_remote_handoff_identities "$id" "$target_home" "${keys[@]}" || {
+    echo "error: pending exact work identity staging failed; outbox preserved at $outbox" >&2
+    return 1
+  }
   remote_deliver_outbox "$id" "$outbox"
 }
 
@@ -813,6 +901,10 @@ REQUESTED_BATCH=$(receiver_wake_batch_id "$@") || {
 }
 
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
+  stage_local_handoff_identities "$SUB_HOME" "$@" || {
+    echo "error: exact work identity staging failed; nothing was moved." >&2
+    exit 1
+  }
   WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
   case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
     prepared:*:"$REQUESTED_BATCH") receiver_wake_promote_prepared "$ID" "$REQUESTED_BATCH" || exit 1 ;;
@@ -825,7 +917,6 @@ if [ "${#TO_MOVE[@]}" -eq 0 ]; then
   wake_pending_secondmate_receiver "$ID" || exit 1
   exit 0
 fi
-
 FAILED=0
 for key in "${TO_MOVE[@]}"; do
   while IFS= read -r line; do
@@ -839,7 +930,7 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-if ! fm_tasks_axi_compatible; then
+if [ "${#TO_MOVE[@]}" -gt 0 ] && ! fm_tasks_axi_compatible; then
   echo "error: a compatible tasks-axi with atomic multi-ID mv support is required to move backlog items; run bin/fm-bootstrap.sh for the required version" >&2
   exit 1
 fi
@@ -860,11 +951,14 @@ if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
       ;;
   esac
 fi
+stage_local_handoff_identities "$SUB_HOME" "$@" || {
+  echo "error: exact work identity staging failed; nothing was moved." >&2
+  exit 1
+}
 receiver_wake_mark_prepared "$ID" "$REQUESTED_BATCH" || {
   echo "error: receiver wake state for secondmate $ID could not be recorded; nothing was moved" >&2
   exit 1
 }
-
 # Seed the destination with firstmate's standard three-section scaffold when it
 # does not exist yet, so the moved item lands under the right section. (Left to
 # create the file itself, tasks-axi mv writes its own `# Backlog` title format,

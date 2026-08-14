@@ -11,6 +11,7 @@ The contract was verified on 2026-08-14 on macOS arm64 through public commands a
 
 ```sh
 tests/fm-work-identity.test.sh
+tests/fm-remote-backlog-handoff.test.sh
 tests/fm-brief.test.sh
 tests/fm-fleet-snapshot-view.test.sh
 ```
@@ -19,17 +20,23 @@ Bounded output:
 
 ```text
 ok - exact multi-work-unit intake survives instructions, metadata, snapshot, and Bearings once per worker
+ok - concurrent identical records converge and intentional unlinked intake stays explicit
 ok - namespaces remain distinct and version, role, duplicate, contradiction, and id syntax are closed
 ok - unsafe manifests, labels, stored files, cross-home copies, and task mismatches refuse
 ok - generated instructions and metadata freeze the exact relation against stale edits
 ok - legacy tasks stay explicitly unlinked despite every fuzzy fallback signal
 ok - secondmate structured summary and Bearings expose one exact delegated-child worker
+ok - linked handoff rebinds identity for delegated decision summaries and Bearings
+ok - delegated linked integrity failures stop parent publication
+ok - schema-maximum delegated identities stream in bounded normalized batches
+ok - Bearings preserves complete IDs and labels for every bounded worker row
+ok - remote handoff stages an exact destination-bound identity before receipt
 ok - fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly
 ok - fixture snapshot covers task rows, backlog rows, pointers, and stable ordering
 ```
 
-The focused suite covers single and multiple work units, Work Aligner `plan_id` and `work_units`, DTM project and issue IDs, Data Team Ticket IDs, local Firstmate plans, namespace separation, stable IDs paired with labels, absent legacy records, idempotence, exact task and home binding, malformed versions and syntax, duplicate and contradictory IDs, unsafe paths and labels, symlink and hardlink refusal, stale digest refusal, stable snapshot output, delegated-child and secondmate projections, and every prohibited fuzzy signal.
-It also confirms that relation recording changes no runtime task-state file.
+The focused suite covers single and multiple work units, Work Aligner `plan_id` and `work_units`, DTM project and issue IDs, Data Team Ticket IDs, local Firstmate plans, namespace separation, complete stable IDs paired with labels, absent legacy records, idempotence, exact task and home binding, local and remote handoff rebinding, malformed versions and syntax, duplicate and contradictory IDs, unsafe paths and labels, symlink and hardlink refusal, stale digest refusal, delegated fail-stop propagation, schema-maximum bounded batching, stable snapshot output, delegated-child and secondmate projections, decision surfaces, and every prohibited fuzzy signal.
+It also confirms that relation recording changes no runtime task-state file and that handoff rebinding adds only local destination identity bookkeeping before the existing backlog move.
 
 ## Runtime-backend applicability
 

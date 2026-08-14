@@ -124,7 +124,7 @@ Default fields: schema, home, generated, prs, in_flight{id,kind,state,repo,doing
   secondmates{id,state,doing,provenance,freshness,age_seconds,contradiction,reason},
   secondmate_reconcile{id,spawn_gen,host,kind,ids},
   delegated_work{owner,id,state,...identity},
-  decisions_open{id,key,verb,summary,owner}, landed{id,what,artifact,owner,...identity},
+  decisions_open{id,key,verb,summary,owner,...identity}, landed{id,what,artifact,owner,...identity},
   gates{id,title,blocked_by,reason,owner,...identity}, reports{id,path}, recorded_prs{id,url},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
 landed merges this home's Done with registered secondmate homes' Done, bounded by
@@ -327,10 +327,10 @@ MODEL=$(printf '%s' "$SNAP" | jq \
     (tostring | gsub("\\s+"; " ") | if (length > $n) then (.[:$n] + "…") else . end) end;
   def exact_ref($i):
     if $i == null then "-"
-    else ("\($i.namespace):\($i.kind):\($i.id) [\($i.label)]" | trunc(300)) end;
+    else "\($i.namespace):\($i.kind):\($i.id) [\($i.label)]" end;
   def exact_refs($xs):
     if ($xs | length) == 0 then "-"
-    else ($xs | map(exact_ref(.)) | join("; ") | trunc(600)) end;
+    else ($xs | map(exact_ref(.)) | join("; ")) end;
   def work_fields($w):
     {work_identity:($w.status // "unlinked"),
      initiative:exact_ref($w.initiative),
@@ -338,6 +338,8 @@ MODEL=$(printf '%s' "$SNAP" | jq \
      stage:exact_ref($w.stage),
      work_units:exact_refs($w.work_units // []),
      sources:exact_refs($w.sources // [])};
+  def mate_work($mate; $ref):
+    ([ $mate.work_identities[]? | select(.task_id == $ref) | .work_identity ][0] // null);
   def round_robin_landed($n):
     . as $groups
     | [range(0; (($groups | map(length) | max) // 0)) as $i
@@ -349,9 +351,13 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   | (($fl | index("paths")) != null) as $f_paths
   | (($fl | index("actions")) != null) as $f_actions
   | (($fl | index("endpoints")) != null) as $f_endpoints
+  | . as $snap
   | ([ .backlog.records[] | select(.state == "done" and .structured and .hold_kind != "captain")
        | {id, title, pr_url, report_path, local_note, work_identity, completion, home:"(main)", home_id:"(main)"} ]) as $main_done
-  | ((.secondmate_landed.records) // []) as $mate_done
+  | (((.secondmate_landed.records) // [])
+      | map(. as $row
+          | ([ $snap.secondmate_current.records[]? | select(.id == $row.home_id) ][0]) as $mate
+          | . + {work_identity:mate_work($mate; $row.work_identity_ref)})) as $mate_done
   | ($main_done + $mate_done) as $all_landed_rows
   | ([ $all_landed_rows | group_by(.home_id)[]
        | sort_by([(.completion.date // ""), .id]) | reverse
@@ -425,17 +431,20 @@ MODEL=$(printf '%s' "$SNAP" | jq \
             + work_fields(.work_identity)) ]) as $in_flight_all
   | ([ $secondmate_views[] as $mate
        | $mate.active_children[]?
-       | ({owner:$mate.id,id,state,doing:(.doing | trunc(90))} + work_fields(.work_identity)) ]) as $delegated_all
+       | ({owner:$mate.id,id,state,doing:(.doing | trunc(90))}
+          + work_fields(mate_work($mate; .work_identity_ref))) ]) as $delegated_all
   | ([ .backlog.records[]
          | select(.structured and .captain_actionable == true)
          | select(($all_decisions == 1) or (.deferred_marker != true))
-         | {id,key:.id,verb:"captain-hold",
-            summary:((.title + ": " + .hold_reason) | trunc(90)),owner:"(main)"} ]
+         | ({id,key:.id,verb:"captain-hold",
+             summary:((.title + ": " + .hold_reason) | trunc(90)),owner:"(main)"}
+            + work_fields(.work_identity)) ]
      + [ (.secondmate_current.records // [])[] as $m | $m.decisions_open[]?
          | select(.source == "backlog" and .verb == "captain-hold")
          | select(($all_decisions == 1) or (.deferred_marker != true))
-         | {id:($m.id + "/" + .id),key,verb,
-            summary:(((.summary // .id) + ": " + (.reason // "captain decision pending")) | trunc(90)),owner:$m.id} ]) as $decisions_all
+         | ({id:($m.id + "/" + .id),key,verb,
+             summary:(((.summary // .id) + ": " + (.reason // "captain decision pending")) | trunc(90)),owner:$m.id}
+            + work_fields(mate_work($m; .work_identity_ref))) ]) as $decisions_all
   | ([ .backlog.records[]
          | select(.structured and .captain_actionable == true and .deferred_marker == true) ]
      + [ (.secondmate_current.records // [])[] | .decisions_open[]?
@@ -473,7 +482,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
             reason:((if (.hold_until // null) != null and .hold_until > $today
                      then ("until " + .hold_until + ": " + (.hold_reason // .blocked_reason // "-"))
                      else (.hold_reason // .blocked_reason // "-") end) | trunc(40)),owner:$m.id}
-            + work_fields(.work_identity)) ]) as $gates_all
+            + work_fields(mate_work($m; .work_identity_ref))) ]) as $gates_all
   | ([ .scout_reports[]
        | . as $r
        | select(($all_reports == 1) or (($rel_ids | index($r.id)) != null))

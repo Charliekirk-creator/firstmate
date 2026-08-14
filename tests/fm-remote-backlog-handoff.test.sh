@@ -53,6 +53,7 @@ printf 'fixture\n' > "$REMOTE_ROOT/AGENTS.md"
 cp "$ROOT/bin/fm-remote-entrypoint.sh" "$ROOT/bin/fm-remote-job-lib.sh" \
   "$ROOT/bin/fm-remote-job-worker.sh" "$ROOT/bin/fm-remote-file.sh" \
   "$ROOT/bin/fm-backlog-receive.sh" "$ROOT/bin/fm-tasks-axi-lib.sh" \
+  "$ROOT/bin/fm-work-identity.sh" "$ROOT/bin/fm-pr-lib.sh" \
   "$ROOT/bin/fm-wake-lib.sh" "$REMOTE_ROOT/bin/"
 ln -s "$(command -v tasks-axi)" "$REMOTE_ROOT/bin/tasks-axi"
 ln -s "$(command -v node)" "$REMOTE_ROOT/bin/node"
@@ -305,6 +306,26 @@ assert_no_grep 'serialized-b' "$PARENT/data/backlog.md" "second serialized hando
   || fail "second serialized handoff was lost or duplicated"
 assert_absent "$PARENT/data/handoff/ios.outbox.md" "serialized handoffs left a pending outbox"
 pass "concurrent handoffs serialize staging through confirmed cleanup"
+
+write_backlog '- [ ] linked-remote - linked remote handoff (repo: alpha)'
+manifest="$PARENT/linked-remote.json"
+FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" template linked-remote \
+  | jq '.initiative.id="remote-project"
+      | .plan_id.id="remote-plan"
+      | .stage.id="remote-stage"
+      | .work_units=[{namespace:"work-aligner",kind:"work-unit",id:"remote-unit",label:"Remote Unit"}]
+      | .sources=[{namespace:"dtm",kind:"issue",id:"DTM-REMOTE-1",label:"Remote Issue"}]' \
+  > "$manifest"
+FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" record linked-remote --file "$manifest" >/dev/null
+handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios linked-remote >/dev/null \
+  || fail "linked remote handoff failed"
+FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-work-identity.sh" verify linked-remote \
+  | jq -e --arg home "$REMOTE" '
+      .status == "linked" and .binding.home == $home and .binding.task_id == "linked-remote"
+        and .work_units[0].id == "remote-unit" and .sources[0].id == "DTM-REMOTE-1"
+    ' >/dev/null || fail "remote receipt lost or misbound the exact work identity"
+assert_grep 'linked-remote' "$REMOTE/data/backlog.md" "linked remote backlog row did not arrive"
+pass "remote handoff stages an exact destination-bound identity before receipt"
 
 # A stale tasks-axi lock is removed only on the destination host after the first
 # move refusal proves a retry is needed. The dead pid and age satisfy the same

@@ -14,6 +14,12 @@
 # Internal consumers:
 #   fm-work-identity.sh brief-block <task-id>
 #   fm-work-identity.sh project <task-id> [--brief <brief.md>] [--meta <task.meta>]
+#   fm-work-identity.sh handoff-export <task-id> --to-home <absolute-home>
+#   fm-work-identity.sh handoff-import <task-id> --file <manifest.json|->
+#   fm-work-identity.sh validate-index --file <index.json|->
+#   fm-work-identity.sh validate-projections --home <absolute-home> --file <records.json|->
+#   fm-work-identity.sh limits
+#   fm-work-identity.sh record-max-bytes
 #
 # The canonical private sidecar is data/<task-id>/work-identity.json.
 # `record` accepts a pretty or compact JSON manifest, validates it, canonicalizes
@@ -83,6 +89,9 @@ FM_HOME_INPUT="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 SCHEMA=fm-work-identity.v1
 MAX_BYTES=65536
 MAX_ARRAY=20
+MAX_PROJECTION_BYTES=$((MAX_BYTES + 2048))
+MAX_PROJECTION_BATCH_BYTES=1048576
+DIE_STATUS=1
 
 # shellcheck source=bin/fm-pr-lib.sh
 # shellcheck disable=SC1091
@@ -94,7 +103,7 @@ usage() {
 
 die() {
   printf 'error: %s\n' "$1" >&2
-  exit 1
+  exit "$DIE_STATUS"
 }
 
 resolve_existing_dir() {  # <name> <path>
@@ -155,15 +164,15 @@ sha256_file() {  # <path>
   fi
 }
 
-safe_regular_file() {  # <path> <label>
-  local path=$1 label=$2 links bytes
+safe_regular_file() {  # <path> <label> [max-bytes]
+  local path=$1 label=$2 max=${3:-$MAX_BYTES} links bytes
   [ ! -L "$path" ] || die "$label is symlinked: $path"
   [ -f "$path" ] || die "$label is not a regular file: $path"
   links=$(file_link_count "$path") || die "cannot inspect $label link count: $path"
   [ "$links" = 1 ] || die "$label is hardlinked: $path"
   bytes=$(file_size "$path") || die "cannot inspect $label size: $path"
   case "$bytes" in ''|*[!0-9]*) die "$label has an invalid size: $path" ;; esac
-  [ "$bytes" -le "$MAX_BYTES" ] || die "$label exceeds $MAX_BYTES bytes: $path"
+  [ "$bytes" -le "$max" ] || die "$label exceeds $max bytes: $path"
 }
 
 ensure_data_dir() {
@@ -202,16 +211,19 @@ ensure_task_dir() {  # <task-id>
   ensure_data_dir
   locate_task_dir "$id"
   if [ ! -d "$TASK_DIR" ]; then
-    mkdir -- "$TASK_DIR" || die "cannot create task data directory: $TASK_DIR"
+    if ! mkdir -- "$TASK_DIR" 2>/dev/null; then
+      [ -d "$TASK_DIR" ] && [ ! -L "$TASK_DIR" ] \
+        || die "cannot create task data directory: $TASK_DIR"
+    fi
     locate_task_dir "$id"
   fi
 }
 
-canonicalize_manifest() {  # <path> <task-id>
-  local path=$1 task=$2 out
+canonicalize_manifest() {  # <path> <task-id> [expected-home]
+  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} out
   out=$(jq -e -S -c \
     --arg schema "$SCHEMA" \
-    --arg home "$FM_HOME_REAL" \
+    --arg home "$expected_home" \
     --arg task "$task" \
     --argjson max_array "$MAX_ARRAY" '
       def exact_keys($ks): (keys | sort) == ($ks | sort);
@@ -261,11 +273,11 @@ canonicalize_manifest() {  # <path> <task-id>
   jq -S -c . "$path" 2>/dev/null || die "manifest is not valid JSON"
 }
 
-validate_sidecar() {  # <path> <task-id>; sets WORK_CANONICAL/WORK_HASH
-  local path=$1 task=$2 before after canonical
+validate_sidecar() {  # <path> <task-id> [expected-home]; sets WORK_CANONICAL/WORK_HASH
+  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} before after canonical
   safe_regular_file "$path" "work identity record"
   before=$(file_identity "$path") || die "cannot inspect work identity record: $path"
-  canonical=$(canonicalize_manifest "$path" "$task")
+  canonical=$(canonicalize_manifest "$path" "$task" "$expected_home")
   if ! printf '%s\n' "$canonical" | cmp -s "$path" -; then
     die "work identity record is not canonical or has trailing data: $path"
   fi
@@ -349,6 +361,151 @@ validate_brief_binding() {  # <brief> <linked|unlinked> [hash] [canonical]
   BRIEF_PROVENANCE=generated-instructions
 }
 
+validate_home_literal() {  # <absolute-home>
+  local home=$1
+  case "$home" in /*) ;; *) die "work identity home must be absolute: $home" ;; esac
+  case "/$home/" in */../*|*/./*) die "work identity home contains traversal: $home" ;; esac
+  case "$home" in *'//'*) die "work identity home contains an empty path component: $home" ;; esac
+  case "$home" in *$'\n'*|*$'\r'*|*$'\t'*) die "work identity home contains control characters" ;; esac
+}
+
+capture_contract_input() {  # <path|-> <label> <max-bytes>; sets CONTRACT_INPUT/CONTRACT_INPUT_TMP
+  local path=$1 label=$2 max=$3 bytes
+  CONTRACT_INPUT_TMP=
+  if [ "$path" = - ]; then
+    CONTRACT_INPUT_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-input.XXXXXX") \
+      || die "cannot create $label temporary file"
+    head -c "$((max + 1))" > "$CONTRACT_INPUT_TMP" \
+      || { rm -f -- "$CONTRACT_INPUT_TMP"; CONTRACT_INPUT_TMP=; die "cannot read $label"; }
+    bytes=$(file_size "$CONTRACT_INPUT_TMP") || die "cannot inspect $label size"
+    [ "$bytes" -le "$max" ] || die "$label exceeds $max bytes"
+    CONTRACT_INPUT=$CONTRACT_INPUT_TMP
+  else
+    safe_regular_file "$path" "$label" "$max"
+    CONTRACT_INPUT=$path
+  fi
+}
+
+validate_projection_index() {  # <path>
+  local path=$1 row task
+  safe_regular_file "$path" "work identity projection index" "$MAX_PROJECTION_BATCH_BYTES"
+  jq -e --arg schema "$SCHEMA" '
+    . as $entries
+    | ($entries | type) == "array"
+    and (($entries | map(.task_id) | unique | length) == ($entries | length))
+    and all($entries[];
+      type == "object"
+      and (keys | sort) == (["schema","sha256","status","task_id"] | sort)
+      and (.task_id | type) == "string"
+      and .schema == $schema
+      and ((.status == "linked" and (.sha256 | type) == "string" and (.sha256 | test("^[0-9a-f]{64}$")))
+        or (.status == "unlinked" and .sha256 == null)))
+  ' "$path" >/dev/null 2>&1 || die "projection index does not satisfy $SCHEMA"
+  while IFS= read -r row; do
+    task=$(printf '%s' "$row" | jq -er '.task_id') || die "projection index task id is malformed"
+    fm_task_id_creation_valid "$task" || die "projection index has an invalid task id"
+    printf '%s\n' "$task"
+  done < <(jq -c '.[]' "$path")
+}
+
+validate_projection_set() {  # <path> <expected-home>
+  local path=$1 expected_home=$2 row task status recorded_hash canonical tmp
+  validate_home_literal "$expected_home"
+  safe_regular_file "$path" "work identity projection set" "$MAX_PROJECTION_BATCH_BYTES"
+  jq -e '
+    . as $entries
+    | ($entries | type) == "array"
+    and (($entries | map(.task_id) | unique | length) == ($entries | length))
+    and all($entries[];
+      type == "object"
+      and (keys | sort) == (["task_id","work_identity"] | sort)
+      and (.task_id | type) == "string"
+      and (.work_identity | type) == "object")
+  ' "$path" >/dev/null 2>&1 || die "projection set does not satisfy $SCHEMA"
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-projection.XXXXXX") \
+    || die "cannot create projection validation file"
+  while IFS= read -r row; do
+    task=$(printf '%s' "$row" | jq -er '.task_id') \
+      || { rm -f -- "$tmp"; die "projection task id is malformed"; }
+    fm_task_id_creation_valid "$task" \
+      || { rm -f -- "$tmp"; die "projection has an invalid task id"; }
+    status=$(printf '%s' "$row" | jq -er '.work_identity.status') \
+      || { rm -f -- "$tmp"; die "projection status is malformed"; }
+    case "$status" in
+      linked)
+        printf '%s' "$row" | jq -e -S -c \
+          --arg schema "$SCHEMA" --arg home "$expected_home" --arg task "$task" '
+          .work_identity as $w
+          | select(($w | keys | sort) == (["binding","initiative","plan_id","provenance","schema","sha256","sources","stage","status","work_units"] | sort))
+          | select($w.status == "linked" and $w.schema == $schema)
+          | select($w.binding == {home:$home,task_id:$task})
+          | select(($w.sha256 | type) == "string" and ($w.sha256 | test("^[0-9a-f]{64}$")))
+          | select(($w.provenance | type) == "object"
+              and ($w.provenance | keys | sort) == (["instructions","metadata","record"] | sort)
+              and $w.provenance.record == "intake-sidecar"
+              and (["absent","legacy","generated-instructions"] | index($w.provenance.instructions)) != null
+              and (["absent","legacy","metadata"] | index($w.provenance.metadata)) != null)
+          | {schema:$w.schema,binding:$w.binding,initiative:$w.initiative,plan_id:$w.plan_id,
+             stage:$w.stage,work_units:$w.work_units,sources:$w.sources}
+        ' > "$tmp" 2>/dev/null \
+          || { rm -f -- "$tmp"; die "linked projection does not satisfy $SCHEMA"; }
+        canonical=$(canonicalize_manifest "$tmp" "$task" "$expected_home")
+        printf '%s\n' "$canonical" | cmp -s "$tmp" - \
+          || { rm -f -- "$tmp"; die "linked projection is not canonical"; }
+        WORK_HASH=$(sha256_file "$tmp") || { rm -f -- "$tmp"; die "SHA-256 is unavailable for linked projection"; }
+        recorded_hash=$(printf '%s' "$row" | jq -er '.work_identity.sha256') \
+          || { rm -f -- "$tmp"; die "linked projection digest is malformed"; }
+        [ "$WORK_HASH" = "$recorded_hash" ] \
+          || { rm -f -- "$tmp"; die "linked projection digest is stale or mismatched"; }
+        ;;
+      unlinked)
+        printf '%s' "$row" | jq -e \
+          --arg schema "$SCHEMA" --arg home "$expected_home" --arg task "$task" '
+          .work_identity as $w
+          | ($w | keys | sort) == (["binding","initiative","plan_id","provenance","reason","schema","sha256","sources","stage","status","work_units"] | sort)
+          and $w.status == "unlinked" and $w.schema == $schema and $w.sha256 == null
+          and $w.binding == {home:$home,task_id:$task}
+          and $w.initiative == null and $w.plan_id == null and $w.stage == null
+          and $w.work_units == [] and $w.sources == []
+          and (["explicitly-unlinked","legacy-no-record"] | index($w.reason)) != null
+          and ($w.provenance | type) == "object"
+          and ($w.provenance | keys | sort) == (["instructions","metadata","record"] | sort)
+          and $w.provenance.record == "absent"
+          and (["absent","legacy","generated-instructions"] | index($w.provenance.instructions)) != null
+          and (["absent","legacy","metadata"] | index($w.provenance.metadata)) != null
+        ' >/dev/null 2>&1 || { rm -f -- "$tmp"; die "unlinked projection does not satisfy $SCHEMA"; }
+        ;;
+      *) rm -f -- "$tmp"; die "projection status does not satisfy $SCHEMA" ;;
+    esac
+  done < <(jq -c '.[]' "$path")
+  rm -f -- "$tmp"
+}
+
+handoff_export() {  # <task-id> <target-home>
+  local task=$1 target_home=$2 meta rebound tmp
+  validate_home_literal "$target_home"
+  [ "$target_home" != "$FM_HOME_REAL" ] || die "work identity handoff target matches the active home"
+  locate_task_dir "$task"
+  meta="$STATE_REAL/$task.meta"
+  if [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ]; then
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] || validate_brief_binding "$BRIEF_DEFAULT" unlinked
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" unlinked
+    return 3
+  fi
+  validate_sidecar "$SIDECAR" "$task"
+  [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+    || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
+  [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+  rebound=$(printf '%s' "$WORK_CANONICAL" | jq -S -c --arg home "$target_home" '.binding.home = $home') \
+    || die "cannot rebind work identity for handoff"
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-handoff.XXXXXX") \
+    || die "cannot create work identity handoff file"
+  printf '%s\n' "$rebound" > "$tmp" || { rm -f -- "$tmp"; die "cannot write work identity handoff file"; }
+  validate_sidecar "$tmp" "$task" "$target_home"
+  cat "$tmp"
+  rm -f -- "$tmp"
+}
+
 project_identity() {  # <task-id> [brief] [meta]
   local task=$1 brief=${2:-} meta=${3:-} reason
   locate_task_dir "$task"
@@ -392,10 +549,55 @@ command -v jq >/dev/null 2>&1 || die "jq not found"
 COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
-  template|record|verify|brief-block|project) ;;
+  limits|record-max-bytes|validate-index|validate-projections) ;;
+  template|record|verify|brief-block|project|handoff-export|handoff-import) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
+
+case "$COMMAND" in
+  limits)
+    [ "$#" -eq 0 ] || die "limits accepts no arguments"
+    jq -n -c --argjson record "$MAX_BYTES" --argjson projection "$MAX_PROJECTION_BYTES" \
+      '{record_max_bytes:$record,projection_max_bytes:$projection}'
+    exit 0
+    ;;
+  record-max-bytes)
+    [ "$#" -eq 0 ] || die "record-max-bytes accepts no arguments"
+    printf '%s\n' "$MAX_BYTES"
+    exit 0
+    ;;
+  validate-index)
+    [ "$#" -eq 2 ] && [ "$1" = --file ] || die "validate-index usage: fm-work-identity.sh validate-index --file <index.json|->"
+    DIE_STATUS=42
+    trap '[ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP"' EXIT
+    capture_contract_input "$2" "work identity projection index" "$MAX_PROJECTION_BATCH_BYTES"
+    validate_projection_index "$CONTRACT_INPUT"
+    [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
+    exit 0
+    ;;
+  validate-projections)
+    EXPECTED_HOME=
+    INPUT_PATH=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --home) shift; [ "$#" -gt 0 ] || die "--home requires a path"; EXPECTED_HOME=$1 ;;
+        --file) shift; [ "$#" -gt 0 ] || die "--file requires a path"; INPUT_PATH=$1 ;;
+        *) die "unknown validate-projections argument: $1" ;;
+      esac
+      shift
+    done
+    [ -n "$EXPECTED_HOME" ] && [ -n "$INPUT_PATH" ] \
+      || die "validate-projections requires --home and --file"
+    DIE_STATUS=42
+    trap '[ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP"' EXIT
+    capture_contract_input "$INPUT_PATH" "work identity projection set" "$MAX_PROJECTION_BATCH_BYTES"
+    validate_projection_set "$CONTRACT_INPUT" "$EXPECTED_HOME"
+    [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
+    exit 0
+    ;;
+esac
+
 TASK=${1:-}
 [ -n "$TASK" ] || die "$COMMAND requires a task id"
 shift
@@ -472,6 +674,24 @@ case "$COMMAND" in
         || die "work identity is immutable once recorded; changed relation requires a new task id"
       printf 'recorded %s task=%s sha256=%s (unchanged)\n' "$SCHEMA" "$TASK" "$WORK_HASH"
     fi
+    ;;
+  handoff-export)
+    [ "$#" -eq 2 ] && [ "$1" = --to-home ] \
+      || die "handoff-export usage: fm-work-identity.sh handoff-export <task-id> --to-home <absolute-home>"
+    handoff_export "$TASK" "$2"
+    ;;
+  handoff-import)
+    [ "$#" -eq 2 ] && [ "$1" = --file ] \
+      || die "handoff-import usage: fm-work-identity.sh handoff-import <task-id> --file <manifest.json|->"
+    trap '[ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP"' EXIT
+    capture_contract_input "$2" "work identity handoff manifest" "$MAX_BYTES"
+    if "$SCRIPT_DIR/fm-work-identity.sh" record "$TASK" --file "$CONTRACT_INPUT"; then
+      IMPORT_RC=0
+    else
+      IMPORT_RC=$?
+    fi
+    [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
+    exit "$IMPORT_RC"
     ;;
   verify)
     [ "$#" -eq 0 ] || die "verify accepts only a task id"
