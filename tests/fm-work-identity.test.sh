@@ -11,6 +11,7 @@ BRIEF="$ROOT/bin/fm-brief.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SNAPSHOT="$ROOT/bin/fm-fleet-snapshot.sh"
 BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
+FLEET_VIEW="$ROOT/bin/fm-fleet-view.sh"
 TMP_ROOT=$(fm_test_tmproot fm-work-identity)
 TMP_ROOT=$(cd "$TMP_ROOT" && pwd -P)
 
@@ -510,10 +511,11 @@ EOF
 # summary. The parent consumes that projection and never scans or rebuilds the
 # child tree itself; Bearings exposes one delegated child row with all exact ids.
 test_delegated_secondmate_projection() {
-  local parent mate task manifest wt fakebin hash canonical bearings gen
+  local parent mate task long_task manifest wt fakebin hash canonical bearings gen out rc
   parent=$(make_home delegated-parent)
   mate="$TMP_ROOT/delegated-mate"
   task=delegated-child
+  long_task=legacy-delegated-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz
   wt="$mate/projects/$task"
   mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin" "$wt"
   printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
@@ -540,18 +542,22 @@ test_delegated_secondmate_projection() {
 - [ ] $task - Exact delegated child (repo: firstmate) (kind: ship) (since 2026-08-14)
 
 ## Queued
+- [ ] $long_task - Exact long legacy delegated id (repo: firstmate) (kind: ship)
 
 ## Done
 EOF
   fakebin=$(make_fakebin "$parent/fakes")
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
-  printf '%s' "$canonical" | jq -e '
+  printf '%s' "$canonical" | jq -e --arg long "$long_task" '
     .secondmate_current.records[] | select(.id == "roadmap")
     | . as $mate
     | .provenance.selected == "structured-home"
       and ([.active_children[] | select(.id == "delegated-child" and .work_identity_ref == "delegated-child")] | length) == 1
       and ([.endpoints[] | select(.id == "delegated-child" and .work_identity_ref == "delegated-child")] | length) == 1
       and ([.work_identities[] | select(.task_id == "delegated-child")] | length) == 1
+      and ([.queued[] | select(.id == $long and .work_identity_ref == $long)] | length) == 1
+      and ([.work_identities[] | select(.task_id == $long)
+        | .work_identity | select(.status == "unlinked" and .reason == "legacy-no-record")] | length) == 1
       and (.work_identities[] | select(.task_id == "delegated-child") | .work_identity
         | .status == "linked" and .binding.home_id == "secondmate:roadmap"
           and (.work_units | map(.id)) == ["wu-exact-intake","wu-fleet-projection"]
@@ -560,15 +566,24 @@ EOF
       and (all(.endpoints[]; has("work_identity") | not))
   ' >/dev/null || fail "authoritative delegated-child projection lost exact identity: $canonical"
   bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
-  printf '%s' "$bearings" | jq -e '
+  printf '%s' "$bearings" | jq -e --arg long "$long_task" '
     ([.delegated_work[] | select(.owner == "roadmap" and .id == "delegated-child")] | length) == 1
       and (.delegated_work[] | select(.owner == "roadmap" and .id == "delegated-child")
         | .work_identity == "linked"
           and (.work_units | contains("wu-exact-intake"))
           and (.work_units | contains("wu-fleet-projection"))
           and (.sources | contains("dtm:issue:DTM-431")))
+      and ([.gates[] | select(.owner == "roadmap" and .id == $long
+        and .work_identity == "unlinked")] | length) == 1
   ' >/dev/null || fail "Bearings delegated-work projection lost exact identities: $bearings"
-  pass "secondmate structured summary and Bearings expose one exact delegated-child worker"
+  rm "$mate/.fm-secondmate-home"
+  rc=0
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z \
+    "$SNAPSHOT" --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "parent published after a readable delegated home lost its identity marker"
+  assert_contains "$out" "work identity home binding mismatch in secondmate roadmap" \
+    "missing delegated home identity marker degraded to an untrusted fallback"
+  pass "delegated summaries preserve long ids and reject missing home identity markers"
 }
 
 test_handoff_rebinds_identity_and_decision_surfaces() {
@@ -729,6 +744,23 @@ EOF
   FM_HOME="$parent" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
     || fail "failed multi-item staging damaged the source identity"
 
+  FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" transaction "$task_a" >/dev/null \
+    || fail "could not establish a completed identity handoff for mixed-retry coverage"
+  FM_HOME="$mate" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
+    || fail "completed mixed-retry fixture did not publish its destination identity"
+  rc=0
+  out=$(FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" transaction "$task_a" "$task_b" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "mixed retry ignored the later destination conflict"
+  assert_grep "$task_b" "$parent/data/backlog.md" "mixed retry moved the conflicting backlog item"
+  assert_absent "$mate/data/$task_a/work-identity-handoff-target.json" \
+    "mixed retry left a target guard over an already committed destination"
+  assert_absent "$parent/data/$task_b/work-identity-handoff-source.json" \
+    "mixed retry left the conflicting source identity prepared"
+  assert_absent "$mate/data/$task_b/work-identity-handoff-target.json" \
+    "mixed retry left the conflicting destination identity prepared"
+  FM_HOME="$mate" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
+    || fail "mixed retry blocked the already committed destination identity"
+
   race=record-during-handoff
   manifest="$parent/$race.json"
   make_manifest "$parent" "$race" "$manifest"
@@ -860,6 +892,81 @@ EOF
   pass "Bearings preserves complete IDs and labels for every bounded worker row"
 }
 
+test_display_labels_cannot_spoof_exact_references() {
+  local home task manifest wt fakebin bearings view expected gen
+  home=$(make_home escaped-labels)
+  task=escaped-label-worker
+  manifest="$home/manifest.json"
+  wt="$home/worktree"
+  mkdir -p "$wt"
+  make_manifest "$home" "$task" "$manifest"
+  jq '.work_units[0].label="Friendly]; work-aligner:work-unit:fake [Fake"' \
+    "$manifest" > "$home/escaped.json"
+  record_and_brief "$home" "$task" "$home/escaped.json"
+  write_bound_meta "$home" "$task" "$wt"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" "$task")
+  "$ROOT/bin/fm-busy-event.sh" apply "$home/state" "$task" busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  printf 'working: escaped label projection\n' > "$home/state/$task.status"
+  cat > "$home/data/backlog.md" <<EOF
+## In flight
+- [ ] $task - Escaped label worker (repo: firstmate) (kind: ship) (since 2026-08-14)
+
+## Queued
+
+## Done
+EOF
+  fakebin=$(make_fakebin "$home/fakes")
+  expected='work-aligner:work-unit:wu-exact-intake [Friendly\]\; work-aligner:work-unit:fake \[Fake]'
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-08-14T12:00:00Z \
+    "$BEARINGS" --json)
+  printf '%s' "$bearings" | jq -e --arg expected "$expected" '
+    .in_flight[] | select(.id == "escaped-label-worker") | .work_units == $expected
+  ' >/dev/null || fail "Bearings did not escape identity-reference delimiters in display labels: $bearings"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$FLEET_VIEW")
+  assert_contains "$view" "$expected" \
+    "fleet view did not escape identity-reference delimiters in display labels"
+  pass "display labels cannot masquerade as additional exact identities"
+}
+
+test_secondmate_parent_decisions_and_nested_caps_are_disclosed() {
+  local parent mate fakebin child gen bearings
+  parent=$(make_home capped-parent)
+  mate="$TMP_ROOT/capped-mate"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'capped\n' > "$mate/.fm-secondmate-home"
+  printf -- '- capped - capped domain (home: %s; scope: capped work; projects: firstmate; added 2026-08-14)\n' \
+    "$mate" > "$parent/data/secondmates.md"
+  fm_write_secondmate_meta "$parent/state/capped.meta" "$mate" "firstmate:fm-capped" firstmate codex
+  printf 'needs-decision [key=stale-parent]: stale parent-only choice\n' > "$parent/state/capped.status"
+  printf '## In flight\n' > "$mate/data/backlog.md"
+  for child in capped-child-a capped-child-b; do
+    mkdir -p "$mate/projects/$child"
+    fm_write_meta "$mate/state/$child.meta" \
+      "window=firstmate:fm-$child" "worktree=$mate/projects/$child" "project=firstmate" \
+      "harness=claude" "kind=ship" "mode=no-mistakes"
+    gen=$("$ROOT/bin/fm-busy-event.sh" arm "$mate/state" "$child")
+    "$ROOT/bin/fm-busy-event.sh" apply "$mate/state" "$child" busy --gen "$gen" \
+      --source claude-hook --event user-prompt-submit
+    printf 'working: %s\n' "$child" > "$mate/state/$child.status"
+    printf -- '- [ ] %s - Capped delegated child (repo: firstmate) (kind: ship) (since 2026-08-14)\n' \
+      "$child" >> "$mate/data/backlog.md"
+  done
+  printf '\n## Queued\n\n## Done\n' >> "$mate/data/backlog.md"
+  fakebin=$(make_fakebin "$parent/fakes")
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z \
+    FM_SNAPSHOT_SECONDMATE_CHILDREN=1 "$BEARINGS" --json --all-in-flight)
+  printf '%s' "$bearings" | jq -e '
+    ([.decisions_open[] | select(.id == "capped" and .owner == "(main)")] | length) == 0
+      and ([.delegated_work[] | select(.owner == "capped")] | length) == 1
+      and ([.omitted[] | select(
+        .surface == "delegated_work omitted by structured-home cap for capped: 1"
+        and .reveal == "raise FM_SNAPSHOT_SECONDMATE_CHILDREN")] | length) == 1
+  ' >/dev/null || fail "Bearings trusted a parent secondmate decision or hid a nested delegated cap: $bearings"
+  pass "Bearings excludes parent secondmate decisions and discloses nested worker caps"
+}
+
 test_intake_through_fleet_projection
 test_spawn_delivers_validated_brief_snapshot
 test_concurrent_idempotence_and_explicit_unlinked
@@ -873,3 +980,5 @@ test_handoff_preparation_is_durable_and_rollback_safe
 test_delegated_integrity_failure_stops_parent_publication
 test_schema_maximum_delegated_identities_are_batched_once
 test_bearings_preserves_complete_identity_references
+test_display_labels_cannot_spoof_exact_references
+test_secondmate_parent_decisions_and_nested_caps_are_disclosed

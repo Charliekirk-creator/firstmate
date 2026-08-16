@@ -325,9 +325,11 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   --argjson candidate_prs "$CANDIDATE_PRS" '
   def trunc($n): if . == null then null else
     (tostring | gsub("\\s+"; " ") | if (length > $n) then (.[:$n] + "…") else . end) end;
+  def escape_label:
+    gsub(";"; "\\;") | gsub("\\["; "\\[") | gsub("\\]"; "\\]");
   def exact_ref($i):
     if $i == null then "-"
-    else "\($i.namespace):\($i.kind):\($i.id) [\($i.label)]" end;
+    else "\($i.namespace):\($i.kind):\($i.id) [\($i.label | escape_label)]" end;
   def exact_refs($xs):
     if ($xs | length) == 0 then "-"
     else ($xs | map(exact_ref(.)) | join("; ")) end;
@@ -441,7 +443,8 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          | ({id,key:.id,verb:"captain-hold",
              summary:((.title + ": " + .hold_reason) | trunc(90)),owner:"(main)"}
             + work_fields(.work_identity)) ]
-     + [ .tasks[] as $t | ($t.hints.open_decisions // [])[]
+     + [ .tasks[] as $t | select($t.kind != "secondmate")
+         | ($t.hints.open_decisions // [])[]
          | ({id:$t.id,key,verb,summary:(.summary | trunc(90)),owner:"(main)"}
             + work_fields($t.work_identity)) ]
      + [ (.secondmate_current.records // [])[] as $m | $m.decisions_open[]?
@@ -545,6 +548,10 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          | if $n > 0 then {surface:("secondmate " + $m.id + " active children omitted by snapshot bound: \($n)"), reveal:"raise FM_SNAPSHOT_SECONDMATE_CHILDREN"} else empty end),
         (if $all_secondmates == 0 and ($secondmates_all | length) > $secondmates_n then {surface:("secondmates showing \($secondmates_n) of \($secondmates_all | length)"), reveal:"--all-secondmates"} else empty end),
         (if $all_in_flight == 0 and ($delegated_all | length) > $in_flight_n then {surface:("delegated_work showing \($in_flight_n) of \($delegated_all | length)"), reveal:"--all-in-flight"} else empty end),
+        (($snap.secondmate_current.records // [])[] as $m
+         | $m.omitted[]?
+         | select(.surface == "active_children")
+         | {surface:("delegated_work omitted by structured-home cap for \($m.id): \(.count)"),reveal:"raise FM_SNAPSHOT_SECONDMATE_CHILDREN"}),
         (if (($snap.secondmate_current.truncated // 0) > 0) then {surface:("registered secondmates omitted by snapshot bound: \($snap.secondmate_current.truncated)"), reveal:"raise FM_SNAPSHOT_SECONDMATES"} else empty end),
         (if $snap.secondmate_current.registry.input_truncated == true then {surface:"secondmate registry input truncated by bounded read", reveal:"raise FM_SNAPSHOT_REGISTRY_LINES or FM_SNAPSHOT_REGISTRY_BYTES"} else empty end),
         (if $snap.secondmate_current.registry.records_truncated == true then {surface:"secondmate registry records omitted by bounded read", reveal:"raise FM_SNAPSHOT_REGISTRY_RECORDS"} else empty end),

@@ -851,7 +851,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
             hold_until:(.hold_until // null),
             deferred_marker:(.deferred_marker // false),source:"backlog",work_identity_ref:.id} ]) as $captain_holds_all
     | ([ $backlog.records[]? | select(.state == "done" and .structured and .hold_kind != "captain")
-         | {id:(.id | trunc(120)),title:(.title | trunc(120)),
+         | {id,title:(.title | trunc(120)),
             pr_url:((.pr_url // null) | if . == null then null else trunc(500) end),
             report_path:((.report_path // null) | if . == null then null else trunc(500) end),
             local_note:((.local_note // null) | if . == null then null else trunc(120) end),
@@ -904,10 +904,10 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
                source:"status",work_identity_ref:$t.id} ])) as $decisions_all
     | ([ $queued_all[]
          | select((.unresolved_blocker_ids | length) > 0 or (.hold_reason != null and .hold_kind != null))
-         | {id:(.id | trunc(120)),title:(.title | trunc(90)),
-            blocked_by:((.unresolved_blocker_ids | join(",")) | if . == "" then null else trunc(120) end),
-            blocked_by_ids:(.blocked_by_ids | map(trunc(120))),
-            unresolved_blocker_ids:(.unresolved_blocker_ids | map(trunc(120))),
+         | {id,title:(.title | trunc(90)),
+            blocked_by:((.unresolved_blocker_ids | join(",")) | if . == "" then null else . end),
+            blocked_by_ids:.blocked_by_ids,
+            unresolved_blocker_ids:.unresolved_blocker_ids,
             reason:((.hold_reason // .blocked_reason // "blocked") | trunc(120)),
             source:"backlog",work_identity_ref:.id} ]
        + [ $owned_in_flight[] as $work
@@ -943,10 +943,10 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
     | ($active_all[:$child_n]) as $active
     | ($decisions_all[:$decisions_n]) as $decisions
     | ($holds_all[:$queued_n]) as $holds
-    | ([ $queued_all[] | {id:(.id | trunc(120)),title:(.title | trunc(120)),
-          blocked_by:((.blocked_by // null) | if . == null then null else trunc(120) end),
-          blocked_by_ids:((.blocked_by_ids // []) | map(trunc(120))),
-          unresolved_blocker_ids:((.unresolved_blocker_ids // []) | map(trunc(120))),
+    | ([ $queued_all[] | {id,title:(.title | trunc(120)),
+          blocked_by:(.blocked_by // null),
+          blocked_by_ids:(.blocked_by_ids // []),
+          unresolved_blocker_ids:(.unresolved_blocker_ids // []),
           blocked_reason:((.blocked_reason // null) | if . == null then null else trunc(160) end),
           hold_reason:((.hold_reason // null) | if . == null then null else trunc(160) end),
           hold_kind:((.hold_kind // null) | if . == null then null else trunc(40) end),
@@ -1734,7 +1734,7 @@ secondmate_current_json() {  # <parent-tasks-json>
         esac
       elif ! validate_secondmate_home "$id" "$home" 2>/dev/null; then
         case "$VALIDATION_ERROR" in
-          'secondmate marker must not be a symlink'|'marked for secondmate '*)
+          'secondmate marker must not be a symlink'|'not a seeded secondmate home'|'marked for secondmate '*)
             rm -f -- "$records_file"
             echo "fm-fleet-snapshot: work identity home binding mismatch in secondmate $id" >&2
             return "$IDENTITY_INTEGRITY_EXIT"

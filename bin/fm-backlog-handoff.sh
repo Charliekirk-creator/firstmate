@@ -569,20 +569,23 @@ remote_target_handoff_action() { # <secondmate-id> <stage|commit|abort> <task-id
 }
 
 rollback_local_handoff_identities() { # <target-home>
-  local target_home=$1 i task payload failed=0
+  local target_home=$1 i task payload failed=0 rc
   i=0
   while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
     task=${HANDOFF_IDENTITY_TASKS[$i]}
     payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
-    local_target_handoff_action "$target_home" abort "$task" "$payload" || failed=1
+    local_target_handoff_action "$target_home" abort "$task" "$payload"
+    rc=$?
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || failed=1
     i=$((i + 1))
   done
-  [ "$failed" -eq 0 ] || return 1
   i=0
   while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
     task=${HANDOFF_IDENTITY_TASKS[$i]}
     payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
-    source_handoff_action cancel "$task" "$payload" || failed=1
+    source_handoff_action cancel "$task" "$payload"
+    rc=$?
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || failed=1
     i=$((i + 1))
   done
   return "$failed"

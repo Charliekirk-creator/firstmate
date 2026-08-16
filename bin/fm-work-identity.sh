@@ -889,19 +889,32 @@ handoff_commit() {  # <task-id> <transfer-path>
   rm -f -- "$TARGET_HANDOFF" || die "cannot clear committed handoff target state"
 }
 
-handoff_abort() {  # <task-id> <transfer-path>; 4 means target may already be committed
+handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already committed
   local task=$1 path=$2 requested
   validate_handoff_envelope "$path" "$task"
   requested=$HANDOFF_CANONICAL
   handoff_target_matches_current
   identity_lock_acquire "$task"
   if [ ! -e "$TARGET_HANDOFF" ] && [ ! -L "$TARGET_HANDOFF" ]; then
-    [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || return 4
+    if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+      [ "$HANDOFF_STATUS" = linked ] || die "unlinked handoff target has a linked record"
+      validate_sidecar "$SIDECAR" "$task"
+      [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
+        || die "committed handoff target linked record is conflicting"
+      return 4
+    fi
     return 0
   fi
   read_handoff_state "$TARGET_HANDOFF" target
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
-  [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || return 4
+  if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+    [ "$HANDOFF_STATUS" = linked ] || die "unlinked handoff target gained a linked record"
+    validate_sidecar "$SIDECAR" "$task"
+    [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
+      || die "committed handoff target linked record is conflicting"
+    rm -f -- "$TARGET_HANDOFF" || die "cannot clear committed handoff target state"
+    return 4
+  fi
   rm -f -- "$TARGET_HANDOFF" || die "cannot abort handoff target state"
 }
 

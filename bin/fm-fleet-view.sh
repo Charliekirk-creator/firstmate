@@ -50,8 +50,10 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   def action_of($t):
     if $t.kind == "secondmate" then "\($t.actions.send) - \($t.actions.watch)"
     else $t.actions.watch end;
+  def escape_label:
+    gsub(";"; "\\;") | gsub("\\["; "\\[") | gsub("\\]"; "\\]");
   def exact_ref($i):
-    if $i == null then "-" else "\($i.namespace):\($i.kind):\($i.id) [\($i.label)]" end;
+    if $i == null then "-" else "\($i.namespace):\($i.kind):\($i.id) [\($i.label | escape_label)]" end;
   def work_of($w):
     if ($w.status // "unlinked") != "linked" then "unlinked"
     else "initiative=\(exact_ref($w.initiative)); plan=\(exact_ref($w.plan_id)); stage=\(exact_ref($w.stage)); units=\(($w.work_units | map(exact_ref(.))) | join("; ")); sources=\(($w.sources | map(exact_ref(.))) | join("; "))" end;
