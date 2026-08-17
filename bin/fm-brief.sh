@@ -287,27 +287,29 @@ fi
 exit 0
 fi
 
-# Serialize exact-identity recording with ship/scout instruction generation.
-# bin/fm-work-identity.sh owns the relation; this shared lock only closes the
-# record-vs-brief race so an unlinked brief and linked sidecar cannot both win.
-# shellcheck source=bin/fm-wake-lib.sh
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/fm-wake-lib.sh"
-WORK_IDENTITY_LOCK="$DATA/$ID/.work-identity.lock"
-fm_lock_acquire_wait "$WORK_IDENTITY_LOCK"
-WORK_IDENTITY_LOCK_HELD=1
-brief_identity_lock_cleanup() {
-  local status=$?
-  if [ "$WORK_IDENTITY_LOCK_HELD" = 1 ]; then
-    WORK_IDENTITY_LOCK_HELD=0
-    fm_lock_release "$WORK_IDENTITY_LOCK" || true
-  fi
-  return "$status"
-}
-trap brief_identity_lock_cleanup EXIT
 [ ! -e "$BRIEF" ] && [ ! -L "$BRIEF" ] \
   || { echo "error: $BRIEF already exists" >&2; exit 1; }
-
+BRIEF_TARGET=$BRIEF
+BRIEF_DRAFT=$(umask 077; mktemp "$DATA/$ID/.brief-draft.XXXXXX") \
+  || { echo "error: could not create brief draft" >&2; exit 1; }
+brief_draft_cleanup() {
+  local status=$?
+  [ -z "${BRIEF_DRAFT:-}" ] || rm -f -- "$BRIEF_DRAFT" 2>/dev/null || true
+  return "$status"
+}
+trap brief_draft_cleanup EXIT
+publish_brief_draft() {
+  FM_HOME="$FM_HOME" \
+    FM_DATA_OVERRIDE="$DATA" \
+    FM_STATE_OVERRIDE="$STATE" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-work-identity.sh" brief-publish "$ID" --file "$BRIEF_DRAFT" \
+    || return 1
+  rm -f -- "$BRIEF_DRAFT"
+  BRIEF_DRAFT=
+  BRIEF=$BRIEF_TARGET
+}
+BRIEF=$BRIEF_DRAFT
 REPO=${POS[1]}
 
 WORK_IDENTITY_SECTION=$(
@@ -400,6 +402,7 @@ Before reporting done, read and follow \`$FM_ROOT/.agents/skills/captain-hold-li
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
+publish_brief_draft || exit 1
 echo "scaffolded: $BRIEF (scout; replace {TASK})"
 exit 0
 fi
@@ -482,4 +485,5 @@ Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced 
 
 $DOD
 EOF
+publish_brief_draft || exit 1
 echo "scaffolded: $BRIEF (ship, mode=$MODE; replace {TASK})"

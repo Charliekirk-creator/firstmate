@@ -719,6 +719,8 @@ SPAWN_CONTROL_LOCK_HELD=0
 SPAWN_CONTROL_PARENT=0
 SPAWN_META_TMP=
 SPAWN_BRIEF_TMP=
+SPAWN_DISPATCH_PENDING=0
+SPAWN_DISPATCH_TRANSACTION=
 SPAWN_META_LOCK=
 SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
@@ -849,6 +851,21 @@ spawn_abort_cleanup() {
         fi
       fi
     fi
+  fi
+  if [ "$SPAWN_DISPATCH_PENDING" = 1 ]; then
+    local dispatch_abort_rc=0
+    SPAWN_DISPATCH_PENDING=0
+    FM_HOME="$FM_HOME" \
+      FM_DATA_OVERRIDE="$DATA" \
+      FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" dispatch-abort "$ID" \
+        --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null 2>&1 \
+      || dispatch_abort_rc=$?
+    case "$dispatch_abort_rc" in
+      0|4) ;;
+      *) echo "warning: work identity dispatch for $ID requires reconciliation" >&2 ;;
+    esac
   fi
   if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_LOCK_HELD=0
@@ -1792,10 +1809,6 @@ cp "$BRIEF_SOURCE" "$SPAWN_BRIEF_TMP" \
   || { echo "error: could not snapshot launch brief at $BRIEF_SOURCE" >&2; exit 1; }
 chmod 400 "$SPAWN_BRIEF_TMP" \
   || { echo "error: could not protect launch brief snapshot" >&2; exit 1; }
-mv -f "$SPAWN_BRIEF_TMP" "$BRIEF_SNAPSHOT" \
-  || { echo "error: could not publish launch brief snapshot" >&2; exit 1; }
-SPAWN_BRIEF_TMP=
-BRIEF=$BRIEF_SNAPSHOT
 
 spawn_sha256_stream() {
   if command -v shasum >/dev/null 2>&1; then
@@ -1805,17 +1818,23 @@ spawn_sha256_stream() {
   fi
 }
 
-# Exact project/plan/work-unit identity is frozen before any endpoint exists.
-# The contract owner validates the sidecar, generated payload, exact home/task
-# binding, and any prior metadata binding. Every harness and backend receives the
-# same generated brief, so this preflight is deliberately above both adapter axes.
 WORK_IDENTITY_STATUS=
 WORK_IDENTITY_SCHEMA=
 WORK_IDENTITY_HASH=
 LAUNCH_BRIEF_HASH=
-WORK_IDENTITY_ARGS=(dispatch-binding "$ID" --brief "$BRIEF")
-if [ "$KIND" != secondmate ] && { [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; }; then
-  WORK_IDENTITY_ARGS+=(--meta "$STATE/$ID.meta")
+SPAWN_DISPATCH_TRANSACTION="spawn:${BASHPID:-$$}:$(date +%s):$RANDOM"
+WORK_IDENTITY_ARGS=(dispatch-prepare "$ID" --brief "$SPAWN_BRIEF_TMP" \
+  --instructions-path "$BRIEF_SNAPSHOT" --transaction "$SPAWN_DISPATCH_TRANSACTION")
+if [ "$RELAUNCH" -eq 1 ]; then
+  PRIOR_LAUNCH_BRIEF=$(fm_meta_get "$RELAUNCH_META" launch_brief)
+  if [ -z "$PRIOR_LAUNCH_BRIEF" ] || { [ ! -e "$PRIOR_LAUNCH_BRIEF" ] && [ ! -L "$PRIOR_LAUNCH_BRIEF" ]; }; then
+    if [ -e "$STATE/$ID.control-relaunch.brief-prior" ] || [ -L "$STATE/$ID.control-relaunch.brief-prior" ]; then
+      PRIOR_LAUNCH_BRIEF="$STATE/$ID.control-relaunch.brief-prior"
+    else
+      PRIOR_LAUNCH_BRIEF=$BRIEF_SOURCE
+    fi
+  fi
+  WORK_IDENTITY_ARGS+=(--meta "$RELAUNCH_META" --prior-brief "$PRIOR_LAUNCH_BRIEF")
 fi
 WORK_DISPATCH_JSON=$(
   FM_HOME="$FM_HOME" \
@@ -1824,6 +1843,7 @@ WORK_DISPATCH_JSON=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
     "$SCRIPT_DIR/fm-work-identity.sh" "${WORK_IDENTITY_ARGS[@]}"
 ) || exit 1
+SPAWN_DISPATCH_PENDING=1
 WORK_IDENTITY_JSON=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -ec '.work_identity') \
   || { echo "error: work identity dispatch binding is malformed for $ID" >&2; exit 1; }
 LAUNCH_BRIEF_HASH=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -er '.instructions_sha256') \
@@ -1833,6 +1853,10 @@ WORK_IDENTITY_STATUS=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.status') \
 WORK_IDENTITY_SCHEMA=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.schema') \
   || { echo "error: work identity projection has no schema for $ID" >&2; exit 1; }
 WORK_IDENTITY_HASH=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -r '.sha256 // ""')
+mv -f "$SPAWN_BRIEF_TMP" "$BRIEF_SNAPSHOT" \
+  || { echo "error: could not publish launch brief snapshot" >&2; exit 1; }
+SPAWN_BRIEF_TMP=
+BRIEF=$BRIEF_SNAPSHOT
 SPAWN_BRIEF_BODY=$(cat "$BRIEF" || exit $?; printf '\034') \
   || { echo "error: could not capture validated launch brief" >&2; exit 1; }
 SPAWN_BRIEF_BODY=${SPAWN_BRIEF_BODY%$'\034'}
@@ -3019,6 +3043,15 @@ if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=0
   SPAWN_META_TMP=
 fi
+FM_HOME="$FM_HOME" \
+  FM_DATA_OVERRIDE="$DATA" \
+  FM_STATE_OVERRIDE="$STATE" \
+  FM_ROOT_OVERRIDE="$FM_ROOT" \
+  "$SCRIPT_DIR/fm-work-identity.sh" dispatch-commit "$ID" \
+    --brief "$BRIEF" --meta "$STATE/$ID.meta" \
+    --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null \
+  || exit 1
+SPAWN_DISPATCH_PENDING=0
 # A dispatch or relaunch keeps the per-task meta lock through launch delivery.
 # The backlog mutation is deliberately the final fallible commit below, so
 # teardown cannot remove a relaunched record while its replacement worker is

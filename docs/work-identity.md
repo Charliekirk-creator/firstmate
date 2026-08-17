@@ -23,8 +23,10 @@ bin/fm-work-identity.sh verify <task-id> | jq .
 ```
 
 Then scaffold and dispatch the task normally.
-`fm-brief.sh` embeds the canonical payload and digest in the generated instructions. `fm-spawn.sh` copies the brief to a per-task launch snapshot, validates and captures its bytes before creating an endpoint, binds both its path and SHA-256 digest in task metadata, and delivers the frozen operational input without rereading the owner-writable snapshot. Kimi receives the same frozen input after its readiness gate.
-Replacing the source brief during launch therefore cannot change what any supported worker tool receives.
+`fm-brief.sh` embeds the canonical payload and digest in the generated instructions and asks the contract owner to publish the validated bytes atomically.
+`fm-spawn.sh` enters an owner-managed prepare/commit transaction before creating an endpoint, copies the brief to a per-task launch snapshot, binds both its path and SHA-256 digest in task metadata, and delivers the frozen operational input without rereading the owner-writable snapshot. Backlog ownership handoff is excluded while dispatch is prepared and remains unavailable once source dispatch metadata exists.
+A ship or scout relaunch validates the prior snapshot and metadata under the same owner transaction before replacing them with the progress-note-bearing instructions; a pre-publication abort restores the prior binding.
+Kimi receives the same frozen input after its readiness gate. Replacing the source brief during launch therefore cannot change what any supported worker tool receives.
 Repeating `record` with the same manifest is an idempotent no-op.
 A relation is immutable once recorded, and a changed relation requires a new task identity.
 

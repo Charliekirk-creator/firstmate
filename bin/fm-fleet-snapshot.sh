@@ -1733,14 +1733,12 @@ secondmate_current_json() {  # <parent-tasks-json>
           *) seen_homes="$seen_homes $host:$home" ;;
         esac
       elif ! validate_secondmate_home "$id" "$home" 2>/dev/null; then
-        case "$VALIDATION_ERROR" in
-          'secondmate marker must not be a symlink'|'not a seeded secondmate home'|'marked for secondmate '*)
-            rm -f -- "$records_file"
-            echo "fm-fleet-snapshot: work identity home binding mismatch in secondmate $id" >&2
-            return "$IDENTITY_INTEGRITY_EXIT"
-            ;;
-          *) reason="invalid home: $VALIDATION_ERROR" ;;
-        esac
+        if [ -e "$home" ] || [ -L "$home" ]; then
+          rm -f -- "$records_file"
+          echo "fm-fleet-snapshot: work identity home binding mismatch in secondmate $id" >&2
+          return "$IDENTITY_INTEGRITY_EXIT"
+        fi
+        reason="invalid home: $VALIDATION_ERROR"
       else
         home=$VALIDATED_HOME
         case " $seen_homes " in

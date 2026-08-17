@@ -388,6 +388,50 @@ test_projection_serializes_identity_ownership() {
   pass "identity projection serializes guard and sidecar state"
 }
 
+test_dispatch_transaction_excludes_backlog_handoff() {
+  local home mate task launch transaction binding hash out rc
+  home=$(make_home dispatch-transaction)
+  mate="$TMP_ROOT/dispatch-transaction-mate"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects"
+  printf 'dispatch-target\n' > "$mate/.fm-secondmate-home"
+  task=dispatch-race-worker
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold dispatch transaction fixture"
+  launch="$home/state/$task.launch-brief.md"
+  transaction=dispatch-race-1
+  binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$transaction") || fail "could not prepare work identity dispatch"
+  rc=0
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" handoff-prepare "$task" \
+    --to-home "$mate" --to-home-id secondmate:dispatch-target 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "backlog handoff entered an in-progress dispatch transaction"
+  assert_contains "$out" "in-progress work identity dispatch" \
+    "handoff refusal did not identify the prepared dispatch"
+
+  cp "$home/data/$task/brief.md" "$launch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$hash" "harness=codex" "kind=ship" \
+    "mode=no-mistakes" "yolo=off" "work_identity_schema=fm-work-identity.v1" \
+    "work_identity_status=unlinked"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+    --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+    || fail "could not commit work identity dispatch"
+  rc=0
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" handoff-prepare "$task" \
+    --to-home "$mate" --to-home-id secondmate:dispatch-target 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "backlog handoff accepted a dispatched source worker"
+  assert_contains "$out" "dispatch metadata" \
+    "committed dispatch handoff refusal did not identify live source metadata"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e \
+    '.status == "unlinked" and .reason == "explicitly-unlinked"' >/dev/null \
+    || fail "committed dispatch did not remain authoritatively publishable"
+  pass "dispatch prepare and committed metadata exclude backlog ownership handoff"
+}
+
 # Namespace is part of identity: identical opaque ids in separate systems stay
 # distinct, while duplicate exact tuples and invalid namespace-role pairs refuse.
 test_namespace_separation_and_contract_rejections() {
@@ -669,6 +713,16 @@ EOF
       and ([.gates[] | select(.owner == "roadmap" and .id == $long
         and .work_identity == "unlinked")] | length) == 1
   ' >/dev/null || fail "Bearings delegated-work projection lost exact identities: $bearings"
+  mv "$mate/data" "$TMP_ROOT/delegated-escaped-data"
+  ln -s "$TMP_ROOT/delegated-escaped-data" "$mate/data"
+  rc=0
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z \
+    "$SNAPSHOT" --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "parent published through an escaping delegated data directory"
+  assert_contains "$out" "work identity home binding mismatch in secondmate roadmap" \
+    "unsafe delegated home path degraded to an untrusted fallback"
+  rm "$mate/data"
+  mv "$TMP_ROOT/delegated-escaped-data" "$mate/data"
   rm "$mate/.fm-secondmate-home"
   rc=0
   out=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z \
@@ -676,7 +730,7 @@ EOF
   [ "$rc" -ne 0 ] || fail "parent published after a readable delegated home lost its identity marker"
   assert_contains "$out" "work identity home binding mismatch in secondmate roadmap" \
     "missing delegated home identity marker degraded to an untrusted fallback"
-  pass "delegated summaries preserve long ids and reject missing home identity markers"
+  pass "delegated summaries preserve ids and reject unsafe home identity paths"
 }
 
 test_handoff_rebinds_identity_and_decision_surfaces() {
@@ -1081,6 +1135,7 @@ test_spawn_delivers_validated_brief_snapshot
 test_sidecar_validation_hashes_captured_bytes
 test_concurrent_idempotence_and_explicit_unlinked
 test_projection_serializes_identity_ownership
+test_dispatch_transaction_excludes_backlog_handoff
 test_namespace_separation_and_contract_rejections
 test_unsafe_files_labels_and_exact_binding
 test_stale_and_changed_relations_refuse

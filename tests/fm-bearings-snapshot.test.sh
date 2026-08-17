@@ -380,6 +380,7 @@ case "$1 $2" in
   '-c %a') printf '600\n' ;;
   '-c %Y') printf '1783792800\n' ;;
   '-c %s') LC_ALL=C wc -c < "$3" | tr -d ' ' ;;
+  '-c %h') printf '1\n' ;;
   -f\ *)
     printf '  File: "%s"\nBlocks: Total: 1\n' "$2"
     exit 1
@@ -547,7 +548,7 @@ write_parent_secondmate_event() {  # <parent> <id> <home> <note>
 }
 
 test_bad_secondmate_homes_never_revive_parent_work() {
-  local home fakebin missing invalid unreadable malformed unknown_child wt json
+  local home fakebin missing invalid unreadable malformed unknown_child wt json out rc
   home=$(make_home bad-homes)
   : > "$home/data/secondmates.md"
   missing="$TMP_ROOT/missing-home"
@@ -585,27 +586,37 @@ test_bad_secondmate_homes_never_revive_parent_work() {
   write_parent_secondmate_event "$home" unknown-child "$unknown_child" "old unknown work"
 
   fakebin=$(make_fakebin "$home")
-  json=$(run "$home" "$fakebin" --json)
+  rc=0
+  out=$(FAKE_NM_SLEEP=1 FM_SNAPSHOT_SECONDMATE_TIMEOUT=1 run "$home" "$fakebin" --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a readable marker-mismatched secondmate home published a fallback"
+  assert_contains "$out" "work identity home binding mismatch in secondmate invalid" \
+    "marker mismatch did not stop authoritative Bearings publication"
+  printf 'invalid\n' > "$invalid/.fm-secondmate-home"
+
+  rc=0
+  out=$(FAKE_NM_SLEEP=1 FM_SNAPSHOT_SECONDMATE_TIMEOUT=1 run "$home" "$fakebin" --json 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "an unsafe unreadable secondmate data path published a fallback"
+  assert_contains "$out" "work identity home binding mismatch in secondmate unreadable" \
+    "unsafe operational path did not stop authoritative Bearings publication"
   chmod 700 "$unreadable/data"
+
+  json=$(FAKE_NM_SLEEP=1 FM_SNAPSHOT_SECONDMATE_TIMEOUT=1 run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.secondmates | length) == 5
-      and all(.secondmates[]; .state == "unknown")
       and (.in_flight | map(.id) | all(. != "invalid" and . != "unreadable" and . != "malformed" and . != "unknown-child"))
       and (.secondmates | any(.[]; .id == "missing" and .provenance == "unknown"
         and .freshness == "unknown" and (.reason | contains("invalid home"))))
-      and ([.secondmates[] | select(.id == "invalid" or .id == "unreadable" or .id == "malformed")]
-        | all(.provenance == "parent-event-fallback" and .freshness == "historical-event"))
+      and (.secondmates | any(.[]; .id == "invalid" and .provenance == "structured-home"))
+      and (.secondmates | any(.[]; .id == "unreadable" and .provenance == "structured-home"))
+      and (.secondmates | any(.[]; .id == "malformed" and .provenance == "parent-event-fallback"
+        and (.reason | contains("unstructured current backlog row"))))
       and (.secondmates | any(.[]; .id == "unknown-child" and .provenance == "structured-home"
-        and .freshness == "fresh"))
-      and (.secondmates | any(.[]; .id == "invalid" and (.reason | contains("marked for"))))
-      and (.secondmates | any(.[]; .id == "unreadable" and (.reason | test("invalid home|unreadable"))))
-      and (.secondmates | any(.[]; .id == "malformed" and (.reason | contains("unstructured current backlog row"))))
-      and (.secondmates | any(.[]; .id == "unknown-child" and (.reason | contains("child current state unavailable"))))
+        and .freshness == "fresh" and (.reason | contains("child current state unavailable"))))
       and ([.secondmate_reconcile[].id] == ["malformed", "unknown-child"])
       and (.secondmate_reconcile[0].kind == "unstructured_current")
       and (.secondmate_reconcile[1].kind == "child_current_unavailable")
   ' >/dev/null || fail "bad home outcomes revived stale work or lacked provenance: $json"
-  pass "missing, invalid, unreadable, malformed, and unavailable-child homes stay explicit unknowns"
+  pass "unsafe homes stop publication while unavailable summaries stay explicit"
 }
 
 test_oversized_secondmate_summary_stays_strict_unknown() {
@@ -1188,7 +1199,7 @@ test_perl_fallback_bounds_github_call() {
   fakebin=$(make_fakebin "$home")
   toolbin="$home/toolbin"
   mkdir -p "$toolbin"
-  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find mktemp rm mkdir chmod mv cp awk; do
+  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find mkdir rm mktemp readlink ln rmdir chmod mv cp awk; do
     ln -s "$(command -v "$cmd")" "$toolbin/$cmd"
   done
   for cmd in shasum sha256sum; do
@@ -1582,17 +1593,18 @@ test_live_blocker_is_not_charted_queue_work() {
   json=$(run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.in_flight | any(.[]; .id == "ship-task" and .state == "blocked"))
-      and (.decisions_open | any(.[]; .id == "ship-task") | not)
+      and (.decisions_open | any(.[]; .id == "ship-task" and .verb == "blocked"
+        and .summary == "firstmate can refresh the synthetic token"))
       and (.gates | any(.[]; .id == "ship-task") | not)
-  ' >/dev/null || fail "live blocked work was projected as queued/deferred work: $json"
-  pass "Bearings keeps a live blocker in structured live state and never converts it to Charted Next queue work"
+  ' >/dev/null || fail "live blocked work lost its canonical live decision projection: $json"
+  pass "Bearings keeps a live blocker in live state and its canonical decision surface"
 }
 
 # Captain's Call is populated only from the durable keyed open-decision set. The
 # anti-leak guard: action-free highlights - a working task, a completed scout,
 # queued/gated items, landed work - must never surface as an open decision, so they
-# cannot leak into Captain's Call. The standard fixture has exactly one genuine open
-# decision (the secondmate's structured captain hold).
+# cannot leak into Captain's Call. The standard fixture has two genuine open
+# decisions: the secondmate's structured captain hold and keyed status decision.
 test_captains_call_anti_leak() {
   local home fakebin json canonical
   home=$(make_home anti-leak); write_fixture "$home"
@@ -1600,7 +1612,9 @@ test_captains_call_anti_leak() {
   json=$(run "$home" "$fakebin" --json)
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-fleet-snapshot.sh" --json)
   jq -n -e --argjson bearings "$json" --argjson canonical "$canonical" '
-    ([$bearings.decisions_open[].id] == ["mate/mate-decision-race"])
+    (($bearings.decisions_open | length) == 2)
+      and ([$bearings.decisions_open[].id] | index("mate/mate-decision-race") != null)
+      and ([$bearings.decisions_open[].id] | index("mate/mate") != null)
       and ($canonical.secondmate_current.records[] | select(.id == "mate")
         | (.decisions_open | any(.source == "status"))
           and (.decisions_open | any(.source == "backlog")))
