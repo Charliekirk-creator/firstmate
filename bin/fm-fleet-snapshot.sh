@@ -252,21 +252,29 @@ case "${1:---json}" in
   *) usage >&2; exit 2 ;;
 esac
 
+identity_owner_setup_failure() {
+  echo "fm-fleet-snapshot: $1" >&2
+  case "$OUTPUT_MODE" in
+    secondmate-home-summary|secondmate-home-identities) exit "$IDENTITY_INTEGRITY_EXIT" ;;
+    *) exit 1 ;;
+  esac
+}
+
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-snapshot: jq not found" >&2; exit 1; }
 WORK_IDENTITY_LIMITS=$(
   FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
     FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" limits
-) || { echo "fm-fleet-snapshot: work identity limits unavailable" >&2; exit 1; }
+) || identity_owner_setup_failure "work identity limits unavailable"
 WORK_IDENTITY_HOME_ID=$(
   FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
     FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" home-id
 ) || { echo "fm-fleet-snapshot: work identity home binding unavailable" >&2; exit "$IDENTITY_INTEGRITY_EXIT"; }
 WORK_IDENTITY_RECORD_MAX_BYTES=$(printf '%s' "$WORK_IDENTITY_LIMITS" | jq -er '.record_max_bytes') \
-  || { echo "fm-fleet-snapshot: invalid work identity record limit" >&2; exit 1; }
+  || identity_owner_setup_failure "invalid work identity record limit"
 WORK_IDENTITY_PROJECTION_MAX_BYTES=$(printf '%s' "$WORK_IDENTITY_LIMITS" | jq -er '.projection_max_bytes') \
-  || { echo "fm-fleet-snapshot: invalid work identity projection limit" >&2; exit 1; }
-case "$WORK_IDENTITY_RECORD_MAX_BYTES" in ''|*[!0-9]*|0) echo "fm-fleet-snapshot: invalid work identity record limit" >&2; exit 1 ;; esac
-case "$WORK_IDENTITY_PROJECTION_MAX_BYTES" in ''|*[!0-9]*|0) echo "fm-fleet-snapshot: invalid work identity projection limit" >&2; exit 1 ;; esac
+  || identity_owner_setup_failure "invalid work identity projection limit"
+case "$WORK_IDENTITY_RECORD_MAX_BYTES" in ''|*[!0-9]*|0) identity_owner_setup_failure "invalid work identity record limit" ;; esac
+case "$WORK_IDENTITY_PROJECTION_MAX_BYTES" in ''|*[!0-9]*|0) identity_owner_setup_failure "invalid work identity projection limit" ;; esac
 WORK_IDENTITY_BATCH_SIZE=$(((FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES - 4096) / WORK_IDENTITY_PROJECTION_MAX_BYTES))
 [ "$WORK_IDENTITY_BATCH_SIZE" -ge 1 ] || {
   echo "fm-fleet-snapshot: FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES cannot hold one valid work identity projection" >&2

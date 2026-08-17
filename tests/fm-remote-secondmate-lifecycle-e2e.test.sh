@@ -1057,6 +1057,17 @@ MISMATCH=$(FM_FAKE_SSH_MODE=wrong-summary-home \
 assert_contains "$MISMATCH" 'work identity home binding mismatch in secondmate ios' \
   "cross-home remote summary did not report an identity integrity failure"
 pass "cross-home remote summaries stop parent publication"
+mv "$REMOTE_HOME/data" "$TMP_ROOT/remote-home-data"
+ln -s "$TMP_ROOT/remote-home-data" "$REMOTE_HOME/data"
+UNSAFE_REMOTE_RC=0
+UNSAFE_REMOTE=$(remote_env "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || UNSAFE_REMOTE_RC=$?
+[ "$UNSAFE_REMOTE_RC" -eq 42 ] \
+  || fail "unsafe remote identity home degraded to an available fallback: $UNSAFE_REMOTE"
+assert_contains "$UNSAFE_REMOTE" 'work identity integrity failure in secondmate ios' \
+  "remote identity-owner setup failure was not typed as an integrity failure"
+rm "$REMOTE_HOME/data"
+mv "$TMP_ROOT/remote-home-data" "$REMOTE_HOME/data"
+pass "unsafe remote identity-owner setup stops parent publication"
 rm -f "$PARENT/state/.wake-queue"
 
 # The remote code root updates independently, then the persistent home imports

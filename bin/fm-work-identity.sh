@@ -20,10 +20,11 @@
 #   fm-work-identity.sh dispatch-commit <task-id> --brief <brief.md> --meta <task.meta> --transaction <id>
 #   fm-work-identity.sh dispatch-abort <task-id> --transaction <id>
 #   fm-work-identity.sh home-id
-#   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id>
+#   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]
 #   fm-work-identity.sh handoff-stage <task-id> --file <transfer.json|->
 #   fm-work-identity.sh handoff-commit <task-id> --file <transfer.json|->
 #   fm-work-identity.sh handoff-abort <task-id> --file <transfer.json|->
+#   fm-work-identity.sh handoff-target-state <task-id> --file <transfer.json|->
 #   fm-work-identity.sh handoff-complete <task-id> --file <transfer.json|->
 #   fm-work-identity.sh handoff-cancel <task-id> --file <transfer.json|->
 #   fm-work-identity.sh validate-index --file <index.json|->
@@ -993,8 +994,18 @@ build_handoff_transfer() {  # <task-id> <target-home> <target-home-id>; sets HAN
   validate_handoff_text "$HANDOFF_CANONICAL" "$task"
 }
 
-handoff_prepare() {  # <task-id> <target-home> <target-home-id>
-  local task=$1 target_home=$2 target_home_id=$3
+emit_handoff_prepare() {
+  local mode=$1 created=$2 transfer=$3
+  if [ "$mode" = result ]; then
+    jq -n -S -c --argjson created "$created" --argjson transfer "$transfer" \
+      '{created:$created,transfer:$transfer}'
+  else
+    printf '%s\n' "$transfer"
+  fi
+}
+
+handoff_prepare() {  # <task-id> <target-home> <target-home-id> [transfer|result]
+  local task=$1 target_home=$2 target_home_id=$3 mode=${4:-transfer}
   validate_home_literal "$target_home"
   home_id_literal_valid "$target_home_id" || die "work identity handoff target home id is malformed"
   ensure_home_identity
@@ -1014,12 +1025,12 @@ handoff_prepare() {  # <task-id> <target-home> <target-home-id>
     [ "$HANDOFF_TARGET_HOME" = "$target_home" ] && [ "$HANDOFF_TARGET_HOME_ID" = "$target_home_id" ] \
       || die "task $task is already prepared for a different handoff target"
     validate_source_transfer "$task"
-    printf '%s\n' "$HANDOFF_TRANSFER"
+    emit_handoff_prepare "$mode" false "$HANDOFF_TRANSFER"
     return 0
   fi
   build_handoff_transfer "$task" "$target_home" "$target_home_id"
   write_handoff_state "$SOURCE_HANDOFF" source prepared "$HANDOFF_CANONICAL"
-  printf '%s\n' "$HANDOFF_CANONICAL"
+  emit_handoff_prepare "$mode" true "$HANDOFF_CANONICAL"
 }
 
 handoff_target_matches_current() {
@@ -1163,6 +1174,42 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
     return 4
   fi
   rm -f -- "$TARGET_HANDOFF" || die "cannot abort handoff target state"
+}
+
+handoff_target_state() {  # <task-id> <transfer-path>
+  local task=$1 path=$2 requested
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  handoff_target_matches_current
+  identity_lock_acquire "$task"
+  if [ ! -e "$TARGET_HANDOFF" ] && [ ! -L "$TARGET_HANDOFF" ]; then
+    if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+      [ "$HANDOFF_STATUS" = linked ] || die "unlinked handoff target has a linked record"
+      validate_sidecar "$SIDECAR" "$task"
+      [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
+        || die "committed handoff target linked record is conflicting"
+      validate_committed_target "$task"
+      write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
+      printf 'completed\n'
+    else
+      printf 'absent\n'
+    fi
+    return 0
+  fi
+  read_handoff_state "$TARGET_HANDOFF" target
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
+  if [ "$HANDOFF_STATE" = completed ]; then
+    validate_committed_target "$task"
+    printf 'completed\n'
+    return 0
+  fi
+  if [ "$HANDOFF_STATUS" = linked ] && { [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; }; then
+    validate_committed_target "$task"
+    write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
+    printf 'completed\n'
+    return 0
+  fi
+  printf 'prepared\n'
 }
 
 handoff_complete() {  # <task-id> <transfer-path>
@@ -1433,7 +1480,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit|dispatch-abort|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit|dispatch-abort|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -1601,11 +1648,19 @@ case "$COMMAND" in
     dispatch_abort "$TASK" "$2"
     ;;
   handoff-prepare)
-    [ "$#" -eq 4 ] && [ "$1" = --to-home ] && [ "$3" = --to-home-id ] \
-      || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id>"
-    handoff_prepare "$TASK" "$2" "$4"
+    [ "$#" -eq 4 ] || [ "$#" -eq 5 ] \
+      || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]"
+    [ "$1" = --to-home ] && [ "$3" = --to-home-id ] \
+      || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]"
+    HANDOFF_PREPARE_MODE=transfer
+    if [ "$#" -eq 5 ]; then
+      [ "$5" = --result ] \
+        || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]"
+      HANDOFF_PREPARE_MODE=result
+    fi
+    handoff_prepare "$TASK" "$2" "$4" "$HANDOFF_PREPARE_MODE"
     ;;
-  handoff-stage|handoff-commit|handoff-abort|handoff-complete|handoff-cancel)
+  handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel)
     [ "$#" -eq 2 ] && [ "$1" = --file ] \
       || die "$COMMAND usage: fm-work-identity.sh $COMMAND <task-id> --file <transfer.json|->"
     capture_contract_input "$2" "work identity handoff transfer" "$HANDOFF_MAX_BYTES"
@@ -1613,6 +1668,7 @@ case "$COMMAND" in
       handoff-stage) handoff_stage "$TASK" "$CONTRACT_INPUT" ;;
       handoff-commit) handoff_commit "$TASK" "$CONTRACT_INPUT" ;;
       handoff-abort) handoff_abort "$TASK" "$CONTRACT_INPUT" ;;
+      handoff-target-state) handoff_target_state "$TASK" "$CONTRACT_INPUT" ;;
       handoff-complete) handoff_complete "$TASK" "$CONTRACT_INPUT" ;;
       handoff-cancel) handoff_cancel "$TASK" "$CONTRACT_INPUT" ;;
     esac

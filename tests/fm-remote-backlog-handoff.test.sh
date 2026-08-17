@@ -335,6 +335,39 @@ jq -e '.state == "completed" and .transfer.target.home_id == "secondmate:ios"' \
   || fail "remote handoff did not retain a completed source ownership tombstone"
 pass "remote handoff commits an exact destination identity and source tombstone"
 
+recovered_task=receipt-recovery-a
+conflicting_task=receipt-recovery-b
+write_backlog $'- [ ] receipt-recovery-a - committed target awaiting source completion (repo: alpha)\n- [ ] receipt-recovery-b - conflicting later prepare (repo: alpha)'
+recovered_transfer=$(FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" \
+  handoff-prepare "$recovered_task" --to-home "$REMOTE" --to-home-id secondmate:ios)
+printf '%s\n' "$recovered_transfer" | FM_HOME="$REMOTE" \
+  "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-stage "$recovered_task" --file - >/dev/null
+printf '%s\n' "$recovered_transfer" | FM_HOME="$REMOTE" \
+  "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-commit "$recovered_task" --file - >/dev/null
+mkdir -p "$PARENT/data/handoff"
+printf '## In flight\n\n## Queued\n\n## Done\n' > "$PARENT/data/handoff/ios.outbox.md"
+tasks-axi mv "$recovered_task" --file "$PARENT/data/backlog.md" \
+  --to "$PARENT/data/handoff/ios.outbox.md" >/dev/null
+printf 'kind=ship\n' > "$PARENT/state/$conflicting_task.meta"
+rc=0
+handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios \
+  "$recovered_task" "$conflicting_task" > "$TMP_ROOT/receipt-recovery.out" 2>&1 || rc=$?
+[ "$rc" -ne 0 ] || fail "mixed remote retry ignored the later source prepare conflict"
+jq -e '.role == "source" and .state == "completed"
+    and .transfer.target.home_id == "secondmate:ios"' \
+  "$PARENT/data/$recovered_task/work-identity-handoff-source.json" >/dev/null \
+  || fail "mixed remote retry canceled ownership after a proven destination commit"
+jq -e '.role == "target" and .state == "completed"' \
+  "$REMOTE/data/$recovered_task/work-identity-handoff-target.json" >/dev/null \
+  || fail "mixed remote retry lost its committed destination receipt"
+if FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" verify "$recovered_task" >/dev/null 2>&1; then
+  fail "mixed remote retry resurrected source ownership"
+fi
+assert_grep "$conflicting_task" "$PARENT/data/backlog.md" \
+  "mixed remote retry moved the conflicting source backlog item"
+rm -f -- "$PARENT/state/$conflicting_task.meta" "$PARENT/data/handoff/ios.outbox.md"
+pass "mixed remote recovery completes source ownership from the target receipt"
+
 # A stale tasks-axi lock is removed only on the destination host after the first
 # move refusal proves a retry is needed. The dead pid and age satisfy the same
 # conservative procedure tasks-axi prints.

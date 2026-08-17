@@ -535,14 +535,21 @@ outbox_keys() { # <path>
 
 HANDOFF_IDENTITY_TASKS=()
 HANDOFF_IDENTITY_PAYLOADS=()
+HANDOFF_IDENTITY_CREATED=()
 
 prepare_handoff_identity() { # <task-id> <target-home> <target-home-id>
-  local task=$1 target_home=$2 target_home_id=$3
-  HANDOFF_IDENTITY_PAYLOAD=$(
+  local task=$1 target_home=$2 target_home_id=$3 result
+  result=$(
     FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
       FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
-      handoff-prepare "$task" --to-home "$target_home" --to-home-id "$target_home_id"
+      handoff-prepare "$task" --to-home "$target_home" --to-home-id "$target_home_id" --result
   ) || return $?
+  HANDOFF_IDENTITY_PAYLOAD=$(printf '%s' "$result" | jq -e -S -c '
+    select(type == "object" and (keys | sort) == ["created","transfer"]
+      and (.created | type) == "boolean" and (.transfer | type) == "object")
+    | .transfer
+  ') || return 1
+  HANDOFF_IDENTITY_WAS_CREATED=$(printf '%s' "$result" | jq -r '.created') || return 1
 }
 
 source_handoff_action() { # <complete|cancel> <task-id> <payload>
@@ -566,6 +573,13 @@ remote_target_handoff_action() { # <secondmate-id> <stage|commit|abort> <task-id
   printf '%s\n' "$payload" \
     | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh \
         "handoff-$action" "$task" --file - >/dev/null
+}
+
+remote_target_handoff_state() { # <secondmate-id> <task-id> <payload>
+  local id=$1 task=$2 payload=$3
+  printf '%s\n' "$payload" \
+    | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh \
+        handoff-target-state "$task" --file -
 }
 
 rollback_local_handoff_identities() { # <target-home>
@@ -607,30 +621,50 @@ stage_local_handoff_identities() { # <target-home> <target-home-id> <task-id>...
   done
 }
 
-cancel_source_handoff_identities() {
-  local i task payload failed=0
+reconcile_remote_handoff_identities() { # <secondmate-id> <outbox>
+  local id=$1 outbox=$2 i task payload created target_state state_rc failed=0 preserved=0
   i=0
   while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
     task=${HANDOFF_IDENTITY_TASKS[$i]}
     payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
-    source_handoff_action cancel "$task" "$payload" || failed=1
+    created=${HANDOFF_IDENTITY_CREATED[$i]}
+    if [ "$created" = true ] && ! backlog_key_section "$outbox" "$task" >/dev/null 2>&1; then
+      source_handoff_action cancel "$task" "$payload" || failed=1
+      i=$((i + 1))
+      continue
+    fi
+    set +e
+    target_state=$(remote_target_handoff_state "$id" "$task" "$payload" 2>/dev/null)
+    state_rc=$?
+    set -e
+    if [ "$state_rc" -ne 0 ]; then
+      preserved=1
+    elif [ "$target_state" = completed ]; then
+      source_handoff_action complete "$task" "$payload" || failed=1
+    elif [ "$target_state" = prepared ] || [ "$target_state" = absent ]; then
+      preserved=1
+    else
+      failed=1
+    fi
     i=$((i + 1))
   done
-  return "$failed"
+  [ "$failed" -eq 0 ] && [ "$preserved" -eq 0 ]
 }
 
-prepare_remote_handoff_identities() { # <target-home> <target-home-id> <task-id>...
-  local target_home=$1 target_home_id=$2 task
-  shift 2
+prepare_remote_handoff_identities() { # <secondmate-id> <target-home> <target-home-id> <outbox> <task-id>...
+  local id=$1 target_home=$2 target_home_id=$3 outbox=$4 task
+  shift 4
   HANDOFF_IDENTITY_TASKS=()
   HANDOFF_IDENTITY_PAYLOADS=()
+  HANDOFF_IDENTITY_CREATED=()
   for task in "$@"; do
     if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id"; then
-      cancel_source_handoff_identities || true
+      reconcile_remote_handoff_identities "$id" "$outbox" || true
       return 1
     fi
     HANDOFF_IDENTITY_TASKS+=("$task")
     HANDOFF_IDENTITY_PAYLOADS+=("$HANDOFF_IDENTITY_PAYLOAD")
+    HANDOFF_IDENTITY_CREATED+=("$HANDOFF_IDENTITY_WAS_CREATED")
   done
 }
 
@@ -645,10 +679,10 @@ stage_prepared_remote_handoff_identities() { # <secondmate-id>
   done
 }
 
-stage_remote_handoff_identities() { # <secondmate-id> <target-home> <target-home-id> <task-id>...
-  local id=$1 target_home=$2 target_home_id=$3
-  shift 3
-  prepare_remote_handoff_identities "$target_home" "$target_home_id" "$@" || return 1
+stage_remote_handoff_identities() { # <secondmate-id> <target-home> <target-home-id> <outbox> <task-id>...
+  local id=$1 target_home=$2 target_home_id=$3 outbox=$4
+  shift 4
+  prepare_remote_handoff_identities "$id" "$target_home" "$target_home_id" "$outbox" "$@" || return 1
   stage_prepared_remote_handoff_identities "$id"
 }
 
@@ -860,7 +894,7 @@ remote_handoff() { # <secondmate-id> <keys...>
     echo "error: remote secondmate $id has no target home for work identity handoff" >&2
     return 1
   }
-  prepare_remote_handoff_identities "$target_home" "secondmate:$id" "${requested[@]}" || {
+  prepare_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "$outbox" "${requested[@]}" || {
     echo "error: exact work identity preparation failed; nothing new was handed off" >&2
     return 1
   }
@@ -874,7 +908,7 @@ remote_handoff() { # <secondmate-id> <keys...>
       done
       if [ "$persisted" -eq 1 ]; then
         echo "error: atomic outbox staging completion is uncertain; identity preparation and outbox are preserved" >&2
-      elif ! cancel_source_handoff_identities; then
+      elif ! reconcile_remote_handoff_identities "$id" "$outbox"; then
         echo "error: atomic outbox staging failed and identity preparation needs recovery" >&2
       else
         echo "error: atomic outbox staging failed; nothing new was handed off" >&2
@@ -932,7 +966,7 @@ resume_remote_outbox() { # <secondmate-id> <outbox-path>
   while IFS= read -r key; do
     [ -n "$key" ] && keys+=("$key")
   done < <(outbox_keys "$outbox")
-  stage_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "${keys[@]}" || {
+  stage_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "$outbox" "${keys[@]}" || {
     echo "error: pending exact work identity staging failed; outbox preserved at $outbox" >&2
     return 1
   }

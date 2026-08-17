@@ -49,7 +49,7 @@ The primary does not reconstruct local or remote child trees, and an identity-in
 
 A local or remote backlog handoff durably prepares an exact source-to-destination transfer through the same contract owner before the backlog row can move.
 New intake and snapshot publication stop while that transfer is pending; after the backlog arrives, the destination retains an exact completed-transfer receipt and the source retains a completed ownership tombstone. A retry that proves the destination commit completes rather than cancels source ownership.
-A failed pre-move batch cancels its prepared records without publishing immutable destination sidecars, while an uncertain remote result preserves the outbox and prepare state for `--resume-pending`.
+A failed pre-move batch cancels only source prepares created by that attempt before any outbox or target state existed. Recovered or uncertain remote prepares remain guarded, and a matching completed target receipt advances the source to its completed tombstone; the outbox remains available for `--resume-pending` until delivery converges.
 Reading, recording, or rebinding this local relation does not change task lifecycle state, assignment, GitHub, DTM, Data Team Ticket, or a Work Aligner plan.
 Malformed, stale, unsafe, cross-home, or task-mismatched linked records stop publication instead of being shown as unlinked.
 
