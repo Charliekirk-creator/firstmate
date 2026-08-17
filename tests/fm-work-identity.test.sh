@@ -226,7 +226,7 @@ test_spawn_delivers_validated_brief_snapshot() {
   wt="$home/worker-copy"
   delivered="$home/delivered.txt"
   make_manifest "$home" "$task" "$manifest" multi
-  jq '.work_units[0].label = "Opaque __WORKTREE__ __TURNEND__ __PIEXT__ __PITURNEND__ __PIWATCH__"' \
+  jq '.work_units[0].label = "Opaque & __WORKTREE__ __TURNEND__ __PIEXT__ __PITURNEND__ __PIWATCH__"' \
     "$manifest" > "$home/opaque-manifest.json"
   mv "$home/opaque-manifest.json" "$manifest"
   record_and_brief "$home" "$task" "$manifest"
@@ -424,6 +424,32 @@ test_projection_serializes_identity_ownership() {
     "$home/projection.json" >/dev/null \
     || fail "serialized projection did not return the coherent unlinked state"
   pass "identity projection serializes guard and sidecar state"
+}
+
+test_handoff_receipts_require_owning_task() {
+  local source target target_real task_a task_b transfer out rc=0
+  source=$(make_home receipt-source)
+  target=$(make_home receipt-target)
+  target_real=$(cd "$target" && pwd -P)
+  task_a=receipt-a
+  task_b=receipt-b
+  transfer=$(FM_HOME="$source" "$WORK_IDENTITY" handoff-prepare "$task_b" \
+    --to-home "$target_real" --to-home-id main) \
+    || fail "could not prepare task-bound handoff receipt fixture"
+  printf '%s\n' "$transfer" | FM_HOME="$target" "$WORK_IDENTITY" \
+    handoff-stage "$task_b" --file - >/dev/null \
+    || fail "could not stage task-bound handoff receipt fixture"
+  printf '%s\n' "$transfer" | FM_HOME="$target" "$WORK_IDENTITY" \
+    handoff-commit "$task_b" --file - >/dev/null \
+    || fail "could not commit task-bound handoff receipt fixture"
+  mkdir -p "$target/data/$task_a"
+  cp "$target/data/$task_b/work-identity-handoff-target.json" \
+    "$target/data/$task_a/work-identity-handoff-target.json"
+  out=$(FM_HOME="$target" "$WORK_IDENTITY" verify "$task_a" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "copied receipt from another task was accepted"
+  assert_contains "$out" "handoff transfer task binding is mismatched" \
+    "copied receipt refusal did not identify the task mismatch"
+  pass "handoff receipts remain bound to their owning task"
 }
 
 test_dispatch_transaction_excludes_backlog_handoff() {
@@ -1298,6 +1324,7 @@ test_sidecar_validation_hashes_captured_bytes
 test_manifest_capture_rejects_same_size_rewrite
 test_concurrent_idempotence_and_explicit_unlinked
 test_projection_serializes_identity_ownership
+test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
 test_snapshot_preflight_and_dispatch_recovery
 test_namespace_separation_and_contract_rejections

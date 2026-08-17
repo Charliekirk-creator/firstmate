@@ -795,8 +795,8 @@ handoff_state_json() {  # <source|target> <prepared|completed> <transfer>
     --argjson transfer "$3" '{schema:$schema,role:$role,state:$state,transfer:$transfer}'
 }
 
-read_handoff_state() {  # <path> <source|target>; sets HANDOFF_STATE/HANDOFF_TRANSFER
-  local path=$1 role=$2 wrapper transfer task
+read_handoff_state() {  # <path> <source|target> <task-id>; sets HANDOFF_STATE/HANDOFF_TRANSFER
+  local path=$1 role=$2 task=$3 wrapper transfer
   safe_regular_file "$path" "work identity handoff state" "$HANDOFF_MAX_BYTES"
   wrapper=$(jq -e -S -c -s --arg schema "$HANDOFF_STATE_SCHEMA" --arg role "$role" '
     def exact_keys($ks): (keys | sort) == ($ks | sort);
@@ -811,7 +811,6 @@ read_handoff_state() {  # <path> <source|target>; sets HANDOFF_STATE/HANDOFF_TRA
   printf '%s\n' "$wrapper" | cmp -s "$path" - \
     || die "work identity handoff state is not canonical: $path"
   transfer=$(printf '%s' "$wrapper" | jq -S -c '.transfer')
-  task=$(printf '%s' "$transfer" | jq -r '.source.task_id')
   validate_handoff_text "$transfer" "$task"
   HANDOFF_STATE=$(printf '%s' "$wrapper" | jq -r '.state')
   HANDOFF_TRANSFER=$HANDOFF_CANONICAL
@@ -944,11 +943,11 @@ validate_completed_dispatch() {  # <task-id>
 reject_handoff_guard() {  # <task-id>
   local task=$1
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
-    read_handoff_state "$SOURCE_HANDOFF" source
+    read_handoff_state "$SOURCE_HANDOFF" source "$task"
     die "work identity ownership was handed off for task $task"
   fi
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
-    read_handoff_state "$TARGET_HANDOFF" target
+    read_handoff_state "$TARGET_HANDOFF" target "$task"
     [ "$HANDOFF_STATE" = completed ] \
       || die "work identity ownership handoff is incomplete for task $task"
     handoff_target_matches_current
@@ -1078,14 +1077,14 @@ handoff_prepare() {  # <task-id> <target-home> <target-home-id> [transfer|result
   identity_mutation_lock_acquire "$task"
   reject_dispatch_for_handoff "$task"
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
-    read_handoff_state "$TARGET_HANDOFF" target
+    read_handoff_state "$TARGET_HANDOFF" target "$task"
     [ "$HANDOFF_STATE" = completed ] \
       || die "task $task has an incomplete incoming work identity handoff"
     handoff_target_matches_current
     validate_committed_target "$task"
   fi
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
-    read_handoff_state "$SOURCE_HANDOFF" source
+    read_handoff_state "$SOURCE_HANDOFF" source "$task"
     [ "$HANDOFF_TARGET_HOME" = "$target_home" ] && [ "$HANDOFF_TARGET_HOME_ID" = "$target_home_id" ] \
       || die "task $task is already prepared for a different handoff target"
     validate_source_transfer "$task"
@@ -1111,11 +1110,11 @@ handoff_stage() {  # <task-id> <transfer-path>
   identity_mutation_lock_acquire "$task"
   reject_dispatch_for_handoff "$task"
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
-    read_handoff_state "$SOURCE_HANDOFF" source
+    read_handoff_state "$SOURCE_HANDOFF" source "$task"
     die "handoff target task $task is already owned by an outgoing transfer"
   fi
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
-    read_handoff_state "$TARGET_HANDOFF" target
+    read_handoff_state "$TARGET_HANDOFF" target "$task"
     [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task has a different prepared incoming handoff"
     return 0
   fi
@@ -1194,7 +1193,7 @@ handoff_commit() {  # <task-id> <transfer-path>
   identity_mutation_lock_acquire "$task"
   [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ] \
     || die "task $task has no prepared incoming handoff"
-  read_handoff_state "$TARGET_HANDOFF" target
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
   if [ "$HANDOFF_STATE" = completed ]; then
     validate_committed_target "$task"
@@ -1223,7 +1222,7 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
     fi
     return 0
   fi
-  read_handoff_state "$TARGET_HANDOFF" target
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
   if [ "$HANDOFF_STATE" = completed ]; then
     validate_committed_target "$task"
@@ -1260,7 +1259,7 @@ handoff_target_state() {  # <task-id> <transfer-path>
     fi
     return 0
   fi
-  read_handoff_state "$TARGET_HANDOFF" target
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
   if [ "$HANDOFF_STATE" = completed ]; then
     validate_committed_target "$task"
@@ -1285,7 +1284,7 @@ handoff_complete() {  # <task-id> <transfer-path>
     || die "handoff completion source does not match the active home"
   identity_mutation_lock_acquire "$task"
   [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ] || die "task $task has no prepared source handoff"
-  read_handoff_state "$SOURCE_HANDOFF" source
+  read_handoff_state "$SOURCE_HANDOFF" source "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different source handoff"
   validate_source_transfer "$task"
   [ "$HANDOFF_STATE" = completed ] || write_handoff_state "$SOURCE_HANDOFF" source completed "$requested"
@@ -1300,7 +1299,7 @@ handoff_cancel() {  # <task-id> <transfer-path>; 4 means source is already compl
     || die "handoff cancellation source does not match the active home"
   identity_mutation_lock_acquire "$task"
   if [ ! -e "$SOURCE_HANDOFF" ] && [ ! -L "$SOURCE_HANDOFF" ]; then return 0; fi
-  read_handoff_state "$SOURCE_HANDOFF" source
+  read_handoff_state "$SOURCE_HANDOFF" source "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different source handoff"
   [ "$HANDOFF_STATE" != completed ] || return 4
   rm -f -- "$SOURCE_HANDOFF" || die "cannot cancel handoff source state"
@@ -1605,13 +1604,13 @@ publication_preflight_locked() {
     locate_task_dir "$task"
     identity_lock_acquire "$task"
     if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
-      read_handoff_state "$SOURCE_HANDOFF" source
+      read_handoff_state "$SOURCE_HANDOFF" source "$task"
       [ "$HANDOFF_STATE" = completed ] \
         || die "work identity ownership handoff is incomplete for task $task"
       validate_source_transfer "$task"
     fi
     if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
-      read_handoff_state "$TARGET_HANDOFF" target
+      read_handoff_state "$TARGET_HANDOFF" target "$task"
       [ "$HANDOFF_STATE" = completed ] \
         || die "work identity ownership handoff is incomplete for task $task"
       handoff_target_matches_current

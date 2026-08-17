@@ -1226,6 +1226,43 @@ shell_quote() {
   printf "'"
 }
 
+render_launch() {
+  local template=$1 output= prefix rest token marker replacement
+  while [[ "$template" == *"__"* ]]; do
+    prefix=${template%%__*}
+    rest=${template#*__}
+    if [[ "$rest" != *"__"* ]]; then
+      output="${output}${prefix}__${rest}"
+      template=
+      break
+    fi
+    token=${rest%%__*}
+    template=${rest#*__}
+    marker="__${token}__"
+    replacement=$marker
+    case "$marker" in
+      __MODELFLAG__) replacement=$MODELFLAG ;;
+      __EFFORTFLAG__) replacement=$EFFORTFLAG ;;
+      __TURNEND__) replacement=$sq_turnend ;;
+      __PIEXT__) replacement=$sq_piext ;;
+      __PITURNEND__) replacement=$sq_piturnend ;;
+      __PIWATCH__) replacement=$sq_piwatch ;;
+      __WORKTREE__) replacement=$sq_worktree ;;
+      __BRIEF__) replacement=$sq_brief ;;
+      __BRIEFINPUT__) replacement=$sq_brief_input ;;
+      __PITUIMODE__) [ "${PI_TUI_MODE+x}" = x ] && replacement=$PI_TUI_MODE ;;
+      __PIBIN__) [ -z "${PI_BIN:-}" ] || replacement=$(shell_quote "$PI_BIN") ;;
+      __CURSORBIN__) [ -z "${CURSOR_BIN:-}" ] || replacement=$(shell_quote "$CURSOR_BIN") ;;
+      __KIMIBIN__) [ -z "${KIMI_BIN:-}" ] || replacement=$(shell_quote "$KIMI_BIN") ;;
+      __MUSEBIN__) [ -z "${MUSE_BIN:-}" ] || replacement=$(shell_quote "$MUSE_BIN") ;;
+      __MUSECONFIG__) [ -z "${MUSE_CONFIG_HOME:-}" ] || replacement=$(shell_quote "$MUSE_CONFIG_HOME") ;;
+      __MUSEDATA__) [ -z "${MUSE_DATA_HOME:-}" ] || replacement=$(shell_quote "$MUSE_DATA_HOME") ;;
+    esac
+    output="${output}${prefix}${replacement}"
+  done
+  printf '%s' "${output}${template}"
+}
+
 resolve_pi_executable() {
   local candidate dir
   candidate=$(type -P -- "$1" 2>/dev/null) || return 1
@@ -1389,7 +1426,6 @@ case "$HARNESS" in
     if pi_supports_tui_mode "$PI_BIN"; then
       PI_TUI_MODE=' --tui-mode regular'
     fi
-    LAUNCH=${LAUNCH//__PITUIMODE__/$PI_TUI_MODE}
     LAUNCH="FM_PI_HARNESS=$HARNESS $LAUNCH"
     ;;
   cursor)
@@ -1590,16 +1626,12 @@ case "$LAUNCH" in
       fi
       exit 1
     fi
-    LAUNCH=${LAUNCH//__MUSEBIN__/$(shell_quote "$MUSE_BIN")}
-    LAUNCH=${LAUNCH//__MUSECONFIG__/$(shell_quote "$MUSE_CONFIG_HOME")}
-    LAUNCH=${LAUNCH//__MUSEDATA__/$(shell_quote "$MUSE_DATA_HOME")}
     ;;
 esac
 
 case "$LAUNCH" in
   *__KIMIBIN__*)
     KIMI_BIN=$(resolve_kimi_binary) || exit 1
-    LAUNCH=${LAUNCH//__KIMIBIN__/$(shell_quote "$KIMI_BIN")}
     if [ "$KIND" != secondmate ]; then
       "$FM_ROOT/bin/fm-kimi-turnend-hook.sh" install || {
         echo "error: refusing Kimi spawn because the global turn-end hook could not be installed safely" >&2
@@ -3080,19 +3112,7 @@ sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
-LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
-LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
-LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
-LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
-LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
-LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
-case "$HARNESS" in
-  pi|pi-signed) LAUNCH=${LAUNCH//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;
-  cursor) LAUNCH=${LAUNCH//__CURSORBIN__/"$(shell_quote "$CURSOR_BIN")"} ;;
-esac
-LAUNCH=${LAUNCH//__WORKTREE__/$sq_worktree}
-LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
-LAUNCH=${LAUNCH//__BRIEFINPUT__/$sq_brief_input}
+LAUNCH=$(render_launch "$LAUNCH") || exit 1
 case "$HARNESS" in
   claude|codex|opencode|pi|pi-signed|grok|kimi|muse)
     LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS $LAUNCH"
