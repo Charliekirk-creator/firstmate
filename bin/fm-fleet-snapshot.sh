@@ -239,6 +239,7 @@ EOF
 
 OUTPUT_MODE=json
 IDENTITY_TASKS=()
+SNAPSHOT_ARGS=("$@")
 case "${1:---json}" in
   --json) [ "$#" -le 1 ] || { usage >&2; exit 2; } ;;
   --secondmate-home-summary) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; OUTPUT_MODE=secondmate-home-summary ;;
@@ -251,6 +252,14 @@ case "${1:---json}" in
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
+
+if [ "${FM_WORK_IDENTITY_PUBLICATION_GUARDED:-0}" != 1 ]; then
+  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" publication-run -- \
+    env FM_WORK_IDENTITY_PUBLICATION_GUARDED=1 \
+      "$SCRIPT_DIR/fm-fleet-snapshot.sh" "${SNAPSHOT_ARGS[@]}"
+  exit $?
+fi
 
 identity_owner_setup_failure() {
   echo "fm-fleet-snapshot: $1" >&2
@@ -516,7 +525,7 @@ backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
 
 project_task_work_identity_json() {  # <task-id>
   local id=$1 meta args output rc
-  args=(project "$id" --brief "$DATA/$id/brief.md")
+  args=(project "$id")
   meta="$STATE/$id.meta"
   if [ -e "$meta" ] || [ -L "$meta" ]; then
     args+=(--meta "$meta")

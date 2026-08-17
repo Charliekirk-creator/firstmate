@@ -22,6 +22,7 @@ Bounded output:
 ok - exact multi-work-unit intake survives instructions, metadata, snapshot, and Bearings once per worker
 ok - spawn delivers validated bytes despite source and snapshot replacement
 ok - sidecar validation hashes one captured byte sequence
+ok - manifest intake canonicalizes one capture and rejects source rewrites
 ok - concurrent identical records converge and intentional unlinked intake stays explicit
 ok - namespaces remain distinct and version, role, duplicate, contradiction, and id syntax are closed
 ok - unsafe manifests, labels, stored files, cross-home copies, and task mismatches refuse
@@ -30,6 +31,7 @@ ok - legacy tasks stay explicitly unlinked despite every fuzzy fallback signal
 ok - secondmate structured summary and Bearings expose one exact delegated-child worker
 ok - linked handoff rebinds identity for delegated decision summaries and Bearings
 ok - handoff preparation freezes intake and failed batches leave no immutable target sidecars
+ok - snapshot preflight blocks prepared ownership and recovers exact dispatch metadata
 ok - delegated linked integrity failures stop parent publication
 ok - schema-maximum delegated identities stream in bounded normalized batches
 ok - Bearings preserves complete IDs and labels for every bounded worker row
@@ -39,7 +41,7 @@ ok - fixture snapshot covers task rows, backlog rows, pointers, and stable order
 ```
 
 The focused suite covers single and multiple work units, Work Aligner `plan_id` and `work_units`, DTM project and issue IDs, Data Team Ticket IDs, local Firstmate plans, namespace separation, complete stable IDs paired with labels, absent and overlong legacy records, idempotence, exact path/task/stable-home binding, local and remote handoff rebinding, malformed versions and syntax, duplicate and contradictory IDs, unsafe paths, C1 controls, Unicode format controls, symlink and hardlink refusal, stale digest refusal, delegated fail-stop propagation, schema-maximum bounded batching, stable snapshot output, delegated-child and secondmate projections, main and delegated status decisions, and every prohibited fuzzy signal.
-It also confirms that relation recording changes no runtime task-state file, all tools receive one captured launch input even when the source and launch snapshot change after preflight, metadata binds the delivered byte digest, handoff prepare excludes concurrent intake, failed multi-item staging publishes no immutable destination sidecar, and successful or recovered transfers retain exact source tombstones and destination commit receipts.
+It also confirms that relation recording changes no runtime task-state file, manifest intake canonicalizes one captured byte sequence and refuses a same-size source rewrite, and all tools receive one captured launch input even when the source and launch snapshot change after preflight. Metadata binds the delivered byte digest and transaction receipt, prepared ownership omitted from backlog and metadata still blocks every snapshot mode, exact published metadata recovers an interrupted dispatch commit, secondmate projection follows the metadata-bound launch snapshot, handoff prepare excludes concurrent intake, failed multi-item staging publishes no immutable destination sidecar, and successful or recovered local and remote transfers retain exact source tombstones and destination commit receipts.
 
 ## Runtime-backend applicability
 

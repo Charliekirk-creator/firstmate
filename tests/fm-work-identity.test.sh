@@ -312,6 +312,41 @@ SH
   pass "sidecar validation hashes one captured byte sequence"
 }
 
+test_manifest_capture_rejects_same_size_rewrite() {
+  local home task manifest replacement fakebin real_jq out rc=0
+  home=$(make_home manifest-capture)
+  task=manifest-capture-worker
+  manifest="$home/manifest.json"
+  replacement="$home/replacement.json"
+  make_manifest "$home" "$task" "$manifest"
+  jq '.work_units[0].id = "wu-other-intake"' "$manifest" > "$replacement"
+  [ "$(LC_ALL=C wc -c < "$manifest" | tr -d ' ')" = \
+    "$(LC_ALL=C wc -c < "$replacement" | tr -d ' ')" ] \
+    || fail "same-size manifest rewrite fixture changed input size"
+  fakebin=$(fm_fakebin "$home/jq-fake")
+  real_jq=$(command -v jq)
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ ! -e "$FM_TEST_REWRITE_MARKER" ]; then
+  /bin/cp "$FM_TEST_REPLACEMENT" "$FM_TEST_MANIFEST"
+  : > "$FM_TEST_REWRITE_MARKER"
+fi
+exec "$FM_TEST_REAL_JQ" "$@"
+SH
+  chmod +x "$fakebin/jq"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_MANIFEST="$manifest" \
+    FM_TEST_REPLACEMENT="$replacement" FM_TEST_REWRITE_MARKER="$home/rewritten" \
+    FM_TEST_REAL_JQ="$real_jq" FM_HOME="$home" \
+    "$WORK_IDENTITY" record "$task" --file "$manifest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "record accepted a manifest rewritten during canonicalization"
+  assert_contains "$out" "changed before publication" \
+    "manifest rewrite refusal did not identify the unstable input"
+  assert_absent "$home/data/$task/work-identity.json" \
+    "manifest rewrite published a sidecar from unstable input"
+  pass "manifest intake canonicalizes one capture and rejects source rewrites"
+}
+
 test_concurrent_idempotence_and_explicit_unlinked() {
   local home task manifest p1 p2 rc1 rc2 links out
   home=$(make_home idempotent)
@@ -414,7 +449,8 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   fm_write_meta "$home/state/$task.meta" \
     "window=firstmate:fm-$task" "endpoint_task_id=$task" \
     "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
-    "launch_brief_sha256=$hash" "harness=codex" "kind=ship" \
+    "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+    "harness=codex" "kind=ship" \
     "mode=no-mistakes" "yolo=off" "work_identity_schema=fm-work-identity.v1" \
     "work_identity_status=unlinked"
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
@@ -430,6 +466,74 @@ test_dispatch_transaction_excludes_backlog_handoff() {
     '.status == "unlinked" and .reason == "explicitly-unlinked"' >/dev/null \
     || fail "committed dispatch did not remain authoritatively publishable"
   pass "dispatch prepare and committed metadata exclude backlog ownership handoff"
+}
+
+test_snapshot_preflight_and_dispatch_recovery() {
+  local home mate task transfer out rc=0 launch transaction binding hash fakebin
+  home=$(make_home publication-preflight)
+  mate="$TMP_ROOT/publication-preflight-mate"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects"
+  printf 'preflight\n' > "$mate/.fm-secondmate-home"
+  task=omitted-prepared-handoff
+  transfer=$(FM_HOME="$home" "$WORK_IDENTITY" handoff-prepare "$task" \
+    --to-home "$mate" --to-home-id secondmate:preflight) \
+    || fail "could not prepare omitted handoff fixture"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json 2>&1) || rc=$?
+  [ "$rc" -eq 42 ] || fail "main snapshot did not reject omitted prepared ownership (rc=$rc): $out"
+  assert_contains "$out" "ownership handoff is incomplete" \
+    "main snapshot preflight did not name prepared ownership"
+  rc=0
+  out=$(FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary 2>&1) || rc=$?
+  [ "$rc" -eq 42 ] || fail "child summary did not reject omitted prepared ownership (rc=$rc): $out"
+  rc=0
+  out=$(FM_HOME="$home" "$SNAPSHOT" --secondmate-home-identities "$task" 2>&1) || rc=$?
+  [ "$rc" -eq 42 ] || fail "identity batch did not reject omitted prepared ownership (rc=$rc): $out"
+  printf '%s\n' "$transfer" | FM_HOME="$home" "$WORK_IDENTITY" \
+    handoff-cancel "$task" --file - >/dev/null \
+    || fail "could not cancel omitted prepared handoff fixture"
+
+  task=secondmate-dispatch-recovery
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold dispatch recovery instructions"
+  launch="$home/state/$task.launch-brief.md"
+  transaction=dispatch-recovery-1
+  binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$transaction") || fail "could not prepare recoverable dispatch"
+  cp "$home/data/$task/brief.md" "$launch"
+  chmod 400 "$launch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/secondmate-home" "project=$home/secondmate-home" \
+    "launch_brief=$launch" "launch_brief_sha256=$hash" \
+    "work_identity_dispatch_transaction=$transaction" \
+    "harness=codex" "kind=secondmate" "mode=secondmate" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  fakebin=$(make_fakebin "$home/preflight-fakes")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" \
+    "$SNAPSHOT" --secondmate-home-identities "$task") \
+    || fail "snapshot did not reconcile exact prepared dispatch metadata"
+  printf '%s' "$out" | jq -e --arg task "$task" '
+    .records[] | select(.task_id == $task)
+    | .work_identity.status == "unlinked"
+      and .work_identity.reason == "explicitly-unlinked"
+  ' >/dev/null || fail "reconciled dispatch projection was malformed: $out"
+  jq -e '.state == "completed" and .transaction_id == "dispatch-recovery-1"' \
+    "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "snapshot preflight did not complete the exact metadata transaction"
+
+  printf '\nUpdated parent-side charter scaffold.\n' >> "$home/data/$task/brief.md"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" \
+    "$SNAPSHOT" --secondmate-home-identities "$task") \
+    || fail "metadata-bound secondmate launch snapshot was not authoritative"
+  printf '%s' "$out" | jq -e --arg task "$task" '
+    .records[] | select(.task_id == $task)
+    | .work_identity.status == "unlinked"
+      and .work_identity.provenance.instructions == "generated-instructions"
+      and .work_identity.provenance.metadata == "metadata"
+  ' >/dev/null || fail "secondmate identity projection reread the changed parent scaffold: $out"
+  pass "snapshot preflight blocks prepared ownership and recovers exact dispatch metadata"
 }
 
 # Namespace is part of identity: identical opaque ids in separate systems stay
@@ -855,7 +959,7 @@ EOF
 }
 
 test_handoff_preparation_is_durable_and_rollback_safe() {
-  local parent mate task_a task_b race manifest transfer out rc
+  local parent mate task_a task_b task_c race manifest transfer out rc
   command -v tasks-axi >/dev/null 2>&1 || { pass "handoff transaction coverage skipped without tasks-axi"; return; }
   parent=$(make_home handoff-transaction-parent)
   mate="$TMP_ROOT/handoff-transaction-mate"
@@ -866,7 +970,8 @@ test_handoff_preparation_is_durable_and_rollback_safe() {
     "$mate" > "$parent/data/secondmates.md"
   task_a=transaction-a
   task_b=transaction-b
-  for task in "$task_a" "$task_b"; do
+  task_c=transaction-c
+  for task in "$task_a" "$task_b" "$task_c"; do
     manifest="$parent/$task.json"
     make_manifest "$parent" "$task" "$manifest"
     FM_HOME="$parent" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
@@ -879,6 +984,7 @@ test_handoff_preparation_is_durable_and_rollback_safe() {
 ## Queued
 - [ ] $task_a - first transactional identity (repo: firstmate)
 - [ ] $task_b - second transactional identity (repo: firstmate)
+- [ ] $task_c - recovered prepared identity (repo: firstmate)
 
 ## Done
 EOF
@@ -923,6 +1029,29 @@ EOF
   rc=0
   out=$(FM_HOME="$parent" "$WORK_IDENTITY" verify "$task_a" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "mixed retry made the completed source identity publishable again"
+
+  transfer=$(FM_HOME="$parent" "$WORK_IDENTITY" handoff-prepare "$task_c" \
+    --to-home "$mate" --to-home-id secondmate:transaction)
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" \
+    handoff-stage "$task_c" --file - >/dev/null \
+    || fail "could not stage the interrupted prepared-target fixture"
+  tasks-axi mv "$task_c" --file "$parent/data/backlog.md" --to "$mate/data/backlog.md" >/dev/null \
+    || fail "could not move the interrupted prepared-target backlog fixture"
+  jq -e '.state == "prepared"' \
+    "$mate/data/$task_c/work-identity-handoff-target.json" >/dev/null \
+    || fail "interrupted prepared-target fixture was not prepared"
+  rc=0
+  out=$(FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" \
+    transaction "$task_c" "$task_b" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "mixed retry ignored the later conflict after a recovered prepare"
+  jq -e '.role == "target" and .state == "completed"' \
+    "$mate/data/$task_c/work-identity-handoff-target.json" >/dev/null \
+    || fail "mixed retry aborted recovered target ownership despite destination backlog"
+  jq -e '.role == "source" and .state == "completed"' \
+    "$parent/data/$task_c/work-identity-handoff-source.json" >/dev/null \
+    || fail "mixed retry resurrected source ownership from a recovered prepare"
+  FM_HOME="$mate" "$WORK_IDENTITY" verify "$task_c" | jq -e '.status == "linked"' >/dev/null \
+    || fail "mixed retry did not publish recovered destination ownership"
 
   race=record-during-handoff
   manifest="$parent/$race.json"
@@ -1133,9 +1262,11 @@ test_secondmate_parent_decisions_and_nested_caps_are_disclosed() {
 test_intake_through_fleet_projection
 test_spawn_delivers_validated_brief_snapshot
 test_sidecar_validation_hashes_captured_bytes
+test_manifest_capture_rejects_same_size_rewrite
 test_concurrent_idempotence_and_explicit_unlinked
 test_projection_serializes_identity_ownership
 test_dispatch_transaction_excludes_backlog_handoff
+test_snapshot_preflight_and_dispatch_recovery
 test_namespace_separation_and_contract_rejections
 test_unsafe_files_labels_and_exact_binding
 test_stale_and_changed_relations_refuse

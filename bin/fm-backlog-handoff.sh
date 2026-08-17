@@ -582,40 +582,54 @@ remote_target_handoff_state() { # <secondmate-id> <task-id> <payload>
         handoff-target-state "$task" --file -
 }
 
-rollback_local_handoff_identities() { # <target-home>
-  local target_home=$1 i task payload failed=0 rc
+rollback_local_handoff_identities() { # <target-home> <target-backlog>
+  local target_home=$1 target_backlog=$2 i task payload created failed=0 preserved=0 rc
   i=0
   while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
     task=${HANDOFF_IDENTITY_TASKS[$i]}
     payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
-    set +e
-    local_target_handoff_action "$target_home" abort "$task" "$payload"
-    rc=$?
-    set -e
-    case "$rc" in
-      0) source_handoff_action cancel "$task" "$payload" || failed=1 ;;
-      4) source_handoff_action complete "$task" "$payload" || failed=1 ;;
-      *) failed=1 ;;
-    esac
+    created=${HANDOFF_IDENTITY_CREATED[$i]}
+    if backlog_key_section "$target_backlog" "$task" >/dev/null 2>&1; then
+      if local_target_handoff_action "$target_home" commit "$task" "$payload" \
+        && source_handoff_action complete "$task" "$payload"; then
+        :
+      else
+        failed=1
+      fi
+    elif [ "$created" = true ]; then
+      set +e
+      local_target_handoff_action "$target_home" abort "$task" "$payload"
+      rc=$?
+      set -e
+      case "$rc" in
+        0) source_handoff_action cancel "$task" "$payload" || failed=1 ;;
+        4) source_handoff_action complete "$task" "$payload" || failed=1 ;;
+        *) failed=1 ;;
+      esac
+    else
+      preserved=1
+    fi
     i=$((i + 1))
   done
-  return "$failed"
+  [ "$failed" -eq 0 ] && [ "$preserved" -eq 0 ]
 }
 
-stage_local_handoff_identities() { # <target-home> <target-home-id> <task-id>...
-  local target_home=$1 target_home_id=$2 task
-  shift 2
+stage_local_handoff_identities() { # <target-home> <target-home-id> <target-backlog> <task-id>...
+  local target_home=$1 target_home_id=$2 target_backlog=$3 task
+  shift 3
   HANDOFF_IDENTITY_TASKS=()
   HANDOFF_IDENTITY_PAYLOADS=()
+  HANDOFF_IDENTITY_CREATED=()
   for task in "$@"; do
     if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id"; then
-      rollback_local_handoff_identities "$target_home" || true
+      rollback_local_handoff_identities "$target_home" "$target_backlog" || true
       return 1
     fi
     HANDOFF_IDENTITY_TASKS+=("$task")
     HANDOFF_IDENTITY_PAYLOADS+=("$HANDOFF_IDENTITY_PAYLOAD")
+    HANDOFF_IDENTITY_CREATED+=("$HANDOFF_IDENTITY_WAS_CREATED")
     if ! local_target_handoff_action "$target_home" stage "$task" "$HANDOFF_IDENTITY_PAYLOAD"; then
-      rollback_local_handoff_identities "$target_home" || true
+      rollback_local_handoff_identities "$target_home" "$target_backlog" || true
       return 1
     fi
   done
@@ -1099,7 +1113,7 @@ if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
       ;;
   esac
 fi
-stage_local_handoff_identities "$SUB_HOME" "secondmate:$ID" "$@" || {
+stage_local_handoff_identities "$SUB_HOME" "secondmate:$ID" "$SUB_BACKLOG" "$@" || {
   echo "error: exact work identity preparation failed; nothing was moved." >&2
   exit 1
 }
@@ -1160,7 +1174,7 @@ if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BAC
   fi
   if [ "$PERSISTED" -eq 1 ]; then
     echo "error: tasks-axi mv completion is uncertain; identity preparation is preserved for recovery." >&2
-  elif ! rollback_local_handoff_identities "$SUB_HOME"; then
+  elif ! rollback_local_handoff_identities "$SUB_HOME" "$SUB_BACKLOG"; then
     echo "error: tasks-axi mv failed and identity preparation needs recovery." >&2
   else
     echo "error: tasks-axi mv failed; nothing was moved." >&2
