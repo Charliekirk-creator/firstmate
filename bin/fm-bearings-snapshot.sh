@@ -434,9 +434,13 @@ MODEL=$(printf '%s' "$SNAP" | jq \
              doing:((.doing // .state) | trunc(90))}
             + work_fields(.work_identity)) ]) as $in_flight_all
   | ([ $secondmate_views[] as $mate
-       | $mate.active_children[]?
-       | ({owner:$mate.id,id,state,doing:(.doing | trunc(90))}
-          + work_fields(mate_work($mate; .work_identity_ref))) ]) as $delegated_all
+       | ($mate.active_children[]?
+          | ({owner:$mate.id,id,state,doing:(.doing | trunc(90))}
+             + work_fields(mate_work($mate; .work_identity_ref)))),
+         ($mate.holds[]?
+          | select(.source == "child-state")
+          | ({owner:$mate.id,id,state:"held",doing:((.reason // "held") | trunc(90))}
+             + work_fields(mate_work($mate; .work_identity_ref)))) ]) as $delegated_all
   | ([ .backlog.records[]
          | select(.structured and .captain_actionable == true)
          | select(($all_decisions == 1) or (.deferred_marker != true))
@@ -556,6 +560,10 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          | $m.omitted[]?
          | select(.surface == "decisions_open")
          | {surface:("decisions_open omitted by structured-home cap for \($m.id): \(.count)"),reveal:"raise FM_SNAPSHOT_SECONDMATE_DECISIONS"}),
+        (($snap.secondmate_current.records // [])[] as $m
+         | $m.omitted[]?
+         | select(.surface == "holds")
+         | {surface:("delegated holds omitted by structured-home cap for \($m.id): \(.count)"),reveal:"raise FM_SNAPSHOT_SECONDMATE_QUEUED"}),
         (($snap.secondmate_current.records // [])[] as $m
          | $m.omitted[]?
          | select(.surface == "queued")

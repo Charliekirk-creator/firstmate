@@ -721,6 +721,11 @@ SPAWN_META_TMP=
 SPAWN_BRIEF_TMP=
 SPAWN_DISPATCH_PENDING=0
 SPAWN_DISPATCH_TRANSACTION=
+SPAWN_ENDPOINT_RECEIPT=
+SPAWN_ENDPOINT_RECOVERED=0
+SPAWN_ENDPOINT_PHASE=
+SPAWN_IDENTITY_HOME=
+SPAWN_IDENTITY_HOME_ID=
 SPAWN_META_LOCK=
 SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
@@ -760,6 +765,173 @@ parse_orca_worktree_result() {
   else
     ORCA_TERMINAL=
   fi
+}
+
+spawn_file_link_count() {
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%l' "$1" 2>/dev/null
+  else
+    stat -c '%h' "$1" 2>/dev/null
+  fi
+}
+
+spawn_endpoint_receipt_publish() {  # <endpoint-created|worktree-requested|worktree-ready> [worktree]
+  local phase=$1 worktree=${2:-} details payload tmp
+  case "$phase" in endpoint-created|worktree-requested|worktree-ready) ;; *) return 1 ;; esac
+  case "$BACKEND" in
+    tmux)
+      details=$(jq -n -S -c --arg session "${SES:-}" --arg window_id "${WT_TARGET:-}" \
+        '{session:$session,window_id:$window_id}') || return 1
+      ;;
+    herdr)
+      details=$(jq -n -S -c --arg session "${HERDR_SES:-}" \
+        --arg workspace_id "${HERDR_WORKSPACE_ID:-}" --arg tab_id "${HERDR_TAB_ID:-}" \
+        --arg pane_id "${HERDR_PANE_ID:-}" \
+        '{session:$session,workspace_id:$workspace_id,tab_id:$tab_id,pane_id:$pane_id}') || return 1
+      ;;
+    zellij)
+      details=$(jq -n -S -c --arg session "${ZELLIJ_SES:-}" \
+        --arg tab_id "${ZELLIJ_TAB_ID:-}" --arg pane_id "${ZELLIJ_PANE_ID:-}" \
+        '{session:$session,tab_id:$tab_id,pane_id:$pane_id}') || return 1
+      ;;
+    cmux)
+      details=$(jq -n -S -c --arg workspace_id "${CMUX_WORKSPACE_ID:-}" \
+        --arg surface_id "${CMUX_SURFACE_ID:-}" \
+        '{workspace_id:$workspace_id,surface_id:$surface_id}') || return 1
+      ;;
+    orca)
+      details=$(jq -n -S -c --arg worktree_id "${ORCA_WORKTREE_ID:-}" \
+        --arg terminal "${ORCA_TERMINAL:-}" \
+        '{worktree_id:$worktree_id,terminal:$terminal}') || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  payload=$(jq -n -S -c \
+    --arg schema fm-spawn-endpoint.v1 --arg phase "$phase" \
+    --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
+    --arg transaction "$SPAWN_DISPATCH_TRANSACTION" \
+    --arg instructions_sha256 "$LAUNCH_BRIEF_HASH" --arg backend "$BACKEND" \
+    --arg kind "$KIND" --arg project "$PROJ_ABS" --arg label "$W" --arg target "$T" \
+    --arg worktree "$worktree" --argjson details "$details" \
+    '{schema:$schema,phase:$phase,binding:{home:$home,home_id:$home_id,task_id:$task},
+      transaction_id:$transaction,instructions_sha256:$instructions_sha256,
+      backend:$backend,kind:$kind,project:$project,
+      endpoint:{label:$label,target:$target,details:$details},
+      worktree:(if $worktree == "" then null else $worktree end)}') || return 1
+  tmp=$(umask 077; mktemp "$STATE/.$ID.spawn-endpoint.XXXXXX") || return 1
+  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
+    && mv -f -- "$tmp" "$SPAWN_ENDPOINT_RECEIPT" || { rm -f -- "$tmp"; return 1; }
+  SPAWN_ENDPOINT_PHASE=$phase
+}
+
+spawn_endpoint_receipt_load() {
+  local receipt=$SPAWN_ENDPOINT_RECEIPT canonical links bytes target worktree details endpoint_state
+  [ -f "$receipt" ] && [ ! -L "$receipt" ] || {
+    echo "error: spawn endpoint receipt is unsafe: $receipt" >&2
+    return 1
+  }
+  links=$(spawn_file_link_count "$receipt") || return 1
+  [ "$links" = 1 ] || { echo "error: spawn endpoint receipt is hardlinked: $receipt" >&2; return 1; }
+  bytes=$(LC_ALL=C wc -c < "$receipt" | tr -d ' ')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 65536 ] || { echo "error: spawn endpoint receipt is oversized: $receipt" >&2; return 1; }
+  canonical=$(jq -e -S -c -s \
+    --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
+    --arg transaction "$SPAWN_DISPATCH_TRANSACTION" \
+    --arg instructions_sha256 "$LAUNCH_BRIEF_HASH" --arg backend "$BACKEND" \
+    --arg kind "$KIND" --arg project "$PROJ_ABS" --arg label "$W" '
+      def exact($keys): (keys | sort) == ($keys | sort);
+      select(length == 1) | .[0] | . as $r | select(
+        type == "object"
+        and exact(["schema","phase","binding","transaction_id","instructions_sha256","backend","kind","project","endpoint","worktree"])
+        and .schema == "fm-spawn-endpoint.v1"
+        and (.phase == "endpoint-created" or .phase == "worktree-requested" or .phase == "worktree-ready")
+        and .binding == {home:$home,home_id:$home_id,task_id:$task}
+        and .transaction_id == $transaction and .instructions_sha256 == $instructions_sha256
+        and .backend == $backend and .kind == $kind and .project == $project
+        and (.endpoint | type == "object" and exact(["label","target","details"])
+          and .label == $label and (.target | type) == "string" and (.target | length) > 0
+          and (.details | type) == "object")
+        and (.worktree == null or (.worktree | type) == "string")
+        and (if .phase == "worktree-ready" then (.worktree | type) == "string" and (.worktree | length) > 0
+             else true end)
+      ) | $r
+    ' "$receipt" 2>/dev/null) || {
+      echo "error: spawn endpoint receipt is malformed or mismatched: $receipt" >&2
+      return 1
+    }
+  printf '%s\n' "$canonical" | cmp -s "$receipt" - || {
+    echo "error: spawn endpoint receipt is not canonical: $receipt" >&2
+    return 1
+  }
+  target=$(printf '%s' "$canonical" | jq -r '.endpoint.target') || return 1
+  worktree=$(printf '%s' "$canonical" | jq -r '.worktree // ""') || return 1
+  details=$(printf '%s' "$canonical" | jq -c '.endpoint.details') || return 1
+  if ! fm_backend_target_exists "$BACKEND" "$target" "$W"; then
+    endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
+    if [ "$endpoint_state" = missing ]; then
+      echo "error: recorded spawn endpoint is gone for $ID: $target" >&2
+      return 2
+    fi
+    echo "error: recorded spawn endpoint is unavailable for $ID: $target" >&2
+    return 1
+  fi
+  if [ "$BACKEND" = tmux ] || [ "$BACKEND" = herdr ]; then
+    endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
+    [ "$endpoint_state" = dead ] || {
+      echo "error: recorded spawn endpoint is not agent-free for $ID: $target ($endpoint_state)" >&2
+      return 1
+    }
+  fi
+  T=$target
+  WT=$worktree
+  SPAWN_ENDPOINT_PHASE=$(printf '%s' "$canonical" | jq -r '.phase') || return 1
+  case "$BACKEND" in
+    tmux)
+      printf '%s' "$details" | jq -e '(keys | sort) == (["session","window_id"] | sort)' >/dev/null \
+        || return 1
+      SES=$(printf '%s' "$details" | jq -er '.session | select(length > 0)') || return 1
+      WT_TARGET=$(printf '%s' "$details" | jq -r '.window_id // ""') || return 1
+      [ -n "$WT_TARGET" ] || WT_TARGET=$T
+      [ "$T" = "$SES:$W" ] || return 1
+      ;;
+    herdr)
+      printf '%s' "$details" | jq -e '(keys | sort) == (["session","workspace_id","tab_id","pane_id"] | sort)' >/dev/null \
+        || return 1
+      HERDR_SES=$(printf '%s' "$details" | jq -er '.session | select(length > 0)') || return 1
+      HERDR_WORKSPACE_ID=$(printf '%s' "$details" | jq -er '.workspace_id | select(length > 0)') || return 1
+      HERDR_TAB_ID=$(printf '%s' "$details" | jq -er '.tab_id | select(length > 0)') || return 1
+      HERDR_PANE_ID=$(printf '%s' "$details" | jq -er '.pane_id | select(length > 0)') || return 1
+      [ "$T" = "$HERDR_SES:$HERDR_PANE_ID" ] || return 1
+      WT_TARGET=$T
+      ;;
+    zellij)
+      printf '%s' "$details" | jq -e '(keys | sort) == (["session","tab_id","pane_id"] | sort)' >/dev/null \
+        || return 1
+      ZELLIJ_SES=$(printf '%s' "$details" | jq -er '.session | select(length > 0)') || return 1
+      ZELLIJ_TAB_ID=$(printf '%s' "$details" | jq -er '.tab_id | select(length > 0)') || return 1
+      ZELLIJ_PANE_ID=$(printf '%s' "$details" | jq -er '.pane_id | select(length > 0)') || return 1
+      [ "$T" = "$ZELLIJ_SES:$ZELLIJ_PANE_ID" ] || return 1
+      WT_TARGET=$T
+      ;;
+    cmux)
+      printf '%s' "$details" | jq -e '(keys | sort) == (["workspace_id","surface_id"] | sort)' >/dev/null \
+        || return 1
+      CMUX_WORKSPACE_ID=$(printf '%s' "$details" | jq -er '.workspace_id | select(length > 0)') || return 1
+      CMUX_SURFACE_ID=$(printf '%s' "$details" | jq -er '.surface_id | select(length > 0)') || return 1
+      [ "$T" = "$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID" ] || return 1
+      WT_TARGET=$T
+      ;;
+    orca)
+      printf '%s' "$details" | jq -e '(keys | sort) == (["worktree_id","terminal"] | sort)' >/dev/null \
+        || return 1
+      ORCA_WORKTREE_ID=$(printf '%s' "$details" | jq -er '.worktree_id | select(length > 0)') || return 1
+      ORCA_TERMINAL=$(printf '%s' "$details" | jq -er '.terminal | select(length > 0)') || return 1
+      [ "$T" = "$ORCA_TERMINAL" ] || return 1
+      WT_TARGET=$T
+      ;;
+  esac
+  SPAWN_ENDPOINT_RECOVERED=1
 }
 
 spawn_abort_cleanup() {
@@ -857,17 +1029,22 @@ spawn_abort_cleanup() {
   if [ "$SPAWN_DISPATCH_PENDING" = 1 ]; then
     local dispatch_abort_rc=0
     SPAWN_DISPATCH_PENDING=0
-    FM_HOME="$FM_HOME" \
-      FM_DATA_OVERRIDE="$DATA" \
-      FM_STATE_OVERRIDE="$STATE" \
-      FM_ROOT_OVERRIDE="$FM_ROOT" \
-      "$SCRIPT_DIR/fm-work-identity.sh" dispatch-abort "$ID" \
-        --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null 2>&1 \
-      || dispatch_abort_rc=$?
-    case "$dispatch_abort_rc" in
-      0|4) ;;
-      *) echo "warning: work identity dispatch for $ID requires reconciliation" >&2 ;;
-    esac
+    if [ -n "$SPAWN_ENDPOINT_RECEIPT" ] \
+       && { [ -e "$SPAWN_ENDPOINT_RECEIPT" ] || [ -L "$SPAWN_ENDPOINT_RECEIPT" ]; }; then
+      echo "warning: work identity dispatch for $ID is preserved with its endpoint receipt for recovery" >&2
+    else
+      FM_HOME="$FM_HOME" \
+        FM_DATA_OVERRIDE="$DATA" \
+        FM_STATE_OVERRIDE="$STATE" \
+        FM_ROOT_OVERRIDE="$FM_ROOT" \
+        "$SCRIPT_DIR/fm-work-identity.sh" dispatch-abort "$ID" \
+          --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null 2>&1 \
+        || dispatch_abort_rc=$?
+      case "$dispatch_abort_rc" in
+        0|4) ;;
+        *) echo "warning: work identity dispatch for $ID requires reconciliation" >&2 ;;
+      esac
+    fi
   fi
   if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_LOCK_HELD=0
@@ -1833,6 +2010,7 @@ fi
 BRIEF_SOURCE=$BRIEF
 mkdir -p "$STATE" || { echo "error: could not create state directory for launch brief" >&2; exit 1; }
 BRIEF_SNAPSHOT="$STATE/$ID.launch-brief.md"
+SPAWN_ENDPOINT_RECEIPT="$STATE/$ID.spawn-endpoint.json"
 if [ -e "$BRIEF_SNAPSHOT" ] || [ -L "$BRIEF_SNAPSHOT" ]; then
   [ -f "$BRIEF_SNAPSHOT" ] && [ ! -L "$BRIEF_SNAPSHOT" ] \
     || { echo "error: launch brief snapshot path is unsafe: $BRIEF_SNAPSHOT" >&2; exit 1; }
@@ -1859,6 +2037,10 @@ LAUNCH_BRIEF_HASH=
 SPAWN_DISPATCH_TRANSACTION="spawn:${BASHPID:-$$}:$(date +%s):$RANDOM"
 WORK_IDENTITY_ARGS=(dispatch-prepare "$ID" --brief "$SPAWN_BRIEF_TMP" \
   --instructions-path "$BRIEF_SNAPSHOT" --transaction "$SPAWN_DISPATCH_TRANSACTION")
+if [ "$RELAUNCH" -eq 0 ] \
+   && { [ -e "$SPAWN_ENDPOINT_RECEIPT" ] || [ -L "$SPAWN_ENDPOINT_RECEIPT" ]; }; then
+  WORK_IDENTITY_ARGS+=(--resume)
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   PRIOR_LAUNCH_BRIEF=$(fm_meta_get "$RELAUNCH_META" launch_brief)
   if [ -z "$PRIOR_LAUNCH_BRIEF" ] || { [ ! -e "$PRIOR_LAUNCH_BRIEF" ] && [ ! -L "$PRIOR_LAUNCH_BRIEF" ]; }; then
@@ -1889,6 +2071,10 @@ WORK_IDENTITY_STATUS=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.status') \
 WORK_IDENTITY_SCHEMA=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.schema') \
   || { echo "error: work identity projection has no schema for $ID" >&2; exit 1; }
 WORK_IDENTITY_HASH=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -r '.sha256 // ""')
+SPAWN_IDENTITY_HOME=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.binding.home') \
+  || { echo "error: work identity projection has no physical home binding for $ID" >&2; exit 1; }
+SPAWN_IDENTITY_HOME_ID=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.binding.home_id') \
+  || { echo "error: work identity projection has no home binding for $ID" >&2; exit 1; }
 mv -f "$SPAWN_BRIEF_TMP" "$BRIEF_SNAPSHOT" \
   || { echo "error: could not publish launch brief snapshot" >&2; exit 1; }
 SPAWN_BRIEF_TMP=
@@ -1909,6 +2095,18 @@ LAUNCH_BRIEF_HASH=$CAPTURED_BRIEF_HASH
 fm_operational_input_construct launch-brief "$SPAWN_BRIEF_BODY" SPAWN_BRIEF_INPUT \
   || { echo "error: could not encode captured launch brief" >&2; exit 1; }
 unset SPAWN_BRIEF_BODY
+W="fm-$ID"
+if [ "$RELAUNCH" -eq 0 ] \
+   && { [ -e "$SPAWN_ENDPOINT_RECEIPT" ] || [ -L "$SPAWN_ENDPOINT_RECEIPT" ]; }; then
+  endpoint_receipt_rc=0
+  spawn_endpoint_receipt_load || endpoint_receipt_rc=$?
+  if [ "$endpoint_receipt_rc" -eq 2 ]; then
+    rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || exit 1
+    echo "error: retired the missing endpoint receipt for $ID; rerun spawn to create a replacement" >&2
+    exit 1
+  fi
+  [ "$endpoint_receipt_rc" -eq 0 ] || exit "$endpoint_receipt_rc"
+fi
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
@@ -2206,6 +2404,8 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$KIND" = secondmate ] || WT=$RELAUNCH_WT
   WT_TARGET=$T
   SES=${T%%:*}
+elif [ "$SPAWN_ENDPOINT_RECOVERED" = 1 ]; then
+  :
 else
 case "$BACKEND" in
   tmux)
@@ -2438,6 +2638,22 @@ EOF
     ;;
 esac
 fi
+if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_RECOVERED" = 0 ]; then
+  endpoint_worktree=
+  if [ "$KIND" = secondmate ] || [ "$BACKEND" = orca ]; then endpoint_worktree=$WT; fi
+  spawn_endpoint_receipt_publish endpoint-created "$endpoint_worktree" || {
+    echo "error: could not publish endpoint recovery receipt for $ID" >&2
+    exit 1
+  }
+  HERDR_PROJECTION_ABORT_CLEANUP=0
+  ORCA_ABORT_CLEANUP=0
+fi
+if [ "$RELAUNCH" -eq 0 ] && { [ "$KIND" = secondmate ] || [ "$BACKEND" = orca ]; }; then
+  spawn_endpoint_receipt_publish worktree-ready "$WT" || {
+    echo "error: could not bind the recovered endpoint worktree for $ID" >&2
+    exit 1
+  }
+fi
 if [ "$KIND" = secondmate ]; then
   FM_INHERITABLE_CONFIG=trace-context \
     propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config" \
@@ -2561,7 +2777,30 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  if [ "$SPAWN_ENDPOINT_PHASE" = worktree-ready ]; then
+    recovered_worktree=$WT
+    recovered_seen=
+    for _ in $(seq 1 10); do
+      recovered_seen=$(spawn_current_path "$WT_TARGET" || true)
+      [ -z "$recovered_seen" ] \
+        || [ "$(real_path_or_raw "$recovered_seen")" != "$(real_path_or_raw "$recovered_worktree")" ] \
+        || break
+      sleep 0.5
+    done
+    if [ -z "$recovered_seen" ] \
+       || [ "$(real_path_or_raw "$recovered_seen")" != "$(real_path_or_raw "$recovered_worktree")" ]; then
+      echo "error: recovered endpoint $T is not in its exact recorded worktree for $ID" >&2
+      exit 1
+    fi
+    validate_spawn_worktree "recovered endpoint" "$T"
+  else
+    if [ "$SPAWN_ENDPOINT_PHASE" = endpoint-created ]; then
+      spawn_endpoint_receipt_publish worktree-requested || {
+        echo "error: could not advance endpoint recovery receipt for $ID" >&2
+        exit 1
+      }
+      spawn_send_text_line "$WT_TARGET" 'treehouse get'
+    fi
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
@@ -2607,7 +2846,12 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get" "$T"
+    validate_spawn_worktree "treehouse get" "$T"
+    spawn_endpoint_receipt_publish worktree-ready "$WT" || {
+      echo "error: could not bind the recovered endpoint worktree for $ID" >&2
+      exit 1
+    }
+  fi
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
@@ -3089,6 +3333,12 @@ FM_HOME="$FM_HOME" \
     --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null \
   || exit 1
 SPAWN_DISPATCH_PENDING=0
+if [ "$RELAUNCH" -eq 0 ]; then
+  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+    echo "error: could not retire endpoint recovery receipt for $ID" >&2
+    exit 1
+  }
+fi
 # A dispatch or relaunch keeps the per-task meta lock through launch delivery.
 # The backlog mutation is deliberately the final fallible commit below, so
 # teardown cannot remove a relaunched record while its replacement worker is

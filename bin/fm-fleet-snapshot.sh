@@ -292,12 +292,11 @@ WORK_IDENTITY_PROJECTION_MAX_BYTES=$(printf '%s' "$WORK_IDENTITY_LIMITS" | jq -e
   || identity_owner_setup_failure "invalid work identity projection limit"
 case "$WORK_IDENTITY_RECORD_MAX_BYTES" in ''|*[!0-9]*|0) identity_owner_setup_failure "invalid work identity record limit" ;; esac
 case "$WORK_IDENTITY_PROJECTION_MAX_BYTES" in ''|*[!0-9]*|0) identity_owner_setup_failure "invalid work identity projection limit" ;; esac
-WORK_IDENTITY_BATCH_SIZE=$(((FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES - 4096) / WORK_IDENTITY_PROJECTION_MAX_BYTES))
+WORK_IDENTITY_BATCH_SIZE=$(((FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES - 4096) / (WORK_IDENTITY_PROJECTION_MAX_BYTES + 2048)))
 [ "$WORK_IDENTITY_BATCH_SIZE" -ge 1 ] || {
   echo "fm-fleet-snapshot: FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES cannot hold one valid work identity projection" >&2
   exit 2
 }
-[ "$WORK_IDENTITY_BATCH_SIZE" -le 8 ] || WORK_IDENTITY_BATCH_SIZE=8
 
 bool_json() {
   if [ "$1" = 1 ]; then printf 'true'; else printf 'false'; fi
@@ -1032,6 +1031,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
         omitted:[
           (if ($active_all | length) > $child_n then {surface:"active_children",count:(($active_all | length) - $child_n)} else empty end),
           (if ($decisions_all | length) > $decisions_n then {surface:"decisions_open",count:(($decisions_all | length) - $decisions_n)} else empty end),
+          (if ($holds_all | length) > $queued_n then {surface:"holds",count:(($holds_all | length) - $queued_n)} else empty end),
           (if ($queued_all | length) > $queued_n then {surface:"queued",count:(($queued_all | length) - $queued_n)} else empty end),
           (if ($tasks | length) > $child_n then {surface:"endpoints",count:(($tasks | length) - $child_n)} else empty end),
           (if $landed_n > 0 and ($landed_all | length) > $landed_n then {surface:"landed",count:(($landed_all | length) - $landed_n)} else empty end)
@@ -1040,8 +1040,8 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
 }
 
 fetch_secondmate_work_identities_json() {  # <id> <home> <remote> <summary-json>
-  local id=$1 home=$2 remote=$3 summary=$4 home_id index ids_raw rc tmp stream_tmp
-  local bytes max_stream_bytes header records expected offset end task
+  local id=$1 home=$2 remote=$3 summary=$4 home_id index ids_raw rc tmp stream_tmp page_tmp
+  local bytes max_stream_bytes header records expected offset end task deadline now remaining first_page
   home_id="secondmate:$id"
   local -a task_ids
   index=$(printf '%s' "$summary" | jq -c '.work_identity_index') \
@@ -1081,10 +1081,46 @@ EOF
     || { rm -f -- "$tmp"; return 1; }
   rc=0
   if [ "$remote" = true ]; then
-    fm_run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" \
-      "$SCRIPT_DIR/fm-on.sh" "$id" fm-fleet-snapshot.sh \
-        --secondmate-home-identity-stream "${task_ids[@]}" \
-        < /dev/null > "$stream_tmp" 2>/dev/null || rc=$?
+    page_tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-parent-work-identity-page.XXXXXX") \
+      || { rm -f -- "$tmp" "$stream_tmp"; return 1; }
+    deadline=$(($(date +%s) + FM_SNAPSHOT_SECONDMATE_TIMEOUT))
+    offset=0
+    first_page=1
+    while [ "$offset" -lt "${#task_ids[@]}" ]; do
+      end=$((offset + WORK_IDENTITY_BATCH_SIZE))
+      [ "$end" -le "${#task_ids[@]}" ] || end=${#task_ids[@]}
+      now=$(date +%s)
+      remaining=$((deadline - now))
+      if [ "$remaining" -le 0 ]; then
+        rc=124
+        break
+      fi
+      : > "$page_tmp"
+      fm_run_timed "$remaining" \
+        "$SCRIPT_DIR/fm-on.sh" "$id" fm-fleet-snapshot.sh \
+          --secondmate-home-identity-stream "${task_ids[@]:$offset:$((end - offset))}" \
+          < /dev/null > "$page_tmp" 2>/dev/null || rc=$?
+      [ "$rc" -eq 0 ] || break
+      bytes=$(LC_ALL=C wc -c < "$page_tmp" | tr -d ' ')
+      if [ "$bytes" -gt "$FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES" ]; then
+        rc=3
+        break
+      fi
+      header=$(LC_ALL=C head -n 1 "$page_tmp") || { rc=3; break; }
+      printf '%s' "$header" | jq -e --arg home "$home" --arg home_id "$home_id" '
+        (keys | sort) == (["generated","home","home_id","schema"] | sort)
+        and .schema == "fm-secondmate-home-identity-stream.v1"
+        and .home == $home and .home_id == $home_id
+      ' >/dev/null 2>&1 || { rc="$IDENTITY_INTEGRITY_EXIT"; break; }
+      if [ "$first_page" -eq 1 ]; then
+        cat "$page_tmp" > "$stream_tmp" || { rc=1; break; }
+        first_page=0
+      else
+        LC_ALL=C tail -n +2 "$page_tmp" >> "$stream_tmp" || { rc=1; break; }
+      fi
+      offset=$end
+    done
+    rm -f -- "$page_tmp"
   else
     fm_run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" env \
       FM_ROOT_OVERRIDE="$FM_ROOT" \

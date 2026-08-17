@@ -71,13 +71,21 @@ case "$*" in
   *"#{pane_current_command}"*) printf '%s\n' "${FM_FAKE_PANE_COMMAND:-codex}"; exit 0 ;;
 esac
 case "${1:-}" in
-  list-windows) exit 0 ;;
+  list-windows)
+    if [ -n "${FM_TEST_ENDPOINT_LABEL:-}" ] \
+       && [ -s "${FM_TEST_ENDPOINT_CREATE_LOG:-/dev/null}" ]; then
+      printf '%s\n' "$FM_TEST_ENDPOINT_LABEL"
+    fi
+    exit 0
+    ;;
   display-message) printf 'firstmate\n'; exit 0 ;;
   capture-pane) printf 'worker ready\n> \n'; exit 0 ;;
   new-window)
     if [ -n "${FM_TEST_MUTATE_BRIEF:-}" ]; then
       printf 'MUTATED_SOURCE_BRIEF\n' > "$FM_TEST_MUTATE_BRIEF"
     fi
+    [ -z "${FM_TEST_ENDPOINT_CREATE_LOG:-}" ] || printf 'created\n' >> "$FM_TEST_ENDPOINT_CREATE_LOG"
+    printf '%%99\n'
     exit 0
     ;;
   send-keys)
@@ -523,7 +531,60 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   assert_contains "$out" "has no exact owner receipt" \
     "missing dispatch receipt refusal did not identify the orphan metadata transaction"
   mv "$home/dispatch.valid" "$home/data/$task/work-identity-dispatch.json"
+  rm "$home/state/$task.meta" "$launch"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire "$task" \
+    || fail "completed dispatch receipt could not retire after lifecycle cleanup"
+  assert_absent "$home/data/$task/work-identity-dispatch.json" \
+    "completed dispatch receipt remained after lifecycle cleanup"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e \
+    '.status == "unlinked"' >/dev/null \
+    || fail "retiring completed dispatch history changed the task identity projection"
   pass "dispatch prepare and committed metadata exclude backlog ownership handoff"
+}
+
+test_spawn_recovers_exact_created_endpoint() {
+  local home task project wt fakebin manifest original_origin out rc=0 creates
+  home=$(make_home endpoint-recovery)
+  task=endpoint-recovery-worker
+  project="$home/project"
+  wt="$home/worker-copy"
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  record_and_brief "$home" "$task" "$manifest"
+  fm_git_worktree "$project" "$wt" endpoint-recovery-copy
+  original_origin=$(git -C "$wt" remote get-url origin)
+  git -C "$wt" remote set-url origin "$home/unavailable-origin.git"
+  fakebin=$(make_fakebin "$home/endpoint-fakes")
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=bash \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "endpoint recovery fixture unexpectedly completed its first spawn"
+  jq -e '.schema == "fm-spawn-endpoint.v1" and .phase == "worktree-ready"
+      and .endpoint.target == "firstmate:fm-endpoint-recovery-worker"
+      and .worktree == $worktree' --arg worktree "$wt" \
+    "$home/state/$task.spawn-endpoint.json" >/dev/null \
+    || fail "failed spawn did not persist its exact endpoint creation receipt: $out"
+  jq -e '.state == "prepared"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "failed spawn did not preserve its matching identity dispatch"
+  assert_absent "$home/state/$task.meta" \
+    "endpoint recovery fixture published metadata before its injected failure"
+
+  git -C "$wt" remote set-url origin "$original_origin"
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=bash \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) \
+    || fail "spawn could not adopt its exact interrupted endpoint: $out"
+  creates=$(wc -l < "$home/endpoint-creates" | tr -d ' ')
+  [ "$creates" = 1 ] || fail "endpoint recovery created a duplicate endpoint"
+  assert_absent "$home/state/$task.spawn-endpoint.json" \
+    "successful endpoint recovery did not retire its receipt"
+  jq -e '.state == "completed"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "endpoint recovery did not complete its original identity dispatch"
+  pass "spawn retries adopt one exact endpoint creation receipt"
 }
 
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
@@ -960,12 +1021,22 @@ EOF
       and ([.gates[] | select(.owner == "roadmap" and .id == $long
         and .work_identity == "unlinked")] | length) == 1
   ' >/dev/null || fail "Bearings delegated-work projection lost exact identities: $bearings"
+  "$ROOT/bin/fm-busy-event.sh" apply "$mate/state" "$task" idle --gen "$gen" \
+    --source claude-hook --event stop
+  printf 'paused [key=external-review]: waiting for exact external review\n' > "$mate/state/$task.status"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
+  printf '%s' "$bearings" | jq -e '
+    .delegated_work[] | select(.owner == "roadmap" and .id == "delegated-child")
+    | .state == "held" and .work_identity == "linked"
+      and (.work_units | contains("wu-exact-intake"))
+      and (.sources | contains("dtm:issue:DTM-431"))
+  ' >/dev/null || fail "Bearings dropped the exact identity of a held delegated child: $bearings"
   mv "$mate/data" "$TMP_ROOT/delegated-escaped-data"
   ln -s "$TMP_ROOT/delegated-escaped-data" "$mate/data"
   rc=0
   out=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z \
     "$SNAPSHOT" --json 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "parent published through an escaping delegated data directory"
+  [ "$rc" -eq 42 ] || fail "parent published through an escaping delegated data directory (rc=$rc)"
   assert_contains "$out" "work identity home binding mismatch in secondmate roadmap" \
     "unsafe delegated home path degraded to an untrusted fallback"
   rm "$mate/data"
@@ -1216,6 +1287,16 @@ EOF
   pass "handoff preparation freezes intake and failed batches leave no immutable target sidecars"
 }
 
+test_unsafe_publication_setup_uses_integrity_exit() {
+  local home out rc=0
+  home=$(make_home unsafe-publication-setup)
+  mv "$home/data" "$home/data-real"
+  ln -s "$home/data-real" "$home/data"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary 2>&1) || rc=$?
+  [ "$rc" -eq 42 ] || fail "unsafe child publication setup returned $rc instead of integrity status: $out"
+  pass "unsafe child publication setup returns typed integrity status"
+}
+
 test_delegated_integrity_failure_stops_parent_publication() {
   local parent mate task guarded manifest transfer out rc=0 sidecar
   parent=$(make_home integrity-parent)
@@ -1261,7 +1342,7 @@ EOF
 }
 
 test_schema_maximum_delegated_identities_are_streamed_once() {
-  local parent mate fakebin canonical task manifest i stream
+  local parent mate fakebin canonical task manifest i stream fake_ssh remote_calls
   local -a identity_tasks
   parent=$(make_home maximum-parent)
   mate="$TMP_ROOT/maximum-mate"
@@ -1313,7 +1394,61 @@ test_schema_maximum_delegated_identities_are_streamed_once() {
           and (.work_units[-1].label | length) == 160
           and (.sources[-1].id | length) == 240)
   ' >/dev/null || fail "schema-maximum delegated identities were repeated, truncated, or suppressed: $(printf '%s' "$canonical" | jq -c '.secondmate_current.records[] | select(.id == "maximum") | {current,provenance,decisions:(.decisions_open|length),holds:(.holds|length),queued:(.queued|length),identities:(.work_identities|length),counts,omitted}')"
-  pass "schema-maximum delegated identities stream through one bounded home invocation"
+
+  printf -- '- maximum - maximum identity domain (host: maximum-remote; root: %s; home: %s; scope: maximum work; projects: firstmate; added 2026-08-14)\n' \
+    "$ROOT" "$mate" > "$parent/data/secondmates.md"
+  fake_ssh="$parent/fakes/fake-ssh"
+  cat > "$fake_ssh" <<'SH'
+#!/usr/bin/env bash
+set -u
+args=("$@")
+n=${#args[@]}
+home_b64=${args[$((n - 2))]}
+argv_b64=${args[$((n - 1))]}
+decode() {
+  if [ "$(uname 2>/dev/null)" = Darwin ]; then
+    printf '%s' "$1" | base64 -D
+  else
+    printf '%s' "$1" | base64 --decode
+  fi
+}
+remote_home=$(decode "$home_b64") || exit 64
+argv_file="$FM_TEST_REMOTE_TMP/argv.$$"
+out_file="$FM_TEST_REMOTE_TMP/out.$$"
+decode "$argv_b64" > "$argv_file" || exit 64
+argv=()
+while IFS= read -r -d '' value; do argv+=("$value"); done < "$argv_file"
+rm -f "$argv_file"
+[ "${#argv[@]}" -gt 0 ] || exit 64
+if [ "${argv[1]:-}" = --secondmate-home-identity-stream ]; then
+  printf 'page\n' >> "$FM_TEST_REMOTE_CALLS"
+fi
+rc=0
+env -i PATH="$PATH" HOME="${HOME:-}" FM_HOME="$remote_home" \
+  FM_ROOT_OVERRIDE="$FM_TEST_ROOT" \
+  "$FM_TEST_ROOT/bin/${argv[0]}" "${argv[@]:1}" > "$out_file" || rc=$?
+head -c 1048576 "$out_file"
+rm -f "$out_file"
+exit "$rc"
+SH
+  chmod +x "$fake_ssh"
+  : > "$parent/remote-calls"
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SSH_BIN="$fake_ssh" \
+    FM_TEST_ROOT="$ROOT" FM_TEST_REMOTE_TMP="$parent" \
+    FM_TEST_REMOTE_CALLS="$parent/remote-calls" \
+    FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES=300000 \
+    FM_SNAPSHOT_SECONDMATE_TIMEOUT=120 \
+    FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json) \
+    || fail "paged remote identity projection failed"
+  printf '%s' "$canonical" | jq -e '
+    .secondmate_current.records[] | select(.id == "maximum")
+    | .provenance.selected == "structured-home"
+      and (.work_identities | length) == 20
+      and all(.work_identities[].work_identity; .status == "linked")
+  ' >/dev/null || fail "paged remote projection lost schema-maximum identities: $canonical"
+  remote_calls=$(wc -l < "$parent/remote-calls" | tr -d ' ')
+  [ "$remote_calls" -gt 1 ] || fail "remote projection did not page below its bounded transport"
+  pass "schema-maximum delegated identities use bounded remote pages"
 }
 
 test_bearings_preserves_complete_identity_references() {
@@ -1452,6 +1587,9 @@ EOF
         .surface == "decisions_open omitted by structured-home cap for capped: 1"
         and .reveal == "raise FM_SNAPSHOT_SECONDMATE_DECISIONS")] | length) == 1
       and ([.omitted[] | select(
+        (.surface | startswith("delegated holds omitted by structured-home cap for capped: "))
+        and .reveal == "raise FM_SNAPSHOT_SECONDMATE_QUEUED")] | length) == 1
+      and ([.omitted[] | select(
         .surface == "gates omitted by structured-home cap for capped: 1"
         and .reveal == "raise FM_SNAPSHOT_SECONDMATE_QUEUED")] | length) == 1
   ' >/dev/null || fail "Bearings trusted a parent decision or hid a nested cap: $bearings"
@@ -1466,6 +1604,7 @@ test_concurrent_idempotence_and_explicit_unlinked
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
+test_spawn_recovers_exact_created_endpoint
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt
 test_metadata_validation_uses_one_stable_capture
 test_snapshot_preflight_and_dispatch_recovery
@@ -1476,6 +1615,7 @@ test_legacy_and_fuzzy_fallbacks_are_unlinked
 test_delegated_secondmate_projection
 test_handoff_rebinds_identity_and_decision_surfaces
 test_handoff_preparation_is_durable_and_rollback_safe
+test_unsafe_publication_setup_uses_integrity_exit
 test_delegated_integrity_failure_stops_parent_publication
 test_schema_maximum_delegated_identities_are_streamed_once
 test_bearings_preserves_complete_identity_references

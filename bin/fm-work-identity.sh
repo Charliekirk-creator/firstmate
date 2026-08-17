@@ -19,6 +19,7 @@
 #   fm-work-identity.sh dispatch-prepare <task-id> --brief <draft.md> --instructions-path <brief.md> --transaction <id> [--meta <task.meta> --prior-brief <brief.md>]
 #   fm-work-identity.sh dispatch-commit <task-id> --brief <brief.md> --meta <task.meta> --transaction <id>
 #   fm-work-identity.sh dispatch-abort <task-id> --transaction <id>
+#   fm-work-identity.sh dispatch-retire <task-id>
 #   fm-work-identity.sh home-id
 #   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]
 #   fm-work-identity.sh handoff-stage <task-id> --file <transfer.json|->
@@ -113,6 +114,7 @@ MAX_ARRAY=20
 MAX_PROJECTION_BYTES=$((MAX_BYTES + 2048))
 MAX_PROJECTION_BATCH_BYTES=1048576
 DIE_STATUS=1
+case "${1:-}" in publication-run) DIE_STATUS=42 ;; esac
 FM_HOME_ID=
 LOCATED_TASK=
 ACTIVE_IDENTITY_LOCK=
@@ -1517,8 +1519,8 @@ dispatch_projection_matches_state() {  # <projection-json> <brief-sha>
     || die "dispatch identity digest is stale or mismatched"
 }
 
-dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction> [meta] [prior-brief]
-  local task=$1 brief=$2 instructions_path=$3 transaction=$4 meta=${5:-} prior_brief=${6:-}
+dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction> [meta] [prior-brief] [resume]
+  local task=$1 brief=$2 instructions_path=$3 transaction=$4 meta=${5:-} prior_brief=${6:-} resume=${7:-false}
   local projection previous_hash= identity_status identity_sha existing_status= existing_path= existing_sha= recovery_meta
   dispatch_transaction_valid "$transaction" || die "dispatch transaction is malformed"
   safe_regular_file "$brief" "dispatch instruction draft"
@@ -1563,6 +1565,15 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
       existing_sha=$DISPATCH_INSTRUCTIONS_SHA
     fi
     validate_completed_dispatch "$task"
+    if [ "$resume" = true ] && [ -z "$meta" ] && [ -z "$prior_brief" ]; then
+      capture_identity_projection_locked "$task" "$brief" "$STATE_REAL/$task.meta" "$instructions_path"
+      projection=$IDENTITY_PROJECTION
+      dispatch_projection_matches_state "$projection" "$BRIEF_HASH"
+      jq -n -S -c --arg transaction "$DISPATCH_TRANSACTION" \
+        --arg hash "$DISPATCH_INSTRUCTIONS_SHA" --argjson identity "$projection" \
+        '{transaction_id:$transaction,instructions_sha256:$hash,work_identity:$identity}'
+      return 0
+    fi
   fi
   if [ -n "$meta" ] || [ -n "$prior_brief" ]; then
     [ -n "$meta" ] && [ -n "$prior_brief" ] \
@@ -1701,6 +1712,25 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
   rm -f -- "$DISPATCH_STATE" || die "cannot abort work identity dispatch"
 }
 
+dispatch_retire() {  # <task-id>
+  local task=$1 meta="$STATE_REAL/$1.meta" launch="$STATE_REAL/$1.launch-brief.md"
+  publication_lock_acquire
+  identity_lock_acquire "$task"
+  reject_handoff_guard "$task"
+  if [ ! -e "$DISPATCH_STATE" ] && [ ! -L "$DISPATCH_STATE" ]; then return 0; fi
+  read_dispatch_state "$task"
+  [ "$DISPATCH_STATUS" = completed ] || die "task $task has an incomplete work identity dispatch"
+  [ ! -e "$meta" ] && [ ! -L "$meta" ] \
+    || die "task $task still has dispatch metadata"
+  [ ! -e "$launch" ] && [ ! -L "$launch" ] \
+    || die "task $task still has launch instructions"
+  [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
+    || die "task $task dispatch instructions path is mismatched"
+  [ ! -e "$DISPATCH_PRIOR" ] && [ ! -L "$DISPATCH_PRIOR" ] \
+    || die "task $task still has retained prior dispatch instructions"
+  rm -f -- "$DISPATCH_STATE" || die "cannot retire work identity dispatch"
+}
+
 publication_preflight_locked() {
   local task_dir task guarded guarded_path
   ensure_data_dir
@@ -1764,7 +1794,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections|publication-run) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit|dispatch-abort|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit|dispatch-abort|dispatch-retire|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -1899,6 +1929,7 @@ case "$COMMAND" in
     DISPATCH_TRANSACTION_ARG=
     DISPATCH_META=
     DISPATCH_PRIOR_BRIEF=
+    DISPATCH_RESUME=false
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --brief) shift; [ "$#" -gt 0 ] || die "--brief requires a path"; DISPATCH_BRIEF=$1 ;;
@@ -1906,6 +1937,7 @@ case "$COMMAND" in
         --transaction) shift; [ "$#" -gt 0 ] || die "--transaction requires an id"; DISPATCH_TRANSACTION_ARG=$1 ;;
         --meta) shift; [ "$#" -gt 0 ] || die "--meta requires a path"; DISPATCH_META=$1 ;;
         --prior-brief) shift; [ "$#" -gt 0 ] || die "--prior-brief requires a path"; DISPATCH_PRIOR_BRIEF=$1 ;;
+        --resume) DISPATCH_RESUME=true ;;
         *) die "unknown dispatch-prepare argument: $1" ;;
       esac
       shift
@@ -1913,7 +1945,7 @@ case "$COMMAND" in
     [ -n "$DISPATCH_BRIEF" ] && [ -n "$DISPATCH_INSTRUCTIONS_PATH" ] && [ -n "$DISPATCH_TRANSACTION_ARG" ] \
       || die "dispatch-prepare requires --brief, --instructions-path, and --transaction"
     dispatch_prepare "$TASK" "$DISPATCH_BRIEF" "$DISPATCH_INSTRUCTIONS_PATH" \
-      "$DISPATCH_TRANSACTION_ARG" "$DISPATCH_META" "$DISPATCH_PRIOR_BRIEF"
+      "$DISPATCH_TRANSACTION_ARG" "$DISPATCH_META" "$DISPATCH_PRIOR_BRIEF" "$DISPATCH_RESUME"
     ;;
   dispatch-commit)
     DISPATCH_BRIEF=
@@ -1936,6 +1968,10 @@ case "$COMMAND" in
     [ "$#" -eq 2 ] && [ "$1" = --transaction ] \
       || die "dispatch-abort usage: fm-work-identity.sh dispatch-abort <task-id> --transaction <id>"
     dispatch_abort "$TASK" "$2"
+    ;;
+  dispatch-retire)
+    [ "$#" -eq 0 ] || die "dispatch-retire accepts only a task id"
+    dispatch_retire "$TASK"
     ;;
   handoff-prepare)
     [ "$#" -eq 4 ] || [ "$#" -eq 5 ] \
