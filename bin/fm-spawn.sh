@@ -1878,6 +1878,8 @@ WORK_DISPATCH_JSON=$(
     "$SCRIPT_DIR/fm-work-identity.sh" "${WORK_IDENTITY_ARGS[@]}"
 ) || exit 1
 SPAWN_DISPATCH_PENDING=1
+SPAWN_DISPATCH_TRANSACTION=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -er '.transaction_id') \
+  || { echo "error: work identity dispatch binding has no transaction receipt for $ID" >&2; exit 1; }
 WORK_IDENTITY_JSON=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -ec '.work_identity') \
   || { echo "error: work identity dispatch binding is malformed for $ID" >&2; exit 1; }
 LAUNCH_BRIEF_HASH=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -er '.instructions_sha256') \

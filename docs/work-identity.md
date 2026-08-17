@@ -24,7 +24,7 @@ bin/fm-work-identity.sh verify <task-id> | jq .
 
 Then scaffold and dispatch the task normally.
 `fm-brief.sh` embeds the canonical payload and digest in the generated instructions and asks the contract owner to publish the validated bytes atomically.
-`fm-spawn.sh` enters an owner-managed prepare/commit transaction before creating an endpoint, copies the brief to a per-task launch snapshot, and binds its path, SHA-256 digest, and dispatch transaction receipt in task metadata before delivering the frozen operational input. If execution stops after metadata publication but before commit, the contract owner completes only that exact metadata-bound transaction; projection reads the bound launch snapshot rather than an older source brief. Backlog ownership handoff is excluded while dispatch is prepared and remains unavailable once source dispatch metadata exists.
+`fm-spawn.sh` enters an owner-managed prepare/commit transaction before creating an endpoint, copies the brief to a per-task launch snapshot, and binds its path, SHA-256 digest, and dispatch transaction receipt in task metadata before delivering the frozen operational input. If execution stops before metadata publication, an exact retry resumes the prepared owner receipt; if it stops after metadata publication but before commit, the contract owner completes only that exact metadata-bound transaction. Projection requires that receipt whenever metadata advertises a transaction, validates one stable metadata capture, and reads the bound launch snapshot rather than an older source brief. Backlog ownership handoff is excluded while dispatch is prepared and remains unavailable once source dispatch metadata exists.
 A ship or scout relaunch validates the prior snapshot and metadata under the same owner transaction before replacing them with the progress-note-bearing instructions; a pre-publication abort restores the prior binding.
 Kimi receives the same frozen input after its readiness gate. Replacing the source brief during launch therefore cannot change what any supported worker tool receives.
 Repeating `record` with the same manifest is an idempotent no-op.
@@ -37,13 +37,13 @@ A task can carry several exact work units while remaining one worker in fleet co
 Every exact identity is paired with a human display label, but the namespace, kind, and ID tuple alone establishes identity.
 
 The binding combines the physical home path with a stable `main` or `secondmate:<id>` home identity, so a remote secondmate at the same absolute path as its primary remains a different owner.
-Tasks without a record remain compatible and appear explicitly as unlinked, including path-safe legacy task IDs longer than the current intake limit.
+Tasks without a record remain compatible and appear explicitly as unlinked, including path-safe legacy task IDs longer than both the current intake limit and one filesystem component; read-only projection uses a bounded derived lock key and does not create a task data directory.
 Firstmate never constructs a relation from a task title, repository, branch, endpoint, worker name, time, label, or status text.
 
 ## Read-only projections
 
 The authoritative fleet snapshot exposes the structured identity on task rows, backlog rows, and validated secondmate child summaries.
-A child summary carries one normalized task reference index, and the primary resolves each exact projection once through schema-sized bounded batches before publishing any delegated surface.
+A child summary carries one normalized task reference index, and the primary resolves each exact projection once through one bounded per-home stream and one overall deadline before publishing any delegated surface.
 Bearings keeps one row per worker and renders every complete exact ID beside its label, including a separate delegated-child projection for work running inside a secondmate home.
 The primary does not reconstruct local or remote child trees, and an identity-integrity failure in a readable child home stops the parent snapshot instead of becoming an unknown transport result.
 

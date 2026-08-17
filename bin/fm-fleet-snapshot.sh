@@ -195,6 +195,7 @@ usage() {
 usage: fm-fleet-snapshot.sh --json
        fm-fleet-snapshot.sh --secondmate-home-summary
        fm-fleet-snapshot.sh --secondmate-home-identities <task-id>...
+       fm-fleet-snapshot.sh --secondmate-home-identity-stream <task-id>...
 
 Print a structured snapshot of the firstmate fleet.
 JSON is the stable machine-readable output contract. The default snapshot
@@ -206,8 +207,8 @@ aggregation, includes generated_epoch for freshness arithmetic, and marks
 inventory contradictions or unavailable child state invalid.
 kind=secondmate meta records are not child inventory for unowned_current or
 terminal_in_flight; they never have backlog rows. Its normalized work-identity
-index is resolved through bounded --secondmate-home-identities batches before a
-parent can publish child surfaces.
+index is resolved through one bounded --secondmate-home-identity-stream
+invocation before a parent can publish child surfaces.
 Its invalidity object names the normalized failure kind and affected ids.
 Actionable tasks-axi captain holds appear as decisions_open and stay visible in
 queued with hold_reason, hold_kind, hold_until, deferred_marker, and plural
@@ -243,10 +244,15 @@ SNAPSHOT_ARGS=("$@")
 case "${1:---json}" in
   --json) [ "$#" -le 1 ] || { usage >&2; exit 2; } ;;
   --secondmate-home-summary) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; OUTPUT_MODE=secondmate-home-summary ;;
-  --secondmate-home-identities)
+  --secondmate-home-identities|--secondmate-home-identity-stream)
+    IDENTITY_MODE=$1
     shift
     [ "$#" -gt 0 ] || { usage >&2; exit 2; }
-    OUTPUT_MODE=secondmate-home-identities
+    if [ "$IDENTITY_MODE" = --secondmate-home-identities ]; then
+      OUTPUT_MODE=secondmate-home-identities
+    else
+      OUTPUT_MODE=secondmate-home-identity-stream
+    fi
     IDENTITY_TASKS=("$@")
     ;;
   -h|--help) usage; exit 0 ;;
@@ -256,7 +262,7 @@ esac
 identity_owner_setup_failure() {
   echo "fm-fleet-snapshot: $1" >&2
   case "$OUTPUT_MODE" in
-    secondmate-home-summary|secondmate-home-identities) exit "$IDENTITY_INTEGRITY_EXIT" ;;
+    secondmate-home-summary|secondmate-home-identities|secondmate-home-identity-stream) exit "$IDENTITY_INTEGRITY_EXIT" ;;
     *) exit 1 ;;
   esac
 }
@@ -562,6 +568,20 @@ secondmate_home_identities_json() {
   rc=$?
   rm -f -- "$tmp"
   return "$rc"
+}
+
+secondmate_home_identity_stream() {
+  local id identity rc
+  jq -n -c --arg generated "$SNAPSHOT_NOW" --arg home "$FM_HOME" --arg home_id "$WORK_IDENTITY_HOME_ID" \
+    '{schema:"fm-secondmate-home-identity-stream.v1",generated:$generated,home:$home,home_id:$home_id}' \
+    || return 1
+  for id in "${IDENTITY_TASKS[@]}"; do
+    rc=0
+    identity=$(project_task_work_identity_json "$id") || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    printf '%s\n' "$identity" | jq -c --arg task_id "$id" \
+      '{task_id:$task_id,work_identity:.}' || return 1
+  done
 }
 
 task_json_lines_raw() {
@@ -1020,10 +1040,10 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
 }
 
 fetch_secondmate_work_identities_json() {  # <id> <home> <remote> <summary-json>
-  local id=$1 home=$2 remote=$3 summary=$4 home_id index ids_raw rc tmp result bytes records expected
+  local id=$1 home=$2 remote=$3 summary=$4 home_id index ids_raw rc tmp stream_tmp
+  local bytes max_stream_bytes header records expected offset end task
   home_id="secondmate:$id"
-  local offset end task
-  local -a task_ids batch
+  local -a task_ids
   index=$(printf '%s' "$summary" | jq -c '.work_identity_index') \
     || return "$IDENTITY_INTEGRITY_EXIT"
   rc=0
@@ -1057,66 +1077,81 @@ EOF
     return 0
   fi
   tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-parent-work-identities.XXXXXX") || return 1
+  stream_tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-parent-work-identity-stream.XXXXXX") \
+    || { rm -f -- "$tmp"; return 1; }
+  rc=0
+  if [ "$remote" = true ]; then
+    fm_run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" \
+      "$SCRIPT_DIR/fm-on.sh" "$id" fm-fleet-snapshot.sh \
+        --secondmate-home-identity-stream "${task_ids[@]}" \
+        < /dev/null > "$stream_tmp" 2>/dev/null || rc=$?
+  else
+    fm_run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" env \
+      FM_ROOT_OVERRIDE="$FM_ROOT" \
+      FM_HOME="$home" \
+      FM_STATE_OVERRIDE="$home/state" \
+      FM_DATA_OVERRIDE="$home/data" \
+      FM_CONFIG_OVERRIDE="$home/config" \
+      FM_PROJECTS_OVERRIDE="$home/projects" \
+      FM_SNAPSHOT_NOW="$SNAPSHOT_NOW" \
+      FM_SNAPSHOT_NOW_EPOCH="$SNAPSHOT_EPOCH" \
+      "$SCRIPT_DIR/fm-fleet-snapshot.sh" --secondmate-home-identity-stream \
+        "${task_ids[@]}" > "$stream_tmp" 2>/dev/null || rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    rm -f -- "$tmp" "$stream_tmp"
+    [ "$rc" -eq "$IDENTITY_INTEGRITY_EXIT" ] && return "$IDENTITY_INTEGRITY_EXIT"
+    return 3
+  fi
+  bytes=$(LC_ALL=C wc -c < "$stream_tmp" | tr -d ' ')
+  max_stream_bytes=$((4096 + ${#task_ids[@]} * (WORK_IDENTITY_PROJECTION_MAX_BYTES + 2048)))
+  if [ "$bytes" -gt "$max_stream_bytes" ]; then
+    rm -f -- "$tmp" "$stream_tmp"
+    return 3
+  fi
+  header=$(LC_ALL=C head -n 1 "$stream_tmp") || {
+    rm -f -- "$tmp" "$stream_tmp"
+    return 3
+  }
+  printf '%s' "$header" | jq -e --arg home "$home" --arg home_id "$home_id" '
+    (keys | sort) == (["generated","home","home_id","schema"] | sort)
+    and .schema == "fm-secondmate-home-identity-stream.v1"
+    and .home == $home and .home_id == $home_id
+  ' >/dev/null 2>&1 || {
+    rm -f -- "$tmp" "$stream_tmp"
+    echo "fm-fleet-snapshot: secondmate work identity stream envelope is mismatched for $id" >&2
+    return "$IDENTITY_INTEGRITY_EXIT"
+  }
+  LC_ALL=C tail -n +2 "$stream_tmp" > "$tmp" || {
+    rm -f -- "$tmp" "$stream_tmp"
+    return 3
+  }
+  rm -f -- "$stream_tmp"
+  records=$(jq -s -c '.' "$tmp") || { rm -f -- "$tmp"; return "$IDENTITY_INTEGRITY_EXIT"; }
+  expected=$(printf '%s\n' "${task_ids[@]}" | jq -R -s -c '[splits("\n") | select(length > 0)]') \
+    || { rm -f -- "$tmp"; return 1; }
+  printf '%s\n%s\n%s\n' "$expected" "$index" "$records" | jq -n -e '
+    (input) as $expected | (input) as $index | (input) as $records
+    | ($records | map(.task_id)) == $expected
+      and ($records | map(.task_id) | unique | length) == ($records | length)
+      and all($records[];
+        . as $record
+        | any($index[];
+            .task_id == $record.task_id
+            and .status == $record.work_identity.status
+            and .schema == $record.work_identity.schema
+            and .sha256 == $record.work_identity.sha256))
+  ' >/dev/null 2>&1 || {
+    rm -f -- "$tmp"
+    echo "fm-fleet-snapshot: secondmate work identity stream commitments are mismatched for $id" >&2
+    return "$IDENTITY_INTEGRITY_EXIT"
+  }
   offset=0
   while [ "$offset" -lt "${#task_ids[@]}" ]; do
     end=$((offset + WORK_IDENTITY_BATCH_SIZE))
     [ "$end" -le "${#task_ids[@]}" ] || end=${#task_ids[@]}
-    batch=("${task_ids[@]:offset:end-offset}")
-    rc=0
-    if [ "$remote" = true ]; then
-      result=$(fm_run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" \
-        "$SCRIPT_DIR/fm-on.sh" "$id" fm-fleet-snapshot.sh \
-          --secondmate-home-identities "${batch[@]}" < /dev/null 2>/dev/null) || rc=$?
-    else
-      result=$(fm_run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" env \
-        FM_ROOT_OVERRIDE="$FM_ROOT" \
-        FM_HOME="$home" \
-        FM_STATE_OVERRIDE="$home/state" \
-        FM_DATA_OVERRIDE="$home/data" \
-        FM_CONFIG_OVERRIDE="$home/config" \
-        FM_PROJECTS_OVERRIDE="$home/projects" \
-        FM_SNAPSHOT_NOW="$SNAPSHOT_NOW" \
-        FM_SNAPSHOT_NOW_EPOCH="$SNAPSHOT_EPOCH" \
-        "$SCRIPT_DIR/fm-fleet-snapshot.sh" --secondmate-home-identities "${batch[@]}" 2>/dev/null) || rc=$?
-    fi
-    if [ "$rc" -ne 0 ]; then
-      rm -f -- "$tmp"
-      [ "$rc" -eq "$IDENTITY_INTEGRITY_EXIT" ] && return "$IDENTITY_INTEGRITY_EXIT"
-      return 3
-    fi
-    bytes=$(printf '%s' "$result" | LC_ALL=C wc -c | tr -d ' ')
-    if [ "$bytes" -gt "$FM_SNAPSHOT_SECONDMATE_IDENTITY_MAX_BYTES" ]; then
-      rm -f -- "$tmp"
-      return 3
-    fi
-    printf '%s' "$result" | jq -e --arg home "$home" --arg home_id "$home_id" '
-      .schema == "fm-secondmate-home-identities.v1"
-      and .home == $home and .home_id == $home_id and (.records | type) == "array"
-    ' >/dev/null 2>&1 || {
-      rm -f -- "$tmp"
-      echo "fm-fleet-snapshot: secondmate work identity batch envelope is mismatched for $id" >&2
-      return "$IDENTITY_INTEGRITY_EXIT"
-    }
-    records=$(printf '%s' "$result" | jq -c '.records') \
-      || { rm -f -- "$tmp"; return "$IDENTITY_INTEGRITY_EXIT"; }
-    expected=$(printf '%s\n' "${batch[@]}" | jq -R -s -c '[splits("\n") | select(length > 0)]') \
+    records=$(jq -s -c --argjson offset "$offset" --argjson end "$end" '.[$offset:$end]' "$tmp") \
       || { rm -f -- "$tmp"; return 1; }
-    printf '%s\n%s\n%s\n' "$expected" "$index" "$records" | jq -n -e '
-      (input) as $expected | (input) as $index | (input) as $records
-      | ($records | map(.task_id)) == $expected
-        and ($records | map(.task_id) | unique | length) == ($records | length)
-        and all($records[];
-          . as $record
-          | any($index[];
-              .task_id == $record.task_id
-              and .status == $record.work_identity.status
-              and .schema == $record.work_identity.schema
-              and .sha256 == $record.work_identity.sha256))
-    ' >/dev/null 2>&1 || {
-      rm -f -- "$tmp"
-      echo "fm-fleet-snapshot: secondmate work identity batch commitments are mismatched for $id" >&2
-      return "$IDENTITY_INTEGRITY_EXIT"
-    }
     rc=0
     printf '%s\n' "$records" \
       | FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
@@ -1126,8 +1161,6 @@ EOF
       rm -f -- "$tmp"
       return "$IDENTITY_INTEGRITY_EXIT"
     fi
-    printf '%s\n' "$records" | jq -c '.[]' >> "$tmp" \
-      || { rm -f -- "$tmp"; return 1; }
     offset=$end
   done
   jq -s -c 'sort_by(.task_id)' "$tmp"
@@ -1965,9 +1998,13 @@ scout_report_lines() {
     | jq -s 'sort_by(.id)'
 }
 
-if [ "$OUTPUT_MODE" = secondmate-home-identities ]; then
+if [ "$OUTPUT_MODE" = secondmate-home-identities ] || [ "$OUTPUT_MODE" = secondmate-home-identity-stream ]; then
   IDENTITY_OUTPUT_RC=0
-  secondmate_home_identities_json || IDENTITY_OUTPUT_RC=$?
+  if [ "$OUTPUT_MODE" = secondmate-home-identities ]; then
+    secondmate_home_identities_json || IDENTITY_OUTPUT_RC=$?
+  else
+    secondmate_home_identity_stream || IDENTITY_OUTPUT_RC=$?
+  fi
   [ "$IDENTITY_OUTPUT_RC" -eq 0 ] || {
     echo "fm-fleet-snapshot: secondmate work identity projection failed" >&2
     exit "$IDENTITY_OUTPUT_RC"

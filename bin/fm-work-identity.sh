@@ -114,6 +114,7 @@ MAX_PROJECTION_BYTES=$((MAX_BYTES + 2048))
 MAX_PROJECTION_BATCH_BYTES=1048576
 DIE_STATUS=1
 FM_HOME_ID=
+LOCATED_TASK=
 ACTIVE_IDENTITY_LOCK=
 ACTIVE_IDENTITY_LOCK_HELD=0
 ACTIVE_PUBLICATION_LOCK=
@@ -124,6 +125,9 @@ MANIFEST_CAPTURE_TMP=
 MANIFEST_CAPTURE_SOURCE=
 MANIFEST_CAPTURE_IDENTITY=
 SIDECAR_SNAPSHOT_TMP=
+META_CAPTURE_TMP=
+META_CAPTURE_SOURCE=
+META_CAPTURE_IDENTITY=
 BRIEF_INPUT_TMP=
 BRIEF_HASH=
 BRIEF_VALIDATED_CAPTURE=
@@ -140,6 +144,7 @@ work_identity_cleanup() {
   [ -z "${VALIDATION_TMP:-}" ] || rm -f -- "$VALIDATION_TMP" 2>/dev/null || true
   [ -z "${MANIFEST_CAPTURE_TMP:-}" ] || rm -f -- "$MANIFEST_CAPTURE_TMP" 2>/dev/null || true
   [ -z "${SIDECAR_SNAPSHOT_TMP:-}" ] || rm -f -- "$SIDECAR_SNAPSHOT_TMP" 2>/dev/null || true
+  [ -z "${META_CAPTURE_TMP:-}" ] || rm -f -- "$META_CAPTURE_TMP" 2>/dev/null || true
   [ -z "${BRIEF_INPUT_TMP:-}" ] || rm -f -- "$BRIEF_INPUT_TMP" 2>/dev/null || true
   [ -z "${BRIEF_VALIDATED_CAPTURE:-}" ] || rm -f -- "$BRIEF_VALIDATED_CAPTURE" 2>/dev/null || true
   [ -z "${PROJECTION_TMP:-}" ] || rm -f -- "$PROJECTION_TMP" 2>/dev/null || true
@@ -289,6 +294,7 @@ ensure_data_dir() {
 
 locate_task_dir() {  # <task-id>, read-only
   local id=$1 dir real
+  LOCATED_TASK=$id
   if [ -e "$DATA_INPUT" ] || [ -L "$DATA_INPUT" ]; then
     [ ! -L "$DATA_INPUT" ] || die "data directory is symlinked: $DATA_INPUT"
     [ -d "$DATA_INPUT" ] || die "data path is not a directory: $DATA_INPUT"
@@ -438,20 +444,70 @@ validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; set
   WORK_CANONICAL=$canonical
 }
 
+capture_metadata() {  # <meta>
+  local meta=$1 before after
+  [ -z "$META_CAPTURE_SOURCE" ] || {
+    [ "$META_CAPTURE_SOURCE" = "$meta" ] || die "cannot validate two task metadata files concurrently"
+    return 0
+  }
+  safe_regular_file "$meta" "task metadata"
+  before=$(file_identity "$meta") || die "cannot inspect task metadata: $meta"
+  META_CAPTURE_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-meta.XXXXXX") \
+    || die "cannot capture task metadata: $meta"
+  cp -- "$meta" "$META_CAPTURE_TMP" || die "cannot capture task metadata: $meta"
+  after=$(file_identity "$meta") || die "cannot reinspect task metadata: $meta"
+  [ "$before" = "$after" ] && cmp -s "$meta" "$META_CAPTURE_TMP" \
+    || die "task metadata changed while it was captured: $meta"
+  safe_regular_file "$META_CAPTURE_TMP" "captured task metadata"
+  META_CAPTURE_SOURCE=$meta
+  META_CAPTURE_IDENTITY=$before
+}
+
+finish_metadata_capture() {  # <meta>
+  local meta=$1 after
+  [ "$META_CAPTURE_SOURCE" = "$meta" ] || die "task metadata capture ownership is mismatched: $meta"
+  safe_regular_file "$meta" "task metadata"
+  after=$(file_identity "$meta") || die "cannot reinspect task metadata: $meta"
+  [ "$after" = "$META_CAPTURE_IDENTITY" ] && cmp -s "$meta" "$META_CAPTURE_TMP" \
+    || die "task metadata changed while it was validated: $meta"
+  rm -f -- "$META_CAPTURE_TMP"
+  META_CAPTURE_TMP=
+  META_CAPTURE_SOURCE=
+  META_CAPTURE_IDENTITY=
+}
+
 meta_field_exact() {  # <meta> <key>; sets META_VALUE, 0 exact, 1 absent, 2 malformed
-  local meta=$1 key=$2 count
-  count=$(grep -c "^${key}=" "$meta" 2>/dev/null || true)
+  local meta=$1 key=$2 input=$1 count
+  if [ -n "$META_CAPTURE_SOURCE" ] && [ "$meta" = "$META_CAPTURE_SOURCE" ]; then
+    input=$META_CAPTURE_TMP
+  fi
+  count=$(grep -c "^${key}=" "$input" 2>/dev/null || true)
   case "$count" in
     0) META_VALUE=; return 1 ;;
-    1) META_VALUE=$(grep "^${key}=" "$meta" | cut -d= -f2-); return 0 ;;
+    1) META_VALUE=$(grep "^${key}=" "$input" | cut -d= -f2-); return 0 ;;
     *) META_VALUE=; return 2 ;;
   esac
 }
 
-validate_meta_binding() {  # <meta> <linked|unlinked> [hash] [brief-hash] [brief-path]
+validate_optional_dispatch_metadata_receipt() {  # <meta>
+  local meta=$1 rc=0 transaction
+  meta_field_exact "$meta" work_identity_dispatch_transaction || rc=$?
+  case "$rc" in
+    1) return 0 ;;
+    2) die "task metadata has duplicate work identity dispatch transactions: $meta" ;;
+  esac
+  transaction=$META_VALUE
+  [ -n "$LOCATED_TASK" ] || die "task metadata dispatch binding has no owning task: $meta"
+  [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ] \
+    || die "task metadata dispatch transaction has no exact owner receipt: $meta"
+  read_dispatch_state "$LOCATED_TASK"
+  [ "$transaction" = "$DISPATCH_TRANSACTION" ] \
+    || die "task metadata work identity dispatch transaction is stale or mismatched: $meta"
+}
+
+validate_meta_binding_captured() {  # <meta> <linked|unlinked> [hash] [brief-hash] [brief-path]
   local meta=$1 expected=$2 hash=${3:-} brief_hash=${4:-${BRIEF_HASH:-}} brief_path=${5:-} status schema recorded_hash recorded_brief_hash recorded_brief_path rc
-  [ -e "$meta" ] || [ -L "$meta" ] || return 0
-  safe_regular_file "$meta" "task metadata"
+  validate_optional_dispatch_metadata_receipt "$meta"
   rc=0; meta_field_exact "$meta" work_identity_status || rc=$?
   if [ "$rc" -eq 1 ]; then
     meta_field_exact "$meta" work_identity_schema >/dev/null 2>&1 && die "task metadata has a work identity schema without status: $meta"
@@ -493,6 +549,17 @@ validate_meta_binding() {  # <meta> <linked|unlinked> [hash] [brief-hash] [brief
       || die "task metadata launch brief path mismatch: $meta"
   fi
   META_PROVENANCE=metadata
+}
+
+validate_meta_binding() {  # <meta> <linked|unlinked> [hash] [brief-hash] [brief-path]
+  local meta=$1 owned=0
+  [ -e "$meta" ] || [ -L "$meta" ] || return 0
+  if [ "$META_CAPTURE_SOURCE" != "$meta" ]; then
+    capture_metadata "$meta"
+    owned=1
+  fi
+  validate_meta_binding_captured "$@"
+  [ "$owned" -eq 0 ] || finish_metadata_capture "$meta"
 }
 
 brief_contract_count() {  # <brief>
@@ -696,12 +763,16 @@ publication_lock_acquire() {
 }
 
 identity_lock_acquire() {  # <task-id>
-  local task=$1
-  ensure_task_dir "$task"
+  local task=$1 lock_key
   ensure_lock_lib
-  ACTIVE_IDENTITY_LOCK="$TASK_DIR/.work-identity.lock"
+  lock_key=$(printf '%s' "$task" | sha256_stream) \
+    || die "SHA-256 is unavailable for work identity task lock"
+  case "$lock_key" in ''|*[!A-Fa-f0-9]*) die "work identity task lock digest is invalid" ;; esac
+  [ "${#lock_key}" -eq 64 ] || die "work identity task lock digest has the wrong length"
+  ACTIVE_IDENTITY_LOCK="$STATE_REAL/.work-identity-task-${lock_key}.lock"
   fm_lock_acquire_wait "$ACTIVE_IDENTITY_LOCK"
   ACTIVE_IDENTITY_LOCK_HELD=1
+  locate_task_dir "$task"
 }
 
 identity_lock_release() {
@@ -714,6 +785,7 @@ identity_lock_release() {
 identity_mutation_lock_acquire() {  # <task-id>
   publication_lock_acquire
   identity_lock_acquire "$1"
+  ensure_task_dir "$1"
 }
 
 validate_handoff_envelope() {  # <path> <task-id>; sets HANDOFF_*
@@ -916,11 +988,14 @@ write_dispatch_state() {  # <prepared|completed> <task> <transaction> <path> <br
   TMP=
 }
 
-validate_completed_dispatch() {  # <task-id>
-  local task=$1 meta projection meta_arg=
+validate_completed_dispatch() {  # <task-id> [meta]
+  local task=$1 meta=${2:-$STATE_REAL/$1.meta} projection meta_arg= owned=0
   [ "$DISPATCH_STATUS" = completed ] || die "work identity dispatch is incomplete for task $task"
-  meta="$STATE_REAL/$task.meta"
   if [ -e "$meta" ] || [ -L "$meta" ]; then
+    if [ "$META_CAPTURE_SOURCE" != "$meta" ]; then
+      capture_metadata "$meta"
+      owned=1
+    fi
     validate_dispatch_metadata_receipt "$meta"
     meta_arg=$meta
   fi
@@ -938,6 +1013,7 @@ validate_completed_dispatch() {  # <task-id>
   elif [ -e "$meta" ] || [ -L "$meta" ]; then
     die "completed dispatch instructions are absent for task $task"
   fi
+  [ "$owned" -eq 0 ] || finish_metadata_capture "$meta"
 }
 
 reject_handoff_guard() {  # <task-id>
@@ -955,19 +1031,32 @@ reject_handoff_guard() {  # <task-id>
   fi
 }
 
-reject_dispatch_guard() {  # <task-id>
-  local task=$1
+reject_dispatch_guard() {  # <task-id> [meta]
+  local task=$1 meta=${2:-$STATE_REAL/$1.meta} rc=0 owned=0
   if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
     read_dispatch_state "$task"
     [ "$DISPATCH_STATUS" = completed ] \
       || die "work identity dispatch is incomplete for task $task"
-    validate_completed_dispatch "$task"
+    validate_completed_dispatch "$task" "$meta"
+    return 0
   fi
+  [ -e "$meta" ] || [ -L "$meta" ] || return 0
+  if [ "$META_CAPTURE_SOURCE" != "$meta" ]; then
+    capture_metadata "$meta"
+    owned=1
+  fi
+  meta_field_exact "$meta" work_identity_dispatch_transaction || rc=$?
+  case "$rc" in
+    0) die "task metadata dispatch transaction has no exact owner receipt: $meta" ;;
+    1) ;;
+    *) die "task metadata has duplicate work identity dispatch transactions: $meta" ;;
+  esac
+  [ "$owned" -eq 0 ] || finish_metadata_capture "$meta"
 }
 
-reject_ownership_guard() {  # <task-id>
+reject_ownership_guard() {  # <task-id> [meta]
   reject_handoff_guard "$1"
-  reject_dispatch_guard "$1"
+  reject_dispatch_guard "$@"
 }
 
 reject_dispatch_for_handoff() {  # <task-id>
@@ -1355,11 +1444,14 @@ capture_identity_projection_locked() {  # <task-id> [brief] [meta] [meta-brief-p
 }
 
 project_identity() {  # <task-id> [brief] [meta]
-  local task=$1 brief=${2:-} meta=${3:-} meta_brief_path= recorded_brief= rc=0
+  local task=$1 brief=${2:-} meta=${3:-} meta_brief_path= recorded_brief= rc=0 meta_captured=0
   identity_lock_acquire "$task"
-  reject_ownership_guard "$task"
   if [ -n "$meta" ]; then
-    safe_regular_file "$meta" "task metadata"
+    capture_metadata "$meta"
+    meta_captured=1
+  fi
+  reject_ownership_guard "$task" "$meta"
+  if [ -n "$meta" ]; then
     meta_field_exact "$meta" launch_brief || rc=$?
     case "$rc" in
       0)
@@ -1376,7 +1468,9 @@ project_identity() {  # <task-id> [brief] [meta]
   if [ -z "$brief" ] && { [ -e "$BRIEF_DEFAULT" ] || [ -L "$BRIEF_DEFAULT" ]; }; then
     brief=$BRIEF_DEFAULT
   fi
-  render_identity_projection_locked "$task" "$brief" "$meta" "$meta_brief_path"
+  capture_identity_projection_locked "$task" "$brief" "$meta" "$meta_brief_path"
+  [ "$meta_captured" -eq 0 ] || finish_metadata_capture "$meta"
+  printf '%s\n' "$IDENTITY_PROJECTION"
 }
 
 brief_publish() {  # <task-id> <draft>
@@ -1447,8 +1541,21 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
         return 0
       fi
       recovery_meta="$STATE_REAL/$task.meta"
-      [ -e "$recovery_meta" ] || [ -L "$recovery_meta" ] \
-        || die "task $task has a different in-progress work identity dispatch"
+      if [ ! -e "$recovery_meta" ] && [ ! -L "$recovery_meta" ]; then
+        [ "$instructions_path" = "$DISPATCH_INSTRUCTIONS" ] \
+          || die "task $task has a different in-progress work identity dispatch"
+        capture_identity_projection_locked "$task" "$brief"
+        projection=$IDENTITY_PROJECTION
+        dispatch_projection_matches_state "$projection" "$BRIEF_HASH"
+        if [ -e "$DISPATCH_INSTRUCTIONS" ] || [ -L "$DISPATCH_INSTRUCTIONS" ]; then
+          capture_identity_projection_locked "$task" "$DISPATCH_INSTRUCTIONS"
+          dispatch_projection_matches_state "$IDENTITY_PROJECTION" "$BRIEF_HASH"
+        fi
+        jq -n -S -c --arg transaction "$DISPATCH_TRANSACTION" \
+          --arg hash "$DISPATCH_INSTRUCTIONS_SHA" --argjson identity "$projection" \
+          '{transaction_id:$transaction,instructions_sha256:$hash,work_identity:$identity}'
+        return 0
+      fi
       complete_prepared_dispatch_locked "$task" "$DISPATCH_INSTRUCTIONS" "$recovery_meta"
       read_dispatch_state "$task"
       existing_status=$DISPATCH_STATUS
@@ -1500,8 +1607,11 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
 }
 
 validate_dispatch_metadata_receipt() {  # <meta>
-  local meta=$1 rc=0
-  safe_regular_file "$meta" "task metadata"
+  local meta=$1 rc=0 owned=0
+  if [ "$META_CAPTURE_SOURCE" != "$meta" ]; then
+    capture_metadata "$meta"
+    owned=1
+  fi
   meta_field_exact "$meta" work_identity_dispatch_transaction || rc=$?
   [ "$rc" -eq 0 ] || {
     [ "$rc" -eq 1 ] \
@@ -1510,17 +1620,23 @@ validate_dispatch_metadata_receipt() {  # <meta>
   }
   [ "$META_VALUE" = "$DISPATCH_TRANSACTION" ] \
     || die "task metadata work identity dispatch transaction is stale or mismatched: $meta"
+  [ "$owned" -eq 0 ] || finish_metadata_capture "$meta"
 }
 
 complete_prepared_dispatch_locked() {  # <task-id> <brief> <meta>
-  local task=$1 brief=$2 meta=$3 projection
+  local task=$1 brief=$2 meta=$3 projection owned=0
   [ "$DISPATCH_STATUS" = prepared ] || die "task $task has no prepared work identity dispatch"
   [ "$brief" = "$DISPATCH_INSTRUCTIONS" ] \
     || die "dispatch commit instructions path is mismatched"
+  if [ "$META_CAPTURE_SOURCE" != "$meta" ]; then
+    capture_metadata "$meta"
+    owned=1
+  fi
   validate_dispatch_metadata_receipt "$meta"
   capture_identity_projection_locked "$task" "$brief" "$meta" "$brief"
   projection=$IDENTITY_PROJECTION
   dispatch_projection_matches_state "$projection" "$BRIEF_HASH"
+  [ "$owned" -eq 0 ] || finish_metadata_capture "$meta"
   write_dispatch_state completed "$task" "$DISPATCH_TRANSACTION" "$DISPATCH_INSTRUCTIONS" \
     "$DISPATCH_INSTRUCTIONS_SHA" "$DISPATCH_IDENTITY_STATUS" "$DISPATCH_IDENTITY_SHA" \
     "$DISPATCH_REPLACEMENT" "$DISPATCH_PREVIOUS_SHA"
@@ -1554,10 +1670,11 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
     || die "task $task prepared a different work identity dispatch"
   [ "$DISPATCH_STATUS" != completed ] || return 4
   if [ -e "$meta" ] || [ -L "$meta" ]; then
-    safe_regular_file "$meta" "task metadata"
+    capture_metadata "$meta"
     meta_field_exact "$meta" launch_brief_sha256 || rc=$?
     [ "$rc" -le 1 ] || die "task metadata has duplicate launch brief digest fields: $meta"
     if [ "$rc" -eq 0 ]; then recorded_hash=$META_VALUE; fi
+    finish_metadata_capture "$meta"
     if [ "$recorded_hash" = "$DISPATCH_INSTRUCTIONS_SHA" ]; then return 5; fi
     [ "$DISPATCH_REPLACEMENT" = true ] || return 5
   fi

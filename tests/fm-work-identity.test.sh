@@ -386,11 +386,15 @@ test_concurrent_idempotence_and_explicit_unlinked() {
 }
 
 test_projection_serializes_identity_ownership() {
-  local home task lock entered release holder projection wait_count
+  local home task lock lock_key entered release holder projection wait_count
   home=$(make_home projection-lock)
   task=serialized-projection
-  mkdir -p "$home/data/$task"
-  lock="$home/data/$task/.work-identity.lock"
+  if command -v shasum >/dev/null 2>&1; then
+    lock_key=$(printf '%s' "$task" | shasum -a 256 | awk '{print $1}')
+  else
+    lock_key=$(printf '%s' "$task" | sha256sum | awk '{print $1}')
+  fi
+  lock="$home/state/.work-identity-task-$lock_key.lock"
   entered="$home/lock.entered"
   release="$home/lock.release"
   FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" /bin/bash -c '
@@ -511,7 +515,87 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   assert_contains "$out" "duplicate work identity dispatch transactions" \
     "completed dispatch did not identify duplicate metadata receipts"
   mv "$meta.valid" "$meta"
+  cp "$home/data/$task/work-identity-dispatch.json" "$home/dispatch.valid"
+  rm "$home/data/$task/work-identity-dispatch.json"
+  rc=0
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "metadata dispatch transaction published without its owner receipt"
+  assert_contains "$out" "has no exact owner receipt" \
+    "missing dispatch receipt refusal did not identify the orphan metadata transaction"
+  mv "$home/dispatch.valid" "$home/data/$task/work-identity-dispatch.json"
   pass "dispatch prepare and committed metadata exclude backlog ownership handoff"
+}
+
+test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
+  local home task launch first second transaction hash
+  home=$(make_home prepared-dispatch-retry)
+  task=prepared-dispatch-retry
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold pre-metadata dispatch retry fixture"
+  launch="$home/state/$task.launch-brief.md"
+  first=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction retry-original) || fail "could not prepare original dispatch receipt"
+  second=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction retry-new-process) || fail "exact pre-metadata dispatch retry was wedged"
+  transaction=$(printf '%s' "$second" | jq -r '.transaction_id')
+  [ "$transaction" = retry-original ] \
+    || fail "pre-metadata retry replaced rather than resumed the exact owner receipt"
+  [ "$(printf '%s' "$first" | jq -r '.instructions_sha256')" = \
+    "$(printf '%s' "$second" | jq -r '.instructions_sha256')" ] \
+    || fail "pre-metadata retry changed the prepared instruction binding"
+  cp "$home/data/$task/brief.md" "$launch"
+  hash=$(printf '%s' "$second" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+    --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+    || fail "resumed pre-metadata dispatch receipt did not commit"
+  pass "pre-metadata dispatch retries resume one exact owner receipt"
+}
+
+test_metadata_validation_uses_one_stable_capture() {
+  local home task manifest meta fakebin real_grep out rc=0
+  home=$(make_home metadata-capture)
+  task=metadata-capture-worker
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  write_bound_meta "$home" "$task" "$home/worktree"
+  meta="$home/state/$task.meta"
+  printf 'operator_note=aaaaaaaa\n' >> "$meta"
+  cp "$meta" "$home/meta-replacement"
+  awk -F= '$1 == "operator_note" { print "operator_note=bbbbbbbb"; next } { print }' \
+    "$home/meta-replacement" > "$home/meta-replacement.tmp"
+  mv "$home/meta-replacement.tmp" "$home/meta-replacement"
+  [ "$(LC_ALL=C wc -c < "$meta" | tr -d ' ')" = \
+    "$(LC_ALL=C wc -c < "$home/meta-replacement" | tr -d ' ')" ] \
+    || fail "same-size metadata rewrite fixture changed file size"
+  fakebin=$(fm_fakebin "$home/grep-fake")
+  real_grep=$(command -v grep)
+  cat > "$fakebin/grep" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ ! -e "$FM_TEST_REWRITE_MARKER" ]; then
+  /bin/cp "$FM_TEST_META_REPLACEMENT" "$FM_TEST_META"
+  : > "$FM_TEST_REWRITE_MARKER"
+fi
+exec "$FM_TEST_REAL_GREP" "$@"
+SH
+  chmod +x "$fakebin/grep"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_META="$meta" \
+    FM_TEST_META_REPLACEMENT="$home/meta-replacement" \
+    FM_TEST_REWRITE_MARKER="$home/meta-rewritten" FM_TEST_REAL_GREP="$real_grep" \
+    FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "projection accepted metadata rewritten during validation"
+  assert_contains "$out" "task metadata changed while it was validated" \
+    "metadata rewrite refusal did not identify the unstable source"
+  pass "metadata projection validates one stable captured byte sequence"
 }
 
 test_snapshot_preflight_and_dispatch_recovery() {
@@ -743,10 +827,11 @@ test_stale_and_changed_relations_refuse() {
 # ignored, including title, repository, branch/worktree, pane, worker, time, and
 # status prose.
 test_legacy_and_fuzzy_fallbacks_are_unlinked() {
-  local home task long_task wt fakebin json bearings
+  local home task long_task component_task before_read after_read wt fakebin json bearings
   home=$(make_home fuzzy)
   task=wa-plan-2026-q3
   long_task=legacy-task-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-0123456789
+  component_task="legacy-$(printf 'x%.0s' {1..300})"
   wt="$home/projects/dtm-project-17/wu-exact-intake"
   mkdir -p "$wt" "$home/data/$task"
   printf 'legacy brief names Work Aligner wu-fleet-projection\n' > "$home/data/$task/brief.md"
@@ -756,6 +841,7 @@ test_legacy_and_fuzzy_fallbacks_are_unlinked() {
 
 ## Queued
 - [ ] $long_task - path-safe overlong legacy task (repo: legacy)
+- [ ] $component_task - filesystem-component-overlong legacy task (repo: legacy)
 
 ## Done
 EOF
@@ -772,8 +858,17 @@ EOF
   FM_HOME="$home" "$WORK_IDENTITY" verify "$long_task" | jq -e '
     .status == "unlinked" and .reason == "legacy-no-record"
   ' >/dev/null || fail "path-safe overlong legacy task did not verify as unlinked"
+  before_read=$(find "$home/data" -mindepth 1 -maxdepth 1 -type d -print | sort)
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$component_task" | jq -e \
+    --arg task "$component_task" '
+    .status == "unlinked" and .reason == "legacy-no-record"
+      and .binding.task_id == $task
+  ' >/dev/null || fail "filesystem-component-overlong legacy task did not verify as unlinked"
+  after_read=$(find "$home/data" -mindepth 1 -maxdepth 1 -type d -print | sort)
+  [ "$before_read" = "$after_read" ] \
+    || fail "legacy verification created a durable task data directory"
   json=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
-  printf '%s' "$json" | jq -e --arg long "$long_task" '
+  printf '%s' "$json" | jq -e --arg long "$long_task" --arg component "$component_task" '
     (.tasks[] | select(.id == "wa-plan-2026-q3")
       | .work_identity.status == "unlinked"
         and .work_identity.reason == "legacy-no-record"
@@ -783,6 +878,8 @@ EOF
       and (.backlog.records[] | select(.id == "wa-plan-2026-q3")
         | .work_identity.status == "unlinked")
       and (.backlog.records[] | select(.id == $long)
+        | .work_identity.status == "unlinked" and .work_identity.reason == "legacy-no-record")
+      and (.backlog.records[] | select(.id == $component)
         | .work_identity.status == "unlinked" and .work_identity.reason == "legacy-no-record")
   ' >/dev/null || fail "a fuzzy title/repo/branch/pane/status relation leaked into snapshot: $json"
   bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-08-14T12:00:00Z "$BEARINGS" --json)
@@ -1163,8 +1260,9 @@ EOF
   pass "delegated linked integrity failures stop parent publication"
 }
 
-test_schema_maximum_delegated_identities_are_batched_once() {
-  local parent mate fakebin canonical task manifest i
+test_schema_maximum_delegated_identities_are_streamed_once() {
+  local parent mate fakebin canonical task manifest i stream
+  local -a identity_tasks
   parent=$(make_home maximum-parent)
   mate="$TMP_ROOT/maximum-mate"
   mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin"
@@ -1173,9 +1271,11 @@ test_schema_maximum_delegated_identities_are_batched_once() {
   printf -- '- maximum - maximum identity domain (home: %s; scope: maximum work; projects: firstmate; added 2026-08-14)\n' \
     "$mate" > "$parent/data/secondmates.md"
   printf '## In flight\n\n## Queued\n' > "$mate/data/backlog.md"
+  identity_tasks=()
   i=1
   while [ "$i" -le 20 ]; do
     task=$(printf 'maximum-child-%02d' "$i")
+    identity_tasks+=("$task")
     manifest="$mate/$task.json"
     make_max_manifest "$mate" "$task" "$manifest"
     FM_HOME="$mate" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
@@ -1184,6 +1284,17 @@ test_schema_maximum_delegated_identities_are_batched_once() {
     i=$((i + 1))
   done
   printf '\n## Done\n' >> "$mate/data/backlog.md"
+  stream=$(FM_HOME="$mate" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z \
+    "$SNAPSHOT" --secondmate-home-identity-stream "${identity_tasks[@]}") \
+    || fail "schema-maximum identity stream failed"
+  printf '%s\n' "$stream" | jq -s -e '
+    length == 21
+      and .[0].schema == "fm-secondmate-home-identity-stream.v1"
+      and .[1].task_id == "maximum-child-01"
+      and .[-1].task_id == "maximum-child-20"
+      and (.[1:] | map(.task_id) | unique | length) == 20
+      and all(.[1:][].work_identity; .status == "linked")
+  ' >/dev/null || fail "schema-maximum identity stream envelope or order was malformed"
   fakebin=$(make_fakebin "$parent/fakes")
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
   printf '%s' "$canonical" | jq -e '
@@ -1202,7 +1313,7 @@ test_schema_maximum_delegated_identities_are_batched_once() {
           and (.work_units[-1].label | length) == 160
           and (.sources[-1].id | length) == 240)
   ' >/dev/null || fail "schema-maximum delegated identities were repeated, truncated, or suppressed: $(printf '%s' "$canonical" | jq -c '.secondmate_current.records[] | select(.id == "maximum") | {current,provenance,decisions:(.decisions_open|length),holds:(.holds|length),queued:(.queued|length),identities:(.work_identities|length),counts,omitted}')"
-  pass "schema-maximum delegated identities stream in bounded normalized batches"
+  pass "schema-maximum delegated identities stream through one bounded home invocation"
 }
 
 test_bearings_preserves_complete_identity_references() {
@@ -1304,18 +1415,47 @@ test_secondmate_parent_decisions_and_nested_caps_are_disclosed() {
     printf -- '- [ ] %s - Capped delegated child (repo: firstmate) (kind: ship) (since 2026-08-14)\n' \
       "$child" >> "$mate/data/backlog.md"
   done
-  printf '\n## Queued\n\n## Done\n' >> "$mate/data/backlog.md"
+  for child in capped-decision-a capped-decision-b; do
+    mkdir -p "$mate/projects/$child"
+    fm_write_meta "$mate/state/$child.meta" \
+      "window=firstmate:fm-$child" "worktree=$mate/projects/$child" "project=firstmate" \
+      "harness=claude" "kind=ship" "mode=no-mistakes"
+    gen=$("$ROOT/bin/fm-busy-event.sh" arm "$mate/state" "$child")
+    "$ROOT/bin/fm-busy-event.sh" apply "$mate/state" "$child" idle --gen "$gen" \
+      --source claude-hook --event stop
+    printf 'needs-decision [key=%s]: choose capped option\n' "$child" > "$mate/state/$child.status"
+    printf -- '- [ ] %s - Capped delegated decision (repo: firstmate) (kind: ship) (since 2026-08-14)\n' \
+      "$child" >> "$mate/data/backlog.md"
+  done
+  cat >> "$mate/data/backlog.md" <<'EOF'
+
+## Queued
+- [ ] capped-gate-a - Capped gate A blocked-by: external-a - external dependency A (repo: firstmate) (kind: ship)
+- [ ] capped-gate-b - Capped gate B blocked-by: external-b - external dependency B (repo: firstmate) (kind: ship)
+
+## Done
+EOF
   fakebin=$(make_fakebin "$parent/fakes")
   bearings=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_BEARINGS_NOW=2026-08-14T12:00:00Z \
-    FM_SNAPSHOT_SECONDMATE_CHILDREN=1 "$BEARINGS" --json --all-in-flight)
+    FM_SNAPSHOT_SECONDMATE_CHILDREN=1 FM_SNAPSHOT_SECONDMATE_DECISIONS=1 \
+    FM_SNAPSHOT_SECONDMATE_QUEUED=1 "$BEARINGS" --json --all-in-flight \
+      --all-decisions --all-queued)
   printf '%s' "$bearings" | jq -e '
     ([.decisions_open[] | select(.id == "capped" and .owner == "(main)")] | length) == 0
       and ([.delegated_work[] | select(.owner == "capped")] | length) == 1
+      and ([.decisions_open[] | select(.owner == "capped")] | length) == 1
+      and ([.gates[] | select(.owner == "capped")] | length) == 1
       and ([.omitted[] | select(
         .surface == "delegated_work omitted by structured-home cap for capped: 1"
         and .reveal == "raise FM_SNAPSHOT_SECONDMATE_CHILDREN")] | length) == 1
-  ' >/dev/null || fail "Bearings trusted a parent secondmate decision or hid a nested delegated cap: $bearings"
-  pass "Bearings excludes parent secondmate decisions and discloses nested worker caps"
+      and ([.omitted[] | select(
+        .surface == "decisions_open omitted by structured-home cap for capped: 1"
+        and .reveal == "raise FM_SNAPSHOT_SECONDMATE_DECISIONS")] | length) == 1
+      and ([.omitted[] | select(
+        .surface == "gates omitted by structured-home cap for capped: 1"
+        and .reveal == "raise FM_SNAPSHOT_SECONDMATE_QUEUED")] | length) == 1
+  ' >/dev/null || fail "Bearings trusted a parent decision or hid a nested cap: $bearings"
+  pass "Bearings excludes parent decisions and discloses nested surface caps"
 }
 
 test_intake_through_fleet_projection
@@ -1326,6 +1466,8 @@ test_concurrent_idempotence_and_explicit_unlinked
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
+test_pre_metadata_dispatch_reuses_exact_prepared_receipt
+test_metadata_validation_uses_one_stable_capture
 test_snapshot_preflight_and_dispatch_recovery
 test_namespace_separation_and_contract_rejections
 test_unsafe_files_labels_and_exact_binding
@@ -1335,7 +1477,7 @@ test_delegated_secondmate_projection
 test_handoff_rebinds_identity_and_decision_surfaces
 test_handoff_preparation_is_durable_and_rollback_safe
 test_delegated_integrity_failure_stops_parent_publication
-test_schema_maximum_delegated_identities_are_batched_once
+test_schema_maximum_delegated_identities_are_streamed_once
 test_bearings_preserves_complete_identity_references
 test_display_labels_cannot_spoof_exact_references
 test_secondmate_parent_decisions_and_nested_caps_are_disclosed

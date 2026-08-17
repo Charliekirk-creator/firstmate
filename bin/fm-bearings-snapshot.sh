@@ -552,6 +552,14 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          | $m.omitted[]?
          | select(.surface == "active_children")
          | {surface:("delegated_work omitted by structured-home cap for \($m.id): \(.count)"),reveal:"raise FM_SNAPSHOT_SECONDMATE_CHILDREN"}),
+        (($snap.secondmate_current.records // [])[] as $m
+         | $m.omitted[]?
+         | select(.surface == "decisions_open")
+         | {surface:("decisions_open omitted by structured-home cap for \($m.id): \(.count)"),reveal:"raise FM_SNAPSHOT_SECONDMATE_DECISIONS"}),
+        (($snap.secondmate_current.records // [])[] as $m
+         | $m.omitted[]?
+         | select(.surface == "queued")
+         | {surface:("gates omitted by structured-home cap for \($m.id): \(.count)"),reveal:"raise FM_SNAPSHOT_SECONDMATE_QUEUED"}),
         (if (($snap.secondmate_current.truncated // 0) > 0) then {surface:("registered secondmates omitted by snapshot bound: \($snap.secondmate_current.truncated)"), reveal:"raise FM_SNAPSHOT_SECONDMATES"} else empty end),
         (if $snap.secondmate_current.registry.input_truncated == true then {surface:"secondmate registry input truncated by bounded read", reveal:"raise FM_SNAPSHOT_REGISTRY_LINES or FM_SNAPSHOT_REGISTRY_BYTES"} else empty end),
         (if $snap.secondmate_current.registry.records_truncated == true then {surface:"secondmate registry records omitted by bounded read", reveal:"raise FM_SNAPSHOT_REGISTRY_RECORDS"} else empty end),
