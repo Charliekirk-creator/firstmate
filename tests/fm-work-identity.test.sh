@@ -226,6 +226,9 @@ test_spawn_delivers_validated_brief_snapshot() {
   wt="$home/worker-copy"
   delivered="$home/delivered.txt"
   make_manifest "$home" "$task" "$manifest" multi
+  jq '.work_units[0].label = "Opaque __WORKTREE__ __TURNEND__ __PIEXT__ __PITURNEND__ __PIWATCH__"' \
+    "$manifest" > "$home/opaque-manifest.json"
+  mv "$home/opaque-manifest.json" "$manifest"
   record_and_brief "$home" "$task" "$manifest"
   fm_git_worktree "$project" "$wt" immutable-delivery-copy
   fakebin=$(make_fakebin "$home/fakes")
@@ -424,7 +427,7 @@ test_projection_serializes_identity_ownership() {
 }
 
 test_dispatch_transaction_excludes_backlog_handoff() {
-  local home mate task launch transaction binding hash out rc
+  local home mate task launch transaction binding hash out rc meta
   home=$(make_home dispatch-transaction)
   mate="$TMP_ROOT/dispatch-transaction-mate"
   mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects"
@@ -465,6 +468,23 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e \
     '.status == "unlinked" and .reason == "explicitly-unlinked"' >/dev/null \
     || fail "committed dispatch did not remain authoritatively publishable"
+  meta="$home/state/$task.meta"
+  cp "$meta" "$meta.valid"
+  awk -F= '$1 == "work_identity_dispatch_transaction" { print "work_identity_dispatch_transaction=other-transaction"; next } { print }' \
+    "$meta.valid" > "$meta"
+  rc=0
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "completed dispatch accepted a stale metadata transaction receipt"
+  assert_contains "$out" "dispatch transaction is stale or mismatched" \
+    "completed dispatch did not identify its stale metadata receipt"
+  cp "$meta.valid" "$meta"
+  printf 'work_identity_dispatch_transaction=%s\n' "$transaction" >> "$meta"
+  rc=0
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "completed dispatch accepted duplicate metadata transaction receipts"
+  assert_contains "$out" "duplicate work identity dispatch transactions" \
+    "completed dispatch did not identify duplicate metadata receipts"
+  mv "$meta.valid" "$meta"
   pass "dispatch prepare and committed metadata exclude backlog ownership handoff"
 }
 
@@ -1074,7 +1094,7 @@ EOF
 }
 
 test_delegated_integrity_failure_stops_parent_publication() {
-  local parent mate task manifest out rc=0 sidecar
+  local parent mate task guarded manifest transfer out rc=0 sidecar
   parent=$(make_home integrity-parent)
   mate="$TMP_ROOT/integrity-mate"
   task=stale-delegated
@@ -1094,9 +1114,22 @@ test_delegated_integrity_failure_stops_parent_publication() {
 
 ## Done
 EOF
+  guarded=omitted-delegated-prepare
+  transfer=$(FM_HOME="$mate" "$WORK_IDENTITY" handoff-prepare "$guarded" \
+    --to-home "$parent" --to-home-id main) \
+    || fail "could not prepare omitted delegated ownership fixture"
+  out=$(FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json 2>&1) || rc=$?
+  [ "$rc" -eq 42 ] || fail "parent publication bypassed the delegated home's ownership preflight (rc=$rc): $out"
+  assert_contains "$out" "work identity integrity failure in secondmate integrity" \
+    "parent did not propagate the delegated ownership preflight failure"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" \
+    handoff-cancel "$guarded" --file - >/dev/null \
+    || fail "could not cancel omitted delegated ownership fixture"
+
   sidecar="$mate/data/$task/work-identity.json"
   jq -S -c '.work_units[0].id="stale-delegated-unit"' "$sidecar" > "$mate/changed.json"
   mv "$mate/changed.json" "$sidecar"
+  rc=0
   out=$(FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "parent published a fallback snapshot for stale delegated identity state"
   assert_contains "$out" "work identity integrity failure in secondmate integrity" \

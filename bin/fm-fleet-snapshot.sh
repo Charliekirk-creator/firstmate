@@ -253,14 +253,6 @@ case "${1:---json}" in
   *) usage >&2; exit 2 ;;
 esac
 
-if [ "${FM_WORK_IDENTITY_PUBLICATION_GUARDED:-0}" != 1 ]; then
-  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
-    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" publication-run -- \
-    env FM_WORK_IDENTITY_PUBLICATION_GUARDED=1 \
-      "$SCRIPT_DIR/fm-fleet-snapshot.sh" "${SNAPSHOT_ARGS[@]}"
-  exit $?
-fi
-
 identity_owner_setup_failure() {
   echo "fm-fleet-snapshot: $1" >&2
   case "$OUTPUT_MODE" in
@@ -268,6 +260,16 @@ identity_owner_setup_failure() {
     *) exit 1 ;;
   esac
 }
+
+SNAPSHOT_PUBLICATION_HOME=$(CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) \
+  || identity_owner_setup_failure "work identity publication home unavailable"
+if [ "${FM_WORK_IDENTITY_PUBLICATION_GUARDED_HOME:-}" != "$SNAPSHOT_PUBLICATION_HOME" ]; then
+  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" publication-run -- \
+    env FM_WORK_IDENTITY_PUBLICATION_GUARDED_HOME="$SNAPSHOT_PUBLICATION_HOME" \
+      "$SCRIPT_DIR/fm-fleet-snapshot.sh" "${SNAPSHOT_ARGS[@]}"
+  exit $?
+fi
 
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-snapshot: jq not found" >&2; exit 1; }
 WORK_IDENTITY_LIMITS=$(

@@ -921,8 +921,12 @@ validate_completed_dispatch() {  # <task-id>
   local task=$1 meta projection meta_arg=
   [ "$DISPATCH_STATUS" = completed ] || die "work identity dispatch is incomplete for task $task"
   meta="$STATE_REAL/$task.meta"
-  if [ -e "$meta" ] || [ -L "$meta" ]; then meta_arg=$meta; fi
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    validate_dispatch_metadata_receipt "$meta"
+    meta_arg=$meta
+  fi
   if [ -e "$DISPATCH_INSTRUCTIONS" ] || [ -L "$DISPATCH_INSTRUCTIONS" ]; then
+    [ -n "$meta_arg" ] || die "completed dispatch metadata is absent for task $task"
     capture_identity_projection_locked "$task" "$DISPATCH_INSTRUCTIONS" \
       "$meta_arg" "$DISPATCH_INSTRUCTIONS"
     projection=$IDENTITY_PROJECTION
