@@ -1777,11 +1777,18 @@ secondmate_current_json() {  # <parent-tasks-json>
       else
         reason="structured home ledger is missing, unreadable, or invalid"
       fi
-      if [ -z "$reason" ] && ! printf '%s' "$summary" | jq -e --arg home_id "secondmate:$id" \
-        '.home_id == $home_id' >/dev/null 2>&1; then
-        rm -f -- "$records_file"
-        echo "fm-fleet-snapshot: work identity home binding mismatch in secondmate $id" >&2
-        return "$IDENTITY_INTEGRITY_EXIT"
+      if [ -z "$reason" ] && printf '%s' "$summary" | jq -e '
+        .schema == "fm-secondmate-home-summary.v1"
+        and (.home | type) == "string" and (.home_id | type) == "string"
+      ' >/dev/null 2>&1; then
+        if ! printf '%s' "$summary" | jq -e --arg home "$home" --arg home_id "secondmate:$id" \
+          '.home == $home and .home_id == $home_id' >/dev/null 2>&1; then
+          rm -f -- "$records_file"
+          echo "fm-fleet-snapshot: work identity home binding mismatch in secondmate $id" >&2
+          return "$IDENTITY_INTEGRITY_EXIT"
+        fi
+      elif [ -z "$reason" ]; then
+        reason="structured home ledger was malformed or stale"
       fi
       if [ -z "$reason" ] && [ "$summary_source" = remote-ledger ] && [ -n "$cache_path" ]; then
         snapshot_cache_store "$summary" "$cache_path" || true

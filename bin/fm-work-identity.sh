@@ -1030,7 +1030,7 @@ handoff_cancel() {  # <task-id> <transfer-path>; 4 means source is already compl
 
 project_identity() {  # <task-id> [brief] [meta]
   local task=$1 brief=${2:-} meta=${3:-} reason
-  locate_task_dir "$task"
+  identity_lock_acquire "$task"
   reject_handoff_guard "$task"
   ensure_home_identity
   META_PROVENANCE=absent

@@ -1813,28 +1813,26 @@ WORK_IDENTITY_STATUS=
 WORK_IDENTITY_SCHEMA=
 WORK_IDENTITY_HASH=
 LAUNCH_BRIEF_HASH=
-if [ "$KIND" != secondmate ]; then
-  WORK_IDENTITY_ARGS=(dispatch-binding "$ID" --brief "$BRIEF")
-  if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
-    WORK_IDENTITY_ARGS+=(--meta "$STATE/$ID.meta")
-  fi
-  WORK_DISPATCH_JSON=$(
-    FM_HOME="$FM_HOME" \
-      FM_DATA_OVERRIDE="$DATA" \
-      FM_STATE_OVERRIDE="$STATE" \
-      FM_ROOT_OVERRIDE="$FM_ROOT" \
-      "$SCRIPT_DIR/fm-work-identity.sh" "${WORK_IDENTITY_ARGS[@]}"
-  ) || exit 1
-  WORK_IDENTITY_JSON=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -ec '.work_identity') \
-    || { echo "error: work identity dispatch binding is malformed for $ID" >&2; exit 1; }
-  LAUNCH_BRIEF_HASH=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -er '.instructions_sha256') \
-    || { echo "error: work identity dispatch binding has no instructions digest for $ID" >&2; exit 1; }
-  WORK_IDENTITY_STATUS=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.status') \
-    || { echo "error: work identity projection has no status for $ID" >&2; exit 1; }
-  WORK_IDENTITY_SCHEMA=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.schema') \
-    || { echo "error: work identity projection has no schema for $ID" >&2; exit 1; }
-  WORK_IDENTITY_HASH=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -r '.sha256 // ""')
+WORK_IDENTITY_ARGS=(dispatch-binding "$ID" --brief "$BRIEF")
+if [ "$KIND" != secondmate ] && { [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; }; then
+  WORK_IDENTITY_ARGS+=(--meta "$STATE/$ID.meta")
 fi
+WORK_DISPATCH_JSON=$(
+  FM_HOME="$FM_HOME" \
+    FM_DATA_OVERRIDE="$DATA" \
+    FM_STATE_OVERRIDE="$STATE" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-work-identity.sh" "${WORK_IDENTITY_ARGS[@]}"
+) || exit 1
+WORK_IDENTITY_JSON=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -ec '.work_identity') \
+  || { echo "error: work identity dispatch binding is malformed for $ID" >&2; exit 1; }
+LAUNCH_BRIEF_HASH=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -er '.instructions_sha256') \
+  || { echo "error: work identity dispatch binding has no instructions digest for $ID" >&2; exit 1; }
+WORK_IDENTITY_STATUS=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.status') \
+  || { echo "error: work identity projection has no status for $ID" >&2; exit 1; }
+WORK_IDENTITY_SCHEMA=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.schema') \
+  || { echo "error: work identity projection has no schema for $ID" >&2; exit 1; }
+WORK_IDENTITY_HASH=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -r '.sha256 // ""')
 SPAWN_BRIEF_BODY=$(cat "$BRIEF" || exit $?; printf '\034') \
   || { echo "error: could not capture validated launch brief" >&2; exit 1; }
 SPAWN_BRIEF_BODY=${SPAWN_BRIEF_BODY%$'\034'}

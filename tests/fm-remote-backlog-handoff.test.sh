@@ -326,8 +326,10 @@ FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-work-identity.sh" verify linked-remote \
         and .work_units[0].id == "remote-unit" and .sources[0].id == "DTM-REMOTE-1"
     ' >/dev/null || fail "remote receipt lost or misbound the exact work identity"
 assert_grep 'linked-remote' "$REMOTE/data/backlog.md" "linked remote backlog row did not arrive"
-assert_absent "$REMOTE/data/linked-remote/work-identity-handoff-target.json" \
-  "remote handoff retained an uncommitted target identity"
+jq -e '.role == "target" and .state == "completed"
+    and .transfer.source.home_id == "main"' \
+  "$REMOTE/data/linked-remote/work-identity-handoff-target.json" >/dev/null \
+  || fail "remote handoff did not retain a completed target ownership receipt"
 jq -e '.state == "completed" and .transfer.target.home_id == "secondmate:ios"' \
   "$PARENT/data/linked-remote/work-identity-handoff-source.json" >/dev/null \
   || fail "remote handoff did not retain a completed source ownership tombstone"

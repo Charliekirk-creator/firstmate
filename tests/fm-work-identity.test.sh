@@ -347,6 +347,47 @@ test_concurrent_idempotence_and_explicit_unlinked() {
   pass "concurrent identical records converge and intentional unlinked intake stays explicit"
 }
 
+test_projection_serializes_identity_ownership() {
+  local home task lock entered release holder projection wait_count
+  home=$(make_home projection-lock)
+  task=serialized-projection
+  mkdir -p "$home/data/$task"
+  lock="$home/data/$task/.work-identity.lock"
+  entered="$home/lock.entered"
+  release="$home/lock.release"
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" /bin/bash -c '
+    set -eu
+    . "$1"
+    fm_lock_acquire_wait "$2"
+    : > "$3"
+    while [ ! -e "$4" ]; do sleep 0.02; done
+    fm_lock_release "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$lock" "$entered" "$release" &
+  holder=$!
+  wait_count=0
+  while [ ! -e "$entered" ]; do
+    kill -0 "$holder" 2>/dev/null || fail "identity lock holder exited before acquisition"
+    wait_count=$((wait_count + 1))
+    [ "$wait_count" -le 250 ] || fail "identity lock holder never acquired the contract lock"
+    sleep 0.02
+  done
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" > "$home/projection.json" 2>&1 &
+  projection=$!
+  sleep 0.2
+  if ! kill -0 "$projection" 2>/dev/null; then
+    touch "$release"
+    wait "$holder" 2>/dev/null || true
+    fail "work identity projection bypassed an in-flight ownership mutation"
+  fi
+  touch "$release"
+  wait "$holder" || fail "identity lock holder failed to release"
+  wait "$projection" || fail "serialized work identity projection failed"
+  jq -e '.status == "unlinked" and .reason == "legacy-no-record"' \
+    "$home/projection.json" >/dev/null \
+    || fail "serialized projection did not return the coherent unlinked state"
+  pass "identity projection serializes guard and sidecar state"
+}
+
 # Namespace is part of identity: identical opaque ids in separate systems stay
 # distinct, while duplicate exact tuples and invalid namespace-role pairs refuse.
 test_namespace_separation_and_contract_rejections() {
@@ -1039,6 +1080,7 @@ test_intake_through_fleet_projection
 test_spawn_delivers_validated_brief_snapshot
 test_sidecar_validation_hashes_captured_bytes
 test_concurrent_idempotence_and_explicit_unlinked
+test_projection_serializes_identity_ownership
 test_namespace_separation_and_contract_rejections
 test_unsafe_files_labels_and_exact_binding
 test_stale_and_changed_relations_refuse

@@ -155,6 +155,13 @@ case "${FM_FAKE_SSH_MODE:-normal}:$command_name:$command_rel" in
     "$FM_FAKE_REMOTE_ENTRYPOINT" "$@" < "$FM_FAKE_INHERIT_PAYLOAD"
     exit $?
     ;;
+  wrong-summary-home:fm-fleet-snapshot.sh:*)
+    if [ "$_command_action" = --secondmate-home-summary ]; then
+      summary=$("$FM_FAKE_REMOTE_ENTRYPOINT" "$@") || exit $?
+      printf '%s' "$summary" | jq -c --arg home "$FM_FAKE_WRONG_SUMMARY_HOME" '.home = $home'
+      exit $?
+    fi
+    ;;
 esac
 # The readiness gate is answered here rather than by the real doctor, which
 # would inspect and repair the RUNNER's own account. tests/fm-remote-doctor.test.sh
@@ -273,6 +280,7 @@ remote_env() {
   FM_FAKE_INHERIT_ENTERED="$TMP_ROOT/inherit.entered" \
   FM_FAKE_INHERIT_RELEASE="$TMP_ROOT/inherit.release" \
   FM_FAKE_INHERIT_PAYLOAD="$TMP_ROOT/inherit.payload" \
+  FM_FAKE_WRONG_SUMMARY_HOME="$TMP_ROOT/wrong-remote-home" \
   FM_FAKE_LAUNCH_ENTERED="$TMP_ROOT/launch.entered" \
   FM_FAKE_LAUNCH_RELEASE="$TMP_ROOT/launch.release" \
   FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_REMOTE_REPLY_WAIT_SECONDS=10 \
@@ -1041,6 +1049,14 @@ printf '%s' "$SNAPSHOT" | jq -e '.tasks[] | select(.id == "ios") | .paths.home.p
 printf '%s' "$SNAPSHOT" | jq -e '.secondmate_current.records | any(.id == "local" and .remote == false)' >/dev/null \
   || fail "fleet snapshot lost the existing local secondmate route"
 pass "fleet snapshot projects mixed local and remote structured state"
+MISMATCH_RC=0
+MISMATCH=$(FM_FAKE_SSH_MODE=wrong-summary-home \
+  remote_env "$ROOT/bin/fm-fleet-snapshot.sh" --json 2>&1) || MISMATCH_RC=$?
+[ "$MISMATCH_RC" -eq 42 ] \
+  || fail "cross-home remote summary degraded to an available fallback: $MISMATCH"
+assert_contains "$MISMATCH" 'work identity home binding mismatch in secondmate ios' \
+  "cross-home remote summary did not report an identity integrity failure"
+pass "cross-home remote summaries stop parent publication"
 rm -f "$PARENT/state/.wake-queue"
 
 # The remote code root updates independently, then the persistent home imports
