@@ -77,6 +77,10 @@ case "${1:-}" in
       case "$literal" in
         *' --auto')
           printf '%s\n' "$literal" >> "$FM_FAKE_LAUNCH_LOG"
+          if [ -n "${FM_FAKE_LAUNCH_BRIEF:-}" ]; then
+            printf 'mutated delayed kimi brief\n' > "$FM_FAKE_LAUNCH_BRIEF.replacement"
+            mv -f "$FM_FAKE_LAUNCH_BRIEF.replacement" "$FM_FAKE_LAUNCH_BRIEF"
+          fi
           printf 'launched\n' > "$FM_FAKE_KIMI_STATE"
           ;;
         *)
@@ -171,6 +175,7 @@ run_spawn() {
     FM_FAKE_KIMI_SWALLOW_FIRST="${FM_FAKE_KIMI_SWALLOW_FIRST:-no}" \
     FM_FAKE_TMUX_CALL_LOG="$case_dir/tmux-calls.log" \
     FM_FAKE_BRIEF_REAL="$(cd "$home/data/$id" && pwd -P)/brief.md" \
+    FM_FAKE_LAUNCH_BRIEF="$home/state/$id.launch-brief.md" \
     FM_KIMI_READY_POLLS=2 FM_KIMI_DELIVERY_POLLS=2 FM_KIMI_POLL_INTERVAL=0 \
     PATH="$fakebin:$BASE_PATH" \
     "$SPAWN" "$id" "$proj" --harness kimi --mode no-mistakes --yolo off "$@" 2>&1
@@ -183,7 +188,7 @@ EOF
 }
 
 test_kimi_launch_then_send_is_verified() {
-  local id rec out rc launch pointer brief_real meta task_tmp
+  local id rec out rc launch input body meta task_tmp
   id="kimi-success-z1-$$"
   task_tmp="/tmp/fm-$id"
   KIMI_RUNTIME_TASK_TMP=$task_tmp
@@ -204,10 +209,14 @@ test_kimi_launch_then_send_is_verified() {
   assert_not_contains "$launch" "turn-ended" "kimi launch embedded a turn-end path"
   assert_not_contains "$launch" "__TURNEND__" "kimi launch retained a turn-end placeholder"
 
-  brief_real="$(cd "$HOME_DIR/data/$id" && pwd -P)/brief.md"
-  pointer=$(cat "$CASE_DIR/pointer.log")
-  [ "$pointer" = "Read the brief at $brief_real and follow it exactly." ] \
-    || fail "kimi pointer was not the exact absolute-path-only instruction: $pointer"
+  input=$(cat "$CASE_DIR/pointer.log")
+  printf '%s' "$input" | "$ROOT/bin/fm-operational-input.sh" kind | grep -qx launch-brief \
+    || fail "kimi delivery was not typed as an immutable launch brief"
+  body=$(printf '%s' "$input" | "$ROOT/bin/fm-operational-input.sh" body)
+  [ "$body" = "brief for kimi" ] \
+    || fail "kimi did not receive the captured launch brief bytes: $body"
+  assert_grep 'mutated delayed kimi brief' "$HOME_DIR/state/$id.launch-brief.md" \
+    "Kimi delivery fixture did not replace the delayed brief path"
   meta="$HOME_DIR/state/$id.meta"
   assert_grep 'model=kimi-code/k3' "$meta" "kimi meta lost the requested model"
   assert_grep 'effort=high' "$meta" "kimi meta did not retain the unsupported effort axis"
@@ -487,11 +496,11 @@ test_kimi_unconfirmed_delivery_fails_loudly() {
   out=$(FM_FAKE_KIMI_DELIVERY=no run_spawn \
     "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id") || rc=$?
   [ "$rc" -ne 0 ] || fail "an unconfirmed kimi delivery should fail"
-  assert_contains "$out" "kimi brief pointer delivery was not confirmed" \
+  assert_contains "$out" "kimi launch brief delivery was not confirmed" \
     "unconfirmed kimi delivery lacked a loud diagnostic"
-  assert_grep 'failed: kimi brief pointer delivery was not confirmed' "$HOME_DIR/state/$id.status" \
+  assert_grep 'failed: kimi launch brief delivery was not confirmed' "$HOME_DIR/state/$id.status" \
     "unconfirmed kimi delivery did not leave a supervisor-visible failure"
-  pass "fm-spawn: kimi treats a silent pointer drop as a failed spawn"
+  pass "fm-spawn: kimi treats a silent launch-brief drop as a failed spawn"
 }
 
 test_kimi_readiness_gate_precedes_pointer() {
@@ -505,11 +514,11 @@ test_kimi_readiness_gate_precedes_pointer() {
   [ "$rc" -ne 0 ] || fail "kimi spawn without a ready signal should fail"
   assert_contains "$out" "kimi did not show a verified ready signal" \
     "kimi readiness failure lacked a loud diagnostic"
-  [ ! -s "$CASE_DIR/pointer.log" ] || fail "kimi pointer was sent before readiness"
+  [ ! -s "$CASE_DIR/pointer.log" ] || fail "kimi launch brief was sent before readiness"
   jq -e --arg id "$id" 'any(.endpoints[]; .id == $id)' \
     "$HOME_DIR/state/home-summary.json" >/dev/null \
     || fail "kimi readiness failure omitted its durable endpoint from the home summary"
-  pass "fm-spawn: kimi never sends the brief pointer before an observable ready signal"
+  pass "fm-spawn: kimi never sends the launch brief before an observable ready signal"
 }
 
 test_kimi_detection_uses_ancestry_after_markers() {

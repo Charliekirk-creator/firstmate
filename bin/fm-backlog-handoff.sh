@@ -574,18 +574,15 @@ rollback_local_handoff_identities() { # <target-home>
   while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
     task=${HANDOFF_IDENTITY_TASKS[$i]}
     payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    set +e
     local_target_handoff_action "$target_home" abort "$task" "$payload"
     rc=$?
-    [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || failed=1
-    i=$((i + 1))
-  done
-  i=0
-  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
-    task=${HANDOFF_IDENTITY_TASKS[$i]}
-    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
-    source_handoff_action cancel "$task" "$payload"
-    rc=$?
-    [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || failed=1
+    set -e
+    case "$rc" in
+      0) source_handoff_action cancel "$task" "$payload" || failed=1 ;;
+      4) source_handoff_action complete "$task" "$payload" || failed=1 ;;
+      *) failed=1 ;;
+    esac
     i=$((i + 1))
   done
   return "$failed"

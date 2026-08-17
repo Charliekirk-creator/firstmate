@@ -20,7 +20,8 @@ Bounded output:
 
 ```text
 ok - exact multi-work-unit intake survives instructions, metadata, snapshot, and Bearings once per worker
-ok - spawn delivers one validated brief snapshot despite source replacement
+ok - spawn delivers validated bytes despite source and snapshot replacement
+ok - sidecar validation hashes one captured byte sequence
 ok - concurrent identical records converge and intentional unlinked intake stays explicit
 ok - namespaces remain distinct and version, role, duplicate, contradiction, and id syntax are closed
 ok - unsafe manifests, labels, stored files, cross-home copies, and task mismatches refuse
@@ -38,7 +39,7 @@ ok - fixture snapshot covers task rows, backlog rows, pointers, and stable order
 ```
 
 The focused suite covers single and multiple work units, Work Aligner `plan_id` and `work_units`, DTM project and issue IDs, Data Team Ticket IDs, local Firstmate plans, namespace separation, complete stable IDs paired with labels, absent and overlong legacy records, idempotence, exact path/task/stable-home binding, local and remote handoff rebinding, malformed versions and syntax, duplicate and contradictory IDs, unsafe paths, C1 controls, Unicode format controls, symlink and hardlink refusal, stale digest refusal, delegated fail-stop propagation, schema-maximum bounded batching, stable snapshot output, delegated-child and secondmate projections, main and delegated status decisions, and every prohibited fuzzy signal.
-It also confirms that relation recording changes no runtime task-state file, all tools receive the validated launch snapshot when the source brief changes after preflight, handoff prepare excludes concurrent intake, failed multi-item staging publishes no immutable destination sidecar, and successful local and remote transfers retain exact source tombstones.
+It also confirms that relation recording changes no runtime task-state file, all tools receive one captured launch input even when the source and launch snapshot change after preflight, metadata binds the delivered byte digest, handoff prepare excludes concurrent intake, failed multi-item staging publishes no immutable destination sidecar, and successful or recovered transfers retain exact source tombstones and destination commit receipts.
 
 ## Runtime-backend applicability
 
@@ -53,7 +54,7 @@ The backend review covered every spawn-capable runtime supported on 2026-08-14:
 | cmux | Applicable | The same snapshot preflight runs before cmux workspace creation. |
 
 No backend parses the relation or receives a backend-specific identity format.
-All five converge on the same protected launch snapshot and schema/status/digest metadata fields.
+All five converge on the same captured launch input and schema/status/identity-digest/instruction-digest metadata fields.
 A secondmate child uses the same interface in its own exact `FM_HOME`; local and remote parent projections consume the bounded `fm-secondmate-home-summary.v1` result rather than scanning or reconstructing that child home.
 
 The common spawn and projection boundaries were exercised with:
@@ -86,7 +87,7 @@ The launch-template review covered every verified worker tool supported on 2026-
 | Pi | Full snapshot passed with the worker extensions | Applicable without a tool-specific parser. |
 | pi-signed | Full snapshot passed through the exact signed selection | Applicable without a tool-specific parser. |
 | Grok | Full encoded snapshot passed at launch | Applicable without a tool-specific parser. |
-| Kimi | Exact absolute snapshot pointer delivered after TUI readiness | Applicable to the same protected snapshot. |
+| Kimi | Full captured operational input delivered after TUI readiness | Applicable without a post-validation path reread. |
 | Cursor | Full snapshot passed with the exact workspace | Applicable without a tool-specific parser. |
 | Muse | Full encoded snapshot passed at launch | Applicable for its supported crewmate and scout roles. |
 

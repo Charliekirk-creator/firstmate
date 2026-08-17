@@ -14,6 +14,7 @@
 # Internal consumers:
 #   fm-work-identity.sh brief-block <task-id>
 #   fm-work-identity.sh project <task-id> [--brief <brief.md>] [--meta <task.meta>]
+#   fm-work-identity.sh dispatch-binding <task-id> --brief <brief.md> [--meta <task.meta>]
 #   fm-work-identity.sh home-id
 #   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id>
 #   fm-work-identity.sh handoff-stage <task-id> --file <transfer.json|->
@@ -110,6 +111,9 @@ ACTIVE_IDENTITY_LOCK=
 ACTIVE_IDENTITY_LOCK_HELD=0
 CONTRACT_INPUT_TMP=
 VALIDATION_TMP=
+SIDECAR_SNAPSHOT_TMP=
+BRIEF_INPUT_TMP=
+BRIEF_HASH=
 TMP=
 
 work_identity_cleanup() {
@@ -117,6 +121,8 @@ work_identity_cleanup() {
   [ -z "${TMP:-}" ] || rm -f -- "$TMP" 2>/dev/null || true
   [ -z "${CONTRACT_INPUT_TMP:-}" ] || rm -f -- "$CONTRACT_INPUT_TMP" 2>/dev/null || true
   [ -z "${VALIDATION_TMP:-}" ] || rm -f -- "$VALIDATION_TMP" 2>/dev/null || true
+  [ -z "${SIDECAR_SNAPSHOT_TMP:-}" ] || rm -f -- "$SIDECAR_SNAPSHOT_TMP" 2>/dev/null || true
+  [ -z "${BRIEF_INPUT_TMP:-}" ] || rm -f -- "$BRIEF_INPUT_TMP" 2>/dev/null || true
   if [ "${ACTIVE_IDENTITY_LOCK_HELD:-0}" -eq 1 ]; then
     ACTIVE_IDENTITY_LOCK_HELD=0
     fm_lock_release "$ACTIVE_IDENTITY_LOCK" 2>/dev/null || true
@@ -354,16 +360,26 @@ validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; set
   local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} expected_home_id=${4:-} before after canonical
   safe_regular_file "$path" "work identity record"
   before=$(file_identity "$path") || die "cannot inspect work identity record: $path"
-  canonical=$(canonicalize_manifest "$path" "$task" "$expected_home" "$expected_home_id")
-  if ! printf '%s\n' "$canonical" | cmp -s "$path" -; then
+  SIDECAR_SNAPSHOT_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-record.XXXXXX") \
+    || die "cannot capture work identity record"
+  cp -- "$path" "$SIDECAR_SNAPSHOT_TMP" || die "cannot capture work identity record: $path"
+  after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
+  [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
+    || die "work identity record changed while it was captured: $path"
+  safe_regular_file "$SIDECAR_SNAPSHOT_TMP" "captured work identity record"
+  canonical=$(canonicalize_manifest "$SIDECAR_SNAPSHOT_TMP" "$task" "$expected_home" "$expected_home_id")
+  if ! printf '%s\n' "$canonical" | cmp -s "$SIDECAR_SNAPSHOT_TMP" -; then
     die "work identity record is not canonical or has trailing data: $path"
   fi
-  after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
-  [ "$before" = "$after" ] || die "work identity record changed while it was read: $path"
-  WORK_HASH=$(sha256_file "$path") || die "SHA-256 is unavailable for work identity record"
+  WORK_HASH=$(sha256_file "$SIDECAR_SNAPSHOT_TMP") || die "SHA-256 is unavailable for work identity record"
   case "$WORK_HASH" in ''|*[!A-Fa-f0-9]*) die "work identity SHA-256 is invalid" ;; esac
   [ "${#WORK_HASH}" -eq 64 ] || die "work identity SHA-256 has the wrong length"
   WORK_HASH=$(printf '%s' "$WORK_HASH" | tr 'A-F' 'a-f')
+  after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
+  [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
+    || die "work identity record changed while it was validated: $path"
+  rm -f -- "$SIDECAR_SNAPSHOT_TMP"
+  SIDECAR_SNAPSHOT_TMP=
   WORK_CANONICAL=$canonical
 }
 
@@ -377,13 +393,14 @@ meta_field_exact() {  # <meta> <key>; sets META_VALUE, 0 exact, 1 absent, 2 malf
   esac
 }
 
-validate_meta_binding() {  # <meta> <linked|unlinked> [hash]
-  local meta=$1 expected=$2 hash=${3:-} status schema recorded_hash rc
+validate_meta_binding() {  # <meta> <linked|unlinked> [hash] [brief-hash]
+  local meta=$1 expected=$2 hash=${3:-} brief_hash=${4:-${BRIEF_HASH:-}} status schema recorded_hash recorded_brief_hash rc
   [ -e "$meta" ] || [ -L "$meta" ] || return 0
   rc=0; meta_field_exact "$meta" work_identity_status || rc=$?
   if [ "$rc" -eq 1 ]; then
     meta_field_exact "$meta" work_identity_schema >/dev/null 2>&1 && die "task metadata has a work identity schema without status: $meta"
     meta_field_exact "$meta" work_identity_sha256 >/dev/null 2>&1 && die "task metadata has a work identity digest without status: $meta"
+    meta_field_exact "$meta" launch_brief_sha256 >/dev/null 2>&1 && die "task metadata has a launch brief digest without work identity status: $meta"
     [ "$expected" = unlinked ] || die "linked work identity is not bound by task metadata: $meta"
     META_PROVENANCE=legacy
     return 0
@@ -403,6 +420,16 @@ validate_meta_binding() {  # <meta> <linked|unlinked> [hash]
     rc=0; meta_field_exact "$meta" work_identity_sha256 || rc=$?
     [ "$rc" -eq 1 ] || die "unlinked task metadata must not carry a work identity digest: $meta"
   fi
+  rc=0; meta_field_exact "$meta" launch_brief_sha256 || rc=$?
+  case "$rc" in
+    0)
+      recorded_brief_hash=$META_VALUE
+      [ -n "$brief_hash" ] && [ "$recorded_brief_hash" = "$brief_hash" ] \
+        || die "stale or mismatched launch brief digest in task metadata: $meta"
+      ;;
+    1) ;;
+    *) die "task metadata has duplicate launch brief digest fields: $meta" ;;
+  esac
   META_PROVENANCE=metadata
 }
 
@@ -410,32 +437,56 @@ brief_contract_count() {  # <brief>
   grep -c '^Work identity contract:' "$1" 2>/dev/null || true
 }
 
+finish_brief_capture() {  # <source> <source-identity>
+  local source=$1 before=$2 after
+  BRIEF_HASH=$(sha256_file "$BRIEF_INPUT_TMP") || die "SHA-256 is unavailable for generated instructions"
+  case "$BRIEF_HASH" in ''|*[!A-Fa-f0-9]*) die "generated instructions SHA-256 is invalid" ;; esac
+  [ "${#BRIEF_HASH}" -eq 64 ] || die "generated instructions SHA-256 has the wrong length"
+  BRIEF_HASH=$(printf '%s' "$BRIEF_HASH" | tr 'A-F' 'a-f')
+  after=$(file_identity "$source") || die "cannot reinspect generated instructions: $source"
+  [ "$before" = "$after" ] && cmp -s "$source" "$BRIEF_INPUT_TMP" \
+    || die "generated instructions changed while they were validated: $source"
+  rm -f -- "$BRIEF_INPUT_TMP"
+  BRIEF_INPUT_TMP=
+}
+
 validate_brief_binding() {  # <brief> <linked|unlinked> [hash] [canonical]
-  local brief=$1 expected=$2 hash=${3:-} canonical=${4:-} count marker payload_count expected_marker
+  local brief=$1 expected=$2 hash=${3:-} canonical=${4:-} count marker payload_count expected_marker before after
+  BRIEF_HASH=
   [ -e "$brief" ] || [ -L "$brief" ] || { BRIEF_PROVENANCE=absent; return 0; }
-  count=$(brief_contract_count "$brief")
+  safe_regular_file "$brief" "generated instructions"
+  before=$(file_identity "$brief") || die "cannot inspect generated instructions: $brief"
+  BRIEF_INPUT_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-brief.XXXXXX") \
+    || die "cannot capture generated instructions"
+  cp -- "$brief" "$BRIEF_INPUT_TMP" || die "cannot capture generated instructions: $brief"
+  after=$(file_identity "$brief") || die "cannot reinspect generated instructions: $brief"
+  [ "$before" = "$after" ] && cmp -s "$brief" "$BRIEF_INPUT_TMP" \
+    || die "generated instructions changed while they were captured: $brief"
+  safe_regular_file "$BRIEF_INPUT_TMP" "captured generated instructions"
+  count=$(brief_contract_count "$BRIEF_INPUT_TMP")
   if [ "$count" = 0 ]; then
     [ "$expected" = unlinked ] || die "linked work identity is missing from generated instructions: $brief"
     BRIEF_PROVENANCE=legacy
+    finish_brief_capture "$brief" "$before"
     return 0
   fi
-  safe_regular_file "$brief" "generated instructions"
   [ "$count" = 1 ] || die "generated instructions contain duplicate work identity contracts: $brief"
-  marker=$(grep '^Work identity contract:' "$brief")
+  marker=$(grep '^Work identity contract:' "$BRIEF_INPUT_TMP")
   if [ "$expected" = linked ]; then
     expected_marker="Work identity contract: $SCHEMA sha256=$hash"
     [ "$marker" = "$expected_marker" ] || die "stale or mismatched work identity contract in generated instructions: $brief"
-    payload_count=$(grep -c '^Work identity payload: ' "$brief" 2>/dev/null || true)
+    payload_count=$(grep -c '^Work identity payload: ' "$BRIEF_INPUT_TMP" 2>/dev/null || true)
     [ "$payload_count" = 1 ] || die "generated instructions require one exact work identity payload: $brief"
-    [ "$(grep '^Work identity payload: ' "$brief")" = "Work identity payload: $canonical" ] \
+    [ "$(grep '^Work identity payload: ' "$BRIEF_INPUT_TMP")" = "Work identity payload: $canonical" ] \
       || die "stale or mismatched work identity payload in generated instructions: $brief"
   else
     [ "$marker" = "Work identity contract: $SCHEMA unlinked" ] \
       || die "generated instructions claim a linked or unknown work identity without a record: $brief"
-    payload_count=$(grep -c '^Work identity payload: ' "$brief" 2>/dev/null || true)
+    payload_count=$(grep -c '^Work identity payload: ' "$BRIEF_INPUT_TMP" 2>/dev/null || true)
     [ "$payload_count" = 0 ] || die "unlinked generated instructions must not carry a work identity payload: $brief"
   fi
   BRIEF_PROVENANCE=generated-instructions
+  finish_brief_capture "$brief" "$before"
 }
 
 validate_home_literal() {  # <absolute-home>
@@ -661,7 +712,7 @@ read_handoff_state() {  # <path> <source|target>; sets HANDOFF_STATE/HANDOFF_TRA
     type == "object" and exact_keys(["schema","role","state","transfer"])
     and .schema == $schema and .role == $role
     and (if $role == "source" then (.state == "prepared" or .state == "completed")
-         else .state == "prepared" end)
+         else (.state == "prepared" or .state == "completed") end)
     and (.transfer | type) == "object"
     ) | $wrapper
   ' "$path" 2>/dev/null) || die "work identity handoff state is malformed: $path"
@@ -694,7 +745,10 @@ reject_handoff_guard() {  # <task-id>
   fi
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
     read_handoff_state "$TARGET_HANDOFF" target
-    die "work identity ownership handoff is incomplete for task $task"
+    [ "$HANDOFF_STATE" = completed ] \
+      || die "work identity ownership handoff is incomplete for task $task"
+    handoff_target_matches_current
+    validate_committed_target "$task"
   fi
 }
 
@@ -784,7 +838,10 @@ handoff_prepare() {  # <task-id> <target-home> <target-home-id>
   identity_lock_acquire "$task"
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
     read_handoff_state "$TARGET_HANDOFF" target
-    die "task $task has an incomplete incoming work identity handoff"
+    [ "$HANDOFF_STATE" = completed ] \
+      || die "task $task has an incomplete incoming work identity handoff"
+    handoff_target_matches_current
+    validate_committed_target "$task"
   fi
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
     read_handoff_state "$SOURCE_HANDOFF" source
@@ -842,6 +899,26 @@ handoff_stage() {  # <task-id> <transfer-path>
   write_handoff_state "$TARGET_HANDOFF" target prepared "$requested"
 }
 
+validate_committed_target() {  # <task-id>; HANDOFF_* loaded
+  local task=$1 meta
+  meta="$STATE_REAL/$task.meta"
+  BRIEF_HASH=
+  if [ "$HANDOFF_STATUS" = linked ]; then
+    [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ] || die "committed handoff target linked record is absent"
+    validate_sidecar "$SIDECAR" "$task"
+    [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
+      || die "committed handoff target linked record is conflicting"
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+  else
+    [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || die "committed unlinked handoff target gained a linked record"
+    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+      || validate_brief_binding "$BRIEF_DEFAULT" unlinked
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" unlinked
+  fi
+}
+
 publish_handoff_sidecar() {  # <task-id>; HANDOFF_RECORD/HANDOFF_TARGET_SHA loaded, lock held
   local task=$1
   if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
@@ -868,7 +945,7 @@ publish_handoff_sidecar() {  # <task-id>; HANDOFF_RECORD/HANDOFF_TARGET_SHA load
 }
 
 handoff_commit() {  # <task-id> <transfer-path>
-  local task=$1 path=$2 requested meta
+  local task=$1 path=$2 requested
   validate_handoff_envelope "$path" "$task"
   requested=$HANDOFF_CANONICAL
   handoff_target_matches_current
@@ -877,16 +954,15 @@ handoff_commit() {  # <task-id> <transfer-path>
     || die "task $task has no prepared incoming handoff"
   read_handoff_state "$TARGET_HANDOFF" target
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
-  meta="$STATE_REAL/$task.meta"
+  if [ "$HANDOFF_STATE" = completed ]; then
+    validate_committed_target "$task"
+    return 0
+  fi
   if [ "$HANDOFF_STATUS" = linked ]; then
     publish_handoff_sidecar "$task"
-    [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
-      || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
-    [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
-  else
-    [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] || die "unlinked handoff target gained a linked record"
   fi
-  rm -f -- "$TARGET_HANDOFF" || die "cannot clear committed handoff target state"
+  validate_committed_target "$task"
+  write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
 }
 
 handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already committed
@@ -907,12 +983,16 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
   fi
   read_handoff_state "$TARGET_HANDOFF" target
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
+  if [ "$HANDOFF_STATE" = completed ]; then
+    validate_committed_target "$task"
+    return 4
+  fi
   if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
     [ "$HANDOFF_STATUS" = linked ] || die "unlinked handoff target gained a linked record"
     validate_sidecar "$SIDECAR" "$task"
     [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
       || die "committed handoff target linked record is conflicting"
-    rm -f -- "$TARGET_HANDOFF" || die "cannot clear committed handoff target state"
+    write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
     return 4
   fi
   rm -f -- "$TARGET_HANDOFF" || die "cannot abort handoff target state"
@@ -995,7 +1075,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections) ;;
-  template|record|verify|brief-block|project|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|project|dispatch-binding|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -1164,7 +1244,7 @@ Do not infer one from the task title, repository, branch, worker, timing, endpoi
 EOF
     fi
     ;;
-  project)
+  project|dispatch-binding)
     BRIEF=
     META=
     while [ "$#" -gt 0 ]; do
@@ -1177,10 +1257,22 @@ EOF
           shift; [ "$#" -gt 0 ] || die "--meta requires a path"
           META=$1
           ;;
-        *) die "unknown project argument: $1" ;;
+        *) die "unknown $COMMAND argument: $1" ;;
       esac
       shift
     done
-    project_identity "$TASK" "$BRIEF" "$META"
+    if [ "$COMMAND" = project ]; then
+      project_identity "$TASK" "$BRIEF" "$META"
+    else
+      [ -n "$BRIEF" ] || die "dispatch-binding requires --brief"
+      TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-dispatch.XXXXXX") \
+        || die "cannot create dispatch binding projection"
+      project_identity "$TASK" "$BRIEF" "$META" > "$TMP"
+      [ -n "$BRIEF_HASH" ] || die "dispatch instructions have no validated digest"
+      jq -n -S -c --arg hash "$BRIEF_HASH" --slurpfile identity "$TMP" \
+        '{instructions_sha256:$hash,work_identity:$identity[0]}'
+      rm -f -- "$TMP"
+      TMP=
+    fi
     ;;
 esac

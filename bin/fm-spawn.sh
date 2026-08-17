@@ -163,7 +163,7 @@
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
 #   $vars and silently breaks ad-hoc `for ... in $pairs` loops).
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
-#     __BRIEF__    absolute path to the validated state/<task-id>.launch-brief.md snapshot
+#     __BRIEFINPUT__ shell-quoted immutable operational input captured from the validated launch brief
 #     __PIBIN__    quoted concrete Pi-family executable path resolved from PATH
 #     __PITUIMODE__ optional --tui-mode regular when that executable advertises it
 #     __TURNEND__  absolute path to state/<task-id>.turn-ended (for harnesses whose
@@ -172,7 +172,6 @@
 #                  written by this script; outside the worktree to avoid pi's trust gate)
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
-#     __OPINPUT__   absolute path to the canonical operational-input encoder
 #     __WORKTREE__  absolute path to the task worktree
 #     __CURSORBIN__ resolved, cursor-verified executable for a cursor launch
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
@@ -828,6 +827,7 @@ spawn_abort_cleanup() {
             echo "worktree=${WT:-}"
             echo "project=$PROJ_ABS"
             echo "launch_brief=${BRIEF:-}"
+            [ -z "${LAUNCH_BRIEF_HASH:-}" ] || echo "launch_brief_sha256=$LAUNCH_BRIEF_HASH"
             echo "harness=$HARNESS"
             echo "kind=$KIND"
             [ -z "${MODE:-}" ] || echo "mode=$MODE"
@@ -1244,21 +1244,21 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG____BRIEFINPUT__' ;;
     codex)
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox __BRIEFINPUT__'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" __BRIEFINPUT__'
       fi
       ;;
-    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt __BRIEFINPUT__' ;;
     pi|pi-signed)
       printf '%s' '__PIBIN____PITUIMODE__'
       if [ "$kind" = secondmate ]; then
-        printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ __BRIEFINPUT__'
       else
-        printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PIEXT__ __BRIEFINPUT__'
       fi
       ;;
     # grok (Grok Build TUI): a positional prompt starts the supervised interactive
@@ -1268,7 +1268,7 @@ launch_template() {
     # --dangerously-skip-permissions. grok's turn-end signal does NOT ride the
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
-    grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG____BRIEFINPUT__' ;;
     # Cursor Agent CLI. --trust suppresses the workspace-trust prompt, which
     # --yolo does NOT cover and which would otherwise block every spawn, since
     # each task gets a fresh worktree path cursor has never seen. --yolo is the
@@ -1281,9 +1281,9 @@ launch_template() {
     # inherited CLAUDECODE cannot outrank cursor's own marker in a process that
     # only reads the environment. Cursor exposes no effort flag, so the shared
     # effort axis is deliberately omitted and stays in task metadata only.
-    cursor) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS -u CURSOR_INVOKED_AS __CURSORBIN__ --trust --yolo __MODELFLAG__--workspace __WORKTREE__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    cursor) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS -u CURSOR_INVOKED_AS __CURSORBIN__ --trust --yolo __MODELFLAG__--workspace __WORKTREE__ __BRIEFINPUT__' ;;
     # Kimi Code rejects a positional prompt, so it launches bare and receives
-    # only an absolute brief pointer after the TUI readiness gate below.
+    # the captured immutable operational input after the TUI readiness gate below.
     # Its turn-end signal is a globally configured Stop hook plus a guarded
     # per-task worktree token, so no launch placeholder belongs here.
     kimi) printf '%s' '__KIMIBIN__ __MODELFLAG__--auto' ;;
@@ -1308,7 +1308,7 @@ launch_template() {
     # session event log instead (bin/fm-busy-lib.sh), bound by the sidecar
     # written below. Nothing to place in the template for it.
     # codex, opencode, and kimi are also markerless and share this inherited-marker hazard; changing their verified launch boundaries belongs in follow-up work.
-    muse) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS XDG_CONFIG_HOME=__MUSECONFIG__ XDG_DATA_HOME=__MUSEDATA__ MUSE_EXPERIMENTAL_FOREIGN_PERSONAL_CONTEXT_KILL=on __MUSEBIN__ --yolo __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    muse) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS XDG_CONFIG_HOME=__MUSECONFIG__ XDG_DATA_HOME=__MUSEDATA__ MUSE_EXPERIMENTAL_FOREIGN_PERSONAL_CONTEXT_KILL=on __MUSEBIN__ --yolo __MODELFLAG____EFFORTFLAG____BRIEFINPUT__' ;;
     *) return 1 ;;
   esac
 }
@@ -1797,6 +1797,14 @@ mv -f "$SPAWN_BRIEF_TMP" "$BRIEF_SNAPSHOT" \
 SPAWN_BRIEF_TMP=
 BRIEF=$BRIEF_SNAPSHOT
 
+spawn_sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    sha256sum | awk '{print $1}'
+  fi
+}
+
 # Exact project/plan/work-unit identity is frozen before any endpoint exists.
 # The contract owner validates the sidecar, generated payload, exact home/task
 # binding, and any prior metadata binding. Every harness and backend receives the
@@ -1804,24 +1812,45 @@ BRIEF=$BRIEF_SNAPSHOT
 WORK_IDENTITY_STATUS=
 WORK_IDENTITY_SCHEMA=
 WORK_IDENTITY_HASH=
+LAUNCH_BRIEF_HASH=
 if [ "$KIND" != secondmate ]; then
-  WORK_IDENTITY_ARGS=(project "$ID" --brief "$BRIEF")
+  WORK_IDENTITY_ARGS=(dispatch-binding "$ID" --brief "$BRIEF")
   if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
     WORK_IDENTITY_ARGS+=(--meta "$STATE/$ID.meta")
   fi
-  WORK_IDENTITY_JSON=$(
+  WORK_DISPATCH_JSON=$(
     FM_HOME="$FM_HOME" \
       FM_DATA_OVERRIDE="$DATA" \
       FM_STATE_OVERRIDE="$STATE" \
       FM_ROOT_OVERRIDE="$FM_ROOT" \
       "$SCRIPT_DIR/fm-work-identity.sh" "${WORK_IDENTITY_ARGS[@]}"
   ) || exit 1
+  WORK_IDENTITY_JSON=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -ec '.work_identity') \
+    || { echo "error: work identity dispatch binding is malformed for $ID" >&2; exit 1; }
+  LAUNCH_BRIEF_HASH=$(printf '%s' "$WORK_DISPATCH_JSON" | jq -er '.instructions_sha256') \
+    || { echo "error: work identity dispatch binding has no instructions digest for $ID" >&2; exit 1; }
   WORK_IDENTITY_STATUS=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.status') \
     || { echo "error: work identity projection has no status for $ID" >&2; exit 1; }
   WORK_IDENTITY_SCHEMA=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.schema') \
     || { echo "error: work identity projection has no schema for $ID" >&2; exit 1; }
   WORK_IDENTITY_HASH=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -r '.sha256 // ""')
 fi
+SPAWN_BRIEF_BODY=$(cat "$BRIEF" || exit $?; printf '\034') \
+  || { echo "error: could not capture validated launch brief" >&2; exit 1; }
+SPAWN_BRIEF_BODY=${SPAWN_BRIEF_BODY%$'\034'}
+CAPTURED_BRIEF_HASH=$(printf '%s' "$SPAWN_BRIEF_BODY" | spawn_sha256_stream) \
+  || { echo "error: could not hash captured launch brief" >&2; exit 1; }
+if [ -n "$LAUNCH_BRIEF_HASH" ] && [ "$CAPTURED_BRIEF_HASH" != "$LAUNCH_BRIEF_HASH" ]; then
+  echo "error: launch brief changed after identity validation: $BRIEF" >&2
+  exit 1
+fi
+LAUNCH_BRIEF_HASH=$CAPTURED_BRIEF_HASH
+# shellcheck source=bin/fm-operational-input.sh
+# shellcheck disable=SC1091
+. "$FM_ROOT/bin/fm-operational-input.sh"
+fm_operational_input_construct launch-brief "$SPAWN_BRIEF_BODY" SPAWN_BRIEF_INPUT \
+  || { echo "error: could not encode captured launch brief" >&2; exit 1; }
+unset SPAWN_BRIEF_BODY
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
@@ -1856,9 +1885,6 @@ if [ "$KIND" = ship ]; then
     echo "notice: $ID ships mode=$MODE while the standing posture for $PROJ_NAME is $STANDING_MODE - less rigor than the captain's standing posture; proceed only on a current explicit captain instruction or an intake judgment you can state" >&2
   fi
 fi
-
-BRIEF_DIR_REAL=$(cd "$(dirname "$BRIEF")" && pwd -P)
-BRIEF_REAL="$BRIEF_DIR_REAL/$(basename "$BRIEF")"
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
@@ -2435,7 +2461,7 @@ kimi_delivery_is_confirmed() {  # <plain-pane-capture>
   local pane=$1
   kimi_composer_is_empty || return 1
   if { printf '%s\n' "$pane" | grep -Fq '✨' \
-       && printf '%s\n' "$pane" | grep -Fq 'Read the brief at'; } \
+       && printf '%s\n' "$pane" | grep -Fq 'FIRSTMATE_OP:'; } \
      || printf '%s\n' "$pane" \
        | grep -qiE 'context:[[:space:]]*(0\.[0-9]*[1-9][0-9]*|[1-9][0-9]*([.][0-9]+)?)[[:space:]]*%'; then
     return 0
@@ -2902,7 +2928,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project launch_brief harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent work_identity_schema work_identity_status work_identity_sha256 backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project launch_brief launch_brief_sha256 harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent work_identity_schema work_identity_status work_identity_sha256 backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2914,6 +2940,7 @@ preserve_relaunch_meta() {
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
   echo "launch_brief=$BRIEF"
+  echo "launch_brief_sha256=$LAUNCH_BRIEF_HASH"
   echo "harness=$HARNESS"
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
@@ -3011,22 +3038,22 @@ fi
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")
+sq_brief_input=$(shell_quote "$SPAWN_BRIEF_INPUT")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
-sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
+LAUNCH=${LAUNCH//__BRIEFINPUT__/$sq_brief_input}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
-LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
 case "$HARNESS" in
   pi|pi-signed) LAUNCH=${LAUNCH//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;
   cursor) LAUNCH=${LAUNCH//__CURSORBIN__/"$(shell_quote "$CURSOR_BIN")"} ;;
@@ -3130,22 +3157,22 @@ if [ "$HARNESS" = kimi ]; then
     kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"
     exit 1
   fi
-  KIMI_POINTER="Read the brief at $BRIEF_REAL and follow it exactly."
+  KIMI_INPUT=$SPAWN_BRIEF_INPUT
   KIMI_SUBMIT_RETRIES=${FM_KIMI_SUBMIT_RETRIES:-3}
   KIMI_SUBMIT_SLEEP=${FM_KIMI_SUBMIT_SLEEP:-${FM_KIMI_POLL_INTERVAL:-0.5}}
   KIMI_SUBMIT_SETTLE=${FM_KIMI_SUBMIT_SETTLE:-0}
-  if ! KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
-      "$BACKEND" "$T" "$KIMI_POINTER" "$KIMI_SUBMIT_RETRIES" \
-      "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W"); then
-    kimi_spawn_fail "kimi brief pointer could not be submitted"
+  KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
+    "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
+    "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || {
+    kimi_spawn_fail "kimi launch brief could not be submitted"
     exit 1
-  fi
+  }
   if [ "$KIMI_SUBMIT_VERDICT" = send-failed ]; then
-    kimi_spawn_fail "kimi brief pointer could not be submitted"
+    kimi_spawn_fail "kimi launch brief could not be submitted"
     exit 1
   fi
   if ! kimi_wait_for_delivery; then
-    kimi_spawn_fail "kimi brief pointer delivery was not confirmed"
+    kimi_spawn_fail "kimi launch brief delivery was not confirmed"
     exit 1
   fi
 fi

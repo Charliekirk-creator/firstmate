@@ -83,6 +83,10 @@ case "${1:-}" in
   send-keys)
     literal=0
     for arg in "$@"; do [ "$arg" != -l ] || literal=1; done
+    if [ "$literal" -eq 1 ] && [ -n "${FM_TEST_MUTATE_LAUNCH_BRIEF:-}" ]; then
+      printf 'MUTATED_LAUNCH_BRIEF\n' > "$FM_TEST_MUTATE_LAUNCH_BRIEF.replacement"
+      mv -f "$FM_TEST_MUTATE_LAUNCH_BRIEF.replacement" "$FM_TEST_MUTATE_LAUNCH_BRIEF"
+    fi
     if [ "$literal" -eq 1 ] && [ -n "${FM_TEST_LAUNCH_COMMAND:-}" ]; then
       printf '%s\n' "${!#}" > "$FM_TEST_LAUNCH_COMMAND"
     fi
@@ -94,7 +98,7 @@ exit 0
 SH
   cat > "$fakebin/codex" <<'SH'
 #!/usr/bin/env bash
-[ -z "${FM_TEST_DELIVERED_BRIEF:-}" ] || printf '%s\n' "${!#}" > "$FM_TEST_DELIVERED_BRIEF"
+[ -z "${FM_TEST_DELIVERED_BRIEF:-}" ] || printf '%s' "${!#}" > "$FM_TEST_DELIVERED_BRIEF"
 exit 0
 SH
   cat > "$fakebin/treehouse" <<'SH'
@@ -214,7 +218,7 @@ test_intake_through_fleet_projection() {
 }
 
 test_spawn_delivers_validated_brief_snapshot() {
-  local home task manifest project wt fakebin out delivered snapshot
+  local home task manifest project wt fakebin out delivered snapshot delivered_body delivered_hash
   home=$(make_home immutable-delivery)
   task=immutable-delivery-worker
   manifest="$home/manifest.json"
@@ -227,6 +231,7 @@ test_spawn_delivers_validated_brief_snapshot() {
   fakebin=$(make_fakebin "$home/fakes")
   out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
     FM_FAKE_WORKTREE="$wt" FM_TEST_MUTATE_BRIEF="$home/data/$task/brief.md" \
+    FM_TEST_MUTATE_LAUNCH_BRIEF="$home/state/$task.launch-brief.md" \
     FM_TEST_LAUNCH_COMMAND="$home/launch.command" FM_TEST_DELIVERED_BRIEF="$delivered" \
     PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
     --mode no-mistakes --yolo off --harness codex 2>&1)
@@ -246,10 +251,16 @@ test_spawn_delivers_validated_brief_snapshot() {
     "worker reread the replaced source brief after validation"
   snapshot="$home/state/$task.launch-brief.md"
   assert_grep "launch_brief=$snapshot" "$home/state/$task.meta" \
-    "task metadata did not bind the delivered launch snapshot"
-  assert_grep '"id":"wu-fleet-projection"' "$snapshot" \
-    "durable launch snapshot lost the validated identity payload"
-  pass "spawn delivers one validated brief snapshot despite source replacement"
+    "task metadata did not bind the launch snapshot"
+  assert_grep 'MUTATED_LAUNCH_BRIEF' "$snapshot" \
+    "delivery fixture did not replace the validated launch snapshot"
+  delivered_body="$home/delivered-body.md"
+  "$ROOT/bin/fm-operational-input.sh" body < "$delivered" > "$delivered_body" \
+    || fail "worker delivery was not a typed launch-brief input"
+  delivered_hash=$(sha256_file_for_test "$delivered_body")
+  assert_grep "launch_brief_sha256=$delivered_hash" "$home/state/$task.meta" \
+    "task metadata did not bind the exact delivered instruction bytes"
+  pass "spawn delivers validated bytes despite source and snapshot replacement"
 }
 
 sha256_file_for_test() {
@@ -258,6 +269,47 @@ sha256_file_for_test() {
   else
     sha256sum "$1" | awk '{print $1}'
   fi
+}
+
+test_sidecar_validation_hashes_captured_bytes() {
+  local home task manifest sidecar replacement fakebin real_shasum projection observed observed_hash
+  home=$(make_home captured-sidecar)
+  task=captured-sidecar-worker
+  manifest="$home/manifest.json"
+  sidecar="$home/data/$task/work-identity.json"
+  replacement="$home/replacement.json"
+  make_manifest "$home" "$task" "$manifest"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  jq -S -c '.work_units[0].id = "wu-other-intake"' "$sidecar" > "$replacement"
+  [ "$(LC_ALL=C wc -c < "$sidecar" | tr -d ' ')" = \
+    "$(LC_ALL=C wc -c < "$replacement" | tr -d ' ')" ] \
+    || fail "same-size sidecar rewrite fixture changed record size"
+  fakebin=$(fm_fakebin "$home/hash-fake")
+  real_shasum=$(command -v shasum || true)
+  cat > "$fakebin/shasum" <<'SH'
+#!/usr/bin/env bash
+set -eu
+last=${!#}
+if [ "$last" = "$FM_TEST_SIDECAR" ]; then
+  /bin/cp "$FM_TEST_REPLACEMENT" "$FM_TEST_SIDECAR"
+fi
+if [ -n "$FM_TEST_REAL_SHASUM" ]; then
+  exec "$FM_TEST_REAL_SHASUM" "$@"
+fi
+exec sha256sum "$last"
+SH
+  chmod +x "$fakebin/shasum"
+  projection=$(PATH="$fakebin:$PATH" FM_TEST_SIDECAR="$sidecar" \
+    FM_TEST_REPLACEMENT="$replacement" FM_TEST_REAL_SHASUM="$real_shasum" \
+    FM_HOME="$home" "$WORK_IDENTITY" verify "$task") \
+    || fail "captured sidecar validation failed"
+  observed="$home/observed.json"
+  printf '%s' "$projection" | jq -S -c \
+    '{schema,binding,initiative,plan_id,stage,work_units,sources}' > "$observed"
+  observed_hash=$(sha256_file_for_test "$observed")
+  [ "$(printf '%s' "$projection" | jq -r '.sha256')" = "$observed_hash" ] \
+    || fail "sidecar projection combined canonical bytes with another version digest"
+  pass "sidecar validation hashes one captured byte sequence"
 }
 
 test_concurrent_idempotence_and_explicit_unlinked() {
@@ -620,8 +672,10 @@ EOF
       and .transfer.target.home_id == "secondmate:planning"' \
     "$parent/data/$task/work-identity-handoff-source.json" >/dev/null \
     || fail "successful handoff did not retain an exact source ownership tombstone"
-  assert_absent "$mate/data/$task/work-identity-handoff-target.json" \
-    "successful handoff retained a pending destination identity"
+  jq -e '.role == "target" and .state == "completed"
+      and .transfer.source.home_id == "main"' \
+    "$mate/data/$task/work-identity-handoff-target.json" >/dev/null \
+    || fail "successful handoff did not retain an exact destination commit receipt"
   out=$(FM_HOME="$parent" "$WORK_IDENTITY" record "$task" --file "$manifest" 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "source intake published again after completed ownership transfer"
 
@@ -744,22 +798,36 @@ EOF
   FM_HOME="$parent" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
     || fail "failed multi-item staging damaged the source identity"
 
-  FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" transaction "$task_a" >/dev/null \
-    || fail "could not establish a completed identity handoff for mixed-retry coverage"
-  FM_HOME="$mate" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
-    || fail "completed mixed-retry fixture did not publish its destination identity"
+  transfer=$(FM_HOME="$parent" "$WORK_IDENTITY" handoff-prepare "$task_a" \
+    --to-home "$mate" --to-home-id secondmate:transaction)
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" handoff-stage "$task_a" --file - >/dev/null \
+    || fail "could not stage the interrupted committed-target fixture"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" handoff-commit "$task_a" --file - >/dev/null \
+    || fail "could not commit the interrupted target fixture"
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$mate/data/backlog.md"
+  tasks-axi mv "$task_a" --file "$parent/data/backlog.md" --to "$mate/data/backlog.md" >/dev/null \
+    || fail "could not move the interrupted target backlog fixture"
+  jq -e '.state == "prepared"' "$parent/data/$task_a/work-identity-handoff-source.json" >/dev/null \
+    || fail "interrupted target fixture unexpectedly completed source ownership"
   rc=0
   out=$(FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" transaction "$task_a" "$task_b" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "mixed retry ignored the later destination conflict"
   assert_grep "$task_b" "$parent/data/backlog.md" "mixed retry moved the conflicting backlog item"
-  assert_absent "$mate/data/$task_a/work-identity-handoff-target.json" \
-    "mixed retry left a target guard over an already committed destination"
+  jq -e '.role == "target" and .state == "completed"' \
+    "$mate/data/$task_a/work-identity-handoff-target.json" >/dev/null \
+    || fail "mixed retry lost the committed destination receipt"
+  jq -e '.role == "source" and .state == "completed"' \
+    "$parent/data/$task_a/work-identity-handoff-source.json" >/dev/null \
+    || fail "mixed retry resurrected source ownership after a proven target commit"
   assert_absent "$parent/data/$task_b/work-identity-handoff-source.json" \
     "mixed retry left the conflicting source identity prepared"
   assert_absent "$mate/data/$task_b/work-identity-handoff-target.json" \
     "mixed retry left the conflicting destination identity prepared"
   FM_HOME="$mate" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
     || fail "mixed retry blocked the already committed destination identity"
+  rc=0
+  out=$(FM_HOME="$parent" "$WORK_IDENTITY" verify "$task_a" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "mixed retry made the completed source identity publishable again"
 
   race=record-during-handoff
   manifest="$parent/$race.json"
@@ -969,6 +1037,7 @@ test_secondmate_parent_decisions_and_nested_caps_are_disclosed() {
 
 test_intake_through_fleet_projection
 test_spawn_delivers_validated_brief_snapshot
+test_sidecar_validation_hashes_captured_bytes
 test_concurrent_idempotence_and_explicit_unlinked
 test_namespace_separation_and_contract_rejections
 test_unsafe_files_labels_and_exact_binding

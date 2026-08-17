@@ -23,7 +23,7 @@ bin/fm-work-identity.sh verify <task-id> | jq .
 ```
 
 Then scaffold and dispatch the task normally.
-`fm-brief.sh` embeds the canonical payload and digest in the generated instructions, and `fm-spawn.sh` copies the brief to a protected per-task launch snapshot, validates that snapshot, binds its path in task metadata, and delivers only those exact bytes after creating the worker endpoint.
+`fm-brief.sh` embeds the canonical payload and digest in the generated instructions. `fm-spawn.sh` copies the brief to a per-task launch snapshot, validates and captures its bytes before creating an endpoint, binds both its path and SHA-256 digest in task metadata, and delivers the frozen operational input without rereading the owner-writable snapshot. Kimi receives the same frozen input after its readiness gate.
 Replacing the source brief during launch therefore cannot change what any supported worker tool receives.
 Repeating `record` with the same manifest is an idempotent no-op.
 A relation is immutable once recorded, and a changed relation requires a new task identity.
@@ -46,7 +46,7 @@ Bearings keeps one row per worker and renders every complete exact ID beside its
 The primary does not reconstruct local or remote child trees, and an identity-integrity failure in a readable child home stops the parent snapshot instead of becoming an unknown transport result.
 
 A local or remote backlog handoff durably prepares an exact source-to-destination transfer through the same contract owner before the backlog row can move.
-New intake and snapshot publication stop while that transfer is pending; after the backlog arrives, the destination record commits and the source retains a completed ownership tombstone.
+New intake and snapshot publication stop while that transfer is pending; after the backlog arrives, the destination retains an exact completed-transfer receipt and the source retains a completed ownership tombstone. A retry that proves the destination commit completes rather than cancels source ownership.
 A failed pre-move batch cancels its prepared records without publishing immutable destination sidecars, while an uncertain remote result preserves the outbox and prepare state for `--resume-pending`.
 Reading, recording, or rebinding this local relation does not change task lifecycle state, assignment, GitHub, DTM, Data Team Ticket, or a Work Aligner plan.
 Malformed, stale, unsafe, cross-home, or task-mismatched linked records stop publication instead of being shown as unlinked.
