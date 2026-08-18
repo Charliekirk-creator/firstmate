@@ -572,7 +572,7 @@ test_queued_legacy_resolution_is_attested_before_teardown() {
 }
 
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
-  local home source victim collision decision digest body foreign id hold n
+  local home source victim collision decision digest body foreign id hold n attestation_token
   home=$(make_home ambiguous-legacy-history)
   source=sample
   victim=sample-decision-route
@@ -608,7 +608,8 @@ test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
     > "$home/ambiguous.out" 2> "$home/ambiguous.err"; then
     fail "claimant metadata rebound ambiguous legacy history"
   fi
-  assert_absent "$home/data/decision-resolution-attestations/$collision.attestation" \
+  attestation_token=$(printf '%s' "$collision" | shasum -a 256 | awk '{print $1}')
+  assert_absent "$home/data/decision-resolution-attestations/$attestation_token.attestation" \
     "ambiguous claimant created a durable legacy attestation"
 
   home=$(make_home foreign-legacy-state)
@@ -654,8 +655,8 @@ test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
   pass "legacy migration rejects missing, conflicting, and foreign ownership"
 }
 
-test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership() {
-  local home origin key hold decision digest body attestation stage alternate
+test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
+  local home origin key hold decision digest body attestation stage stage_name alternate token unrelated n
   home=$(make_home compatible-unambiguous-legacy)
   origin=sample-compatible-review
   key=old-answer
@@ -681,14 +682,31 @@ test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership() {
     || fail "could not preserve unambiguous released-version history"
   run_decisions "$home" verify "$origin" >/dev/null \
     || fail "unambiguous released-version identity required ephemeral proof"
-  attestation="$home/data/decision-resolution-attestations/$hold.attestation"
+  token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
+  attestation="$home/data/decision-resolution-attestations/$token.attestation"
   assert_present "$attestation" "compatible legacy verification did not persist exact identity"
-  stage="$home/data/decision-resolution-attestations/.attestation.interrupted"
+
+  stage_name=.attestation.A1b2C3
+  stage="$home/data/decision-resolution-attestations/$stage_name"
+  printf 'publication_stage=%s\n' "$stage_name" >> "$attestation"
   ln "$attestation" "$stage" \
-    || fail "could not reproduce interrupted attestation publication"
+    || fail "could not reproduce authenticated interrupted attestation publication"
   run_decisions "$home" verify "$origin" >/dev/null \
-    || fail "interrupted attestation publication was not recoverable"
-  assert_absent "$stage" "attestation retry retained its interrupted staging link"
+    || fail "authenticated interrupted attestation publication was not recoverable"
+  assert_absent "$stage" "attestation retry retained its authenticated staging link"
+
+  unrelated="$home/data/decision-resolution-attestations/.attestation.interrupted"
+  ln "$attestation" "$unrelated" || fail "could not reproduce an unrelated attestation hardlink"
+  if run_decisions "$home" verify "$origin" > "$home/unrelated-link.out" 2> "$home/unrelated-link.err"; then
+    fail "an unrelated hardlink was treated as an interrupted attestation publication"
+  fi
+  assert_present "$unrelated" "verification removed an unauthenticated attestation hardlink"
+  assert_grep "is hardlinked" "$home/unrelated-link.err" \
+    "an unrelated attestation hardlink did not fail safely"
+  rm -f "$unrelated"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "removing the unrelated hardlink did not restore verification"
+
   rm -f "$home/state/$origin.meta" "$attestation"
   run_decisions "$home" complete "$origin" --none --resolved "$key" >/dev/null \
     || fail "unambiguous legacy identity depended on metadata or attestation"
@@ -697,7 +715,7 @@ test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership() {
   origin=sample
   key=route-decision-later
   alternate=sample-decision-route
-  tasks_in "$home" add "$origin" "Review migratable ambiguous legacy identity" \
+  tasks_in "$home" add "$origin" "Review ambiguous legacy identity" \
     --kind scout --repo sample --start >/dev/null \
     || fail "could not create ambiguous legacy origin"
   tasks_in "$home" add "$alternate" "Review unrelated alternate identity" \
@@ -707,29 +725,60 @@ test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership() {
   write_origin_meta "$home" "$alternate"
   printf 'decisions_reviewed=1\ndecision_keys=other\n' >> "$home/state/$alternate.meta"
   hold=$(run_decisions "$home" hold "$origin" "$key" \
-    --title "Choose the migratable legacy answer" \
-    --reason "captain migratable answer pending" --repo sample) \
+    --title "Choose the ambiguous legacy answer" \
+    --reason "captain ambiguous answer pending" --repo sample) \
     || fail "could not create ambiguous legacy hold"
   run_decisions "$home" complete "$origin" "$key" >/dev/null \
     || fail "could not inventory ambiguous legacy hold"
-  decision='Captain resolved the migratable ambiguous identity.'
-  printf '%s\n' "$decision" > "$home/migratable-answer.txt"
+  decision='Captain resolved the ambiguous legacy identity.'
+  printf '%s\n' "$decision" > "$home/ambiguous-compatible-answer.txt"
   run_decisions "$home" answer "$origin" "$key" \
-    --decision-file "$home/migratable-answer.txt" >/dev/null \
+    --decision-file "$home/ambiguous-compatible-answer.txt" >/dev/null \
     || fail "could not resolve ambiguous legacy hold"
   digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
   body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
     "$digest" "$decision")
   tasks_in "$home" update "$hold" --body "$body" >/dev/null \
     || fail "could not preserve ambiguous released-version history"
+  if run_decisions "$home" verify "$origin" > "$home/ambiguous-compatible.out" 2> "$home/ambiguous-compatible.err"; then
+    fail "mutable reviewed metadata attested an ambiguous legacy identity"
+  fi
+  token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
+  assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
+    "ambiguous reviewed metadata created a durable identity attestation"
+
+  home=$(make_home compatible-long-legacy)
+  origin=sample-
+  key=
+  n=0
+  while [ "$n" -lt 180 ]; do origin="${origin}o"; n=$((n + 1)); done
+  n=0
+  while [ "$n" -lt 80 ]; do key="${key}k"; n=$((n + 1)); done
+  tasks_in "$home" add "$origin" "Review a long legacy identity" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create long legacy origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the long legacy answer" \
+    --reason "captain long answer pending" --repo sample) \
+    || fail "could not create long legacy hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory long legacy hold"
+  decision='Captain resolved the long legacy identity.'
+  printf '%s\n' "$decision" > "$home/long-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" --decision-file "$home/long-answer.txt" >/dev/null \
+    || fail "could not resolve long legacy hold"
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not preserve long released-version history"
   run_decisions "$home" verify "$origin" >/dev/null \
-    || fail "reviewed ambiguous released-version identity was not migrated"
-  attestation="$home/data/decision-resolution-attestations/$hold.attestation"
-  assert_present "$attestation" "ambiguous legacy migration did not persist exact identity"
-  rm -f "$home/state/$origin.meta"
-  run_decisions "$home" complete "$origin" --none --resolved "$key" >/dev/null \
-    || fail "migrated ambiguous identity depended on ephemeral owner metadata"
-  pass "legacy identity compatibility migrates reviewed ambiguous ownership"
+    || fail "a long released-version identity exceeded the attestation filename limit"
+  token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
+  assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
+    "long legacy verification did not use a bounded attestation filename"
+  pass "legacy compatibility stays bounded and rejects ambiguous ownership"
 }
 
 test_option_shaped_keys_and_jq_free_verification() {
@@ -1942,7 +1991,7 @@ test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
-test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership
+test_legacy_identity_compatibility_is_bounded_and_fail_closed
 test_nonarchive_rows_cannot_prove_pruned_history
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions

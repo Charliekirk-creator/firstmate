@@ -54,9 +54,9 @@
 # identities so an exact retry is idempotent while a changed identity, decision,
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
 # mode:` naming their path. A legacy record remains valid when its composed hold
-# id has one possible origin/key decomposition, an exact durable identity
-# attestation already matches the complete record, or its surviving reviewed
-# owner can be migrated while alternate durable decompositions are disproven.
+# id has one possible origin/key decomposition or an exact durable identity
+# attestation already matches the complete record. Ambiguous unattested legacy
+# identities fail closed because mutable owner metadata cannot prove provenance.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -139,7 +139,13 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 DECISION_META_LOCK=
 DECISION_META_LOCK_HELD=0
+DECISION_ATTESTATION_LOCK=
+DECISION_ATTESTATION_LOCK_HELD=0
 decision_hold_cleanup() {
+  if [ "$DECISION_ATTESTATION_LOCK_HELD" = 1 ]; then
+    fm_lock_release "$DECISION_ATTESTATION_LOCK" || true
+    DECISION_ATTESTATION_LOCK_HELD=0
+  fi
   if [ "$DECISION_META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK" || true
     DECISION_META_LOCK_HELD=0
@@ -436,67 +442,13 @@ legacy_resolution_identity_unambiguous() {  # <hold-id> <origin-id> <decision-ke
   esac
 }
 
-META_DECISION_KEYS=''
-reviewed_decision_inventory() {  # <meta-path>
-  local path=$1 links keys key canonical
-  META_DECISION_KEYS=''
-  [ -e "$path" ] || [ -L "$path" ] || return 1
-  [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] \
-    || fail "decision owner metadata is unsafe: $path"
-  links=$(file_link_count "$path") \
-    || fail "could not inspect decision owner metadata link count: $path"
-  [ "$links" = 1 ] || fail "decision owner metadata is hardlinked: $path"
-  [ "$(meta_value "$path" decisions_reviewed)" = 1 ] || return 1
-  keys=$(meta_value "$path" decision_keys)
-  case "$keys" in ,*|*,|*,,*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
-  while IFS= read -r key; do
-    [ -n "$key" ] || continue
-    case "$key" in *[!A-Za-z0-9._-]*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
-  done <<EOF
-$(printf '%s\n' "$keys" | tr ',' '\n')
-EOF
-  canonical=$(printf '%s\n' "$keys" | tr ',' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)
-  [ "$keys" = "$canonical" ] \
-    || fail "decision owner metadata has noncanonical decision keys: $path"
-  META_DECISION_KEYS=$keys
-}
-
-legacy_resolution_reviewed_owner_valid() {  # <hold-id> <origin-id> <decision-key>
-  local id=$1 origin=$2 key=$3 left right candidate_origin candidate_key candidate_meta
-  reviewed_decision_inventory "$DECISION_STATE/$origin.meta" || return 1
-  list_has_key "$META_DECISION_KEYS" "$key" || return 1
-  left=${id%%-decision-*}
-  right=${id#*-decision-}
-  while [ "$left-decision-$right" = "$id" ]; do
-    candidate_origin=$left
-    candidate_key=$right
-    if [ -n "$candidate_origin" ] && [ -n "$candidate_key" ] \
-      && [[ "$candidate_origin" != *[!A-Za-z0-9._-]* ]] \
-      && [[ "$candidate_key" != *[!A-Za-z0-9._-]* ]] \
-      && { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; }; then
-      candidate_meta="$DECISION_STATE/$candidate_origin.meta"
-      reviewed_decision_inventory "$candidate_meta" || return 1
-      list_has_key "$META_DECISION_KEYS" "$candidate_key" && return 1
-    fi
-    case "$right" in
-      *-decision-*)
-        left="$left-decision-${right%%-decision-*}"
-        right=${right#*-decision-}
-        ;;
-      *) break ;;
-    esac
-  done
-  persist_legacy_resolution_attestation "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
-}
-
 legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id
   authoritative_state_path
   id="${origin}-decision-${key}"
   legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
     && return 0
-  legacy_resolution_identity_unambiguous "$id" "$origin" "$key" && return 0
-  legacy_resolution_reviewed_owner_valid "$id" "$origin" "$key"
+  legacy_resolution_identity_unambiguous "$id" "$origin" "$key"
 }
 
 resolution_record_valid() {  # <hold-body> [<origin-id> <decision-key>]
@@ -780,11 +732,47 @@ legacy_resolution_attestation_content() {  # <hold-id> <origin-id> <decision-key
     "$LEGACY_ATTESTATION_SCHEMA" "$1" "$2" "$3" "$4"
 }
 
-legacy_resolution_attestation_valid() {  # <hold-id> <origin-id> <decision-key> <record-digest>
-  local id=$1 origin=$2 key=$3 record_digest=$4 dir path links actual expected stage stage_links
-  legacy_resolution_attestation_dir 0 || return 1
-  dir=$LEGACY_ATTESTATION_DIR
-  path="$dir/$id.attestation"
+legacy_resolution_attestation_path() {  # <directory> <hold-id>
+  local token
+  token=$(sha256_text "$2")
+  printf '%s/%s.attestation\n' "$1" "$token"
+}
+
+legacy_resolution_attestation_lock_acquire() {  # <directory> <hold-id>
+  local token
+  token=$(sha256_text "$2")
+  DECISION_ATTESTATION_LOCK="$1/.attestation-$token.lock"
+  fm_lock_acquire_wait "$DECISION_ATTESTATION_LOCK"
+  DECISION_ATTESTATION_LOCK_HELD=1
+}
+
+legacy_resolution_attestation_lock_release() {
+  fm_lock_release "$DECISION_ATTESTATION_LOCK"
+  DECISION_ATTESTATION_LOCK_HELD=0
+}
+
+legacy_resolution_attestation_canonicalize() {  # <directory> <path> <content> <origin-id> <decision-key>
+  local dir=$1 path=$2 expected=$3 origin=$4 key=$5 tmp links actual
+  tmp=$(umask 077; mktemp "$dir/.attestation-finalize.XXXXXX") \
+    || fail "could not finalize decision resolution attestation for $origin/$key"
+  if ! printf '%s\n' "$expected" > "$tmp" || ! chmod 0600 "$tmp" \
+    || ! mv -f "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    fail "could not finalize decision resolution attestation for $origin/$key"
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] \
+    || fail "decision resolution attestation is not an ordinary file: $path"
+  links=$(file_link_count "$path") \
+    || fail "could not inspect decision resolution attestation link count: $path"
+  [ "$links" = 1 ] || fail "decision resolution attestation is hardlinked: $path"
+  actual=$(cat "$path") || fail "could not read decision resolution attestation: $path"
+  [ "$actual" = "$expected" ] \
+    || fail "decision resolution attestation does not match $origin/$key: $path"
+}
+
+legacy_resolution_attestation_valid_locked() {  # <directory> <path> <hold-id> <origin-id> <decision-key> <record-digest>
+  local dir=$1 path=$2 id=$3 origin=$4 key=$5 record_digest=$6
+  local links actual expected prefix stage_name suffix stage stage_links
   [ -e "$path" ] || [ -L "$path" ] || return 1
   [ -f "$path" ] && [ ! -L "$path" ] \
     || fail "decision resolution attestation is not an ordinary file: $path"
@@ -792,52 +780,84 @@ legacy_resolution_attestation_valid() {  # <hold-id> <origin-id> <decision-key> 
     || fail "could not inspect decision resolution attestation link count: $path"
   actual=$(cat "$path") || fail "could not read decision resolution attestation: $path"
   expected=$(legacy_resolution_attestation_content "$id" "$origin" "$key" "$record_digest")
-  [ "$actual" = "$expected" ] \
+  if [ "$actual" = "$expected" ]; then
+    [ "$links" = 1 ] || fail "decision resolution attestation is hardlinked: $path"
+    return 0
+  fi
+  prefix="${expected}"$'\n''publication_stage='
+  case "$actual" in
+    "$prefix"*) stage_name=${actual#"$prefix"} ;;
+    *) fail "decision resolution attestation does not match $origin/$key: $path" ;;
+  esac
+  case "$stage_name" in .attestation.??????) : ;; *) fail "decision resolution attestation has invalid publication provenance: $path" ;; esac
+  suffix=${stage_name#.attestation.}
+  case "$suffix" in *[!A-Za-z0-9]*) fail "decision resolution attestation has invalid publication provenance: $path" ;; esac
+  [ "$actual" = "${expected}"$'\n'"publication_stage=$stage_name" ] \
     || fail "decision resolution attestation does not match $origin/$key: $path"
   if [ "$links" = 2 ]; then
-    for stage in "$dir"/.attestation.*; do
-      [ -e "$stage" ] || [ -L "$stage" ] || continue
-      [ -f "$stage" ] && [ ! -L "$stage" ] || continue
-      [ "$stage" -ef "$path" ] || continue
-      stage_links=$(file_link_count "$stage") \
-        || fail "could not inspect staged decision resolution attestation: $stage"
-      [ "$stage_links" = 2 ] || continue
-      rm -f -- "$stage" \
-        || fail "could not recover staged decision resolution attestation: $stage"
-      links=$(file_link_count "$path") \
-        || fail "could not inspect decision resolution attestation link count: $path"
-      break
-    done
+    stage="$dir/$stage_name"
+    [ -f "$stage" ] && [ ! -L "$stage" ] && [ "$stage" -ef "$path" ] \
+      || fail "decision resolution attestation has unauthenticated publication link: $path"
+    stage_links=$(file_link_count "$stage") \
+      || fail "could not inspect staged decision resolution attestation: $stage"
+    [ "$stage_links" = 2 ] \
+      || fail "decision resolution attestation has unauthenticated publication link: $path"
+    rm -f -- "$stage" \
+      || fail "could not recover staged decision resolution attestation: $stage"
+    links=$(file_link_count "$path") \
+      || fail "could not inspect decision resolution attestation link count: $path"
   fi
   [ "$links" = 1 ] || fail "decision resolution attestation is hardlinked: $path"
+  legacy_resolution_attestation_canonicalize "$dir" "$path" "$expected" "$origin" "$key"
+}
+
+legacy_resolution_attestation_valid() {  # <hold-id> <origin-id> <decision-key> <record-digest>
+  local id=$1 origin=$2 key=$3 record_digest=$4 dir path rc=0
+  legacy_resolution_attestation_dir 0 || return 1
+  dir=$LEGACY_ATTESTATION_DIR
+  path=$(legacy_resolution_attestation_path "$dir" "$id")
+  [ -e "$path" ] || [ -L "$path" ] || return 1
+  legacy_resolution_attestation_lock_acquire "$dir" "$id"
+  legacy_resolution_attestation_valid_locked "$dir" "$path" "$id" "$origin" "$key" "$record_digest" || rc=$?
+  legacy_resolution_attestation_lock_release
+  return "$rc"
 }
 
 persist_legacy_resolution_attestation() {  # <hold-id> <origin-id> <decision-key> <record-digest>
-  local id=$1 origin=$2 key=$3 record_digest=$4 dir path tmp
+  local id=$1 origin=$2 key=$3 record_digest=$4 dir path tmp stage rc=0
   legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest" && return 0
   legacy_resolution_attestation_dir 1
   dir=$LEGACY_ATTESTATION_DIR
-  path="$dir/$id.attestation"
-  if [ -e "$path" ] || [ -L "$path" ]; then
-    legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest"
-    return
+  path=$(legacy_resolution_attestation_path "$dir" "$id")
+  legacy_resolution_attestation_lock_acquire "$dir" "$id"
+  if legacy_resolution_attestation_valid_locked "$dir" "$path" "$id" "$origin" "$key" "$record_digest"; then
+    legacy_resolution_attestation_lock_release
+    return 0
   fi
   tmp=$(umask 077; mktemp "$dir/.attestation.XXXXXX") \
     || fail "could not stage decision resolution attestation for $origin/$key"
+  stage=${tmp##*/}
   if ! legacy_resolution_attestation_content "$id" "$origin" "$key" "$record_digest" > "$tmp" \
+    || ! printf 'publication_stage=%s\n' "$stage" >> "$tmp" \
     || ! chmod 0600 "$tmp"; then
     rm -f -- "$tmp"
     fail "could not stage decision resolution attestation for $origin/$key"
   fi
-  if ln "$tmp" "$path" 2>/dev/null; then
-    rm -f -- "$tmp" \
-      || fail "could not finish decision resolution attestation for $origin/$key"
-    legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest"
-    return
+  if ! ln "$tmp" "$path" 2>/dev/null; then
+    rm -f -- "$tmp"
+    if legacy_resolution_attestation_valid_locked "$dir" "$path" "$id" "$origin" "$key" "$record_digest"; then
+      legacy_resolution_attestation_lock_release
+      return 0
+    fi
+    rc=1
+  elif ! legacy_resolution_attestation_valid_locked "$dir" "$path" "$id" "$origin" "$key" "$record_digest"; then
+    rc=1
   fi
-  rm -f -- "$tmp"
-  legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest" \
-    || fail "could not record decision resolution attestation for $origin/$key"
+  if [ "$rc" -ne 0 ]; then
+    legacy_resolution_attestation_lock_release
+    fail "could not record decision resolution attestation for $origin/$key"
+  fi
+  legacy_resolution_attestation_lock_release
 }
 
 persist_parsed_legacy_resolution() {  # <hold-id> <origin-id> <decision-key>
