@@ -727,6 +727,7 @@ SPAWN_ENDPOINT_CREATING_RECOVERY=0
 SPAWN_ENDPOINT_PHASE=
 SPAWN_IDENTITY_HOME=
 SPAWN_IDENTITY_HOME_ID=
+SPAWN_ORCA_OPERATION=
 SPAWN_META_LOCK=
 SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
@@ -776,9 +777,9 @@ spawn_file_link_count() {
   fi
 }
 
-spawn_endpoint_receipt_publish() {  # <endpoint-creating|endpoint-created|worktree-requested|worktree-ready> [worktree]
+spawn_endpoint_receipt_publish() {  # <endpoint-creating|endpoint-created|worktree-requesting|worktree-requested|worktree-ready> [worktree]
   local phase=$1 worktree=${2:-} details payload tmp
-  case "$phase" in endpoint-creating|endpoint-created|worktree-requested|worktree-ready) ;; *) return 1 ;; esac
+  case "$phase" in endpoint-creating|endpoint-created|worktree-requesting|worktree-requested|worktree-ready) ;; *) return 1 ;; esac
   case "$BACKEND" in
     tmux)
       details=$(jq -n -S -c --arg session "${SES:-}" --arg window_id "${WT_TARGET:-}" \
@@ -847,13 +848,14 @@ spawn_endpoint_receipt_load() {
         and exact(["schema","phase","binding","transaction_id","instructions_sha256","backend","kind","project","endpoint","worktree"])
         and .schema == "fm-spawn-endpoint.v1"
         and (.phase == "endpoint-creating" or .phase == "endpoint-created"
-          or .phase == "worktree-requested" or .phase == "worktree-ready")
+          or .phase == "worktree-requesting" or .phase == "worktree-requested"
+          or .phase == "worktree-ready")
         and .binding == {home:$home,home_id:$home_id,task_id:$task}
         and .transaction_id == $transaction and .instructions_sha256 == $instructions_sha256
         and .backend == $backend and .kind == $kind and .project == $project
         and (.endpoint | type == "object" and exact(["label","target","details"])
           and .label == $label
-          and (if .phase == "endpoint-creating" then (.target == null or (.target | type) == "string")
+          and (if $r.phase == "endpoint-creating" then (.target == null or (.target | type) == "string")
                else (.target | type) == "string" and (.target | length) > 0 end)
           and (.details | type) == "object"
           and (if $backend == "tmux" then (.details | exact(["session","window_id"]))
@@ -894,10 +896,14 @@ spawn_endpoint_receipt_load() {
   fi
   if [ "$BACKEND" = tmux ] || [ "$BACKEND" = herdr ]; then
     endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
-    [ "$endpoint_state" = dead ] || {
-      echo "error: recorded spawn endpoint is not agent-free for $ID: $target ($endpoint_state)" >&2
-      return 1
-    }
+    case "$SPAWN_ENDPOINT_PHASE:$endpoint_state" in
+      worktree-requesting:dead|worktree-requesting:ambiguous|worktree-requested:dead|worktree-requested:ambiguous) ;;
+      *:dead) ;;
+      *)
+        echo "error: recorded spawn endpoint is not safely recoverable for $ID: $target ($endpoint_state)" >&2
+        return 1
+        ;;
+    esac
   fi
   T=$target
   WT=$worktree
@@ -949,8 +955,236 @@ spawn_endpoint_receipt_load() {
   SPAWN_ENDPOINT_RECOVERED=1
 }
 
+spawn_orca_operation_prepare() {
+  if [ -e "$SPAWN_ORCA_OPERATION" ] || [ -L "$SPAWN_ORCA_OPERATION" ]; then
+    [ -d "$SPAWN_ORCA_OPERATION" ] && [ ! -L "$SPAWN_ORCA_OPERATION" ] || {
+      echo "error: Orca endpoint operation path is unsafe: $SPAWN_ORCA_OPERATION" >&2
+      return 1
+    }
+  else
+    (umask 077; mkdir "$SPAWN_ORCA_OPERATION") || return 1
+  fi
+}
+
+spawn_orca_operation_publish() {  # <result|failure> <payload>
+  local kind=$1 payload=$2 tmp target
+  case "$kind" in
+    result) target="$SPAWN_ORCA_OPERATION/result.json" ;;
+    failure) target="$SPAWN_ORCA_OPERATION/failure.json" ;;
+    *) return 1 ;;
+  esac
+  tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.${kind}.XXXXXX") || return 1
+  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
+    && mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
+}
+
+spawn_orca_operation_helper() {
+  local claim_tmp raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation
+  set +e
+  claim_tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.claim.XXXXXX") || exit 1
+  printf '%s\n' "${BASHPID:-$$}" > "$claim_tmp" || { rm -f -- "$claim_tmp"; exit 1; }
+  if ! ln "$claim_tmp" "$SPAWN_ORCA_OPERATION/claim" 2>/dev/null; then
+    rm -f -- "$claim_tmp"
+    exit 0
+  fi
+  rm -f -- "$claim_tmp"
+
+  raw=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
+  rc=$?
+  if [ -n "$raw" ]; then
+    wt_id=${raw%%$'\t'*}
+    if [ "$raw" != "$wt_id" ]; then
+      rest=${raw#*$'\t'}
+      wt_path=${rest%%$'\t'*}
+      if [ "$rest" != "$wt_path" ]; then terminal=${rest#*$'\t'}; fi
+    fi
+  fi
+  if [ "$rc" -ne 0 ] && [ -n "$wt_id" ] && [ -z "$wt_path" ]; then
+    failure_reason=path
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$wt_id" ] && [ -n "$wt_path" ]; then
+    wt_real=$(cd "$wt_path" 2>/dev/null && pwd -P)
+    wt_top=$(git -C "$wt_path" rev-parse --show-toplevel 2>/dev/null)
+    wt_top_real=
+    [ -z "$wt_top" ] || wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P)
+    proj_real=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P)
+    if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] \
+       || [ "$wt_real" = "$proj_real" ]; then
+      rc=3
+      failure_reason=isolation
+    fi
+  fi
+  if [ "$rc" -eq 0 ] && [ -z "$terminal" ]; then
+    terminal=$(fm_backend_orca_terminal_create "$wt_id" "$W")
+    rc=$?
+    [ "$rc" -eq 0 ] || failure_reason=terminal
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$wt_id" ] && [ -n "$wt_path" ] && [ -n "$terminal" ]; then
+    payload=$(jq -n -S -c \
+      --arg schema fm-spawn-orca-endpoint.v1 \
+      --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
+      --arg transaction "$SPAWN_DISPATCH_TRANSACTION" --arg project "$PROJ_ABS" --arg label "$W" \
+      --arg worktree_id "$wt_id" --arg worktree "$wt_path" --arg terminal "$terminal" \
+      '{schema:$schema,binding:{home:$home,home_id:$home_id,task_id:$task},
+        transaction_id:$transaction,project:$project,label:$label,
+        worktree_id:$worktree_id,worktree:$worktree,terminal:$terminal}') || rc=1
+    if [ "$rc" -eq 0 ] && spawn_orca_operation_publish result "$payload"; then
+      exit 0
+    fi
+    [ -z "$terminal" ] || fm_backend_kill orca "$terminal" >/dev/null 2>&1 || true
+    [ -z "$wt_id" ] || fm_backend_remove_worktree orca "$wt_id" >/dev/null 2>&1 || true
+    exit 1
+  fi
+
+  payload=$(jq -n -S -c \
+    --arg schema fm-spawn-orca-operation-failure.v1 \
+    --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
+    --arg transaction "$SPAWN_DISPATCH_TRANSACTION" --arg project "$PROJ_ABS" --arg label "$W" \
+    --arg reason "$failure_reason" --arg worktree_id "$wt_id" --arg worktree "$wt_path" --arg terminal "$terminal" \
+    '{schema:$schema,binding:{home:$home,home_id:$home_id,task_id:$task},
+      transaction_id:$transaction,project:$project,label:$label,reason:$reason,
+      worktree_id:(if $worktree_id == "" then null else $worktree_id end),
+      worktree:(if $worktree == "" then null else $worktree end),
+      terminal:(if $terminal == "" then null else $terminal end)}') || exit 1
+  spawn_orca_operation_publish failure "$payload" || exit 1
+  exit 1
+}
+
+spawn_orca_operation_start() {
+  local error_file="$SPAWN_ORCA_OPERATION/helper.err" links
+  if [ -e "$error_file" ] || [ -L "$error_file" ]; then
+    [ -f "$error_file" ] && [ ! -L "$error_file" ] || return 1
+    links=$(spawn_file_link_count "$error_file") || return 1
+    [ "$links" = 1 ] || return 1
+    : > "$error_file" || return 1
+  else
+    (umask 077; : > "$error_file") || return 1
+  fi
+  (trap - EXIT; trap '' HUP INT TERM; spawn_orca_operation_helper) \
+    </dev/null >/dev/null 2>"$error_file" &
+}
+
+spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator exited
+  local file canonical links pid failure_reason
+  file="$SPAWN_ORCA_OPERATION/result.json"
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    links=$(spawn_file_link_count "$file") || return 1
+    [ "$links" = 1 ] || return 1
+    canonical=$(jq -e -S -c -s \
+      --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
+      --arg transaction "$SPAWN_DISPATCH_TRANSACTION" --arg project "$PROJ_ABS" --arg label "$W" '
+        def exact($keys): (keys | sort) == ($keys | sort);
+        select(length == 1) | .[0] | . as $r | select(
+          type == "object"
+          and exact(["schema","binding","transaction_id","project","label","worktree_id","worktree","terminal"])
+          and .schema == "fm-spawn-orca-endpoint.v1"
+          and .binding == {home:$home,home_id:$home_id,task_id:$task}
+          and .transaction_id == $transaction and .project == $project and .label == $label
+          and ([.worktree_id,.worktree,.terminal] | all(type == "string" and length > 0))
+        ) | $r
+      ' "$file" 2>/dev/null) || return 1
+    printf '%s\n' "$canonical" | cmp -s "$file" - || return 1
+    ORCA_WORKTREE_ID=$(printf '%s' "$canonical" | jq -r '.worktree_id') || return 1
+    WT=$(printf '%s' "$canonical" | jq -r '.worktree') || return 1
+    ORCA_TERMINAL=$(printf '%s' "$canonical" | jq -r '.terminal') || return 1
+    return 0
+  fi
+
+  file="$SPAWN_ORCA_OPERATION/failure.json"
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    links=$(spawn_file_link_count "$file") || return 1
+    [ "$links" = 1 ] || return 1
+    canonical=$(jq -e -S -c -s \
+      --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
+      --arg transaction "$SPAWN_DISPATCH_TRANSACTION" --arg project "$PROJ_ABS" --arg label "$W" '
+        def exact($keys): (keys | sort) == ($keys | sort);
+        select(length == 1) | .[0] | . as $r | select(
+          type == "object"
+          and exact(["schema","binding","transaction_id","project","label","reason","worktree_id","worktree","terminal"])
+          and .schema == "fm-spawn-orca-operation-failure.v1"
+          and .binding == {home:$home,home_id:$home_id,task_id:$task}
+          and .transaction_id == $transaction and .project == $project and .label == $label
+          and (.reason == "creation" or .reason == "isolation" or .reason == "path" or .reason == "terminal")
+          and ([.worktree_id,.worktree,.terminal] | all(. == null or (type == "string" and length > 0)))
+        ) | $r
+      ' "$file" 2>/dev/null) || return 1
+    printf '%s\n' "$canonical" | cmp -s "$file" - || return 1
+    ORCA_WORKTREE_ID=$(printf '%s' "$canonical" | jq -r '.worktree_id // ""') || return 1
+    WT=$(printf '%s' "$canonical" | jq -r '.worktree // ""') || return 1
+    ORCA_TERMINAL=$(printf '%s' "$canonical" | jq -r '.terminal // ""') || return 1
+    failure_reason=$(printf '%s' "$canonical" | jq -r '.reason') || return 1
+    [ -z "$ORCA_WORKTREE_ID" ] || ORCA_ABORT_CLEANUP=1
+    case "$failure_reason" in
+      isolation)
+        echo "error: orca worktree create did not yield an isolated worktree (resolved '$WT'; primary '$PROJ_ABS')" >&2
+        ;;
+      path)
+        echo "error: orca worktree create did not return a path for $W" >&2
+        ;;
+      *)
+        echo "error: Orca endpoint creation failed for $ID; exact partial resources are preserved for cleanup" >&2
+        ;;
+    esac
+    return 1
+  fi
+
+  file="$SPAWN_ORCA_OPERATION/claim"
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then return 3; fi
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  links=$(spawn_file_link_count "$file") || return 1
+  [ "$links" = 1 ] || return 1
+  pid=$(tr -d '[:space:]' < "$file")
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if kill -0 "$pid" 2>/dev/null; then return 2; fi
+  return 4
+}
+
+spawn_orca_operation_wait() {
+  local status started=0 creator_exited=0 i=0 max=${FM_SPAWN_ORCA_CREATE_POLLS:-600} interval=${FM_SPAWN_ORCA_CREATE_INTERVAL:-0.1}
+  while [ "$i" -lt "$max" ]; do
+    set +e
+    spawn_orca_operation_load
+    status=$?
+    set -e
+    case "$status" in
+      0) return 0 ;;
+      3)
+        if [ "$started" -eq 0 ]; then
+          spawn_orca_operation_start || return 1
+          started=1
+        fi
+        ;;
+      2) creator_exited=0 ;;
+      4)
+        creator_exited=$((creator_exited + 1))
+        if [ "$creator_exited" -ge 10 ]; then
+          [ ! -s "$SPAWN_ORCA_OPERATION/helper.err" ] || cat "$SPAWN_ORCA_OPERATION/helper.err" >&2
+          echo "error: Orca endpoint creator stopped without a recoverable result for $ID" >&2
+          return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "$interval"
+  done
+  echo "error: Orca endpoint creation is still in progress for $ID; rerun spawn to resume it" >&2
+  return 1
+}
+
+spawn_orca_operation_retire() {
+  [ -n "$SPAWN_ORCA_OPERATION" ] || return 0
+  if [ ! -e "$SPAWN_ORCA_OPERATION" ] && [ ! -L "$SPAWN_ORCA_OPERATION" ]; then return 0; fi
+  [ -d "$SPAWN_ORCA_OPERATION" ] && [ ! -L "$SPAWN_ORCA_OPERATION" ] || return 1
+  rm -f -- "$SPAWN_ORCA_OPERATION/result.json" "$SPAWN_ORCA_OPERATION/failure.json" \
+    "$SPAWN_ORCA_OPERATION/claim" "$SPAWN_ORCA_OPERATION/helper.err" 2>/dev/null || return 1
+  rmdir "$SPAWN_ORCA_OPERATION" 2>/dev/null
+}
+
 spawn_abort_cleanup() {
-  local status=$?
+  local status=$? orca_cleanup_compensated=0
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -999,7 +1233,9 @@ spawn_abort_cleanup() {
       fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
     fi
     if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-      if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
+      if fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
+        orca_cleanup_compensated=1
+      else
         if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ]; then
           if ! spawn_fresh_commit_rollback; then
             status=1
@@ -1040,6 +1276,10 @@ spawn_abort_cleanup() {
         fi
       fi
     fi
+  fi
+  if [ "$orca_cleanup_compensated" = 1 ]; then
+    spawn_orca_operation_retire 2>/dev/null || true
+    [ -z "$SPAWN_ENDPOINT_RECEIPT" ] || rm -f -- "$SPAWN_ENDPOINT_RECEIPT" 2>/dev/null || true
   fi
   if [ "$SPAWN_DISPATCH_PENDING" = 1 ]; then
     local dispatch_abort_rc=0
@@ -2026,6 +2266,7 @@ BRIEF_SOURCE=$BRIEF
 mkdir -p "$STATE" || { echo "error: could not create state directory for launch brief" >&2; exit 1; }
 BRIEF_SNAPSHOT="$STATE/$ID.launch-brief.md"
 SPAWN_ENDPOINT_RECEIPT="$STATE/$ID.spawn-endpoint.json"
+[ "$BACKEND" != orca ] || SPAWN_ORCA_OPERATION="$STATE/$ID.spawn-orca-operation"
 if [ -e "$BRIEF_SNAPSHOT" ] || [ -L "$BRIEF_SNAPSHOT" ]; then
   [ -f "$BRIEF_SNAPSHOT" ] && [ ! -L "$BRIEF_SNAPSHOT" ] \
     || { echo "error: launch brief snapshot path is unsafe: $BRIEF_SNAPSHOT" >&2; exit 1; }
@@ -2711,27 +2952,29 @@ EOF
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
     ;;
   orca)
-    set +e
-    ORCA_WT_RAW=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
-    ORCA_WT_STATUS=$?
-    set -e
-    if [ "$ORCA_WT_STATUS" -ne 0 ]; then
-      if [ "$ORCA_WT_STATUS" -eq 2 ] && [ -n "$ORCA_WT_RAW" ]; then
-        if parse_orca_worktree_result "$ORCA_WT_RAW" && [ -n "$ORCA_WORKTREE_ID" ]; then
-          ORCA_ABORT_CLEANUP=1
-        fi
+    if [ "$SPAWN_ENDPOINT_CREATING_RECOVERY" != 1 ]; then
+      if [ -e "$SPAWN_ORCA_OPERATION" ] || [ -L "$SPAWN_ORCA_OPERATION" ]; then
+        echo "error: stale Orca endpoint operation exists without a matching creation receipt: $SPAWN_ORCA_OPERATION" >&2
+        exit 1
       fi
-      exit 1
+      spawn_endpoint_receipt_publish endpoint-creating || {
+        echo "error: could not publish Orca endpoint creation intent for $ID" >&2
+        exit 1
+      }
     fi
-    parse_orca_worktree_result "$ORCA_WT_RAW" || true
+    spawn_orca_operation_prepare || exit 1
+    spawn_orca_operation_wait || exit 1
     ORCA_ABORT_CLEANUP=1
-    if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
-      echo "error: orca did not return a worktree id/path for $W" >&2
+    if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ] || [ -z "$ORCA_TERMINAL" ]; then
+      echo "error: Orca endpoint result is incomplete for $W" >&2
       exit 1
     fi
     validate_spawn_worktree "orca worktree create" "$W"
-    if [ -z "$ORCA_TERMINAL" ]; then
-      ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
+    if [ "$SPAWN_ENDPOINT_CREATING_RECOVERY" = 1 ]; then
+      fm_backend_target_exists orca "$ORCA_TERMINAL" "$W" || {
+        echo "error: recovered Orca terminal is unavailable for $W" >&2
+        exit 1
+      }
     fi
     T="$ORCA_TERMINAL"
     ;;
@@ -2744,6 +2987,10 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_RECOVERED" = 0 ]; then
     echo "error: could not publish endpoint recovery receipt for $ID" >&2
     exit 1
   }
+  if [ "$BACKEND" = orca ]; then
+    spawn_orca_operation_retire \
+      || echo "warning: exact Orca creation journal could not be retired; endpoint receipt remains authoritative" >&2
+  fi
   HERDR_PROJECTION_ABORT_CLEANUP=0
   ORCA_ABORT_CLEANUP=0
 fi
@@ -2892,90 +3139,123 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       exit 1
     fi
     validate_spawn_worktree "recovered endpoint" "$T"
+    WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || exit 1
+    WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
+    if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
+      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] \
+        && rmdir "$WORKTREE_REQUEST_MARKER" || {
+          echo "error: could not retire the exact worktree request marker for $ID" >&2
+          exit 1
+        }
+    fi
   else
-    candidate=""
-    worktree_request_send=0
-    if [ "$SPAWN_ENDPOINT_PHASE" = endpoint-created ]; then
-      spawn_endpoint_receipt_publish worktree-requested || {
-        echo "error: could not advance endpoint recovery receipt for $ID" >&2
-        exit 1
-      }
-      worktree_request_send=1
-    elif [ "$SPAWN_ENDPOINT_PHASE" = worktree-requested ]; then
-      resume_candidate=""
-      for _ in $(seq 1 2); do
-        p=$(spawn_current_path "$WT_TARGET" || true)
-        if [ -z "$p" ] || [ "$(real_path_or_raw "$p")" = "$PROJ_ABS_REAL" ]; then
-          candidate=""
-          break
+    WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || exit 1
+    WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
+    WORKTREE_REQUEST_COMMAND="mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { treehouse get; rc=\$?; rmdir $(shell_quote "$WORKTREE_REQUEST_MARKER") 2>/dev/null || true; [ \"\$rc\" -eq 0 ]; }"
+    worktree_request_recovery=0
+    case "$SPAWN_ENDPOINT_PHASE" in
+      endpoint-created)
+        if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
+          echo "error: stale worktree request marker exists before dispatch: $WORKTREE_REQUEST_MARKER" >&2
+          exit 1
         fi
-        p_real=$(real_path_or_raw "$p")
-        if [ -n "$resume_candidate" ] && [ "$resume_candidate" = "$p_real" ]; then
-          candidate=$p_real
+        spawn_endpoint_receipt_publish worktree-requesting || {
+          echo "error: could not publish worktree request intent for $ID" >&2
+          exit 1
+        }
+        spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || {
+          echo "error: could not send worktree acquisition for $ID; request intent preserved" >&2
+          exit 1
+        }
+        spawn_endpoint_receipt_publish worktree-requested || {
+          echo "error: could not confirm the sent worktree request for $ID" >&2
+          exit 1
+        }
+        ;;
+      worktree-requesting|worktree-requested)
+        worktree_request_recovery=1
+        ;;
+      *)
+        echo "error: endpoint receipt has no valid worktree acquisition phase for $ID" >&2
+        exit 1
+        ;;
+    esac
+
+    worktree_poll_max=${FM_SPAWN_WORKTREE_POLLS:-60}
+    worktree_poll_interval=${FM_SPAWN_WORKTREE_INTERVAL:-1}
+    worktree_request_round=0
+    while [ "$worktree_request_round" -lt 2 ] && [ -z "$WT" ]; do
+      candidate=""
+      project_shell_observed=0
+      for _ in $(seq 1 "$worktree_poll_max"); do
+        p=$(spawn_current_path "$WT_TARGET" || true)
+        if [ -n "$p" ]; then
+          p_real=$(real_path_or_raw "$p")
+          if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
+            if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
+              WT="$p"
+              break
+            fi
+            candidate="$p_real"
+          else
+            candidate=""
+            case "$BACKEND" in zellij|cmux) project_shell_observed=1 ;; esac
+          fi
         else
           candidate=""
-          resume_candidate=$p_real
         fi
-        sleep 0.5
+        sleep "$worktree_poll_interval"
       done
-      [ -n "$candidate" ] || worktree_request_send=1
-    fi
-    if [ "$worktree_request_send" -eq 1 ]; then
-      candidate=""
-      spawn_send_text_line "$WT_TARGET" 'treehouse get' || {
-        echo "error: could not resume worktree acquisition for $ID; endpoint receipt preserved" >&2
+      [ -z "$WT" ] || break
+      [ "$worktree_request_recovery" -eq 1 ] || break
+
+      worktree_request_idle=0
+      case "$BACKEND" in
+        tmux|herdr)
+          [ "$(fm_backend_agent_state "$BACKEND" "$T")" != dead ] || worktree_request_idle=1
+          ;;
+        zellij|cmux)
+          [ "$project_shell_observed" -ne 1 ] || worktree_request_idle=1
+          ;;
+      esac
+      [ "$worktree_request_idle" -eq 1 ] || break
+      if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
+        [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] \
+          || { echo "error: worktree request marker is unsafe: $WORKTREE_REQUEST_MARKER" >&2; exit 1; }
+        break
+      fi
+      spawn_endpoint_receipt_publish worktree-requesting || {
+        echo "error: could not republish worktree request intent for $ID" >&2
         exit 1
       }
+      spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || {
+        echo "error: could not resume failed worktree acquisition for $ID; request intent preserved" >&2
+        exit 1
+      }
+      spawn_endpoint_receipt_publish worktree-requested || {
+        echo "error: could not confirm the resumed worktree request for $ID" >&2
+        exit 1
+      }
+      worktree_request_recovery=0
+      worktree_request_round=$((worktree_request_round + 1))
+    done
+    if [ -z "$WT" ]; then
+      echo "error: treehouse get did not enter a worktree; in-flight request preserved for $ID at $T" >&2
+      exit 1
     fi
-
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
-  # Target the stable window id, not the name: if the name is ever lost (e.g. an
-  # automatic-rename slips through), display-message -t <bad-name> falls back to the
-  # active client's window, which would misread firstmate's OWN pane path as the
-  # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
-  #
-  # A single read that already differs from PROJ_ABS_REAL is not proof the pane
-  # settled there: on some tmux/WSL setups a brand-new window's pane_current_path
-  # transiently reports an unrelated stale path (seen live as another real git
-  # checkout entirely) before the shell catches up with treehouse get's cd. That
-  # stale path still passes the PROJ_ABS_REAL comparison and validate_spawn_worktree
-  # below (it resolves to a real, distinct worktree top-level too), so accepting it
-  # on one read alone silently records the wrong worktree= in state/<id>.meta. Require
-  # two consecutive reads to agree on the same non-project path before accepting it;
-  # a mismatch just becomes the new candidate rather than resetting the wait, so a
-  # pane that is already settled by the first real read only costs the one existing
-  # inter-poll sleep as confirmation, not a whole extra cycle on top.
-  for _ in $(seq 1 60); do
-    p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ]; then
-      p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
-        if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-          WT="$p"
-          break
-        fi
-        candidate="$p_real"
-      else
-        candidate=""
-      fi
-    else
-      candidate=""
-    fi
-    sleep 1
-  done
-  if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
-    exit 1
-  fi
 
     validate_spawn_worktree "treehouse get" "$T"
     spawn_endpoint_receipt_publish worktree-ready "$WT" || {
       echo "error: could not bind the recovered endpoint worktree for $ID" >&2
       exit 1
     }
+    if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
+      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] \
+        && rmdir "$WORKTREE_REQUEST_MARKER" || {
+          echo "error: could not retire the exact worktree request marker for $ID" >&2
+          exit 1
+        }
+    fi
   fi
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
@@ -3463,6 +3743,12 @@ if [ "$RELAUNCH" -eq 0 ]; then
     echo "error: could not retire endpoint recovery receipt for $ID" >&2
     exit 1
   }
+  if [ "$BACKEND" = orca ]; then
+    spawn_orca_operation_retire || {
+      echo "error: could not retire Orca endpoint operation journal for $ID" >&2
+      exit 1
+    }
+  fi
 fi
 # A dispatch or relaunch keeps the per-task meta lock through launch delivery.
 # The backlog mutation is deliberately the final fallible commit below, so

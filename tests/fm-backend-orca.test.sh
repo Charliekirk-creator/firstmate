@@ -23,6 +23,11 @@ next=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
   for a in "$@"; do printf '\x1f%s' "$a"; done
   printf '\n'
 } >> "$LOG"
+if [ "${1:-}" = worktree ] && [ "${2:-}" = create ] \
+   && [ -n "${FM_ORCA_WORKTREE_CREATE_BLOCK:-}" ]; then
+  : > "$FM_ORCA_WORKTREE_CREATE_BLOCK"
+  while [ ! -f "${FM_ORCA_WORKTREE_CREATE_RELEASE:?}" ]; do sleep 0.02; done
+fi
 if [ "${1:-}" = status ] && [ "${FM_ORCA_STATUS_RESPONSE:-ready}" != sequence ]; then
   printf '{"ok":true,"result":{"runtime":{"reachable":true,"state":"ready"}}}\n'
   exit 0
@@ -526,6 +531,70 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
   pass "fm-spawn.sh --backend orca: reuses implicit terminal, records metadata, launches harness"
 }
 
+test_spawn_recovers_orca_creation_after_parent_kill() {
+  local proj wt data state config id out_file spawn_pid rc=0 i creates out
+  id="orcarecoverz2"
+  proj="$TMP_ROOT/recover-spawn-project"
+  wt="$TMP_ROOT/recover-spawn-wt"
+  data="$TMP_ROOT/recover-spawn-data"
+  state="$TMP_ROOT/recover-spawn-state"
+  config="$TMP_ROOT/recover-spawn-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case spawn-parent-kill
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-recover"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-recover","path":"%s"},"terminal":{"handle":"term-recover"}}}\n' "$wt" > "$RESP/3.out"
+  printf '{"ok":true,"result":{"terminal":{"tail":["shell ready"]}}}\n' > "$RESP/4.out"
+  out_file="$CASE_DIR/spawn.out"
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_WORKTREE_CREATE_BLOCK="$CASE_DIR/create-started" \
+    FM_ORCA_WORKTREE_CREATE_RELEASE="$CASE_DIR/create-release" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca \
+    >"$out_file" 2>&1 &
+  spawn_pid=$!
+  for i in $(seq 1 100); do
+    [ ! -f "$CASE_DIR/create-started" ] || break
+    sleep 0.02
+  done
+  assert_present "$CASE_DIR/create-started" "Orca worktree creation never reached the blocked side effect"
+  jq -e '.phase == "endpoint-creating" and .endpoint.details.worktree_id == ""' \
+    "$state/$id.spawn-endpoint.json" >/dev/null \
+    || fail "Orca creation began without durable endpoint intent"
+  kill -KILL "$spawn_pid"
+  wait "$spawn_pid" 2>/dev/null || rc=$?
+  [ "$rc" -ne 0 ] || fail "Orca parent-kill fixture did not terminate the spawn"
+  : > "$CASE_DIR/create-release"
+  for i in $(seq 1 100); do
+    [ ! -f "$state/$id.spawn-orca-operation/result.json" ] || break
+    sleep 0.02
+  done
+  assert_present "$state/$id.spawn-orca-operation/result.json" \
+    "detached Orca creator did not persist its exact result after the spawn died"
+
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_WORKTREE_CREATE_BLOCK="$CASE_DIR/create-started" \
+    FM_ORCA_WORKTREE_CREATE_RELEASE="$CASE_DIR/create-release" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1) \
+    || fail "Orca spawn did not adopt the detached creator's exact result: $out"
+  creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
+  [ "$creates" = 1 ] || fail "Orca recovery issued $creates worktree creations"
+  assert_grep 'orca_worktree_id=wt-recover' "$state/$id.meta" \
+    "recovered Orca metadata lost the exact worktree id"
+  assert_grep 'terminal=term-recover' "$state/$id.meta" \
+    "recovered Orca metadata lost the exact terminal handle"
+  assert_absent "$state/$id.spawn-endpoint.json" \
+    "successful Orca recovery did not retire its endpoint receipt"
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh --backend orca: parent death resumes one exact creation"
+}
+
 test_spawn_refuses_orca_secondmate_before_home_mutation() {
   local home subhome data state config id out status
   id="orcasmz1"
@@ -682,7 +751,7 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   pass "fm-spawn.sh --backend orca: preserves metadata when abort cleanup fails"
 }
 
-test_spawn_releases_orca_resources_when_metadata_write_fails() {
+test_spawn_refuses_unsafe_metadata_path_before_orca_creation() {
   local proj wt data state config id out status
   id="orcametafailz9"
   proj="$TMP_ROOT/meta-fail-project"
@@ -694,24 +763,20 @@ test_spawn_releases_orca_resources_when_metadata_write_fails() {
   mkdir -p "$data/$id" "$state/$id.meta" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
   orca_case meta-fail
-  printf '1\n' > "$RESP/1.exit"
-  printf '{"ok":true,"result":{"repo":{"id":"repo-meta-fail"}}}\n' > "$RESP/2.out"
-  printf '{"ok":true,"result":{"worktree":{"id":"wt-meta-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
-  printf '{"ok":true,"result":{"terminal":{"handle":"term-meta-fail"}}}\n' > "$RESP/4.out"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "Orca spawn should fail when metadata cannot be written"
-  assert_contains "$out" "task record for $id could not be published" \
-    "spawn should report metadata publication failure without relying on platform-specific mv output"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-meta-fail'$'\x1f''--json' \
-    "Orca spawn should close the recorded terminal when a later abort occurs"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-meta-fail'$'\x1f''--force'$'\x1f''--json' \
-    "Orca spawn should remove the recorded worktree when a later abort occurs"
-  [ ! -f "$state/$id.meta" ] || fail "metadata-write abort should not publish a regular metadata file"
-  pass "fm-spawn.sh --backend orca: releases terminal and worktree on later aborts"
+  assert_contains "$out" "fresh dispatch found existing task metadata" \
+    "spawn should reject the unsafe metadata path during identity preflight"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''create' \
+    "unsafe metadata preflight should not create an Orca worktree"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''create' \
+    "unsafe metadata preflight should not create an Orca terminal"
+  [ -d "$state/$id.meta" ] || fail "unsafe metadata preflight changed the conflicting path"
+  pass "fm-spawn.sh --backend orca: unsafe metadata refuses before endpoint mutation"
 }
 
 test_peek_send_and_crew_state_route_through_orca_meta() {
@@ -1332,12 +1397,13 @@ test_worktree_and_terminal_helpers_parse_json
 test_worktree_create_removes_worktree_when_path_missing
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness
+test_spawn_recovers_orca_creation_after_parent_kill
 test_spawn_refuses_orca_secondmate_before_home_mutation
 test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
 test_spawn_removes_orca_worktree_when_terminal_create_fails
 test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
-test_spawn_releases_orca_resources_when_metadata_write_fails
+test_spawn_refuses_unsafe_metadata_path_before_orca_creation
 test_peek_send_and_crew_state_route_through_orca_meta
 test_peek_and_crew_state_fail_closed_on_orca_error_json
 test_target_exists_rejects_orca_error_json

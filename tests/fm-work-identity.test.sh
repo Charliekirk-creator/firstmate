@@ -69,7 +69,8 @@ set -u
 case "$*" in
   *"#{pane_current_path}"*)
     if [ -n "${FM_TEST_TREEHOUSE_SUCCESS_MARKER:-}" ] \
-       && [ ! -f "$FM_TEST_TREEHOUSE_SUCCESS_MARKER" ]; then
+       && { [ ! -f "$FM_TEST_TREEHOUSE_SUCCESS_MARKER" ] \
+         || [ "${FM_TEST_TREEHOUSE_INFLIGHT:-0}" = 1 ]; }; then
       printf '%s\n' "${FM_TEST_PROJECT_PATH:?}"
     else
       printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_HOME:?}}"
@@ -108,12 +109,22 @@ case "${1:-}" in
     for arg in "$@"; do [ "$arg" != -l ] || literal=1; done
     if [ "$literal" -eq 0 ] && [ -n "${FM_TEST_TREEHOUSE_SUCCESS_MARKER:-}" ] \
        && printf '%s\n' "$*" | grep -Fq 'treehouse get'; then
+      [ -z "${FM_TEST_TREEHOUSE_SEND_LOG:-}" ] || printf 'sent\n' >> "$FM_TEST_TREEHOUSE_SEND_LOG"
       if [ -n "${FM_TEST_TREEHOUSE_FAIL_MARKER:-}" ] \
          && [ ! -f "$FM_TEST_TREEHOUSE_FAIL_MARKER" ]; then
         : > "$FM_TEST_TREEHOUSE_FAIL_MARKER"
         exit 1
       fi
+      command_arg=${@: -2:1}
+      bash -c "$command_arg" || exit 1
       : > "$FM_TEST_TREEHOUSE_SUCCESS_MARKER"
+      if [ -n "${FM_TEST_TREEHOUSE_KILL_MARKER:-}" ] \
+         && [ ! -f "$FM_TEST_TREEHOUSE_KILL_MARKER" ]; then
+        : > "$FM_TEST_TREEHOUSE_KILL_MARKER"
+        kill -KILL "$PPID"
+        sleep 1
+        exit 137
+      fi
     fi
     if [ "$literal" -eq 1 ] && [ -n "${FM_TEST_MUTATE_LAUNCH_BRIEF:-}" ]; then
       printf 'MUTATED_LAUNCH_BRIEF\n' > "$FM_TEST_MUTATE_LAUNCH_BRIEF.replacement"
@@ -666,7 +677,7 @@ test_spawn_resumes_unsent_worktree_request() {
     PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
     --mode no-mistakes --yolo off 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "worktree request fixture unexpectedly completed its failed send"
-  jq -e '.phase == "worktree-requested" and .worktree == null' \
+  jq -e '.phase == "worktree-requesting" and .worktree == null' \
     "$home/state/$task.spawn-endpoint.json" >/dev/null \
     || fail "failed worktree send did not retain its resumable request phase: $out"
   out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
@@ -674,6 +685,7 @@ test_spawn_resumes_unsent_worktree_request() {
     FM_TEST_TREEHOUSE_FAIL_MARKER="$home/treehouse-failed" \
     FM_TEST_TREEHOUSE_SUCCESS_MARKER="$home/treehouse-succeeded" \
     FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 \
     PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
     --mode no-mistakes --yolo off 2>&1) \
     || fail "spawn did not resend an interrupted worktree request: $out"
@@ -681,6 +693,46 @@ test_spawn_resumes_unsent_worktree_request() {
   creates=$(wc -l < "$home/endpoint-creates" | tr -d ' ')
   [ "$creates" = 1 ] || fail "worktree request recovery created a duplicate endpoint"
   pass "spawn resumes a worktree request interrupted before send"
+}
+
+test_spawn_does_not_resend_inflight_worktree_request() {
+  local home task project wt fakebin manifest out rc=0 sends
+  home=$(make_home worktree-request-inflight)
+  task=worktree-request-inflight
+  project="$home/project"
+  wt="$home/worker-copy"
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  record_and_brief "$home" "$task" "$manifest"
+  fm_git_worktree "$project" "$wt" worktree-inflight-copy
+  fakebin=$(make_fakebin "$home/worktree-inflight-fakes")
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=bash FM_TEST_PROJECT_PATH="$project" \
+    FM_TEST_TREEHOUSE_SUCCESS_MARKER="$home/treehouse-started" \
+    FM_TEST_TREEHOUSE_SEND_LOG="$home/treehouse-sends" \
+    FM_TEST_TREEHOUSE_KILL_MARKER="$home/treehouse-killed" \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "in-flight worktree request fixture unexpectedly survived its injected kill"
+  jq -e '.phase == "worktree-requesting" and .worktree == null' \
+    "$home/state/$task.spawn-endpoint.json" >/dev/null \
+    || fail "interrupted worktree request did not retain its pre-send receipt: $out"
+
+  rc=0
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=treehouse FM_TEST_PROJECT_PATH="$project" \
+    FM_TEST_TREEHOUSE_SUCCESS_MARKER="$home/treehouse-started" \
+    FM_TEST_TREEHOUSE_INFLIGHT=1 FM_TEST_TREEHOUSE_SEND_LOG="$home/treehouse-sends" \
+    FM_TEST_TREEHOUSE_KILL_MARKER="$home/treehouse-killed" \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "retry should keep waiting for the in-flight acquisition"
+  sends=$(wc -l < "$home/treehouse-sends" | tr -d ' ')
+  [ "$sends" = 1 ] || fail "retry sent $sends worktree requests while the first acquisition was still active: $out"
+  pass "spawn retries do not duplicate in-flight worktree acquisition"
 }
 
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
@@ -1753,6 +1805,7 @@ test_dispatch_transaction_excludes_backlog_handoff
 test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect
 test_spawn_resumes_unsent_worktree_request
+test_spawn_does_not_resend_inflight_worktree_request
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt
 test_metadata_validation_uses_one_stable_capture
 test_snapshot_preflight_and_dispatch_recovery
