@@ -106,6 +106,21 @@ if (data.ok === false) {
 '
 }
 
+fm_backend_orca_json_error_code() {
+  node -e '
+const fs = require("fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (_) {
+  process.exit(1);
+}
+const code = data && data.error && data.error.code;
+if (typeof code !== "string" || !code) process.exit(1);
+process.stdout.write(code);
+'
+}
+
 fm_backend_orca_run_json() {
   local out
   out=$("$@") || return 1
@@ -153,7 +168,7 @@ fm_backend_orca_worktree_response_parse() {  # <response-path> <name>
   wt_path=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-path) || {
     echo "error: orca worktree create did not return a path for $name" >&2
     [ -z "$terminal" ] || fm_backend_orca_kill "$terminal" >/dev/null 2>&1 || true
-    if fm_backend_orca_remove_worktree "$wt_id" >/dev/null; then
+    if fm_backend_orca_remove_worktree "$wt_id" --absent-ok >/dev/null; then
       return 3
     fi
     if [ -n "$terminal" ]; then
@@ -167,7 +182,7 @@ fm_backend_orca_worktree_response_parse() {  # <response-path> <name>
   [ -z "$terminal" ] || printf '\t%s' "$terminal"
 }
 
-fm_backend_orca_worktree_response_ready() {  # <response-path>
+fm_backend_orca_worktree_response_complete() {  # <response-path>
   local response=$1 out links bytes
   [ -f "$response" ] && [ ! -L "$response" ] || return 1
   links=$(fm_backend_orca_file_link_count "$response") || return 1
@@ -176,8 +191,15 @@ fm_backend_orca_worktree_response_ready() {  # <response-path>
   case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
   [ "$bytes" -le 65536 ] || return 1
   out=$(cat "$response") || return 1
-  printf '%s' "$out" | fm_backend_orca_json_get worktree-id >/dev/null 2>&1 \
-    && printf '%s' "$out" | fm_backend_orca_json_get worktree-path >/dev/null 2>&1
+  printf '%s' "$out" | fm_backend_orca_json_ok >/dev/null 2>&1 \
+    && printf '%s' "$out" | fm_backend_orca_json_get worktree-id >/dev/null 2>&1
+}
+
+fm_backend_orca_worktree_response_ready() {  # <response-path>
+  local response=$1 out
+  fm_backend_orca_worktree_response_complete "$response" || return 1
+  out=$(cat "$response") || return 1
+  printf '%s' "$out" | fm_backend_orca_json_get worktree-path >/dev/null 2>&1
 }
 
 fm_backend_orca_worktree_create() {  # <project-path> <name>
@@ -239,19 +261,109 @@ fm_backend_orca_terminal_create() {  # <worktree-id> <title>
   printf '%s' "$terminal"
 }
 
-fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-path>
-  local worktree_id=$1 title=$2 response=$3 creator rc
-  [ ! -e "$response" ] && [ ! -L "$response" ] || return 1
+fm_backend_orca_operation_scalar_read() {  # <path>
+  local path=$1 links value
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  links=$(fm_backend_orca_file_link_count "$path") || return 1
+  [ "$links" = 1 ] || return 1
+  value=$(tr -d '\n' < "$path") || return 1
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$value" | cmp -s "$path" - || return 1
+  printf '%s' "$value"
+}
+
+fm_backend_orca_operation_scalar_publish() {  # <path> <value>
+  local path=$1 value=$2 tmp
+  tmp=$(umask 077; mktemp "${path}.XXXXXX") || return 1
+  printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
+    && ln "$tmp" "$path" 2>/dev/null
+  local rc=$?
+  rm -f -- "$tmp"
+  return "$rc"
+}
+
+fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-path> <operation-prefix>
+  local worktree_id=$1 title=$2 response=$3 operation=$4
+  local pid_file="${operation}.pid" start_file="${operation}.start" status_file="${operation}.status"
+  local creator pid status tmp rc i=0 max=${FM_ORCA_TERMINAL_POLLS:-3000} interval=${FM_ORCA_TERMINAL_INTERVAL:-0.02}
   fm_backend_orca_tool_check || return 1
-  (
-    umask 077
-    set -C
-    exec orca terminal create --worktree "id:$worktree_id" --title "$title" --json > "$response"
-  ) &
-  creator=$!
-  if wait "$creator"; then rc=0; else rc=$?; fi
-  [ "$rc" -eq 0 ] || return "$rc"
-  fm_backend_orca_terminal_response_parse "$response" "$title"
+  while :; do
+    if [ -e "$status_file" ] || [ -L "$status_file" ]; then
+      status=$(fm_backend_orca_operation_scalar_read "$status_file") || return 1
+      if [ "$status" -eq 0 ]; then
+        fm_backend_orca_terminal_response_parse "$response" "$title"
+        return $?
+      fi
+      [ "$status" -le 125 ] || return 1
+      return "$status"
+    fi
+
+    if [ -e "$pid_file" ] || [ -L "$pid_file" ]; then
+      pid=$(fm_backend_orca_operation_scalar_read "$pid_file") || return 1
+      if kill -0 "$pid" 2>/dev/null; then
+        if [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; then
+          fm_backend_orca_operation_scalar_publish "$start_file" 1 || return 1
+        else
+          fm_backend_orca_operation_scalar_read "$start_file" >/dev/null || return 1
+        fi
+      elif [ -e "$response" ] || [ -L "$response" ]; then
+        fm_backend_orca_terminal_response_parse "$response" "$title"
+        return $?
+      elif [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; then
+        rm -f -- "$pid_file" || return 1
+        continue
+      else
+        echo "error: Orca terminal creation stopped without a recoverable outcome for $title" >&2
+        return 1
+      fi
+    elif [ -e "$response" ] || [ -L "$response" ] \
+      || [ -e "$start_file" ] || [ -L "$start_file" ]; then
+      echo "error: Orca terminal creation journal is incomplete for $title" >&2
+      return 1
+    else
+      (
+        trap '' HUP INT
+        i=0
+        while [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; do
+          i=$((i + 1))
+          [ "$i" -lt 1500 ] || exit 124
+          sleep 0.02
+        done
+        fm_backend_orca_operation_scalar_read "$start_file" >/dev/null || exit 1
+        tmp=$(umask 077; mktemp "${response}.XXXXXX") || exit 1
+        if orca terminal create --worktree "id:$worktree_id" --title "$title" --json > "$tmp"; then
+          rc=0
+          chmod 600 "$tmp" || rc=1
+          if [ "$rc" -eq 0 ]; then
+            ln "$tmp" "$response" 2>/dev/null || rc=1
+          fi
+        else
+          rc=$?
+        fi
+        rm -f -- "$tmp"
+        fm_backend_orca_operation_scalar_publish "$status_file" "$rc" || exit 1
+        exit "$rc"
+      ) &
+      creator=$!
+      if ! fm_backend_orca_operation_scalar_publish "$pid_file" "$creator"; then
+        kill "$creator" 2>/dev/null || true
+        wait "$creator" 2>/dev/null || true
+        return 1
+      fi
+      fm_backend_orca_operation_scalar_publish "$start_file" 1 || {
+        kill "$creator" 2>/dev/null || true
+        wait "$creator" 2>/dev/null || true
+        return 1
+      }
+    fi
+
+    i=$((i + 1))
+    [ "$i" -lt "$max" ] || {
+      echo "error: Orca terminal creation is still in progress for $title" >&2
+      return 1
+    }
+    sleep "$interval"
+  done
 }
 
 fm_backend_orca_send_text_line() {  # <terminal-id> <text>
@@ -266,11 +378,22 @@ fm_backend_orca_send_literal() {  # <terminal-id> <text>
   fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$text" --json
 }
 
-fm_backend_orca_remove_worktree() {  # <worktree-id>
-  local worktree_id=${1:-}
+fm_backend_orca_remove_worktree() {  # <worktree-id> [--absent-ok]
+  local worktree_id=${1:-} absent_ok=${2:-} out rc code
   [ -n "$worktree_id" ] || { echo "error: missing Orca worktree id; cannot remove worktree" >&2; return 1; }
+  case "$absent_ok" in ''|--absent-ok) ;; *) return 1 ;; esac
   fm_backend_orca_tool_check || return 1
-  fm_backend_orca_run_json orca worktree rm --worktree "id:$worktree_id" --force --json
+  if out=$(orca worktree rm --worktree "id:$worktree_id" --force --json); then
+    rc=0
+  else
+    rc=$?
+  fi
+  code=$(printf '%s' "$out" | fm_backend_orca_json_error_code 2>/dev/null || true)
+  if [ "$absent_ok" = --absent-ok ]; then
+    case "$code" in worktree_not_found|not_found) return 0 ;; esac
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  printf '%s' "$out" | fm_backend_orca_json_ok
 }
 
 fm_backend_orca_worktree_path() {

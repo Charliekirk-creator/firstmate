@@ -673,6 +673,8 @@ spawn_remote_secondmate() {
     echo "remote_backend=$remote_backend"
     echo "remote_herdr_session=$remote_herdr_session"
     echo "remote_target=$remote_target"
+    echo "work_identity_schema=$SECONDMATE_WORK_IDENTITY_SCHEMA"
+    echo "work_identity_status=$SECONDMATE_WORK_IDENTITY_STATUS"
     [ -z "$remote_recorded_traceparent" ] || echo "traceparent=$remote_recorded_traceparent"
   } > "$tmp"
   if ! fm_backlog_atomic_transition publish "$tmp" "$meta" "task record" "$STATE"; then
@@ -1024,13 +1026,9 @@ spawn_orca_operation_helper() {
   fi
   if [ "$rc" -eq 0 ] && [ -z "$terminal" ]; then
     terminal_response="$SPAWN_ORCA_OPERATION/terminal-response.json"
-    if [ -e "$terminal_response" ] || [ -L "$terminal_response" ]; then
-      terminal=$(fm_backend_orca_terminal_response_parse "$terminal_response" "$W")
-      rc=$?
-    else
-      terminal=$(fm_backend_orca_terminal_create_durable "$wt_id" "$W" "$terminal_response")
-      rc=$?
-    fi
+    terminal=$(fm_backend_orca_terminal_create_durable "$wt_id" "$W" \
+      "$terminal_response" "$SPAWN_ORCA_OPERATION/terminal-create")
+    rc=$?
     [ "$rc" -eq 0 ] || failure_reason=terminal
   fi
   if [ "$rc" -eq 0 ] && [ -n "$wt_id" ] && [ -n "$wt_path" ] && [ -n "$terminal" ]; then
@@ -1079,7 +1077,7 @@ spawn_orca_operation_start() {
 }
 
 spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator exited, 6=recoverable response
-  local file canonical links pid failure_reason create_response_ready=0
+  local file canonical links pid failure_reason create_response_complete=0
   file="$SPAWN_ORCA_OPERATION/result.json"
   if [ -e "$file" ] || [ -L "$file" ]; then
     [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -1154,7 +1152,7 @@ spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator
     [ -f "$file" ] && [ ! -L "$file" ] || return 1
     links=$(spawn_file_link_count "$file") || return 1
     [ "$links" = 1 ] || return 1
-    fm_backend_orca_worktree_response_ready "$file" && create_response_ready=1
+    fm_backend_orca_worktree_response_complete "$file" && create_response_complete=1
   fi
 
   file="$SPAWN_ORCA_OPERATION/claim"
@@ -1165,7 +1163,7 @@ spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator
   pid=$(tr -d '[:space:]' < "$file")
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   if kill -0 "$pid" 2>/dev/null; then return 2; fi
-  [ "$create_response_ready" -eq 0 ] || return 6
+  [ "$create_response_complete" -eq 0 ] || return 6
   return 4
 }
 
@@ -1194,10 +1192,13 @@ spawn_orca_operation_wait() {
         fi
         ;;
       6)
-        rm -f -- "$SPAWN_ORCA_OPERATION/claim" || return 1
-        spawn_orca_operation_start || return 1
-        started=1
-        creator_exited=0
+        creator_exited=$((creator_exited + 1))
+        if [ "$creator_exited" -ge 10 ]; then
+          rm -f -- "$SPAWN_ORCA_OPERATION/claim" || return 1
+          spawn_orca_operation_start || return 1
+          started=1
+          creator_exited=0
+        fi
         ;;
       5)
         [ ! -s "$SPAWN_ORCA_OPERATION/helper.err" ] || cat "$SPAWN_ORCA_OPERATION/helper.err" >&2
@@ -1569,7 +1570,28 @@ if [ "$RELAUNCH" -eq 0 ]; then
   fi
   SPAWN_TASK_SET_LOCK_HELD=1
 fi
+SECONDMATE_WORK_IDENTITY_SCHEMA=
+SECONDMATE_WORK_IDENTITY_STATUS=
 if [ "$KIND" = secondmate ]; then
+  secondmate_identity_args=(project "$ID")
+  if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+    secondmate_identity_args+=(--meta "$STATE/$ID.meta")
+  fi
+  SECONDMATE_WORK_IDENTITY_JSON=$(
+    FM_HOME="$FM_HOME" \
+      FM_DATA_OVERRIDE="$DATA" \
+      FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" "${secondmate_identity_args[@]}"
+  ) || exit 1
+  SECONDMATE_WORK_IDENTITY_SCHEMA=$(printf '%s' "$SECONDMATE_WORK_IDENTITY_JSON" | jq -er '.schema') \
+    || { echo "error: persistent secondmate work identity projection is malformed for $ID" >&2; exit 1; }
+  SECONDMATE_WORK_IDENTITY_STATUS=$(printf '%s' "$SECONDMATE_WORK_IDENTITY_JSON" | jq -er '.status') \
+    || { echo "error: persistent secondmate work identity projection is malformed for $ID" >&2; exit 1; }
+  [ "$SECONDMATE_WORK_IDENTITY_STATUS" = unlinked ] || {
+    echo "error: persistent secondmate control task $ID cannot carry a linked work identity; route exact work units to tasks in the secondmate home" >&2
+    exit 1
+  }
   if spawn_remote_secondmate "$ID"; then
     exit 0
   else

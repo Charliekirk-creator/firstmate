@@ -97,5 +97,5 @@ The launch-template review covered every verified worker tool supported on 2026-
 | Muse | Full encoded snapshot passed at launch | Applicable for its supported crewmate and scout roles. |
 
 Persistent secondmate agents are not work-unit workers themselves.
-Their ship and scout children use the same table in the secondmate home's ordinary spawn path, while Muse remains inapplicable to the persistent secondmate role for its pre-existing supervision limitation.
+Their local and remote control tasks refuse linked intake before endpoint or home mutation and record the route as explicitly unlinked; their ship and scout children use the same table in the secondmate home's ordinary spawn path, while Muse remains inapplicable to the persistent secondmate role for its pre-existing supervision limitation.
 No tool may infer a relation from rendered output, process identity, endpoint labels, or status prose.

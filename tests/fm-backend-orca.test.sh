@@ -50,6 +50,11 @@ if [ "${1:-}" = terminal ] && [ "${2:-}" = create ] \
   : > "$FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_BLOCK"
   while [ ! -f "${FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_RELEASE:?}" ]; do sleep 0.02; done
 fi
+if [ "${1:-}" = worktree ] && [ "${2:-}" = rm ] \
+   && [ -n "${FM_ORCA_WORKTREE_REMOVE_AFTER_OUTPUT_BLOCK:-}" ]; then
+  : > "$FM_ORCA_WORKTREE_REMOVE_AFTER_OUTPUT_BLOCK"
+  while [ ! -f "${FM_ORCA_WORKTREE_REMOVE_AFTER_OUTPUT_RELEASE:?}" ]; do sleep 0.02; done
+fi
 exit 0
 SH
   chmod +x "$fb/orca"
@@ -508,13 +513,74 @@ test_spawn_retries_after_compensated_pathless_worktree() {
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 ) \
-    || fail "retry after compensated Orca creation remained wedged: $out"
+    || fail "retry after compensated Orca creation remained wedged: $out$(printf '\n%s' "$(cat "$LOG")")"
   creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
   [ "$creates" -eq 2 ] || fail "compensated Orca retry issued $creates worktree creations"
   assert_grep 'orca_worktree_id=wt-compensated' "$state/$id.meta" \
     "retry after compensation lost the successful worktree identity"
   rm -rf "/tmp/fm-$id"
   pass "fm-spawn.sh --backend orca: compensated creation retires recovery state and permits retry"
+}
+
+test_spawn_recovers_compensated_pathless_response_after_creator_crash() {
+  local proj wt data state config id out_file spawn_pid helper_pid rc=0 i out creates
+  id="orcacompensatedcrashz8"
+  proj="$TMP_ROOT/compensated-crash-project"
+  wt="$TMP_ROOT/compensated-crash-wt"
+  data="$TMP_ROOT/compensated-crash-data"
+  state="$TMP_ROOT/compensated-crash-state"
+  config="$TMP_ROOT/compensated-crash-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case compensated-pathless-crash
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-compensated-crash"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-compensated-crash"},"terminal":{"handle":"term-compensated-crash"}}}\n' > "$RESP/3.out"
+  printf '{"ok":false,"error":{"code":"worktree_not_found","message":"worktree not found"}}\n' > "$RESP/7.out"
+  out_file="$CASE_DIR/spawn.out"
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_WORKTREE_REMOVE_AFTER_OUTPUT_BLOCK="$CASE_DIR/remove-returned" \
+    FM_ORCA_WORKTREE_REMOVE_AFTER_OUTPUT_RELEASE="$CASE_DIR/remove-return-release" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca \
+    >"$out_file" 2>&1 &
+  spawn_pid=$!
+  for i in $(seq 1 200); do
+    [ ! -f "$CASE_DIR/remove-returned" ] || break
+    sleep 0.02
+  done
+  assert_present "$CASE_DIR/remove-returned" \
+    "pathless compensation crash fixture never reached worktree removal"
+  helper_pid=$(tr -d '[:space:]' < "$state/$id.spawn-orca-operation/claim")
+  kill -KILL "$helper_pid" || fail "could not stop the detached Orca creator after compensation"
+  : > "$CASE_DIR/remove-return-release"
+  wait "$spawn_pid" || rc=$?
+  [ "$rc" -ne 0 ] || fail "compensated pathless creation should still report its failed attempt"
+  assert_contains "$(cat "$out_file")" "failed without leaving resources" \
+    "pathless response was not reconciled to a compensated outcome"
+  assert_absent "$state/$id.spawn-endpoint.json" \
+    "reconciled pathless response retained its endpoint receipt"
+  assert_absent "$state/$id.spawn-orca-operation" \
+    "reconciled pathless response retained its operation journal"
+  assert_absent "$data/$id/work-identity-dispatch.json" \
+    "reconciled pathless response retained its prepared identity dispatch"
+
+  printf '{"ok":true,"result":{"repo":{"id":"repo-compensated-crash"}}}\n' > "$RESP/8.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-compensated-retry","path":"%s"},"terminal":{"handle":"term-compensated-retry"}}}\n' "$wt" > "$RESP/9.out"
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1) \
+    || fail "retry after interrupted pathless compensation remained wedged: $out$(printf '\n%s' "$(cat "$LOG")")"
+  creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
+  [ "$creates" -eq 2 ] || fail "interrupted compensation retry issued $creates worktree creations"
+  assert_grep 'orca_worktree_id=wt-compensated-retry' "$state/$id.meta" \
+    "retry after interrupted compensation lost the successful worktree identity"
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh --backend orca: pathless compensation survives creator interruption"
 }
 
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
@@ -735,6 +801,16 @@ test_spawn_recovers_orca_terminal_response_after_creator_crash() {
     "Orca terminal crash fixture never completed its terminal side effect"
   helper_pid=$(tr -d '[:space:]' < "$state/$id.spawn-orca-operation/claim")
   kill -KILL "$helper_pid" || fail "could not stop the detached Orca creator after terminal creation"
+  sleep 0.2
+  kill -0 "$spawn_pid" 2>/dev/null \
+    || fail "spawn parsed a terminal response while its exact creation was still in flight"
+  assert_absent "$state/$id.spawn-orca-operation/result.json" \
+    "in-flight terminal creation published a completed endpoint result"
+  assert_absent "$state/$id.spawn-orca-operation/failure.json" \
+    "in-flight terminal creation published a failure before its operation completed"
+  terminal_creates=$(grep -c $'orca\x1fterminal\x1fcreate' "$LOG")
+  [ "$terminal_creates" -eq 1 ] \
+    || fail "terminal recovery restarted an in-flight creation $terminal_creates times"
   : > "$CASE_DIR/terminal-return-release"
   wait "$spawn_pid" || rc=$?
   expect_code 0 "$rc" "spawn did not reconcile the exact Orca terminal response after its creator crashed$(printf '\n%s' "$(cat "$out_file")")"
@@ -1611,6 +1687,7 @@ test_json_get_ignores_undocumented_terminal_id_shapes
 test_worktree_and_terminal_helpers_parse_json
 test_worktree_create_removes_worktree_when_path_missing
 test_spawn_retries_after_compensated_pathless_worktree
+test_spawn_recovers_compensated_pathless_response_after_creator_crash
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness
 test_spawn_recovers_orca_creation_after_parent_kill
