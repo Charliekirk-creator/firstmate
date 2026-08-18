@@ -212,6 +212,22 @@ fm_backend_orca_worktree_create_durable() {  # <project-path> <name> <response-p
   fm_backend_orca_worktree_response_parse "$response" "$name"
 }
 
+fm_backend_orca_terminal_response_parse() {  # <response-path> <title>
+  local response=$1 title=$2 out terminal links bytes
+  [ -f "$response" ] && [ ! -L "$response" ] || return 1
+  links=$(fm_backend_orca_file_link_count "$response") || return 1
+  [ "$links" = 1 ] || return 1
+  bytes=$(LC_ALL=C wc -c < "$response" | tr -d ' ')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 65536 ] || return 1
+  out=$(cat "$response") || return 1
+  terminal=$(printf '%s' "$out" | fm_backend_orca_json_get terminal-handle) || {
+    echo "error: orca terminal create did not return a terminal handle for $title" >&2
+    return 1
+  }
+  printf '%s' "$terminal"
+}
+
 fm_backend_orca_terminal_create() {  # <worktree-id> <title>
   local worktree_id=$1 title=$2 out terminal
   fm_backend_orca_tool_check || return 1
@@ -221,6 +237,21 @@ fm_backend_orca_terminal_create() {  # <worktree-id> <title>
     return 1
   }
   printf '%s' "$terminal"
+}
+
+fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-path>
+  local worktree_id=$1 title=$2 response=$3 creator rc
+  [ ! -e "$response" ] && [ ! -L "$response" ] || return 1
+  fm_backend_orca_tool_check || return 1
+  (
+    umask 077
+    set -C
+    exec orca terminal create --worktree "id:$worktree_id" --title "$title" --json > "$response"
+  ) &
+  creator=$!
+  if wait "$creator"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  fm_backend_orca_terminal_response_parse "$response" "$title"
 }
 
 fm_backend_orca_send_text_line() {  # <terminal-id> <text>

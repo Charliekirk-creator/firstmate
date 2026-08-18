@@ -18,6 +18,7 @@
 #   fm-work-identity.sh dispatch-binding <task-id> --brief <brief.md> [--meta <task.meta>]
 #   fm-work-identity.sh dispatch-prepare <task-id> --brief <draft.md> --instructions-path <brief.md> --transaction <id> [--meta <task.meta> --prior-brief <brief.md>]
 #   fm-work-identity.sh dispatch-commit-preflight <task-id> --brief <brief.md> --meta <task.meta> --transaction <id>
+#   fm-work-identity.sh dispatch-publish <task-id> --brief <brief.md> --meta <metadata-candidate> --transaction <id>
 #   fm-work-identity.sh dispatch-commit <task-id> --brief <brief.md> --meta <task.meta> --transaction <id>
 #   fm-work-identity.sh dispatch-abort <task-id> --transaction <id>
 #   fm-work-identity.sh dispatch-retire-preflight <task-id>
@@ -1015,9 +1016,29 @@ write_dispatch_state() {  # <prepared|completed> <task> <transaction> <path> <br
   TMP=
 }
 
+validate_dispatch_prior_locked() {
+  local current_hash
+  if [ ! -e "$DISPATCH_PRIOR" ] && [ ! -L "$DISPATCH_PRIOR" ]; then return 0; fi
+  [ "$DISPATCH_REPLACEMENT" = true ] \
+    || die "non-replacement dispatch has retained prior instructions"
+  safe_regular_file "$DISPATCH_PRIOR" "retained prior dispatch instructions"
+  current_hash=$(sha256_file "$DISPATCH_PRIOR") \
+    || die "SHA-256 is unavailable for retained prior instructions"
+  [ "$current_hash" = "$DISPATCH_PREVIOUS_SHA" ] \
+    || die "retained prior dispatch instructions are stale or mismatched"
+}
+
+retire_dispatch_prior_locked() {
+  validate_dispatch_prior_locked
+  if [ -e "$DISPATCH_PRIOR" ] || [ -L "$DISPATCH_PRIOR" ]; then
+    rm -f -- "$DISPATCH_PRIOR" || die "cannot retire retained prior dispatch instructions"
+  fi
+}
+
 validate_completed_dispatch() {  # <task-id> [meta]
   local task=$1 meta=${2:-$STATE_REAL/$1.meta} projection meta_arg= owned=0
   [ "$DISPATCH_STATUS" = completed ] || die "work identity dispatch is incomplete for task $task"
+  validate_dispatch_prior_locked
   if [ -e "$meta" ] || [ -L "$meta" ]; then
     if [ "$META_CAPTURE_SOURCE" != "$meta" ]; then
       capture_metadata "$meta"
@@ -1693,6 +1714,7 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
       existing_sha=$DISPATCH_INSTRUCTIONS_SHA
     fi
     validate_completed_dispatch "$task"
+    retire_dispatch_prior_locked
     if [ "$resume" = true ] && [ -z "$meta" ] && [ -z "$prior_brief" ]; then
       capture_identity_projection_locked "$task" "$brief" "$STATE_REAL/$task.meta" "$instructions_path"
       projection=$IDENTITY_PROJECTION
@@ -1781,12 +1803,10 @@ complete_prepared_dispatch_locked() {  # <task-id> <brief> <meta>
   local task=$1 brief=$2 meta=$3
   [ "$DISPATCH_STATUS" = prepared ] || die "task $task has no prepared work identity dispatch"
   validate_dispatch_commit_candidate_locked "$task" "$brief" "$meta"
+  retire_dispatch_prior_locked
   write_dispatch_state completed "$task" "$DISPATCH_TRANSACTION" "$DISPATCH_INSTRUCTIONS" \
     "$DISPATCH_INSTRUCTIONS_SHA" "$DISPATCH_IDENTITY_STATUS" "$DISPATCH_IDENTITY_SHA" \
     "$DISPATCH_REPLACEMENT" "$DISPATCH_PREVIOUS_SHA"
-  if [ "$DISPATCH_REPLACEMENT" = true ]; then
-    rm -f -- "$DISPATCH_PRIOR" || die "cannot retire retained prior dispatch instructions"
-  fi
 }
 
 dispatch_commit_preflight() {  # <task-id> <brief> <meta> <transaction>
@@ -1801,6 +1821,39 @@ dispatch_commit_preflight() {  # <task-id> <brief> <meta> <transaction>
   validate_dispatch_commit_candidate_locked "$task" "$brief" "$meta"
 }
 
+dispatch_publish() {  # <task-id> <brief> <metadata-candidate> <transaction>
+  local task=$1 brief=$2 candidate=$3 transaction=$4 target="$STATE_REAL/$1.meta"
+  [ "$candidate" != "$target" ] || die "dispatch metadata candidate must not be authoritative metadata"
+  identity_mutation_lock_acquire "$task"
+  reject_handoff_guard "$task"
+  [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ] \
+    || die "task $task has no prepared work identity dispatch"
+  read_dispatch_state "$task"
+  [ "$DISPATCH_TRANSACTION" = "$transaction" ] \
+    || die "task $task prepared a different work identity dispatch"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    safe_regular_file "$target" "authoritative task metadata"
+  fi
+  capture_metadata "$candidate"
+  validate_dispatch_commit_candidate_locked "$task" "$brief" "$candidate"
+  TMP=$(umask 077; mktemp "$STATE_REAL/.$task.meta-publish.XXXXXX") \
+    || die "cannot create authoritative task metadata"
+  cp -- "$META_CAPTURE_TMP" "$TMP" || die "cannot capture authoritative task metadata"
+  chmod 600 "$TMP" || die "cannot protect authoritative task metadata"
+  finish_metadata_capture "$candidate"
+  mv -f -- "$TMP" "$target" || die "cannot publish authoritative task metadata"
+  TMP=
+  read_dispatch_state "$task"
+  [ "$DISPATCH_TRANSACTION" = "$transaction" ] \
+    || die "task $task dispatch changed during metadata publication"
+  if [ "$DISPATCH_STATUS" = completed ]; then
+    validate_dispatch_commit_candidate_locked "$task" "$brief" "$target"
+    retire_dispatch_prior_locked
+    return 0
+  fi
+  complete_prepared_dispatch_locked "$task" "$brief" "$target"
+}
+
 dispatch_commit() {  # <task-id> <brief> <meta> <transaction>
   local task=$1 brief=$2 meta=$3 transaction=$4
   identity_mutation_lock_acquire "$task"
@@ -1812,6 +1865,7 @@ dispatch_commit() {  # <task-id> <brief> <meta> <transaction>
     || die "task $task prepared a different work identity dispatch"
   if [ "$DISPATCH_STATUS" = completed ]; then
     validate_dispatch_commit_candidate_locked "$task" "$brief" "$meta"
+    retire_dispatch_prior_locked
     return 0
   fi
   complete_prepared_dispatch_locked "$task" "$brief" "$meta"
@@ -1866,8 +1920,6 @@ dispatch_retire_preflight() {  # <task-id>
   [ "$DISPATCH_STATUS" = completed ] || die "task $task has an incomplete work identity dispatch"
   [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
     || die "task $task dispatch instructions path is mismatched"
-  [ ! -e "$DISPATCH_PRIOR" ] && [ ! -L "$DISPATCH_PRIOR" ] \
-    || die "task $task still has retained prior dispatch instructions"
   validate_completed_dispatch "$task"
 }
 
@@ -1885,8 +1937,7 @@ dispatch_retire() {  # <task-id>
     || die "task $task still has launch instructions"
   [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
     || die "task $task dispatch instructions path is mismatched"
-  [ ! -e "$DISPATCH_PRIOR" ] && [ ! -L "$DISPATCH_PRIOR" ] \
-    || die "task $task still has retained prior dispatch instructions"
+  retire_dispatch_prior_locked
   rm -f -- "$DISPATCH_STATE" || die "cannot retire work identity dispatch"
 }
 
@@ -1955,7 +2006,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections|publication-run) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -2112,7 +2163,7 @@ case "$COMMAND" in
     dispatch_prepare "$TASK" "$DISPATCH_BRIEF" "$DISPATCH_INSTRUCTIONS_PATH" \
       "$DISPATCH_TRANSACTION_ARG" "$DISPATCH_META" "$DISPATCH_PRIOR_BRIEF" "$DISPATCH_RESUME"
     ;;
-  dispatch-commit-preflight|dispatch-commit)
+  dispatch-commit-preflight|dispatch-publish|dispatch-commit)
     DISPATCH_BRIEF=
     DISPATCH_META=
     DISPATCH_TRANSACTION_ARG=
@@ -2127,11 +2178,17 @@ case "$COMMAND" in
     done
     [ -n "$DISPATCH_BRIEF" ] && [ -n "$DISPATCH_META" ] && [ -n "$DISPATCH_TRANSACTION_ARG" ] \
       || die "$COMMAND requires --brief, --meta, and --transaction"
-    if [ "$COMMAND" = dispatch-commit-preflight ]; then
-      dispatch_commit_preflight "$TASK" "$DISPATCH_BRIEF" "$DISPATCH_META" "$DISPATCH_TRANSACTION_ARG"
-    else
-      dispatch_commit "$TASK" "$DISPATCH_BRIEF" "$DISPATCH_META" "$DISPATCH_TRANSACTION_ARG"
-    fi
+    case "$COMMAND" in
+      dispatch-commit-preflight)
+        dispatch_commit_preflight "$TASK" "$DISPATCH_BRIEF" "$DISPATCH_META" "$DISPATCH_TRANSACTION_ARG"
+        ;;
+      dispatch-publish)
+        dispatch_publish "$TASK" "$DISPATCH_BRIEF" "$DISPATCH_META" "$DISPATCH_TRANSACTION_ARG"
+        ;;
+      dispatch-commit)
+        dispatch_commit "$TASK" "$DISPATCH_BRIEF" "$DISPATCH_META" "$DISPATCH_TRANSACTION_ARG"
+        ;;
+    esac
     ;;
   dispatch-abort)
     [ "$#" -eq 2 ] && [ "$1" = --transaction ] \

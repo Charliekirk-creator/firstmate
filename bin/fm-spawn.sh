@@ -979,7 +979,7 @@ spawn_orca_operation_publish() {  # <result|failure> <payload>
 }
 
 spawn_orca_operation_helper() {
-  local claim_tmp create_response raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation
+  local claim_tmp create_response terminal_response raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation
   set +e
   claim_tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.claim.XXXXXX") || exit 1
   printf '%s\n' "${BASHPID:-$$}" > "$claim_tmp" || { rm -f -- "$claim_tmp"; exit 1; }
@@ -1023,8 +1023,14 @@ spawn_orca_operation_helper() {
     fi
   fi
   if [ "$rc" -eq 0 ] && [ -z "$terminal" ]; then
-    terminal=$(fm_backend_orca_terminal_create "$wt_id" "$W")
-    rc=$?
+    terminal_response="$SPAWN_ORCA_OPERATION/terminal-response.json"
+    if [ -e "$terminal_response" ] || [ -L "$terminal_response" ]; then
+      terminal=$(fm_backend_orca_terminal_response_parse "$terminal_response" "$W")
+      rc=$?
+    else
+      terminal=$(fm_backend_orca_terminal_create_durable "$wt_id" "$W" "$terminal_response")
+      rc=$?
+    fi
     [ "$rc" -eq 0 ] || failure_reason=terminal
   fi
   if [ "$rc" -eq 0 ] && [ -n "$wt_id" ] && [ -n "$wt_path" ] && [ -n "$terminal" ]; then
@@ -1237,13 +1243,20 @@ spawn_orca_operation_retire() {
   rm -rf -- "$retired" 2>/dev/null || true
 }
 
+spawn_metadata_transaction_published() {
+  local meta="$STATE/$ID.meta" links count
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  links=$(spawn_file_link_count "$meta") || return 1
+  [ "$links" = 1 ] || return 1
+  count=$(grep -Fxc "work_identity_dispatch_transaction=$SPAWN_DISPATCH_TRANSACTION" "$meta" 2>/dev/null || true)
+  [ "$count" = 1 ]
+}
+
 spawn_abort_cleanup() {
   local status=$? orca_cleanup_compensated=0
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
-     && [ -n "$SPAWN_META_TMP" ] \
-     && [ ! -e "$SPAWN_META_TMP" ] \
-     && [ ! -L "$SPAWN_META_TMP" ]; then
+     && spawn_metadata_transaction_published; then
     RELAUNCH_REPLACEMENT_PENDING=0
   fi
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ]; then
@@ -3760,45 +3773,29 @@ preserve_relaunch_meta() {
   exit 1
 }
 chmod 600 "$SPAWN_META_PATH" || exit 1
+SPAWN_META_PUBLISH_STARTED=1
 FM_HOME="$FM_HOME" \
   FM_DATA_OVERRIDE="$DATA" \
   FM_STATE_OVERRIDE="$STATE" \
   FM_ROOT_OVERRIDE="$FM_ROOT" \
-  "$SCRIPT_DIR/fm-work-identity.sh" dispatch-commit-preflight "$ID" \
+  "$SCRIPT_DIR/fm-work-identity.sh" dispatch-publish "$ID" \
     --brief "$BRIEF" --meta "$SPAWN_META_PATH" \
     --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null \
   || exit 1
 
-# Fuse the backlog In-flight transition into the publication that just created
-# the record (bin/fm-backlog-transition-lib.sh owns the invariant). It runs under
-# this task's own meta lock, so a steer or teardown racing the same id stays
-# serialized exactly as before. The call itself is deferred to the final commit
+# Fuse the backlog In-flight transition into the identity owner's publication
+# that just created the record. The call itself is deferred to the final commit
 # point below so every earlier launch-delivery failure remains unwindable.
 spawn_commit_backlog_transition() {
   [ "$BACKLOG_TRANSITION" = 1 ] || return 0
   fm_backlog_atomic_transition dispatch "$STATE/$ID.meta" "$DATA" "$ID" "$STATE"
 }
-
-SPAWN_META_PUBLISH_STARTED=1
-if ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE"; then
-  if [ "$RELAUNCH" -eq 1 ]; then
-    echo "error: replacement task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
-  else
-    echo "error: task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
-  fi
-  exit 1
-fi
 [ "$RELAUNCH" -ne 1 ] || RELAUNCH_REPLACEMENT_PENDING=0
 SPAWN_META_PUBLISH_STARTED=0
+published_meta_candidate=$SPAWN_META_TMP
 SPAWN_META_TMP=
-FM_HOME="$FM_HOME" \
-  FM_DATA_OVERRIDE="$DATA" \
-  FM_STATE_OVERRIDE="$STATE" \
-  FM_ROOT_OVERRIDE="$FM_ROOT" \
-  "$SCRIPT_DIR/fm-work-identity.sh" dispatch-commit "$ID" \
-    --brief "$BRIEF" --meta "$STATE/$ID.meta" \
-    --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null \
-  || exit 1
+rm -f -- "$published_meta_candidate" \
+  || echo "warning: could not retire published metadata candidate for $ID" >&2
 SPAWN_DISPATCH_PENDING=0
 if [ "$RELAUNCH" -eq 0 ]; then
   if [ "$BACKEND" = orca ]; then

@@ -768,6 +768,137 @@ test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
   pass "pre-metadata dispatch retries resume one exact owner receipt"
 }
 
+test_dispatch_publish_refuses_unstable_metadata_without_publication() {
+  local home task launch transaction binding hash candidate replacement fakebin real_grep out rc=0
+  home=$(make_home dispatch-publish-capture)
+  task=dispatch-publish-capture
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold atomic dispatch publication fixture"
+  launch="$home/state/$task.launch-brief.md"
+  transaction=dispatch-publish-capture-1
+  binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$transaction") || fail "could not prepare atomic dispatch publication"
+  cp "$home/data/$task/brief.md" "$launch"
+  chmod 400 "$launch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  candidate="$home/state/.$task.meta.candidate"
+  fm_write_meta "$candidate" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked" \
+    "operator_note=aaaaaaaa"
+  replacement="$home/meta-replacement"
+  awk -F= '$1 == "operator_note" { print "operator_note=bbbbbbbb"; next } { print }' \
+    "$candidate" > "$replacement"
+  fakebin=$(fm_fakebin "$home/dispatch-publish-fakes")
+  real_grep=$(command -v grep)
+  cat > "$fakebin/grep" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ ! -e "$FM_TEST_REWRITE_MARKER" ]; then
+  /bin/cp "$FM_TEST_META_REPLACEMENT" "$FM_TEST_META_CANDIDATE"
+  : > "$FM_TEST_REWRITE_MARKER"
+fi
+exec "$FM_TEST_REAL_GREP" "$@"
+SH
+  chmod +x "$fakebin/grep"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_META_CANDIDATE="$candidate" \
+    FM_TEST_META_REPLACEMENT="$replacement" FM_TEST_REWRITE_MARKER="$home/meta-rewritten" \
+    FM_TEST_REAL_GREP="$real_grep" FM_HOME="$home" "$WORK_IDENTITY" \
+    dispatch-publish "$task" --brief "$launch" --meta "$candidate" \
+      --transaction "$transaction" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "dispatch publication accepted metadata rewritten during validation"
+  assert_contains "$out" "task metadata changed while it was validated" \
+    "dispatch publication did not identify its unstable metadata candidate"
+  assert_absent "$home/state/$task.meta" \
+    "unstable metadata candidate was partially published"
+  jq -e '.state == "prepared"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "unstable metadata candidate advanced the dispatch receipt"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
+    --brief "$launch" --meta "$candidate" --transaction "$transaction" \
+    || fail "stable metadata candidate did not publish atomically"
+  jq -e '.state == "completed"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "atomic metadata publication did not complete its dispatch receipt"
+  assert_present "$home/state/$task.meta" "atomic dispatch publication omitted metadata"
+  pass "dispatch publication validates, publishes, and completes under one owner lock"
+}
+
+test_replacement_dispatch_recovers_prior_retirement() {
+  local home task launch old_transaction old_binding old_hash old_candidate draft transaction binding hash candidate fakebin real_rm out rc=0
+  home=$(make_home replacement-prior-recovery)
+  task=replacement-prior-recovery
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold replacement dispatch recovery fixture"
+  launch="$home/state/$task.launch-brief.md"
+  old_transaction=replacement-prior-original
+  old_binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$old_transaction") || fail "could not prepare original dispatch"
+  cp "$home/data/$task/brief.md" "$launch"
+  chmod 400 "$launch"
+  old_hash=$(printf '%s' "$old_binding" | jq -r '.instructions_sha256')
+  old_candidate="$home/state/.$task.meta.original"
+  fm_write_meta "$old_candidate" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$old_hash" "work_identity_dispatch_transaction=$old_transaction" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
+    --brief "$launch" --meta "$old_candidate" --transaction "$old_transaction" \
+    || fail "could not publish original dispatch"
+
+  draft="$home/state/.$task.launch-replacement"
+  cp "$launch" "$draft"
+  chmod 600 "$draft"
+  printf '\nContinue the replacement.\n' >> "$draft"
+  transaction=replacement-prior-next
+  binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$draft" --instructions-path "$launch" --transaction "$transaction" \
+    --meta "$home/state/$task.meta" --prior-brief "$launch") \
+    || fail "could not prepare replacement dispatch"
+  mv -f "$draft" "$launch"
+  chmod 400 "$launch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  candidate="$home/state/.$task.meta.replacement"
+  awk -F= -v hash="$hash" -v transaction="$transaction" '
+    $1 == "launch_brief_sha256" { print "launch_brief_sha256=" hash; next }
+    $1 == "work_identity_dispatch_transaction" { print "work_identity_dispatch_transaction=" transaction; next }
+    { print }
+  ' "$home/state/$task.meta" > "$candidate"
+  fakebin=$(fm_fakebin "$home/prior-retirement-fakes")
+  real_rm=$(command -v rm)
+  cat > "$fakebin/rm" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  [ "$arg" != "$FM_TEST_PRIOR" ] || exit 1
+done
+exec "$FM_TEST_REAL_RM" "$@"
+SH
+  chmod +x "$fakebin/rm"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_PRIOR="$home/data/$task/work-identity-dispatch-prior.md" \
+    FM_TEST_REAL_RM="$real_rm" FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
+    --brief "$launch" --meta "$candidate" --transaction "$transaction" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "injected retained-prior retirement failure unexpectedly completed"
+  assert_contains "$out" "cannot retire retained prior dispatch instructions" \
+    "retained-prior failure did not identify the recoverable transition"
+  jq -e '.state == "prepared"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "replacement was marked completed before retained prior retirement"
+  assert_present "$home/data/$task/work-identity-dispatch-prior.md" \
+    "failed retained-prior retirement lost its recovery material"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
+    --brief "$launch" --meta "$candidate" --transaction "$transaction" \
+    || fail "replacement dispatch did not recover retained-prior retirement"
+  jq -e '.state == "completed"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "recovered replacement dispatch did not complete"
+  assert_absent "$home/data/$task/work-identity-dispatch-prior.md" \
+    "recovered replacement dispatch retained prior instructions"
+  pass "replacement dispatch retires prior instructions before completion"
+}
+
 test_metadata_validation_uses_one_stable_capture() {
   local home task manifest meta fakebin real_grep out rc=0
   home=$(make_home metadata-capture)
@@ -1807,6 +1938,8 @@ test_spawn_recovers_creation_intent_after_endpoint_side_effect
 test_spawn_resumes_unsent_worktree_request
 test_spawn_does_not_resend_inflight_worktree_request
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt
+test_dispatch_publish_refuses_unstable_metadata_without_publication
+test_replacement_dispatch_recovers_prior_retirement
 test_metadata_validation_uses_one_stable_capture
 test_snapshot_preflight_and_dispatch_recovery
 test_namespace_separation_and_contract_rejections

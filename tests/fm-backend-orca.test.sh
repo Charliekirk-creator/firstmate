@@ -45,6 +45,11 @@ if [ "${1:-}" = worktree ] && [ "${2:-}" = create ] \
   : > "$FM_ORCA_WORKTREE_CREATE_AFTER_OUTPUT_BLOCK"
   while [ ! -f "${FM_ORCA_WORKTREE_CREATE_AFTER_OUTPUT_RELEASE:?}" ]; do sleep 0.02; done
 fi
+if [ "${1:-}" = terminal ] && [ "${2:-}" = create ] \
+   && [ -n "${FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_BLOCK:-}" ]; then
+  : > "$FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_BLOCK"
+  while [ ! -f "${FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_RELEASE:?}" ]; do sleep 0.02; done
+fi
 exit 0
 SH
   chmod +x "$fb/orca"
@@ -694,6 +699,55 @@ test_spawn_recovers_orca_response_after_creator_crash() {
     "creator crash recovery lost the exact Orca terminal handle"
   rm -rf "/tmp/fm-$id"
   pass "fm-spawn.sh --backend orca: creator crash recovers its durable exact response"
+}
+
+test_spawn_recovers_orca_terminal_response_after_creator_crash() {
+  local proj wt data state config id out_file spawn_pid helper_pid rc=0 i worktree_creates terminal_creates
+  id="orcaterminalcrashz5"
+  proj="$TMP_ROOT/terminal-crash-project"
+  wt="$TMP_ROOT/terminal-crash-wt"
+  data="$TMP_ROOT/terminal-crash-data"
+  state="$TMP_ROOT/terminal-crash-state"
+  config="$TMP_ROOT/terminal-crash-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case terminal-helper-crash
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-terminal-crash"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-terminal-crash","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-terminal-crash"}}}\n' > "$RESP/4.out"
+  out_file="$CASE_DIR/spawn.out"
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_BLOCK="$CASE_DIR/terminal-returned" \
+    FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_RELEASE="$CASE_DIR/terminal-return-release" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca \
+    >"$out_file" 2>&1 &
+  spawn_pid=$!
+  for i in $(seq 1 200); do
+    [ ! -f "$CASE_DIR/terminal-returned" ] || break
+    sleep 0.02
+  done
+  assert_present "$CASE_DIR/terminal-returned" \
+    "Orca terminal crash fixture never completed its terminal side effect"
+  helper_pid=$(tr -d '[:space:]' < "$state/$id.spawn-orca-operation/claim")
+  kill -KILL "$helper_pid" || fail "could not stop the detached Orca creator after terminal creation"
+  : > "$CASE_DIR/terminal-return-release"
+  wait "$spawn_pid" || rc=$?
+  expect_code 0 "$rc" "spawn did not reconcile the exact Orca terminal response after its creator crashed$(printf '\n%s' "$(cat "$out_file")")"
+  worktree_creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
+  terminal_creates=$(grep -c $'orca\x1fterminal\x1fcreate' "$LOG")
+  [ "$worktree_creates" -eq 1 ] || fail "terminal crash recovery issued $worktree_creates Orca worktree creations"
+  [ "$terminal_creates" -eq 1 ] || fail "terminal crash recovery issued $terminal_creates Orca terminal creations"
+  assert_grep 'orca_worktree_id=wt-terminal-crash' "$state/$id.meta" \
+    "terminal crash recovery lost the exact Orca worktree id"
+  assert_grep 'terminal=term-terminal-crash' "$state/$id.meta" \
+    "terminal crash recovery lost the exact Orca terminal handle"
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh --backend orca: creator crash recovers one exact terminal"
 }
 
 test_spawn_retries_orca_journal_retirement_before_receipt_cleanup() {
@@ -1561,6 +1615,7 @@ test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness
 test_spawn_recovers_orca_creation_after_parent_kill
 test_spawn_recovers_orca_response_after_creator_crash
+test_spawn_recovers_orca_terminal_response_after_creator_crash
 test_spawn_retries_orca_journal_retirement_before_receipt_cleanup
 test_spawn_refuses_orca_secondmate_before_home_mutation
 test_spawn_refuses_orca_when_runtime_not_ready
