@@ -454,12 +454,15 @@ test_pruned_resolved_history_does_not_block_later_review() {
   assert_grep "already durably resolved" "$home/reused-key.err" \
     "pruned historical identity did not remain reserved"
 
-  printf 'needs-decision [key=old-a]: choose old sample A again\n' > "$home/state/$id.status"
+  printf 'needs-decision [key=old-a]: choose old sample A again\ndone: later review pass complete\n' \
+    > "$home/state/$id.status"
   if run_decisions "$home" complete "$id" old-a > "$home/reopened-old.out" 2> "$home/reopened-old.err"; then
     fail "archived history masked a currently open decision with no active hold"
   fi
   assert_grep "captain hold $old_a is absent" "$home/reopened-old.err" \
     "an open key did not require its current active owner"
+  assert_no_grep "captain-held [key=old-a]" "$home/state/$id.status" \
+    "failed active ownership check transferred the terminal decision"
   printf 'done: historical ownership guard verified\n' > "$home/state/$id.status"
 
   cp "$home/.tasks.toml" "$home/.tasks.toml.safe"
@@ -562,7 +565,7 @@ test_queued_legacy_resolution_is_attested_before_teardown() {
   pass "queued legacy resolution identity survives teardown and retry"
 }
 
-test_legacy_migration_requires_unambiguous_home_bound_metadata() {
+test_legacy_migration_rejects_conflicting_or_foreign_owners() {
   local home source victim collision decision digest body foreign id hold n
   home=$(make_home ambiguous-legacy-history)
   source=sample
@@ -644,7 +647,103 @@ test_legacy_migration_requires_unambiguous_home_bound_metadata() {
   fi
   assert_grep "authoritative state directory is unsafe" "$foreign/state-symlink.err" \
     "symlinked state metadata did not fail safely"
-  pass "legacy migration requires unambiguous home-bound metadata"
+  pass "legacy migration rejects conflicting and foreign ownership"
+}
+
+test_ambiguous_legacy_ids_migrate_for_the_sole_durable_owner() {
+  local home origin key hold decision digest body attestation stage
+  while read -r origin key; do
+    home=$(make_home "compatible-$origin-$key")
+    tasks_in "$home" add "$origin" "Review compatible legacy identity" \
+      --kind scout --repo sample --start >/dev/null \
+      || fail "could not create compatible legacy origin $origin"
+    write_origin_meta "$home" "$origin"
+    hold=$(run_decisions "$home" hold "$origin" "$key" \
+      --title "Choose the compatible legacy answer" \
+      --reason "captain compatible answer pending" --repo sample) \
+      || fail "could not create compatible legacy hold for $origin/$key"
+    run_decisions "$home" complete "$origin" "$key" >/dev/null \
+      || fail "could not inventory compatible legacy hold for $origin/$key"
+    decision="Captain resolved compatible legacy identity $origin/$key."
+    printf '%s\n' "$decision" > "$home/compatible-answer.txt"
+    run_decisions "$home" answer "$origin" "$key" \
+      --decision-file "$home/compatible-answer.txt" >/dev/null \
+      || fail "could not resolve compatible legacy hold for $origin/$key"
+    digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+    body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+      "$digest" "$decision")
+    tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+      || fail "could not preserve compatible released-version history for $origin/$key"
+    run_decisions "$home" verify "$origin" >/dev/null \
+      || fail "reviewed metadata did not migrate compatible legacy identity $origin/$key"
+    attestation="$home/data/decision-resolution-attestations/$hold.attestation"
+    assert_present "$attestation" "compatible legacy migration did not persist exact identity"
+
+    if [ "$origin" = sample ]; then
+      stage="$home/data/decision-resolution-attestations/.attestation.interrupted"
+      ln "$attestation" "$stage" \
+        || fail "could not reproduce interrupted attestation publication"
+      run_decisions "$home" verify "$origin" >/dev/null \
+        || fail "interrupted attestation publication was not recoverable"
+      assert_absent "$stage" "attestation retry retained its interrupted staging link"
+      run_decisions "$home" verify "$origin" >/dev/null \
+        || fail "recovered attestation was not idempotent"
+    fi
+
+    rm -f "$home/state/$origin.meta"
+    run_decisions "$home" complete "$origin" "$key" >/dev/null \
+      || fail "exact attestation did not preserve ambiguous legacy identity $origin/$key"
+  done <<'EOF'
+sample route-decision-later
+sample-decision-route later
+EOF
+  pass "sole-owner legacy ids migrate and interrupted publication recovers"
+}
+
+test_nonarchive_rows_cannot_prove_pruned_history() {
+  local home origin key hold n archive
+  home=$(make_home nonarchive-history-row)
+  origin=sample-nonarchive-review
+  key=old-answer
+  tasks_in "$home" add "$origin" "Review nonarchive history" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create nonarchive history origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the nonarchive answer" --reason "captain nonarchive answer pending" --repo sample) \
+    || fail "could not create nonarchive history hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory nonarchive history hold"
+  printf 'Captain resolved the nonarchive fixture.\n' > "$home/nonarchive-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" --decision-file "$home/nonarchive-answer.txt" >/dev/null \
+    || fail "could not resolve nonarchive history hold"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "nonarchive-filler-$n" "Nonarchive filler $n" \
+      --kind ship --repo sample >/dev/null \
+      || fail "could not create nonarchive filler $n"
+    tasks_in "$home" "done" "nonarchive-filler-$n" >/dev/null \
+      || fail "could not complete nonarchive filler $n"
+  done
+  archive="$home/data/done-archive.md"
+  assert_no_grep "- [x] $hold -" "$home/data/backlog.md" \
+    "nonarchive fixture did not leave the bounded Done window"
+  assert_grep "- [x] $hold -" "$archive" \
+    "nonarchive fixture was not pruned by configured retention"
+  awk '
+    /^## Archived [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
+      print "## Notes"
+      next
+    }
+    { print }
+  ' "$archive" > "$archive.tmp" && mv "$archive.tmp" "$archive" \
+    || fail "could not create nonarchive persisted-record counterfactual"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/nonarchive.out" 2> "$home/nonarchive.err"; then
+    fail "a resolution-shaped row outside a canonical archive section proved history"
+  fi
+  assert_grep "not durably resolved in its archive" "$home/nonarchive.err" \
+    "nonarchive row did not fail as absent retained history"
+  pass "only canonical retention sections prove archived decisions"
 }
 
 test_retained_resolution_rejects_oversized_decision() {
@@ -1674,7 +1773,9 @@ test_origin_slug_validation_precedes_path_construction
 test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_queued_legacy_resolution_is_attested_before_teardown
-test_legacy_migration_requires_unambiguous_home_bound_metadata
+test_legacy_migration_rejects_conflicting_or_foreign_owners
+test_ambiguous_legacy_ids_migrate_for_the_sole_durable_owner
+test_nonarchive_rows_cannot_prove_pruned_history
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
 test_historical_resolution_proof_is_exact_and_home_bound

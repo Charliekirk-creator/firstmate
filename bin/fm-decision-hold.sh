@@ -49,10 +49,10 @@
 # the hold body, and store the origin, decision key, decision digest, and routed
 # identities so an exact retry is idempotent while a changed identity, decision,
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
-# mode:` naming their path. A legacy record with one unambiguous origin/key id
-# decomposition remains valid when live reviewed metadata binds it and creates an
-# exact durable identity attestation before teardown, or when that attestation
-# already matches the record.
+# mode:` naming their path. A legacy record remains valid when an exact durable
+# identity attestation already matches it, or when live reviewed metadata is the
+# sole durable owner among its composed id's valid decompositions and creates
+# that attestation before teardown.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -257,6 +257,16 @@ list_has_key() {  # <comma-list> <key>
   esac
 }
 
+status_decisions_have_key() {  # <structured-decisions> <key>
+  local decisions=$1 expected=$2 key
+  while IFS=$'\t' read -r key _verb _summary; do
+    [ "$key" = "$expected" ] && return 0
+  done <<EOF
+$decisions
+EOF
+  return 1
+}
+
 sorted_key_union() {  # <comma-list> <newline-or-space-separated-new-keys>
   local existing=$1 new=$2
   {
@@ -393,6 +403,26 @@ EOF
   RESOLUTION_RECORD_DIGEST=$(sha256_text "$body")
 }
 
+legacy_resolution_alternate_owner_exists() {  # <hold-id> <origin-id> <decision-key>
+  local id=$1 origin=$2 key=$3 candidate_origin candidate_key
+  candidate_origin=${id%%-decision-*}
+  candidate_key=${id#*-decision-}
+  while :; do
+    if { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; } \
+      && origin_exists_here "$candidate_origin"; then
+      return 0
+    fi
+    case "$candidate_key" in
+      *-decision-*)
+        candidate_origin="${candidate_origin}-decision-${candidate_key%%-decision-*}"
+        candidate_key=${candidate_key#*-decision-}
+        ;;
+      *) break ;;
+    esac
+  done
+  return 1
+}
+
 legacy_resolution_meta_identity_valid() (  # <origin-id> <decision-key>
   local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key links
   expected_meta="$DECISION_STATE/$origin.meta"
@@ -402,9 +432,7 @@ legacy_resolution_meta_identity_valid() (  # <origin-id> <decision-key>
   [ "$(meta_value "$expected_meta" decisions_reviewed)" = 1 ] || return 1
   list_has_key "$(meta_value "$expected_meta" decision_keys)" "$key" || return 1
   expected_id="${origin}-decision-${key}"
-  case "$expected_id" in *-decision-*-decision-*) return 1 ;; esac
-  [ "${expected_id%%-decision-*}" = "$origin" ] || return 1
-  [ "${expected_id#*-decision-}" = "$key" ] || return 1
+  legacy_resolution_alternate_owner_exists "$expected_id" "$origin" "$key" && return 1
   shopt -s nullglob dotglob
   for candidate_meta in "$DECISION_STATE"/*.meta; do
     [ -f "$candidate_meta" ] && [ ! -L "$candidate_meta" ] || return 1
@@ -431,9 +459,6 @@ legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id
   authoritative_state_path
   id="${origin}-decision-${key}"
-  case "$id" in *-decision-*-decision-*) return 1 ;; esac
-  [ "${id%%-decision-*}" = "$origin" ] || return 1
-  [ "${id#*-decision-}" = "$key" ] || return 1
   legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
     && return 0
   legacy_resolution_meta_identity_valid "$origin" "$key"
@@ -709,7 +734,7 @@ legacy_resolution_attestation_content() {  # <hold-id> <origin-id> <decision-key
 }
 
 legacy_resolution_attestation_valid() {  # <hold-id> <origin-id> <decision-key> <record-digest>
-  local id=$1 origin=$2 key=$3 record_digest=$4 dir path links actual expected
+  local id=$1 origin=$2 key=$3 record_digest=$4 dir path links actual expected stage stage_links
   legacy_resolution_attestation_dir 0 || return 1
   dir=$LEGACY_ATTESTATION_DIR
   path="$dir/$id.attestation"
@@ -718,11 +743,26 @@ legacy_resolution_attestation_valid() {  # <hold-id> <origin-id> <decision-key> 
     || fail "decision resolution attestation is not an ordinary file: $path"
   links=$(file_link_count "$path") \
     || fail "could not inspect decision resolution attestation link count: $path"
-  [ "$links" = 1 ] || fail "decision resolution attestation is hardlinked: $path"
   actual=$(cat "$path") || fail "could not read decision resolution attestation: $path"
   expected=$(legacy_resolution_attestation_content "$id" "$origin" "$key" "$record_digest")
   [ "$actual" = "$expected" ] \
     || fail "decision resolution attestation does not match $origin/$key: $path"
+  if [ "$links" = 2 ]; then
+    for stage in "$dir"/.attestation.*; do
+      [ -e "$stage" ] || [ -L "$stage" ] || continue
+      [ -f "$stage" ] && [ ! -L "$stage" ] || continue
+      [ "$stage" -ef "$path" ] || continue
+      stage_links=$(file_link_count "$stage") \
+        || fail "could not inspect staged decision resolution attestation: $stage"
+      [ "$stage_links" = 2 ] || continue
+      rm -f -- "$stage" \
+        || fail "could not recover staged decision resolution attestation: $stage"
+      links=$(file_link_count "$path") \
+        || fail "could not inspect decision resolution attestation link count: $path"
+      break
+    done
+  fi
+  [ "$links" = 1 ] || fail "decision resolution attestation is hardlinked: $path"
 }
 
 persist_legacy_resolution_attestation() {  # <hold-id> <origin-id> <decision-key> <record-digest>
@@ -743,8 +783,10 @@ persist_legacy_resolution_attestation() {  # <hold-id> <origin-id> <decision-key
     fail "could not stage decision resolution attestation for $origin/$key"
   fi
   if ln "$tmp" "$path" 2>/dev/null; then
-    rm -f -- "$tmp"
-    return 0
+    rm -f -- "$tmp" \
+      || fail "could not finish decision resolution attestation for $origin/$key"
+    legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest"
+    return
   fi
   rm -f -- "$tmp"
   legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest" \
@@ -829,10 +871,20 @@ archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   [ "$links" = 1 ] || fail "decision archive is hardlinked: $archive"
 
   if record=$(LC_ALL=C awk -v id="$id" '
-    BEGIN { prefix = "- [x] " id " - "; found = 0; capture = 0 }
+    BEGIN { prefix = "- [x] " id " - "; found = 0; capture = 0; archived = 0 }
+    /^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/ {
+      capture = 0
+      archived = 1
+      next
+    }
+    /^## / {
+      capture = 0
+      archived = 0
+      next
+    }
     /^- \[[ x]\] / {
       capture = 0
-      if (index($0, prefix) == 1) {
+      if (archived && index($0, prefix) == 1) {
         found++
         if (found > 1) exit 2
         print "H" $0
@@ -840,7 +892,6 @@ archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
       }
       next
     }
-    /^## / { capture = 0; next }
     capture {
       if ($0 == "") { print "B"; next }
       if (substr($0, 1, 2) != "  ") exit 3
@@ -1092,17 +1143,21 @@ command_complete() {
     previous=$(meta_value "$meta" decision_keys)
   fi
   keys=$(sorted_key_union "$previous" "$supplied")
+  status_file="$STATE/$origin.status"
+  raw_open=$(status_open_decisions "$status_file")
   if [ -n "$keys" ]; then
     while IFS= read -r key; do
       [ -n "$key" ] || continue
-      verify_hold_durable "$origin" "$key"
+      if [ "$has_meta" = 1 ] && status_decisions_have_key "$raw_open" "$key"; then
+        verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
+      else
+        verify_hold_durable "$origin" "$key"
+      fi
     done <<EOF
 $(printf '%s\n' "$keys" | tr ',' '\n')
 EOF
   fi
 
-  status_file="$STATE/$origin.status"
-  raw_open=$(status_open_decisions "$status_file")
   open=$(origin_open_decisions "$origin")
   while IFS=$'\t' read -r key _verb _summary; do
     [ -n "$key" ] || continue
