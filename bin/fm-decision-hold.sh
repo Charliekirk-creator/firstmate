@@ -21,7 +21,7 @@
 #   fm-decision-hold.sh hold <origin-id> <decision-key> \
 #     --title <title> --reason <reason> [--repo <repo>]
 #   fm-decision-hold.sh complete <origin-id> (--none | <decision-key>...) \
-#     [--resolved <decision-key>]...
+#     [--resolved <decision-key>]... [-- <option-shaped-decision-key>...]
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
 #     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
@@ -54,9 +54,9 @@
 # identities so an exact retry is idempotent while a changed identity, decision,
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
 # mode:` naming their path. A legacy record remains valid when its composed hold
-# id has one possible origin/key decomposition or an exact durable identity
-# attestation already matches the complete record. Ambiguous ids are never bound
-# from a later claimant's live metadata.
+# id has one possible origin/key decomposition, an exact durable identity
+# attestation already matches the complete record, or its surviving reviewed
+# owner can be migrated while alternate durable decompositions are disproven.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -233,7 +233,7 @@ tasks_axi() {
 
 require_tasks_axi() {
   fm_tasks_axi_compatible || fail "compatible tasks-axi is required"
-  command -v jq >/dev/null 2>&1 || fail "jq is required"
+  command -v node >/dev/null 2>&1 || fail "node is required"
   tasks-axi hold --help 2>&1 | grep -F -- '--kind captain' >/dev/null \
     || fail "tasks-axi does not expose the captain-hold contract"
 }
@@ -314,6 +314,19 @@ RESOLUTION_MODE=''
 RESOLUTION_DECISION=''
 RESOLUTION_RECORD_DIGEST=''
 
+decode_json_string() {
+  printf '%s' "$1" | node -e '
+    const fs = require("fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(0, "utf8"));
+      if (typeof value !== "string") process.exit(1);
+      process.stdout.write(value);
+    } catch (_) {
+      process.exit(1);
+    }
+  '
+}
+
 parse_resolution_record() {  # <hold-body>
   local encoded=$1 body rest metadata tail line digest routes decision routed_work
   local captain_marker=$'\n\nCaptain decision:\n' routed_marker=$'\n\nRouted work:\n'
@@ -327,7 +340,7 @@ parse_resolution_record() {  # <hold-body>
   RESOLUTION_RECORD_DIGEST=''
 
   case "$encoded" in
-    \"*) body=$(printf '%s\n' "$encoded" | jq -Rer 'fromjson | strings') || return 1 ;;
+    \"*) body=$(decode_json_string "$encoded") || return 1 ;;
     *) body=$encoded ;;
   esac
   case "$body" in
@@ -423,13 +436,105 @@ legacy_resolution_identity_unambiguous() {  # <hold-id> <origin-id> <decision-ke
   esac
 }
 
+META_DECISION_KEYS=''
+reviewed_decision_inventory() {  # <meta-path>
+  local path=$1 links keys key canonical
+  META_DECISION_KEYS=''
+  [ -e "$path" ] || [ -L "$path" ] || return 1
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] \
+    || fail "decision owner metadata is unsafe: $path"
+  links=$(file_link_count "$path") \
+    || fail "could not inspect decision owner metadata link count: $path"
+  [ "$links" = 1 ] || fail "decision owner metadata is hardlinked: $path"
+  [ "$(meta_value "$path" decisions_reviewed)" = 1 ] || return 1
+  keys=$(meta_value "$path" decision_keys)
+  case "$keys" in ,*|*,|*,,*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    case "$key" in *[!A-Za-z0-9._-]*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
+  done <<EOF
+$(printf '%s\n' "$keys" | tr ',' '\n')
+EOF
+  canonical=$(printf '%s\n' "$keys" | tr ',' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)
+  [ "$keys" = "$canonical" ] \
+    || fail "decision owner metadata has noncanonical decision keys: $path"
+  META_DECISION_KEYS=$keys
+}
+
+archive_has_task_id() {  # <task-id>
+  local id=$1 archive links
+  authoritative_archive_path
+  archive=$DECISION_ARCHIVE
+  [ -e "$archive" ] || [ -L "$archive" ] || return 1
+  [ ! -L "$archive" ] && [ -f "$archive" ] \
+    || fail "decision archive is not an ordinary file: $archive"
+  links=$(file_link_count "$archive") \
+    || fail "could not inspect decision archive link count: $archive"
+  [ "$links" = 1 ] || fail "decision archive is hardlinked: $archive"
+  LC_ALL=C awk -v id="$id" '
+    BEGIN { prefix = "- [x] " id " - "; archived = 0; found = 0 }
+    /^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/ { archived = 1; next }
+    /^## / { archived = 0; next }
+    archived && index($0, prefix) == 1 { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$archive"
+}
+
+legacy_origin_artifact_exists() {  # <origin-id>
+  local origin=$1 output code
+  [ -e "$DECISION_STATE/$origin.meta" ] || [ -L "$DECISION_STATE/$origin.meta" ] \
+    && return 0
+  authoritative_archive_path
+  [ -e "$DECISION_DATA/$origin/report.md" ] || [ -L "$DECISION_DATA/$origin/report.md" ] \
+    && return 0
+  if output=$(tasks_axi show "$origin" --full 2>&1); then
+    return 0
+  fi
+  code=$(printf '%s\n' "$output" | sed -n 's/^code: //p' | head -1)
+  [ "$code" = NOT_FOUND ] \
+    || fail "could not read possible legacy decision owner $origin"
+  archive_has_task_id "$origin"
+}
+
+legacy_resolution_reviewed_owner_valid() {  # <hold-id> <origin-id> <decision-key>
+  local id=$1 origin=$2 key=$3 left right candidate_origin candidate_key candidate_meta
+  reviewed_decision_inventory "$DECISION_STATE/$origin.meta" || return 1
+  list_has_key "$META_DECISION_KEYS" "$key" || return 1
+  left=${id%%-decision-*}
+  right=${id#*-decision-}
+  while [ "$left-decision-$right" = "$id" ]; do
+    candidate_origin=$left
+    candidate_key=$right
+    if [ -n "$candidate_origin" ] && [ -n "$candidate_key" ] \
+      && [[ "$candidate_origin" != *[!A-Za-z0-9._-]* ]] \
+      && [[ "$candidate_key" != *[!A-Za-z0-9._-]* ]] \
+      && { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; }; then
+      candidate_meta="$DECISION_STATE/$candidate_origin.meta"
+      if reviewed_decision_inventory "$candidate_meta"; then
+        list_has_key "$META_DECISION_KEYS" "$candidate_key" && return 1
+      elif legacy_origin_artifact_exists "$candidate_origin"; then
+        return 1
+      fi
+    fi
+    case "$right" in
+      *-decision-*)
+        left="$left-decision-${right%%-decision-*}"
+        right=${right#*-decision-}
+        ;;
+      *) break ;;
+    esac
+  done
+  persist_legacy_resolution_attestation "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
+}
+
 legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id
   authoritative_state_path
   id="${origin}-decision-${key}"
   legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
     && return 0
-  legacy_resolution_identity_unambiguous "$id" "$origin" "$key"
+  legacy_resolution_identity_unambiguous "$id" "$origin" "$key" && return 0
+  legacy_resolution_reviewed_owner_valid "$id" "$origin" "$key"
 }
 
 resolution_record_valid() {  # <hold-body> [<origin-id> <decision-key>]
@@ -1121,7 +1226,7 @@ command_hold() {
 
 command_complete() {
   local origin=${1:-} meta previous='' supplied='' resolved='' supplied_csv='' resolved_csv=''
-  local keys='' key status_file open raw_open key_seen=0 has_meta=0 none=0
+  local keys='' key status_file open raw_open key_seen=0 has_meta=0 none=0 positional_only=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
   authoritative_state_path
@@ -1139,20 +1244,25 @@ command_complete() {
   require_tasks_axi
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
   while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --none) none=1 ;;
-      --resolved)
-        shift
-        [ "$#" -gt 0 ] || { usage >&2; exit 2; }
-        validate_slug decision-key "$1"
-        resolved="${resolved}${resolved:+ }$1"
-        ;;
-      --*) usage >&2; exit 2 ;;
-      *)
-        validate_slug decision-key "$1"
-        supplied="${supplied}${supplied:+ }$1"
-        ;;
-    esac
+    if [ "$positional_only" -eq 1 ]; then
+      validate_slug decision-key "$1"
+      supplied="${supplied}${supplied:+ }$1"
+    else
+      case "$1" in
+        --) positional_only=1 ;;
+        --none) none=1 ;;
+        --resolved)
+          shift
+          [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+          validate_slug decision-key "$1"
+          resolved="${resolved}${resolved:+ }$1"
+          ;;
+        *)
+          validate_slug decision-key "$1"
+          supplied="${supplied}${supplied:+ }$1"
+          ;;
+      esac
+    fi
     shift
   done
   [ "$none" -eq 0 ] || [ -z "$supplied" ] \

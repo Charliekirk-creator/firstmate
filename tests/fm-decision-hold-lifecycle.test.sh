@@ -12,7 +12,6 @@ BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
 TMP_ROOT=$(fm_test_tmproot fm-decision-hold)
 TASKS_AXI_BIN=$(command -v tasks-axi || true)
 
-command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found"; exit 0; }
 
 make_home() {  # <name>
@@ -657,8 +656,8 @@ test_legacy_migration_rejects_conflicting_or_foreign_owners() {
   pass "legacy migration rejects conflicting and foreign ownership"
 }
 
-test_legacy_identity_compatibility_is_unambiguous_or_attested() {
-  local home origin key hold decision digest body attestation stage record_digest
+test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership() {
+  local home origin key hold decision digest body attestation stage alternate
   home=$(make_home compatible-unambiguous-legacy)
   origin=sample-compatible-review
   key=old-answer
@@ -696,42 +695,74 @@ test_legacy_identity_compatibility_is_unambiguous_or_attested() {
   run_decisions "$home" complete "$origin" --none --resolved "$key" >/dev/null \
     || fail "unambiguous legacy identity depended on metadata or attestation"
 
-  home=$(make_home compatible-attested-ambiguous-legacy)
+  home=$(make_home compatible-reviewed-ambiguous-legacy)
   origin=sample
   key=route-decision-later
-  tasks_in "$home" add "$origin" "Review attested ambiguous legacy identity" \
+  alternate=sample-decision-route
+  tasks_in "$home" add "$origin" "Review migratable ambiguous legacy identity" \
     --kind scout --repo sample --start >/dev/null \
     || fail "could not create ambiguous legacy origin"
+  tasks_in "$home" add "$alternate" "Review unrelated alternate identity" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create alternate legacy origin"
   write_origin_meta "$home" "$origin"
+  write_origin_meta "$home" "$alternate"
+  printf 'decisions_reviewed=1\ndecision_keys=other\n' >> "$home/state/$alternate.meta"
   hold=$(run_decisions "$home" hold "$origin" "$key" \
-    --title "Choose the attested legacy answer" \
-    --reason "captain attested answer pending" --repo sample) \
+    --title "Choose the migratable legacy answer" \
+    --reason "captain migratable answer pending" --repo sample) \
     || fail "could not create ambiguous legacy hold"
   run_decisions "$home" complete "$origin" "$key" >/dev/null \
     || fail "could not inventory ambiguous legacy hold"
-  decision='Captain resolved the attested ambiguous identity.'
-  printf '%s\n' "$decision" > "$home/attested-answer.txt"
+  decision='Captain resolved the migratable ambiguous identity.'
+  printf '%s\n' "$decision" > "$home/migratable-answer.txt"
   run_decisions "$home" answer "$origin" "$key" \
-    --decision-file "$home/attested-answer.txt" >/dev/null \
+    --decision-file "$home/migratable-answer.txt" >/dev/null \
     || fail "could not resolve ambiguous legacy hold"
   digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
   body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
     "$digest" "$decision")
   tasks_in "$home" update "$hold" --body "$body" >/dev/null \
     || fail "could not preserve ambiguous released-version history"
-  if run_decisions "$home" verify "$origin" \
-    > "$home/unattested.out" 2> "$home/unattested.err"; then
-    fail "ambiguous legacy identity was rebound from claimant metadata"
-  fi
-  record_digest=$(printf '%s' "$body" | shasum -a 256 | awk '{print $1}')
-  mkdir -m 700 "$home/data/decision-resolution-attestations"
-  attestation="$home/data/decision-resolution-attestations/$hold.attestation"
-  printf 'schema=fm-decision-legacy-resolution.v1\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
-    "$hold" "$origin" "$key" "$record_digest" > "$attestation"
-  chmod 0600 "$attestation"
   run_decisions "$home" verify "$origin" >/dev/null \
-    || fail "exact pre-existing attestation did not preserve ambiguous legacy identity"
-  pass "legacy identity compatibility is unambiguous or pre-attested"
+    || fail "reviewed ambiguous released-version identity was not migrated"
+  attestation="$home/data/decision-resolution-attestations/$hold.attestation"
+  assert_present "$attestation" "ambiguous legacy migration did not persist exact identity"
+  rm -f "$home/state/$origin.meta"
+  run_decisions "$home" complete "$origin" --none --resolved "$key" >/dev/null \
+    || fail "migrated ambiguous identity depended on ephemeral owner metadata"
+  pass "legacy identity compatibility migrates reviewed ambiguous ownership"
+}
+
+test_option_shaped_keys_and_jq_free_verification() {
+  local home origin key hold show
+  home=$(make_home option-shaped-jq-free)
+  origin=sample-option-review
+  key=--route
+  tasks_in "$home" add "$origin" "Review option-shaped decision key" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create option-shaped origin"
+  write_origin_meta "$home" "$origin"
+  cat > "$home/fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+exit 127
+SH
+  chmod +x "$home/fakebin/jq"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the option-shaped route" \
+    --reason "captain option route pending" --repo sample) \
+    || fail "could not create an option-shaped decision hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "option-shaped decision key was parsed as an unsupported option"
+  printf 'Captain resolved the option-shaped route.\n' > "$home/option-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/option-answer.txt" >/dev/null \
+    || fail "jq-free answer recording failed"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "jq-free retained decision verification failed"
+  show=$(tasks_in "$home" show "$hold" --full)
+  assert_contains "$show" "state: done" "option-shaped decision did not close"
+  pass "option-shaped keys and jq-free decision verification stay compatible"
 }
 
 test_nonarchive_rows_cannot_prove_pruned_history() {
@@ -1895,6 +1926,12 @@ SH
   pass "the chat channel feeds the same keyed-answer intake a captured review does"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  test_option_shaped_keys_and_jq_free_verification
+  echo "skip: jq not found; remaining decision lifecycle cases require jq"
+  exit 0
+fi
+
 test_uninventoried_report_decision_refuses_completion
 
 test_scout_teardown_always_requires_inventory_verification
@@ -1907,7 +1944,7 @@ test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_conflicting_or_foreign_owners
-test_legacy_identity_compatibility_is_unambiguous_or_attested
+test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership
 test_nonarchive_rows_cannot_prove_pruned_history
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
@@ -1921,3 +1958,4 @@ test_bound_channel_answers_close_their_holds_at_answer_time
 test_unbound_source_closes_no_hold
 test_answer_preserves_every_unrouted_close_guard
 test_chat_channel_feeds_the_same_keyed_answer_intake
+test_option_shaped_keys_and_jq_free_verification
