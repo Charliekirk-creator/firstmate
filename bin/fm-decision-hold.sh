@@ -1292,6 +1292,7 @@ verify_resolution_identity() {  # <hold-id> <origin-id> <decision-key> <body> <d
 
 command_migrate_legacy() {
   local origin=${1:-} key=${2:-} decision_file='' identity_file='' id meta show state held kind hold_kind body
+  local has_meta=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   shift 2
   while [ "$#" -gt 0 ]; do
@@ -1306,15 +1307,19 @@ command_migrate_legacy() {
   validate_slug decision-key "$key"
   authoritative_state_path
   meta="$DECISION_STATE/$origin.meta"
-  DECISION_META_LOCK=$(fm_meta_lock_path "$meta") || fail "could not resolve task metadata lock"
-  fm_lock_acquire_wait "$DECISION_META_LOCK"
-  DECISION_META_LOCK_HELD=1
-  reviewed_decision_inventory "$meta" \
-    || fail "origin $origin has no surviving reviewed decision inventory"
-  list_has_key "$META_DECISION_KEYS" "$key" \
-    || fail "origin $origin does not review decision key $key"
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    has_meta=1
+    DECISION_META_LOCK=$(fm_meta_lock_path "$meta") || fail "could not resolve task metadata lock"
+    fm_lock_acquire_wait "$DECISION_META_LOCK"
+    DECISION_META_LOCK_HELD=1
+    reviewed_decision_inventory "$meta" \
+      || fail "origin $origin has no surviving reviewed decision inventory"
+    list_has_key "$META_DECISION_KEYS" "$key" \
+      || fail "origin $origin does not review decision key $key"
+  fi
   load_decision "$decision_file"
   require_tasks_axi
+  origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
   id=$(hold_id "$origin" "$key")
   if task_show_optional "$id"; then
     show=$TASK_SHOW_OUTPUT
@@ -1350,8 +1355,10 @@ command_migrate_legacy() {
     fail "captain decision $id has ambiguous legacy ownership and requires an independent --identity-file authorization"
   fi
   persist_legacy_resolution_attestation "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
-  fm_lock_release "$DECISION_META_LOCK"
-  DECISION_META_LOCK_HELD=0
+  if [ "$has_meta" = 1 ]; then
+    fm_lock_release "$DECISION_META_LOCK"
+    DECISION_META_LOCK_HELD=0
+  fi
   printf 'migrated: %s\n' "$id"
 }
 

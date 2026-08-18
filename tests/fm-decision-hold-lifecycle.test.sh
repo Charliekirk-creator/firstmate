@@ -738,6 +738,8 @@ test_legacy_identity_compatibility_is_bounded_and_authorized() {
   tasks_in "$home" add "$alternate" "Review unrelated alternate identity" \
     --kind scout --repo sample --start >/dev/null \
     || fail "could not create alternate legacy origin"
+  mkdir -p "$home/data/$origin"
+  printf '# Durable ambiguous legacy report\n' > "$home/data/$origin/report.md"
   write_origin_meta "$home" "$origin"
   write_origin_meta "$home" "$alternate"
   printf 'decisions_reviewed=1\ndecision_keys=other\n' >> "$home/state/$alternate.meta"
@@ -788,14 +790,28 @@ test_legacy_identity_compatibility_is_bounded_and_authorized() {
 
   authorization="$home/legacy-identity.txt"
   write_legacy_identity_authorization "$authorization" "$hold" "$origin" "$key" "$body"
+  tasks_in "$home" rm "$origin" >/dev/null \
+    || fail "could not remove the migrated legacy origin task"
+  rm -f "$home/state/$origin.meta"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "authorized-legacy-filler-$n" "Authorized legacy filler $n" \
+      --kind ship --repo sample >/dev/null \
+      || fail "could not create authorized legacy filler $n"
+    tasks_in "$home" "done" "authorized-legacy-filler-$n" >/dev/null \
+      || fail "could not complete authorized legacy filler $n"
+  done
+  assert_absent "$home/state/$origin.meta" \
+    "post-teardown legacy migration unexpectedly retained origin metadata"
+  assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
+    "authorized legacy record was not pruned through configured retention"
   run_decisions "$home" migrate-legacy "$origin" "$key" \
     --decision-file "$home/ambiguous-compatible-answer.txt" \
     --identity-file "$authorization" >/dev/null \
-    || fail "independently authorized ambiguous legacy identity did not migrate"
-  run_decisions "$home" verify "$origin" >/dev/null \
-    || fail "authorized ambiguous released-version identity did not verify"
+    || fail "post-teardown authorized ambiguous legacy identity did not migrate"
+  run_decisions "$home" complete "$origin" --none --resolved "$key" >/dev/null \
+    || fail "post-teardown migrated legacy identity did not complete from durable evidence"
   assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
-    "authorized ambiguous migration did not persist exact identity"
+    "post-teardown authorized migration did not persist exact identity"
   printf 'decision_keys=later\n' >> "$home/state/$alternate.meta"
   if run_decisions "$home" complete "$alternate" --none --resolved later \
     > "$home/alternate-owner.out" 2> "$home/alternate-owner.err"; then
