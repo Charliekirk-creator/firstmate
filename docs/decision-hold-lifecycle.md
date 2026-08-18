@@ -1,56 +1,14 @@
 # Decision hold lifecycle mechanism
 
 The normative policy is owned by `.agents/skills/decision-hold-lifecycle/SKILL.md` and is not restated here.
-This document records the deterministic mechanism, structured surfaces, and privacy-safe regression evidence.
+This document records integration context, structured surfaces, and privacy-safe regression evidence.
 
 ## Mechanism
 
-`bin/fm-decision-hold.sh` is the only lifecycle command for an investigation or visual review's unresolved captain decisions.
-The command runs tasks-axi in the active `FM_HOME`, so the existing backlog remains the only durable work database and a secondmate-owned decision stays in the secondmate home.
-It never reads report bodies, review artifacts, terminal output, or chat.
-
-The `hold` subcommand maps an originating work id and stable decision key to `<origin-id>-decision-<decision-key>`.
-It creates a kind `captain` backlog item when absent and invokes `tasks-axi hold <id> --reason <reason> --kind captain` on every retry.
-It rejects an identity collision, a changed title, and attempts to reopen an already resolved identity.
-
-The `complete` subcommand unions the reviewed keys into `decision_keys=` and appends `decisions_reviewed=1` while originating task metadata is live.
-A post-teardown visual review can complete against the surviving report and durable holds without recreating volatile task metadata.
-Positional keys are the explicit current unresolved inventory and always require active holds, independent of status text; `--none` explicitly records an empty current inventory, and repeated `--resolved <key>` arguments carry older keys that must have exact durable resolution proof when no live metadata remains.
-It verifies every listed identity against tasks-axi before recording completion.
-When normal configured retention has moved an older Done identity out of `data/backlog.md`, it reads that identity's exact record from the `[markdown].archive` path used by tasks-axi without restoring it.
-The configured archive and backlog must resolve under the active `FM_HOME` through ordinary physical paths; a foreign data override or symlinked data parent cannot supply history.
-A configured archive may have not-yet-created nested parents, which are normalized under the physical home and accepted only while every existing ancestor is an ordinary directory; tasks-axi remains responsible for creating them during normal pruning.
-Only one ordinary, single-linked archived record inside a canonical `## Archived YYYY-MM-DD` retention section whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; rows under notes or other prose sections are not history, and parsing stops at the canonical metadata boundary, so title text is never provenance.
-Its resolution block must bind the exact origin and decision key, contain no more than the decision-file limit of 8192 captain-answer bytes, recompute to the recorded captain-answer digest, enforce resolution-mode routing, and list the same routed identities in both structured routing fields.
-Released-version records without embedded origin and key remain compatible directly when the composed hold id has exactly one valid origin/key decomposition, through an existing exact record attestation, or through the explicit `migrate-legacy` path while exact reviewed metadata survives.
-An ambiguous legacy record without that durable attestation fails closed because mutable owner inventories cannot prove which colliding origin and key created it; migration requires the exact recorded captain decision and refuses a competing reviewed decomposition.
-Successful unambiguous verification or explicit migration atomically persists an attestation matching the hold id, origin, key, and complete resolution-record digest under a bounded digest filename in the authoritative data directory before teardown, and the same path covers a queued legacy resolution left by an interrupted close so an exact retry remains deterministic.
-A publication interrupted after its no-clobber link is recoverable only when the record names that exact generated staging link; the recovered record is then canonicalized so a later unrelated hardlink remains invalid. Only the legacy routed format may omit `Resolution mode:`.
-Absence, duplicate or ambiguous identity, unsafe archive files, non-absence backlog read errors, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
-For any keyed status decision it will transfer, including one followed by a terminal status line, it requires the matching active backlog hold before appending a `captain-held [key=<key>]: ...` event; archived history cannot own a new transfer.
-`bin/fm-classify-lib.sh` recognizes that transfer as closing the live status copy without claiming that the captain has answered it.
-
-Scout teardown calls the script's `verify` subcommand after checking for the report and before removing any source state.
-Verification never changes the backlog or archive; it may atomically persist an exact attestation for a uniquely decomposable legacy record, while an unattested ambiguous legacy record remains unverified.
-`migrate-legacy <origin-id> <decision-key> --decision-file <path>` is the explicit compatibility path for that ambiguous case: it requires the surviving canonical reviewed inventory, validates retained or normally archived captain-hold provenance and the complete legacy resolution, matches the supplied decision digest, rejects a competing reviewed owner, and writes only the home-local attestation.
-The `--force` path remains the explicit captain-approved discard escape hatch.
-
-The `resolve`, `answer`, and `decline` subcommands close active holds, while `repair` attests a hold already closed outside the script.
-All four require a non-empty captain decision file and record the same resolution block in the hold body with the origin, decision key, decision digest, routed identities, and a `Resolution mode:` naming the path.
-An exact retry is idempotent, while a changed decision or, for `resolve`, a changed routed-task set is rejected; a queued record carrying repair's Done-only mode is malformed and cannot satisfy completion or verification.
-
-The `resolve` subcommand is the routed path and additionally requires at least one existing dependent task whose structured `blocked-by` edge points to the hold.
-It clears each dependency edge through tasks-axi and marks the hold Done only after those writes succeed.
-An exact retry can finish a partial routing operation, and a failed intermediate step leaves the hold open.
-
-The `answer` and `decline` subcommands share one unrouted close implementation and differ only in the `Resolution mode:` they record and the outcome word they print, so neither can drift into a weaker close than the other.
-Both record `(none)` as the routed identities and refuse while any task in the same backlog is still blocked by the hold, because releasing routed work without recording it is `resolve`'s job.
-Every candidate found in the listing prefilter is confirmed against its own structured record before the refusal is reported.
-`answer` exists so the act carrying a captain answer can also be the act that closes its hold; `decline` continues to mean the stronger claim that the answer routes no follow-up work at all.
-
-The `repair` subcommand records the resolution block on a hold that was already closed outside the script, such as by a direct `tasks-axi done`, so an origin whose decision was genuinely answered stops failing `verify`.
-It refuses a hold that is still actively held, never reopens a closed hold, and never clears a dependency edge, so an unanswered decision keeps blocking teardown until the captain's word closes it.
-It also requires the identity to carry the captain-hold provenance that tasks-axi preserves through a close and requires the surviving body to match the requested origin and key before any update, so neither an ordinary captain-kind task nor a colliding composed id can be repaired into another decision.
+The semantic lifecycle is owned by `.agents/skills/decision-hold-lifecycle/SKILL.md`.
+The executable interface, identity and retry rules, operation ordering, retained-history validation, path and file protections, and legacy compatibility mechanics are owned by `bin/fm-decision-hold.sh`; run `bin/fm-decision-hold.sh --help` for that contract.
+Scout teardown points to the script's `verify` command, and the shared classifier points to its durable transfer record.
+This document intentionally keeps only integration context and regression evidence rather than duplicating those owners.
 
 ## Answer-time closure
 
@@ -116,7 +74,7 @@ The same explicit unresolved inventory is required to have an active hold even w
 After normal teardown removes origin metadata and its generated attestation is removed to reproduce a pre-upgrade home, repeated completion still recognizes the uniquely decomposable legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
 Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, refuse automatic or competing migration of that collision, spoof captain metadata in an ordinary captain-kind title, exceed the captain decision size bound, mismatch resolution modes, digests, and routed-work lists, and point archive or legacy state reads across home boundaries; none can masquerade as historical resolution.
-A surviving exact reviewed owner can explicitly migrate an ambiguous released-version record with the matching captain decision, and repeated migration and verification are idempotent. A queued repair-only resolution is separately rejected, while a queued released-version resolution is verified through teardown and then retried after its ephemeral metadata is gone; another case proves overlong released task identities use bounded attestation filenames, authenticated interrupted publication recovers, and unrelated hardlinks remain untouched and rejected.
+An ambiguous released-version record remains fail-closed even when claimant metadata and the recorded answer survive, while a queued repair-only resolution is separately rejected and a uniquely decomposable queued released-version resolution remains retryable after teardown. Another case proves overlong released task identities use bounded attestation filenames, authenticated interrupted publication recovers, and unrelated hardlinks remain untouched and rejected.
 The public completion gate also accepts option-shaped decision keys and verifies active and resolved records while `jq` is unavailable, relying only on the universal toolchain.
 
 Three answer-time closure regressions run against the published poll response shape, with synthetic `sample` identities.
@@ -141,12 +99,14 @@ ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
 ok - queued legacy resolution identity survives teardown and retry
 ok - legacy migration rejects missing, conflicting, and foreign ownership
-ok - legacy compatibility stays bounded and explicitly migrates ambiguous ownership
+ok - legacy compatibility stays bounded and ambiguous ownership fails closed
 ok - only canonical retention sections prove archived decisions
 ok - queued holds reject the repair-only resolution mode
 ok - retained resolutions enforce the captain decision size bound
 ok - pruned-history fallback rejects missing, malformed, and mismatched decisions
 ok - historical resolution proof is exact, structured, and home-bound
+ok - retained history requires safe state records
+ok - contained operational overrides remain supported
 ok - resolved findings and decision-like prose do not create false holds
 ok - terminal single-owner stale status decisions do not block empty inventory
 ok - main-home and secondmate-home captain holds remain correctly routed

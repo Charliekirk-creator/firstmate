@@ -611,6 +611,15 @@ test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
   attestation_token=$(printf '%s' "$collision" | shasum -a 256 | awk '{print $1}')
   assert_absent "$home/data/decision-resolution-attestations/$attestation_token.attestation" \
     "ambiguous claimant created a durable legacy attestation"
+  if run_decisions "$home" migrate-legacy "$victim" later \
+    --decision-file "$home/ambiguous.txt" \
+    > "$home/claimant-migration.out" 2> "$home/claimant-migration.err"; then
+    fail "claimant metadata and a replayed answer migrated another owner's legacy history"
+  fi
+  assert_grep "ambiguous legacy ownership" "$home/claimant-migration.err" \
+    "ambiguous claimant migration did not require origin-bound proof"
+  assert_absent "$home/data/decision-resolution-attestations/$attestation_token.attestation" \
+    "refused claimant migration created a durable legacy attestation"
 
   home=$(make_home foreign-legacy-state)
   id=sample-state-review
@@ -752,21 +761,20 @@ test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
     > "$home/competing-migration.out" 2> "$home/competing-migration.err"; then
     fail "legacy migration ignored a competing reviewed owner"
   fi
-  assert_grep "competing reviewed legacy owner" "$home/competing-migration.err" \
-    "legacy migration did not report the competing structured owner"
+  assert_grep "ambiguous legacy ownership" "$home/competing-migration.err" \
+    "legacy migration did not require origin-bound proof"
   assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
     "failed competing migration created a durable identity attestation"
   printf 'decision_keys=other\n' >> "$home/state/$alternate.meta"
-  run_decisions "$home" migrate-legacy "$origin" "$key" \
-    --decision-file "$home/ambiguous-compatible-answer.txt" >/dev/null \
-    || fail "explicit migration rejected exact surviving released-version metadata"
-  run_decisions "$home" migrate-legacy "$origin" "$key" \
-    --decision-file "$home/ambiguous-compatible-answer.txt" >/dev/null \
-    || fail "repeated explicit legacy migration was not idempotent"
-  assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
-    "explicit ambiguous legacy migration did not persist exact identity"
-  run_decisions "$home" verify "$origin" >/dev/null \
-    || fail "explicitly migrated released-version identity did not verify"
+  if run_decisions "$home" migrate-legacy "$origin" "$key" \
+    --decision-file "$home/ambiguous-compatible-answer.txt" \
+    > "$home/unattested-migration.out" 2> "$home/unattested-migration.err"; then
+    fail "exact claimant metadata and a replayed answer established ambiguous legacy ownership"
+  fi
+  assert_grep "ambiguous legacy ownership" "$home/unattested-migration.err" \
+    "unattested ambiguous migration did not fail closed"
+  assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
+    "failed ambiguous migration persisted an identity attestation"
 
   home=$(make_home compatible-long-legacy)
   origin=sample-
@@ -799,7 +807,7 @@ test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
   token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
   assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
     "long legacy verification did not use a bounded attestation filename"
-  pass "legacy compatibility stays bounded and explicitly migrates ambiguous ownership"
+  pass "legacy compatibility stays bounded and ambiguous ownership fails closed"
 }
 
 test_option_shaped_keys_and_jq_free_verification() {
@@ -1276,6 +1284,25 @@ test_retained_history_rejects_unsafe_state_and_status() {
   assert_grep "configured state directory is outside the active home" \
     "$home/foreign-state-verify.err" "verification did not enforce its state-home boundary"
 
+  mv "$home/state/$origin.meta" "$home/meta-target"
+  ln -s "$home/meta-target" "$home/state/$origin.meta"
+  if run_decisions "$home" complete "$origin" --none --resolved "$key" \
+    > "$home/symlink-meta-complete.out" 2> "$home/symlink-meta-complete.err"; then
+    fail "archived history accepted a symlinked origin metadata record"
+  fi
+  assert_grep "decision owner metadata is unsafe" "$home/symlink-meta-complete.err" \
+    "completion did not reject symlinked origin metadata"
+  rm "$home/state/$origin.meta"
+  ln "$home/meta-target" "$home/state/$origin.meta"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/hardlink-meta-verify.out" 2> "$home/hardlink-meta-verify.err"; then
+    fail "archived history accepted a hardlinked origin metadata record"
+  fi
+  assert_grep "decision owner metadata is hardlinked" "$home/hardlink-meta-verify.err" \
+    "verification did not reject hardlinked origin metadata"
+  rm "$home/state/$origin.meta"
+  mv "$home/meta-target" "$home/state/$origin.meta"
+
   mv "$home/state/$origin.status" "$home/status-target"
   ln -s "$home/status-target" "$home/state/$origin.status"
   if run_decisions "$home" complete "$origin" --none --resolved "$key" \
@@ -1298,7 +1325,55 @@ test_retained_history_rejects_unsafe_state_and_status() {
   fi
   assert_grep "origin status is hardlinked" "$home/hardlink-status.err" \
     "verification did not reject a hardlinked current status"
-  pass "retained history requires authoritative state and safe current status"
+  pass "retained history requires safe state records"
+}
+
+test_contained_operational_overrides_remain_supported() {
+  local home state data origin hold
+  home=$(make_home contained-decision-overrides)
+  state="$home/fixtures/state"
+  data="$home/fixtures/data"
+  mkdir -p "$state" "$data"
+  mv "$home/data/backlog.md" "$data/backlog.md"
+  awk '
+    $0 == "path = \"data/backlog.md\"" { print "path = \"fixtures/data/backlog.md\""; next }
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"fixtures/data/history/done.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure contained operational overrides"
+  origin=sample-contained-review
+  tasks_in "$home" add "$origin" "Review contained override behavior" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create contained-override origin"
+  fm_write_meta "$state/$origin.meta" \
+    "window=firstmate:fm-$origin" \
+    "worktree=$home/projects/missing-$origin" \
+    "project=$home/projects/sample" \
+    "harness=codex" \
+    "kind=scout" \
+    "mode=scout"
+  printf 'done: contained override review complete\n' > "$state/$origin.status"
+  mkdir -p "$data/$origin"
+  printf '# Contained override review\n' > "$data/$origin/report.md"
+  hold=$(PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
+    "$ROOT/bin/fm-decision-hold.sh" hold "$origin" route \
+    --title "Choose contained route" --reason "captain contained route pending" --repo sample) \
+    || fail "contained operational overrides could not create a decision hold"
+  PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
+    "$ROOT/bin/fm-decision-hold.sh" complete "$origin" route >/dev/null \
+    || fail "contained operational overrides could not complete the inventory"
+  PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" \
+    "$ROOT/bin/fm-decision-hold.sh" verify "$origin" >/dev/null \
+    || fail "contained operational overrides could not verify the inventory"
+  assert_grep "$hold" "$data/backlog.md" \
+    "contained data override did not own the captain hold"
+  assert_absent "$home/data/backlog.md" \
+    "captain hold leaked into the default data directory"
+  pass "contained operational overrides remain supported"
 }
 
 test_none_inventory_and_resolved_prose_do_not_create_holds() {
@@ -2054,6 +2129,7 @@ test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
 test_historical_resolution_proof_is_exact_and_home_bound
 test_retained_history_rejects_unsafe_state_and_status
+test_contained_operational_overrides_remain_supported
 test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home

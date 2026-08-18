@@ -58,8 +58,8 @@
 # mode:` naming their path. A legacy record remains valid when its composed hold
 # id has one possible origin/key decomposition or an exact durable identity
 # attestation already matches the complete record. An ambiguous unattested legacy
-# identity fails closed until `migrate-legacy` explicitly binds exact surviving
-# reviewed metadata and the recorded captain decision to a durable attestation.
+# identity fails closed because mutable claimant metadata and a replayed decision
+# cannot prove which origin and key created it.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -483,16 +483,21 @@ queued_hold_body_valid() {  # <hold-body> <origin-id> <decision-key>
   [ "$RESOLUTION_MODE" != repaired ]
 }
 
-META_DECISION_KEYS=''
-reviewed_decision_inventory() {  # <meta-path>
-  local path=$1 links keys key canonical
-  META_DECISION_KEYS=''
+require_safe_origin_metadata_file() {
+  local path=$1 links
   [ -e "$path" ] || [ -L "$path" ] || return 1
   [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] \
     || fail "decision owner metadata is unsafe: $path"
   links=$(file_link_count "$path") \
     || fail "could not inspect decision owner metadata link count: $path"
   [ "$links" = 1 ] || fail "decision owner metadata is hardlinked: $path"
+}
+
+META_DECISION_KEYS=''
+reviewed_decision_inventory() {  # <meta-path>
+  local path=$1 keys key canonical
+  META_DECISION_KEYS=''
+  require_safe_origin_metadata_file "$path" || return 1
   [ "$(meta_value "$path" decisions_reviewed)" = 1 ] || return 1
   keys=$(meta_value "$path" decision_keys)
   case "$keys" in ,*|*,|*,,*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
@@ -506,34 +511,6 @@ EOF
   [ "$keys" = "$canonical" ] \
     || fail "decision owner metadata has noncanonical decision keys: $path"
   META_DECISION_KEYS=$keys
-}
-
-legacy_competing_reviewed_owner_exists() {  # <hold-id> <origin-id> <decision-key>
-  local id=$1 origin=$2 key=$3 left right candidate_origin candidate_key candidate_meta
-  left=${id%%-decision-*}
-  right=${id#*-decision-}
-  while [ "$left-decision-$right" = "$id" ]; do
-    candidate_origin=$left
-    candidate_key=$right
-    if [ -n "$candidate_origin" ] && [ -n "$candidate_key" ] \
-      && [[ "$candidate_origin" != *[!A-Za-z0-9._-]* ]] \
-      && [[ "$candidate_key" != *[!A-Za-z0-9._-]* ]] \
-      && { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; }; then
-      candidate_meta="$DECISION_STATE/$candidate_origin.meta"
-      if reviewed_decision_inventory "$candidate_meta" \
-        && list_has_key "$META_DECISION_KEYS" "$candidate_key"; then
-        return 0
-      fi
-    fi
-    case "$right" in
-      *-decision-*)
-        left="$left-decision-${right%%-decision-*}"
-        right=${right#*-decision-}
-        ;;
-      *) break ;;
-    esac
-  done
-  return 1
 }
 
 file_link_count() {  # <path>
@@ -611,27 +588,42 @@ tasks_config_string() {  # <config-path> <table> <key>
   ' "$path"
 }
 
+CONTAINED_OPERATIONAL_PATH=''
+resolve_contained_operational_directory() {
+  local label=$1 input=$2 physical_home=$3 logical_home input_path physical_input cwd
+  CONTAINED_OPERATIONAL_PATH=''
+  [ -d "$input" ] && [ ! -L "$input" ] \
+    || fail "$label directory is unsafe: $input"
+  physical_input=$(cd "$input" && pwd -P) \
+    || fail "could not resolve $label directory: $input"
+  case "$physical_input" in
+    "$physical_home"/*) ;;
+    *) fail "$label directory is outside the active home: $input" ;;
+  esac
+  cwd=$(pwd -P) || fail "could not resolve the current directory"
+  case "$FM_HOME" in /*) logical_home=$FM_HOME ;; *) logical_home="$cwd/$FM_HOME" ;; esac
+  case "$input" in /*) input_path=$input ;; *) input_path="$cwd/$input" ;; esac
+  normalize_home_owned_path "$input_path" "$logical_home" "$physical_home" \
+    || fail "$label directory is outside the active home: $input"
+  [ "$NORMALIZED_HOME_PATH" = "$physical_input" ] \
+    || fail "$label directory has an unsafe symlink path: $input"
+  CONTAINED_OPERATIONAL_PATH=$physical_input
+}
+
 DECISION_STATE=''
 authoritative_state_path() {
-  local physical_home expected_state physical_expected physical_state
+  local physical_home expected_state
   DECISION_STATE=''
   [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
   physical_home=$(cd "$FM_HOME" && pwd -P) \
     || fail "could not resolve active home: $FM_HOME"
   expected_state="$FM_HOME/state"
-  [ -d "$expected_state" ] && [ ! -L "$expected_state" ] \
-    || fail "authoritative state directory is unsafe: $expected_state"
-  physical_expected=$(cd "$expected_state" && pwd -P) \
-    || fail "could not resolve authoritative state directory: $expected_state"
-  [ "$physical_expected" = "$physical_home/state" ] \
-    || fail "authoritative state directory escapes the active home: $expected_state"
-  [ -d "$STATE" ] && [ ! -L "$STATE" ] \
-    || fail "configured state directory is unsafe: $STATE"
-  physical_state=$(cd "$STATE" && pwd -P) \
-    || fail "could not resolve configured state directory: $STATE"
-  [ "$physical_state" = "$physical_expected" ] \
-    || fail "configured state directory is outside the active home: $STATE"
-  DECISION_STATE=$physical_state
+  if [ "$STATE" = "$expected_state" ]; then
+    [ -d "$expected_state" ] && [ ! -L "$expected_state" ] \
+      || fail "authoritative state directory is unsafe: $expected_state"
+  fi
+  resolve_contained_operational_directory "configured state" "$STATE" "$physical_home"
+  DECISION_STATE=$CONTAINED_OPERATIONAL_PATH
 }
 
 NORMALIZED_HOME_PATH=''
@@ -691,7 +683,7 @@ contained_archive_parent_safe() {  # <physical-home> <archive-parent>
 DECISION_ARCHIVE=''
 DECISION_DATA=''
 authoritative_archive_path() {
-  local physical_home expected_data physical_expected physical_data project_config home_config
+  local physical_home expected_data physical_data project_config home_config
   local archive_value='' backlog_value='' configured_backlog configured_archive archive_dir archive_name
   local physical_backlog_dir rc
   DECISION_ARCHIVE=''
@@ -700,18 +692,12 @@ authoritative_archive_path() {
   physical_home=$(cd "$FM_HOME" && pwd -P) \
     || fail "could not resolve active home: $FM_HOME"
   expected_data="$FM_HOME/data"
-  [ -d "$expected_data" ] && [ ! -L "$expected_data" ] \
-    || fail "authoritative data directory is unsafe: $expected_data"
-  physical_expected=$(cd "$expected_data" && pwd -P) \
-    || fail "could not resolve authoritative data directory: $expected_data"
-  [ "$physical_expected" = "$physical_home/data" ] \
-    || fail "authoritative data directory escapes the active home: $expected_data"
-  [ -d "$DATA" ] && [ ! -L "$DATA" ] \
-    || fail "configured data directory is unsafe: $DATA"
-  physical_data=$(cd "$DATA" && pwd -P) \
-    || fail "could not resolve configured data directory: $DATA"
-  [ "$physical_data" = "$physical_expected" ] \
-    || fail "configured data directory is outside the active home: $DATA"
+  if [ "$DATA" = "$expected_data" ]; then
+    [ -d "$expected_data" ] && [ ! -L "$expected_data" ] \
+      || fail "authoritative data directory is unsafe: $expected_data"
+  fi
+  resolve_contained_operational_directory "configured data" "$DATA" "$physical_home"
+  physical_data=$CONTAINED_OPERATIONAL_PATH
   DECISION_DATA=$physical_data
 
   project_config="$FM_HOME/.tasks.toml"
@@ -1273,8 +1259,9 @@ command_migrate_legacy() {
     || fail "queued captain decision $id has an impossible repaired resolution"
   [ "$RESOLUTION_DIGEST" = "$DECISION_DIGEST" ] \
     || fail "captain decision $id records a different captain decision"
-  if legacy_competing_reviewed_owner_exists "$id" "$origin" "$key"; then
-    fail "captain decision $id has a competing reviewed legacy owner"
+  if ! legacy_resolution_identity_unambiguous "$id" "$origin" "$key"; then
+    legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
+      || fail "captain decision $id has ambiguous legacy ownership and no origin-bound attestation"
   fi
   persist_legacy_resolution_attestation "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
   fm_lock_release "$DECISION_META_LOCK"
@@ -1350,12 +1337,13 @@ command_complete() {
   meta="$DECISION_STATE/$origin.meta"
   status_file="$DECISION_STATE/$origin.status"
   require_safe_status_file "$status_file"
-  [ -f "$meta" ] && has_meta=1
+  { [ -e "$meta" ] || [ -L "$meta" ]; } && has_meta=1
   if [ "$has_meta" = 1 ]; then
     DECISION_META_LOCK=$(fm_meta_lock_path "$meta") || fail "could not resolve task metadata lock"
     fm_lock_acquire_wait "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=1
-    [ -f "$meta" ] || fail "task metadata disappeared while recording completion"
+    require_safe_origin_metadata_file "$meta" \
+      || fail "task metadata disappeared while recording completion"
   fi
   require_tasks_axi
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
@@ -1466,8 +1454,15 @@ command_verify() {
   authoritative_state_path
   meta="$DECISION_STATE/$origin.meta"
   status_file="$DECISION_STATE/$origin.status"
-  [ -f "$meta" ] || fail "origin metadata is absent: $meta"
+  [ -e "$meta" ] || [ -L "$meta" ] || fail "origin metadata is absent: $meta"
   require_safe_status_file "$status_file"
+  DECISION_META_LOCK=$(fm_meta_lock_path "$meta") || fail "could not resolve task metadata lock"
+  if [ "$(cat "$DECISION_META_LOCK/pid" 2>/dev/null || true)" != "$PPID" ]; then
+    fm_lock_acquire_wait "$DECISION_META_LOCK"
+    DECISION_META_LOCK_HELD=1
+  fi
+  require_safe_origin_metadata_file "$meta" \
+    || fail "origin metadata disappeared while verifying completion"
   require_tasks_axi
   reviewed=$(meta_value "$meta" decisions_reviewed)
   [ "$reviewed" = 1 ] || fail "origin $origin has no completed unresolved-decision inventory"
@@ -1489,6 +1484,10 @@ EOF
   done <<EOF
 $open
 EOF
+  if [ "$DECISION_META_LOCK_HELD" = 1 ]; then
+    fm_lock_release "$DECISION_META_LOCK"
+    DECISION_META_LOCK_HELD=0
+  fi
   printf 'verified: %s unresolved-decision inventory\n' "$origin"
 }
 
