@@ -36,9 +36,9 @@
 # `--none` is an explicit semantic attestation that the just-reviewed surface has
 # no unresolved captain decision. Later review passes may add keys; a live task's
 # metadata inventory is unioned idempotently. A resolved historical key may be
-# proven by its structured record in data/done-archive.md after normal bounded
-# Done retention prunes it; the gate never restores archived rows. A missing key
-# with no valid archived resolution still fails. A post-teardown visual review
+# proven by its structured record in tasks-axi's configured archive after normal
+# bounded Done retention prunes it; the gate never restores archived rows. A
+# missing key with no valid archived resolution still fails. A post-teardown visual review
 # can complete against the surviving report and holds without recreating task
 # state. `verify` is read-only and is called by scout teardown so teardown cannot
 # erase a source before this gate has succeeded.
@@ -49,7 +49,8 @@
 # the hold body, and store the origin, decision key, decision digest, and routed
 # identities so an exact retry is idempotent while a changed identity, decision,
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
-# mode:` naming their path.
+# mode:` naming their path. Legacy records remain valid only when the existing
+# reviewed inventory uniquely binds their origin and key.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -222,6 +223,19 @@ task_show() {  # <id>
   tasks_axi show "$1" --full 2>/dev/null
 }
 
+TASK_SHOW_OUTPUT=''
+task_show_optional() {  # <id>
+  local id=$1 code detail
+  TASK_SHOW_OUTPUT=''
+  if TASK_SHOW_OUTPUT=$(tasks_axi show "$id" --full 2>&1); then
+    return 0
+  fi
+  code=$(printf '%s\n' "$TASK_SHOW_OUTPUT" | sed -n 's/^code: //p' | head -1)
+  [ "$code" = NOT_FOUND ] && return 1
+  detail=$(printf '%s\n' "$TASK_SHOW_OUTPUT" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+  fail "could not read backlog item $id${detail:+: $detail}"
+}
+
 show_field() {  # <show-output> <field>
   local output=$1 field=$2
   printf '%s\n' "$output" | sed -n "s/^  $field: //p" | head -1
@@ -357,6 +371,14 @@ EOF
     [ "$routes" = "$canonical_routes" ] || return 1
     [ "$routed_work" = "$expected_work" ] || return 1
   fi
+  case "$RESOLUTION_MODE" in
+    routed) [ "$routes" != "$ROUTED_NONE" ] || return 1 ;;
+    answered|declined|repaired) [ "$routes" = "$ROUTED_NONE" ] || return 1 ;;
+    '')
+      [ -z "$RESOLUTION_ORIGIN" ] && [ -z "$RESOLUTION_KEY" ] \
+        && [ "$routes" != "$ROUTED_NONE" ] || return 1
+      ;;
+  esac
   [ "$(sha256_text "$decision")" = "$digest" ] || return 1
 
   RESOLUTION_DIGEST=$digest
@@ -364,10 +386,41 @@ EOF
   RESOLUTION_DECISION=$decision
 }
 
+legacy_resolution_identity_valid() (  # <origin-id> <decision-key>
+  local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key
+  expected_meta="$STATE/$origin.meta"
+  [ -f "$expected_meta" ] && [ ! -L "$expected_meta" ] || return 1
+  [ "$(meta_value "$expected_meta" decisions_reviewed)" = 1 ] || return 1
+  list_has_key "$(meta_value "$expected_meta" decision_keys)" "$key" || return 1
+  expected_id="${origin}-decision-${key}"
+  shopt -s nullglob dotglob
+  for candidate_meta in "$STATE"/*.meta; do
+    [ -f "$candidate_meta" ] && [ ! -L "$candidate_meta" ] || return 1
+    candidate_origin=${candidate_meta##*/}
+    candidate_origin=${candidate_origin%.meta}
+    case "$candidate_origin" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    candidate_keys=$(meta_value "$candidate_meta" decision_keys)
+    while IFS= read -r candidate_key; do
+      [ -n "$candidate_key" ] || continue
+      case "$candidate_key" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+      if [ "${candidate_origin}-decision-${candidate_key}" = "$expected_id" ] \
+        && { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; }; then
+        return 1
+      fi
+    done <<EOF
+$(printf '%s\n' "$candidate_keys" | tr ',' '\n')
+EOF
+  done
+)
+
 resolution_record_valid() {  # <hold-body> [<origin-id> <decision-key>]
   parse_resolution_record "$1" || return 1
   if [ "$#" -eq 3 ]; then
-    [ "$RESOLUTION_ORIGIN" = "$2" ] && [ "$RESOLUTION_KEY" = "$3" ] || return 1
+    if [ -n "$RESOLUTION_ORIGIN" ] || [ -n "$RESOLUTION_KEY" ]; then
+      [ "$RESOLUTION_ORIGIN" = "$2" ] && [ "$RESOLUTION_KEY" = "$3" ] || return 1
+    else
+      legacy_resolution_identity_valid "$2" "$3" || return 1
+    fi
   fi
 }
 
@@ -389,9 +442,66 @@ file_link_count() {  # <path>
   fi
 }
 
+tasks_config_string() {  # <config-path> <table> <key>
+  local path=$1 table=$2 key=$3
+  [ -e "$path" ] || return 1
+  [ -f "$path" ] && [ ! -L "$path" ] || return 3
+  awk -v wanted_table="$table" -v wanted_key="$key" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    function uncomment(value, i, ch, quote) {
+      quote = ""
+      for (i = 1; i <= length(value); i++) {
+        ch = substr(value, i, 1)
+        if (quote != "") {
+          if (ch == quote) quote = ""
+        } else if (ch == "\"" || ch == sprintf("%c", 39)) {
+          quote = ch
+        } else if (ch == "#") {
+          return substr(value, 1, i - 1)
+        }
+      }
+      return value
+    }
+    BEGIN { current = "root"; found = 0; bad = 0 }
+    {
+      line = trim(uncomment($0))
+      if (line == "") next
+      if (line ~ /^\[[^]]+\]$/) {
+        current = trim(substr(line, 2, length(line) - 2))
+        next
+      }
+      if (current != wanted_table) next
+      equals = index(line, "=")
+      if (equals == 0) next
+      name = trim(substr(line, 1, equals - 1))
+      if (name != wanted_key) next
+      raw = trim(substr(line, equals + 1))
+      quote = substr(raw, 1, 1)
+      if (length(raw) <= 1 || (quote != "\"" && quote != sprintf("%c", 39)) \
+        || substr(raw, length(raw), 1) != quote) {
+        bad = 1
+        next
+      }
+      value = substr(raw, 2, length(raw) - 2)
+      found = 1
+    }
+    END {
+      if (bad) exit 2
+      if (!found) exit 1
+      print value
+    }
+  ' "$path"
+}
+
 DECISION_ARCHIVE=''
 authoritative_archive_path() {
-  local physical_home expected_data physical_expected physical_data
+  local physical_home expected_data physical_expected physical_data project_config home_config
+  local archive_value='' backlog_value='' configured_backlog configured_archive archive_dir archive_name
+  local physical_backlog_dir physical_archive_dir rc
   DECISION_ARCHIVE=''
   [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
   physical_home=$(cd "$FM_HOME" && pwd -P) \
@@ -409,12 +519,67 @@ authoritative_archive_path() {
     || fail "could not resolve configured data directory: $DATA"
   [ "$physical_data" = "$physical_expected" ] \
     || fail "configured data directory is outside the active home: $DATA"
-  DECISION_ARCHIVE="$physical_expected/done-archive.md"
+
+  project_config="$FM_HOME/.tasks.toml"
+  home_config="${HOME:-}/.tasks-axi/config.toml"
+  if archive_value=$(tasks_config_string "$project_config" markdown archive); then
+    :
+  else
+    rc=$?
+    [ "$rc" -eq 1 ] || fail "tasks-axi project configuration is unsafe or has an invalid markdown.archive"
+    if archive_value=$(tasks_config_string "$home_config" markdown archive); then
+      :
+    else
+      rc=$?
+      [ "$rc" -eq 1 ] || fail "tasks-axi home configuration is unsafe or has an invalid markdown.archive"
+      archive_value=''
+    fi
+  fi
+  if backlog_value=$(tasks_config_string "$project_config" markdown path); then
+    :
+  else
+    rc=$?
+    [ "$rc" -eq 1 ] || fail "tasks-axi project configuration is unsafe or has an invalid markdown.path"
+    if backlog_value=$(tasks_config_string "$home_config" markdown path); then
+      :
+    else
+      rc=$?
+      [ "$rc" -eq 1 ] || fail "tasks-axi home configuration is unsafe or has an invalid markdown.path"
+      if [ -e "$FM_HOME/backlog.md" ]; then backlog_value=backlog.md; else backlog_value=data/backlog.md; fi
+    fi
+  fi
+
+  case "$backlog_value" in /*) configured_backlog=$backlog_value ;; *) configured_backlog="$FM_HOME/$backlog_value" ;; esac
+  [ -f "$configured_backlog" ] && [ ! -L "$configured_backlog" ] \
+    || fail "configured backlog is not an ordinary file: $configured_backlog"
+  physical_backlog_dir=$(cd "${configured_backlog%/*}" && pwd -P) \
+    || fail "could not resolve configured backlog directory: ${configured_backlog%/*}"
+  [ "$physical_backlog_dir/${configured_backlog##*/}" = "$physical_data/backlog.md" ] \
+    || fail "configured backlog is outside the authoritative data directory: $configured_backlog"
+
+  if [ -n "$archive_value" ]; then
+    case "$archive_value" in /*) configured_archive=$archive_value ;; *) configured_archive="$FM_HOME/$archive_value" ;; esac
+  else
+    configured_archive="$physical_backlog_dir/done-archive.md"
+  fi
+  archive_dir=${configured_archive%/*}
+  archive_name=${configured_archive##*/}
+  [ -n "$archive_name" ] && [ -d "$archive_dir" ] && [ ! -L "$archive_dir" ] \
+    || fail "configured decision archive directory is unsafe: $archive_dir"
+  physical_archive_dir=$(cd "$archive_dir" && pwd -P) \
+    || fail "could not resolve configured decision archive directory: $archive_dir"
+  case "$physical_archive_dir" in
+    "$physical_home"|"$physical_home"/*) ;;
+    *) fail "configured decision archive is outside the active home: $configured_archive" ;;
+  esac
+  DECISION_ARCHIVE="$physical_archive_dir/$archive_name"
+  [ "$DECISION_ARCHIVE" != "$physical_data/backlog.md" ] \
+    || fail "configured decision archive is the active backlog: $DECISION_ARCHIVE"
 }
 
 archived_header_has_captain_provenance() {  # <header> <hold-id>
   local header=$1 id=$2 rest kind='' hold_kind='' value
-  local kind_seen=0 hold_kind_seen=0 hold_seen=0
+  local kind_seen=0 hold_kind_seen=0 hold_seen=0 repo_seen=0
   local re_dep='^(.*)[[:space:]]+(blocked-by|parent|discovered-from):[[:space:]]+[A-Za-z0-9][A-Za-z0-9._-]*([[:space:]]+-[[:space:]].*)?[[:space:]]*$'
   local re_repo='^(.*)[[:space:]]+\(repo:[[:space:]]*([^)]*)\)[[:space:]]*$'
   local re_kind='^(.*)[[:space:]]+\(kind:[[:space:]]*([^)]*)\)[[:space:]]*$'
@@ -429,15 +594,20 @@ archived_header_has_captain_provenance() {  # <header> <hold-id>
     if [[ "$rest" =~ $re_dep ]]; then
       rest=${BASH_REMATCH[1]}
     elif [[ "$rest" =~ $re_repo ]]; then
+      [ "$kind_seen" -eq 1 ] && [ "$hold_kind_seen" -eq 1 ] && [ "$hold_seen" -eq 1 ] \
+        || return 1
+      repo_seen=1
       rest=${BASH_REMATCH[1]}
+      break
     elif [[ "$rest" =~ $re_kind ]]; then
-      if [ "$kind_seen" -eq 0 ]; then
-        value=${BASH_REMATCH[2]}
-        value="${value#"${value%%[![:space:]]*}"}"
-        value="${value%"${value##*[![:space:]]}"}"
-        kind=$value
-        kind_seen=1
-      fi
+      [ "$kind_seen" -eq 0 ] || return 1
+      value=${BASH_REMATCH[2]}
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      kind=$value
+      kind_seen=1
+      [ "$kind" = captain ] && [ "$hold_kind_seen" -eq 1 ] && [ "$hold_seen" -eq 1 ] \
+        || return 1
       rest=${BASH_REMATCH[1]}
     elif [[ "$rest" =~ $re_priority ]]; then
       rest=${BASH_REMATCH[1]}
@@ -460,7 +630,8 @@ archived_header_has_captain_provenance() {  # <header> <hold-id>
       break
     fi
   done
-  [ "$kind" = captain ] && [ "$hold_kind" = captain ] && [ "$hold_seen" -eq 1 ]
+  [ "$repo_seen" -eq 1 ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
+    && [ "$hold_seen" -eq 1 ]
 }
 
 # Load one normally pruned Done record without moving it back into the bounded
@@ -615,7 +786,9 @@ verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
 verify_hold_durable() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id show state held kind hold_kind body
   id=$(hold_id "$origin" "$key")
-  if ! show=$(task_show "$id"); then
+  if task_show_optional "$id"; then
+    show=$TASK_SHOW_OUTPUT
+  else
     archived_hold_resolved "$id" "$origin" "$key" && return 0
     fail "captain decision $id is absent from $FM_HOME/data/backlog.md and is not durably resolved in its archive"
   fi
@@ -672,13 +845,17 @@ command_hold() {
   require_tasks_axi
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
   id=$(hold_id "$origin" "$key")
-  if show=$(task_show "$id"); then
+  if task_show_optional "$id"; then
+    show=$TASK_SHOW_OUTPUT
     state=$(show_field "$show" state)
     kind=$(show_field "$show" kind)
     existing_title=$(show_field "$show" title)
+    body=$(show_field "$show" body)
     [ "$state" != "done" ] || fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
     [ "$kind" = captain ] || fail "existing backlog identity $id is not kind captain"
     [ "$existing_title" = "$title" ] || fail "existing captain hold $id has a different title"
+    active_hold_body_valid "$body" "$origin" "$key" \
+      || fail "existing captain hold $id has malformed or mismatched active provenance"
   else
     if archived_hold_resolved "$id" "$origin" "$key"; then
       fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
@@ -745,6 +922,7 @@ EOF
     [ -n "$key" ] || continue
     list_has_key "$keys" "$key" \
       || fail "open structured decision $origin/$key has no captain-held inventory entry"
+    verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
   done <<EOF
 $open
 EOF
@@ -801,7 +979,7 @@ EOF
     [ -n "$key" ] || continue
     list_has_key "$keys" "$key" \
       || fail "open structured decision $origin/$key is outside the reviewed inventory"
-    verify_hold_durable "$origin" "$key"
+    verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
   done <<EOF
 $open
 EOF

@@ -391,8 +391,12 @@ test_visual_review_uses_shared_completion_owner() {
 # structured proof of those historical answers; completion must read that proof
 # without restoring rows and displacing other retained history.
 test_pruned_resolved_history_does_not_block_later_review() {
-  local home id old_a old_b later before after done_count n show
+  local home id old_a old_b later before after done_count n show archive decision digest body
   home=$(make_home pruned-resolved-history)
+  archive="$home/data/history.md"
+  awk '{ if ($0 == "archive = \"data/done-archive.md\"") print "archive = \"data/history.md\""; else print }' \
+    "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure the retained-history archive"
   id=sample-long-review
   mkdir -p "$home/data/$id"
   tasks_in "$home" add "$id" "Review a long-lived sample" --kind scout --repo sample --start >/dev/null \
@@ -415,8 +419,14 @@ test_pruned_resolved_history_does_not_block_later_review() {
     || fail "could not resolve old-a"
   run_decisions "$home" answer "$id" old-b --decision-file "$home/old-b.txt" >/dev/null \
     || fail "could not resolve old-b"
+  decision='Captain resolved old A.'
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$old_a" --body "$body" >/dev/null \
+    || fail "could not preserve a released-version resolution record"
   run_decisions "$home" verify "$id" >/dev/null \
-    || fail "proven retained-history path did not verify"
+    || fail "existing released-version metadata did not verify"
 
   # The tracked configuration retains ten Done rows. Twelve newer completions move
   # both historical decisions into the configured archive through public
@@ -432,10 +442,10 @@ test_pruned_resolved_history_does_not_block_later_review() {
     "old-a unexpectedly remained in the retained Done window"
   assert_no_grep "- [x] $old_b -" "$home/data/backlog.md" \
     "old-b unexpectedly remained in the retained Done window"
-  assert_grep "- [x] $old_a -" "$home/data/done-archive.md" \
-    "old-a was not pruned through normal retention"
-  assert_grep "- [x] $old_b -" "$home/data/done-archive.md" \
-    "old-b was not pruned through normal retention"
+  assert_grep "- [x] $old_a -" "$archive" \
+    "old-a was not pruned through normal configured retention"
+  assert_grep "- [x] $old_b -" "$archive" \
+    "old-b was not pruned through normal configured retention"
   if run_decisions "$home" hold "$id" old-a \
     --title "Choose old sample A" --reason "captain old a pending" --repo sample \
     > "$home/reused-key.out" 2> "$home/reused-key.err"; then
@@ -444,10 +454,28 @@ test_pruned_resolved_history_does_not_block_later_review() {
   assert_grep "already durably resolved" "$home/reused-key.err" \
     "pruned historical identity did not remain reserved"
 
+  printf 'needs-decision [key=old-a]: choose old sample A again\n' > "$home/state/$id.status"
+  if run_decisions "$home" complete "$id" old-a > "$home/reopened-old.out" 2> "$home/reopened-old.err"; then
+    fail "archived history masked a currently open decision with no active hold"
+  fi
+  assert_grep "captain hold $old_a is absent" "$home/reopened-old.err" \
+    "an open key did not require its current active owner"
+  printf 'done: historical ownership guard verified\n' > "$home/state/$id.status"
+
+  cp "$home/.tasks.toml" "$home/.tasks.toml.safe"
+  awk '{ if ($0 == "backend = \"markdown\"") print "backend = \"unavailable\""; else print }' \
+    "$home/.tasks.toml.safe" > "$home/.tasks.toml"
+  if run_decisions "$home" verify "$id" > "$home/backend-error.out" 2> "$home/backend-error.err"; then
+    fail "a tasks-axi read error was treated as pruned absence"
+  fi
+  assert_grep "could not read backlog item $old_a" "$home/backend-error.err" \
+    "the active backend error was not distinguished from exact absence"
+  mv "$home/.tasks.toml.safe" "$home/.tasks.toml"
+
   later=$(run_decisions "$home" hold "$id" later-choice \
     --title "Choose the later sample" --reason "captain later choice pending" --repo sample) \
     || fail "could not register the later decision"
-  before=$(shasum -a 256 "$home/data/backlog.md" "$home/data/done-archive.md")
+  before=$(shasum -a 256 "$home/data/backlog.md" "$archive")
   run_decisions "$home" complete "$id" later-choice >/dev/null \
     || fail "later review was blocked by normally pruned resolved history"
   run_decisions "$home" complete "$id" later-choice >/dev/null \
@@ -456,7 +484,7 @@ test_pruned_resolved_history_does_not_block_later_review() {
     || fail "later review did not verify against archived resolved history"
   run_decisions "$home" verify "$id" >/dev/null \
     || fail "repeated archived-history verification was not idempotent"
-  after=$(shasum -a 256 "$home/data/backlog.md" "$home/data/done-archive.md")
+  after=$(shasum -a 256 "$home/data/backlog.md" "$archive")
   [ "$before" = "$after" ] \
     || fail "completion or verification restored and oscillated bounded Done history"
   done_count=$(grep -cE '^- \[x\] ' "$home/data/backlog.md")
@@ -569,7 +597,7 @@ test_pruned_history_fallback_rejects_unproven_decisions() {
 # bodies with false digests or routing lists can satisfy the public gate.
 test_historical_resolution_proof_is_exact_and_home_bound() {
   local home digest_origin route_origin hold decision digest body source victim collision spoof_origin spoof
-  local foreign symlink_home n
+  local foreign symlink_home n show
   home=$(make_home exact-history-proof)
 
   digest_origin=sample-digest-review
@@ -612,6 +640,26 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   if run_decisions "$home" verify "$route_origin" > "$home/false-route.out" 2> "$home/false-route.err"; then
     fail "verification accepted routed identities that disagreed with routed work"
   fi
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: exact-route\nDecision digest: %s\nRouted identities: sample-route-alpha\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n- sample-route-alpha' \
+    "$route_origin" "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create answered-with-routing record"
+  if run_decisions "$home" verify "$route_origin" > "$home/answered-route.out" 2> "$home/answered-route.err"; then
+    fail "verification accepted an unrouted mode with routed identities"
+  fi
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: exact-route\nDecision digest: %s\nRouted identities: (none)\nResolution mode: routed\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$route_origin" "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create routed-without-routing record"
+  if run_decisions "$home" verify "$route_origin" > "$home/empty-route.out" 2> "$home/empty-route.err"; then
+    fail "verification accepted routed mode without routed identities"
+  fi
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: sample-route-alpha\n\nCaptain decision:\n%s\n\nRouted work:\n- sample-route-alpha' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create legacy routed resolution record"
+  run_decisions "$home" verify "$route_origin" >/dev/null \
+    || fail "the explicitly supported legacy routed record was rejected"
 
   source=sample
   victim=sample-decision-route
@@ -626,6 +674,16 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
     || fail "could not create source collision hold"
   run_decisions "$home" complete "$source" route-decision-later >/dev/null \
     || fail "could not inventory source collision hold"
+  if run_decisions "$home" hold "$victim" later \
+    --title "Choose the source route" --reason "captain victim route pending" --repo sample \
+    > "$home/active-collision.out" 2> "$home/active-collision.err"; then
+    fail "a colliding origin reused another active hold"
+  fi
+  show=$(tasks_in "$home" show "$collision" --full)
+  assert_contains "$show" "hold_reason: captain source route pending" \
+    "a rejected identity collision mutated the active hold reason"
+  assert_not_contains "$show" "captain victim route pending" \
+    "a rejected identity collision retained the colliding reason"
   printf 'Captain chose the source route.\n' > "$home/source-route.txt"
   run_decisions "$home" answer "$source" route-decision-later --decision-file "$home/source-route.txt" >/dev/null \
     || fail "could not resolve source collision hold"
@@ -642,7 +700,7 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
   body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: fake\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
     "$spoof_origin" "$digest" "$decision")
-  tasks_in "$home" add "$spoof" "Ordinary title" --kind ship --repo sample --body "$body" >/dev/null \
+  tasks_in "$home" add "$spoof" "Ordinary title" --kind captain --repo sample --body "$body" >/dev/null \
     || fail "could not create title-spoof ordinary task"
   tasks_in "$home" "done" "$spoof" >/dev/null || fail "could not close title-spoof ordinary task"
   awk -v id="$spoof" '

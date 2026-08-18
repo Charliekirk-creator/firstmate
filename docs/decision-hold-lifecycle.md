@@ -17,11 +17,12 @@ The `complete` subcommand unions the reviewed keys into `decision_keys=` and app
 A post-teardown visual review can complete against the surviving report and durable holds without recreating volatile task metadata.
 It accepts `--none` as an explicit semantic inventory result, not as inferred absence.
 It verifies every listed identity against tasks-axi before recording completion.
-When normal configured retention has moved an older Done identity out of `data/backlog.md`, it reads that identity's exact record from `data/done-archive.md` without restoring it.
-The archive must resolve under the active `FM_HOME` through its ordinary physical `data` directory; a foreign data override or symlinked data parent cannot supply history.
-Only one ordinary, single-linked archived record whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; title text is never provenance.
-Its resolution block must bind the exact origin and decision key, recompute to the recorded captain-answer digest, and list the same routed identities in both structured routing fields.
-Absence, duplicate identity, unsafe archive files, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
+When normal configured retention has moved an older Done identity out of `data/backlog.md`, it reads that identity's exact record from the `[markdown].archive` path used by tasks-axi without restoring it.
+The configured archive and backlog must resolve under the active `FM_HOME` through ordinary physical paths; a foreign data override or symlinked data parent cannot supply history.
+Only one ordinary, single-linked archived record whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; parsing stops at the canonical metadata boundary, so title text is never provenance.
+Its resolution block must bind the exact origin and decision key, recompute to the recorded captain-answer digest, enforce resolution-mode routing, and list the same routed identities in both structured routing fields.
+Released-version records without embedded origin and key remain compatible only when existing reviewed metadata uniquely binds the composed hold identity; only their routed format may omit `Resolution mode:`.
+Absence, duplicate or ambiguous identity, unsafe archive files, non-absence backlog read errors, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
 For an open keyed status decision, it appends a `captain-held [key=<key>]: ...` transfer event only after the matching backlog hold is durable.
 `bin/fm-classify-lib.sh` recognizes that transfer as closing the live status copy without claiming that the captain has answered it.
 
@@ -104,9 +105,9 @@ A hold closed by a direct `tasks-axi done` reproduces the shape that fails `veri
 An unanswered decision still blocks completion and teardown, and neither `decline` nor `repair` can close a hold that is still actively held or supply an answer with a missing or empty decision file.
 `repair` also refuses a closed captain-kind task that was never held for the captain.
 
-A retained-history regression resolves two synthetic decisions, proves the existing retained-row path first, moves both records into the configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
+A retained-history regression resolves two synthetic decisions, proves retained released-version metadata first, moves both records into a non-default configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
-Companion failure cases remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, spoof captain metadata in an ordinary title, mismatch digests and routed-work lists, and point archive reads across home boundaries; none can masquerade as historical resolution.
+Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, spoof captain metadata in an ordinary captain-kind title, mismatch resolution modes, digests, and routed-work lists, and point archive reads across home boundaries; none can masquerade as historical resolution.
 
 Three answer-time closure regressions run against the published poll response shape, with synthetic `sample` identities.
 A bound source whose origin exposes six holds captures one review carrying five structured choices plus one freeform message, and the runner feeds it through a fixture adapter that is not the review adapter at all, so what is proven is that any bound channel with an `answers` command gets closure rather than that one channel is wired specially.
