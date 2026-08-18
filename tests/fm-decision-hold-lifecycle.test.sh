@@ -741,11 +741,32 @@ test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
   tasks_in "$home" update "$hold" --body "$body" >/dev/null \
     || fail "could not preserve ambiguous released-version history"
   if run_decisions "$home" verify "$origin" > "$home/ambiguous-compatible.out" 2> "$home/ambiguous-compatible.err"; then
-    fail "mutable reviewed metadata attested an ambiguous legacy identity"
+    fail "mutable reviewed metadata automatically attested an ambiguous legacy identity"
   fi
   token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
   assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
-    "ambiguous reviewed metadata created a durable identity attestation"
+    "ambiguous reviewed metadata automatically created a durable identity attestation"
+  printf 'decision_keys=later\n' >> "$home/state/$alternate.meta"
+  if run_decisions "$home" migrate-legacy "$origin" "$key" \
+    --decision-file "$home/ambiguous-compatible-answer.txt" \
+    > "$home/competing-migration.out" 2> "$home/competing-migration.err"; then
+    fail "legacy migration ignored a competing reviewed owner"
+  fi
+  assert_grep "competing reviewed legacy owner" "$home/competing-migration.err" \
+    "legacy migration did not report the competing structured owner"
+  assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
+    "failed competing migration created a durable identity attestation"
+  printf 'decision_keys=other\n' >> "$home/state/$alternate.meta"
+  run_decisions "$home" migrate-legacy "$origin" "$key" \
+    --decision-file "$home/ambiguous-compatible-answer.txt" >/dev/null \
+    || fail "explicit migration rejected exact surviving released-version metadata"
+  run_decisions "$home" migrate-legacy "$origin" "$key" \
+    --decision-file "$home/ambiguous-compatible-answer.txt" >/dev/null \
+    || fail "repeated explicit legacy migration was not idempotent"
+  assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
+    "explicit ambiguous legacy migration did not persist exact identity"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "explicitly migrated released-version identity did not verify"
 
   home=$(make_home compatible-long-legacy)
   origin=sample-
@@ -778,7 +799,7 @@ test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
   token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
   assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
     "long legacy verification did not use a bounded attestation filename"
-  pass "legacy compatibility stays bounded and rejects ambiguous ownership"
+  pass "legacy compatibility stays bounded and explicitly migrates ambiguous ownership"
 }
 
 test_option_shaped_keys_and_jq_free_verification() {
@@ -856,6 +877,41 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   assert_grep "not durably resolved in its archive" "$home/nonarchive.err" \
     "nonarchive row did not fail as absent retained history"
   pass "only canonical retention sections prove archived decisions"
+}
+
+test_queued_repaired_resolution_is_rejected() {
+  local home origin key hold decision digest body
+  home=$(make_home queued-repaired-resolution)
+  origin=sample-queued-repair-review
+  key=repair-shaped
+  tasks_in "$home" add "$origin" "Review queued repair provenance" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create queued-repair origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the repair-shaped answer" \
+    --reason "captain repair-shaped answer pending" --repo sample) \
+    || fail "could not create queued-repair hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory queued-repair hold"
+  decision='Captain answer copied into an impossible queued repair.'
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: %s\nDecision digest: %s\nRouted identities: (none)\nResolution mode: repaired\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$origin" "$key" "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create queued repaired-resolution fixture"
+  if run_decisions "$home" complete "$origin" "$key" \
+    > "$home/complete.out" 2> "$home/complete.err"; then
+    fail "completion accepted a repaired resolution on a queued hold"
+  fi
+  assert_grep "malformed or mismatched active provenance" "$home/complete.err" \
+    "queued repaired resolution did not fail active validation"
+  if run_decisions "$home" verify "$origin" > "$home/verify.out" 2> "$home/verify.err"; then
+    fail "verification accepted a repaired resolution on a queued hold"
+  fi
+  assert_grep "malformed or mismatched active provenance" "$home/verify.err" \
+    "queued repaired resolution did not fail durable validation"
+  pass "queued holds reject the repair-only resolution mode"
 }
 
 test_retained_resolution_rejects_oversized_decision() {
@@ -1993,6 +2049,7 @@ test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
 test_legacy_identity_compatibility_is_bounded_and_fail_closed
 test_nonarchive_rows_cannot_prove_pruned_history
+test_queued_repaired_resolution_is_rejected
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
 test_historical_resolution_proof_is_exact_and_home_bound

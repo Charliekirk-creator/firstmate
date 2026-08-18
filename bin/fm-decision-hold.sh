@@ -32,6 +32,8 @@
 #   fm-decision-hold.sh binding <source-id>
 #   fm-decision-hold.sh decline <origin-id> <decision-key> --decision-file <path>
 #   fm-decision-hold.sh repair <origin-id> <decision-key> --decision-file <path>
+#   fm-decision-hold.sh migrate-legacy <origin-id> <decision-key> \
+#     --decision-file <path>
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # Positional keys are the unresolved decisions in the just-reviewed surface and
@@ -55,8 +57,9 @@
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
 # mode:` naming their path. A legacy record remains valid when its composed hold
 # id has one possible origin/key decomposition or an exact durable identity
-# attestation already matches the complete record. Ambiguous unattested legacy
-# identities fail closed because mutable owner metadata cannot prove provenance.
+# attestation already matches the complete record. An ambiguous unattested legacy
+# identity fails closed until `migrate-legacy` explicitly binds exact surviving
+# reviewed metadata and the recorded captain decision to a durable attestation.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -470,6 +473,67 @@ active_hold_body_valid() {  # <hold-body> <origin-id> <decision-key>
   local expected
   expected="\"Origin: $2\\nDecision key: $3\\nState: awaiting captain decision.\""
   [ "$1" = "$expected" ] || resolution_record_valid "$1" "$2" "$3"
+}
+
+queued_hold_body_valid() {  # <hold-body> <origin-id> <decision-key>
+  local expected
+  expected="\"Origin: $2\\nDecision key: $3\\nState: awaiting captain decision.\""
+  [ "$1" = "$expected" ] && return 0
+  resolution_record_valid "$1" "$2" "$3" || return 1
+  [ "$RESOLUTION_MODE" != repaired ]
+}
+
+META_DECISION_KEYS=''
+reviewed_decision_inventory() {  # <meta-path>
+  local path=$1 links keys key canonical
+  META_DECISION_KEYS=''
+  [ -e "$path" ] || [ -L "$path" ] || return 1
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] \
+    || fail "decision owner metadata is unsafe: $path"
+  links=$(file_link_count "$path") \
+    || fail "could not inspect decision owner metadata link count: $path"
+  [ "$links" = 1 ] || fail "decision owner metadata is hardlinked: $path"
+  [ "$(meta_value "$path" decisions_reviewed)" = 1 ] || return 1
+  keys=$(meta_value "$path" decision_keys)
+  case "$keys" in ,*|*,|*,,*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    case "$key" in *[!A-Za-z0-9._-]*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
+  done <<EOF
+$(printf '%s\n' "$keys" | tr ',' '\n')
+EOF
+  canonical=$(printf '%s\n' "$keys" | tr ',' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)
+  [ "$keys" = "$canonical" ] \
+    || fail "decision owner metadata has noncanonical decision keys: $path"
+  META_DECISION_KEYS=$keys
+}
+
+legacy_competing_reviewed_owner_exists() {  # <hold-id> <origin-id> <decision-key>
+  local id=$1 origin=$2 key=$3 left right candidate_origin candidate_key candidate_meta
+  left=${id%%-decision-*}
+  right=${id#*-decision-}
+  while [ "$left-decision-$right" = "$id" ]; do
+    candidate_origin=$left
+    candidate_key=$right
+    if [ -n "$candidate_origin" ] && [ -n "$candidate_key" ] \
+      && [[ "$candidate_origin" != *[!A-Za-z0-9._-]* ]] \
+      && [[ "$candidate_key" != *[!A-Za-z0-9._-]* ]] \
+      && { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; }; then
+      candidate_meta="$DECISION_STATE/$candidate_origin.meta"
+      if reviewed_decision_inventory "$candidate_meta" \
+        && list_has_key "$META_DECISION_KEYS" "$candidate_key"; then
+        return 0
+      fi
+    fi
+    case "$right" in
+      *-decision-*)
+        left="$left-decision-${right%%-decision-*}"
+        right=${right#*-decision-}
+        ;;
+      *) break ;;
+    esac
+  done
+  return 1
 }
 
 file_link_count() {  # <path>
@@ -930,8 +994,10 @@ archived_header_has_captain_provenance() {  # <header> <hold-id>
 # backlog window. The archive path is the tracked tasks-axi configuration's
 # durable history owner. Only an exact, single, ordinary captain-hold record with
 # this owner's resolution body can prove a historical decision.
-archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
-  local id=$1 origin=$2 key=$3 archive links record rc header='' body='' line body_started=0
+ARCHIVED_HOLD_BODY=''
+archived_hold_body() {  # <hold-id>
+  local id=$1 archive links record rc header='' body='' line body_started=0
+  ARCHIVED_HOLD_BODY=''
   authoritative_archive_path
   archive=$DECISION_ARCHIVE
   [ -e "$archive" ] || [ -L "$archive" ] || return 1
@@ -996,7 +1062,13 @@ EOF
   while [ "${body%$'\n'}" != "$body" ]; do body=${body%$'\n'}; done
   archived_header_has_captain_provenance "$header" "$id" \
     || fail "captain decision $id has mismatched archived captain-hold provenance"
-  resolution_record_valid "$body" "$origin" "$key" \
+  ARCHIVED_HOLD_BODY=$body
+}
+
+archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
+  local id=$1 origin=$2 key=$3
+  archived_hold_body "$id" || return 1
+  resolution_record_valid "$ARCHIVED_HOLD_BODY" "$origin" "$key" \
     || fail "captain decision $id has a malformed or mismatched archived resolution"
 }
 
@@ -1065,7 +1137,7 @@ verify_hold_active() {  # <hold-id> <origin-id> <decision-key>
   [ "$held" = yes ] || fail "captain hold $id is not active"
   [ "$kind" = captain ] || fail "backlog item $id is not kind captain"
   [ "$hold_kind" = captain ] || fail "backlog item $id is not held for the captain"
-  active_hold_body_valid "$body" "$origin" "$key" \
+  queued_hold_body_valid "$body" "$origin" "$key" \
     || fail "captain hold $id has malformed or mismatched active provenance"
 }
 
@@ -1123,7 +1195,7 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   hold_kind=$(show_field "$show" hold_kind)
   body=$(show_field "$show" body)
   if [ "$state" = queued ] && [ "$held" = yes ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ]; then
-    active_hold_body_valid "$body" "$origin" "$key" \
+    queued_hold_body_valid "$body" "$origin" "$key" \
       || fail "captain decision $id has malformed or mismatched active provenance"
     if resolution_record_valid "$body" "$origin" "$key"; then
       persist_parsed_legacy_resolution "$id" "$origin" "$key"
@@ -1146,6 +1218,68 @@ verify_resolution_identity() {  # <hold-id> <origin-id> <decision-key> <body> <d
     || fail "captain hold $id records a different captain decision"
   [ "$RESOLUTION_ROUTES" = "$routed_csv" ] \
     || fail "captain hold $id records different routed work"
+}
+
+command_migrate_legacy() {
+  local origin=${1:-} key=${2:-} decision_file='' id meta show state held kind hold_kind body
+  [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --decision-file) shift; decision_file=${1:-} ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  validate_slug origin-id "$origin"
+  validate_slug decision-key "$key"
+  authoritative_state_path
+  meta="$DECISION_STATE/$origin.meta"
+  DECISION_META_LOCK=$(fm_meta_lock_path "$meta") || fail "could not resolve task metadata lock"
+  fm_lock_acquire_wait "$DECISION_META_LOCK"
+  DECISION_META_LOCK_HELD=1
+  reviewed_decision_inventory "$meta" \
+    || fail "origin $origin has no surviving reviewed decision inventory"
+  list_has_key "$META_DECISION_KEYS" "$key" \
+    || fail "origin $origin does not review decision key $key"
+  load_decision "$decision_file"
+  require_tasks_axi
+  id=$(hold_id "$origin" "$key")
+  if task_show_optional "$id"; then
+    show=$TASK_SHOW_OUTPUT
+    state=$(show_field "$show" state)
+    held=$(show_field "$show" held)
+    kind=$(show_field "$show" kind)
+    hold_kind=$(show_field "$show" hold_kind)
+    body=$(show_field "$show" body)
+    [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
+      || fail "backlog item $id does not retain captain-hold provenance"
+    case "$state" in
+      queued) [ "$held" = yes ] || fail "captain hold $id is not active" ;;
+      done) : ;;
+      *) fail "captain decision $id is not queued or done (state=$state)" ;;
+    esac
+  else
+    archived_hold_body "$id" \
+      || fail "captain decision $id is absent from the backlog and configured archive"
+    state=done
+    body=$ARCHIVED_HOLD_BODY
+  fi
+  parse_resolution_record "$body" \
+    || fail "captain decision $id has a malformed legacy resolution"
+  [ -z "$RESOLUTION_ORIGIN" ] && [ -z "$RESOLUTION_KEY" ] \
+    || fail "captain decision $id already has embedded identity"
+  [ "$state" != queued ] || [ "$RESOLUTION_MODE" != repaired ] \
+    || fail "queued captain decision $id has an impossible repaired resolution"
+  [ "$RESOLUTION_DIGEST" = "$DECISION_DIGEST" ] \
+    || fail "captain decision $id records a different captain decision"
+  if legacy_competing_reviewed_owner_exists "$id" "$origin" "$key"; then
+    fail "captain decision $id has a competing reviewed legacy owner"
+  fi
+  persist_legacy_resolution_attestation "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
+  fm_lock_release "$DECISION_META_LOCK"
+  DECISION_META_LOCK_HELD=0
+  printf 'migrated: %s\n' "$id"
 }
 
 command_id() {
@@ -1183,7 +1317,7 @@ command_hold() {
     [ "$state" != "done" ] || fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
     [ "$kind" = captain ] || fail "existing backlog identity $id is not kind captain"
     [ "$existing_title" = "$title" ] || fail "existing captain hold $id has a different title"
-    active_hold_body_valid "$body" "$origin" "$key" \
+    queued_hold_body_valid "$body" "$origin" "$key" \
       || fail "existing captain hold $id has malformed or mismatched active provenance"
   else
     if archived_hold_resolved "$id" "$origin" "$key"; then
@@ -1662,6 +1796,7 @@ case "${1:-}" in
   binding) shift; command_binding "$@" ;;
   decline) shift; command_decline "$@" ;;
   repair) shift; command_repair "$@" ;;
+  migrate-legacy) shift; command_migrate_legacy "$@" ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
