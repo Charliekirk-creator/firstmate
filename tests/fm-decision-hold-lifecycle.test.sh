@@ -393,8 +393,8 @@ test_visual_review_uses_shared_completion_owner() {
 test_pruned_resolved_history_does_not_block_later_review() {
   local home id old_a old_b later before after done_count n show archive decision digest body
   home=$(make_home pruned-resolved-history)
-  archive="$home/data/history.md"
-  awk '{ if ($0 == "archive = \"data/done-archive.md\"") print "archive = \"data/history.md\""; else print }' \
+  archive="$home/data/history/done.md"
+  awk '{ if ($0 == "archive = \"data/done-archive.md\"") print "archive = \"data/history/done.md\""; else print }' \
     "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
     || fail "could not configure the retained-history archive"
   id=sample-long-review
@@ -522,6 +522,157 @@ test_pruned_resolved_history_does_not_block_later_review() {
   [ "$before" = "$after" ] \
     || fail "post-teardown compatibility changed the backlog or configured archive"
   pass "pruned resolved history permits later decisions without retention oscillation"
+}
+
+test_queued_legacy_resolution_is_attested_before_teardown() {
+  local home id hold decision digest body show
+  home=$(make_home queued-legacy-resolution)
+  id=sample-partial-review
+  mkdir -p "$home/data/$id"
+  tasks_in "$home" add "$id" "Review a partial legacy resolution" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create partial legacy origin"
+  write_origin_meta "$home" "$id"
+  printf 'done: partial legacy review complete\n' > "$home/state/$id.status"
+  printf '# Partial legacy review\n' > "$home/data/$id/report.md"
+  hold=$(run_decisions "$home" hold "$id" partial-answer \
+    --title "Choose the partial answer" --reason "captain partial answer pending" --repo sample) \
+    || fail "could not create partial legacy hold"
+  run_decisions "$home" complete "$id" partial-answer >/dev/null \
+    || fail "could not inventory partial legacy hold"
+  decision='Captain recorded the partial legacy answer.'
+  printf '%s\n' "$decision" > "$home/partial-answer.txt"
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not reproduce a queued released-version resolution"
+  show=$(tasks_in "$home" show "$hold" --full)
+  assert_contains "$show" "state: queued" "partial legacy fixture did not remain queued"
+
+  run_teardown "$home" "$id" >/dev/null 2> "$home/teardown.err" \
+    || fail "queued legacy resolution blocked teardown: $(cat "$home/teardown.err")"
+  assert_absent "$home/state/$id.meta" "teardown retained partial legacy metadata"
+  run_decisions "$home" answer "$id" partial-answer --decision-file "$home/partial-answer.txt" >/dev/null \
+    || fail "post-teardown partial resolution retry lost its legacy identity"
+  run_decisions "$home" answer "$id" partial-answer --decision-file "$home/partial-answer.txt" >/dev/null \
+    || fail "repeated partial resolution retry was not idempotent"
+  show=$(tasks_in "$home" show "$hold" --full)
+  assert_contains "$show" "state: done" "partial legacy retry did not close the hold"
+  assert_contains "$show" "Origin: $id" "partial legacy retry did not retain its exact origin"
+  pass "queued legacy resolution identity survives teardown and retry"
+}
+
+test_legacy_migration_requires_unambiguous_home_bound_metadata() {
+  local home source victim collision decision digest body foreign id hold n
+  home=$(make_home ambiguous-legacy-history)
+  source=sample
+  victim=sample-decision-route
+  tasks_in "$home" add "$source" "Review an old ambiguous source" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create ambiguous legacy source"
+  tasks_in "$home" add "$victim" "Review an ambiguous claimant" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create ambiguous legacy claimant"
+  write_origin_meta "$home" "$source"
+  write_origin_meta "$home" "$victim"
+  collision=$(run_decisions "$home" hold "$source" route-decision-later \
+    --title "Choose the old ambiguous route" --reason "captain ambiguous route pending" --repo sample) \
+    || fail "could not create ambiguous legacy hold"
+  run_decisions "$home" complete "$source" route-decision-later >/dev/null \
+    || fail "could not inventory ambiguous legacy source"
+  decision='Captain resolved the old ambiguous route.'
+  printf '%s\n' "$decision" > "$home/ambiguous.txt"
+  run_decisions "$home" answer "$source" route-decision-later --decision-file "$home/ambiguous.txt" >/dev/null \
+    || fail "could not resolve ambiguous legacy source"
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$collision" --body "$body" >/dev/null \
+    || fail "could not preserve ambiguous released-version history"
+  printf 'decisions_reviewed=1\ndecision_keys=later\n' >> "$home/state/$victim.meta"
+  rm -f "$home/state/$source.meta"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "ambiguous-filler-$n" "Ambiguous filler $n" --kind ship --repo sample >/dev/null \
+      || fail "could not create ambiguous filler $n"
+    tasks_in "$home" "done" "ambiguous-filler-$n" >/dev/null \
+      || fail "could not complete ambiguous filler $n"
+  done
+  assert_grep "- [x] $collision -" "$home/data/done-archive.md" \
+    "ambiguous legacy record was not pruned normally"
+  if run_decisions "$home" complete "$victim" later \
+    > "$home/ambiguous.out" 2> "$home/ambiguous.err"; then
+    fail "claimant metadata rebound ambiguous legacy history"
+  fi
+  assert_absent "$home/data/decision-resolution-attestations/$collision.attestation" \
+    "ambiguous claimant created a durable legacy attestation"
+
+  home=$(make_home foreign-legacy-state)
+  id=sample-state-review
+  tasks_in "$home" add "$id" "Review legacy state ownership" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create state-bound legacy origin"
+  write_origin_meta "$home" "$id"
+  hold=$(run_decisions "$home" hold "$id" old-answer \
+    --title "Choose the state-bound answer" --reason "captain state answer pending" --repo sample) \
+    || fail "could not create state-bound legacy hold"
+  run_decisions "$home" complete "$id" old-answer >/dev/null \
+    || fail "could not inventory state-bound legacy hold"
+  decision='Captain resolved the state-bound answer.'
+  printf '%s\n' "$decision" > "$home/state-answer.txt"
+  run_decisions "$home" answer "$id" old-answer --decision-file "$home/state-answer.txt" >/dev/null \
+    || fail "could not resolve state-bound legacy hold"
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not preserve state-bound released-version history"
+  foreign=$(make_home foreign-legacy-state-claimant)
+  write_origin_meta "$foreign" "$id"
+  printf 'decisions_reviewed=1\ndecision_keys=old-answer\n' >> "$foreign/state/$id.meta"
+  if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$foreign/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-decision-hold.sh" complete "$id" old-answer \
+    > "$foreign/state-override.out" 2> "$foreign/state-override.err"; then
+    fail "foreign state metadata authorized legacy migration"
+  fi
+  assert_grep "configured state directory is outside the active home" "$foreign/state-override.err" \
+    "foreign state metadata did not fail the home boundary"
+  mv "$home/state" "$home/state-real"
+  ln -s "$foreign/state" "$home/state"
+  if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-decision-hold.sh" complete "$id" old-answer \
+    > "$foreign/state-symlink.out" 2> "$foreign/state-symlink.err"; then
+    fail "symlinked state metadata authorized legacy migration"
+  fi
+  assert_grep "authoritative state directory is unsafe" "$foreign/state-symlink.err" \
+    "symlinked state metadata did not fail safely"
+  pass "legacy migration requires unambiguous home-bound metadata"
+}
+
+test_retained_resolution_rejects_oversized_decision() {
+  local home id hold decision digest body
+  home=$(make_home oversized-retained-decision)
+  id=sample-size-review
+  tasks_in "$home" add "$id" "Review retained decision size" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create retained-size origin"
+  write_origin_meta "$home" "$id"
+  hold=$(run_decisions "$home" hold "$id" bounded-answer \
+    --title "Choose the bounded answer" --reason "captain bounded answer pending" --repo sample) \
+    || fail "could not create retained-size hold"
+  run_decisions "$home" complete "$id" bounded-answer >/dev/null \
+    || fail "could not inventory retained-size hold"
+  decision=$(LC_ALL=C awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: bounded-answer\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$id" "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create oversized retained resolution"
+  tasks_in "$home" "done" "$hold" >/dev/null \
+    || fail "could not retain oversized resolution"
+  if run_decisions "$home" verify "$id" > "$home/oversized.out" 2> "$home/oversized.err"; then
+    fail "verification accepted an oversized retained captain decision"
+  fi
+  assert_grep "neither actively held nor durably resolved" "$home/oversized.err" \
+    "oversized retained decision did not fail as malformed"
+  pass "retained resolutions enforce the captain decision size bound"
 }
 
 # Missing active ownership and malformed retained records remain hard failures.
@@ -1522,6 +1673,9 @@ test_structured_holds_survive_teardown_and_route_resolution
 test_origin_slug_validation_precedes_path_construction
 test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
+test_queued_legacy_resolution_is_attested_before_teardown
+test_legacy_migration_requires_unambiguous_home_bound_metadata
+test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
 test_historical_resolution_proof_is_exact_and_home_bound
 test_none_inventory_and_resolved_prose_do_not_create_holds

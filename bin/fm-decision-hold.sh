@@ -49,9 +49,10 @@
 # the hold body, and store the origin, decision key, decision digest, and routed
 # identities so an exact retry is idempotent while a changed identity, decision,
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
-# mode:` naming their path. A legacy record remains valid when live reviewed
-# metadata uniquely binds it and creates an exact durable identity attestation
-# before teardown, or when that attestation already matches the record.
+# mode:` naming their path. A legacy record with one unambiguous origin/key id
+# decomposition remains valid when live reviewed metadata binds it and creates an
+# exact durable identity attestation before teardown, or when that attestation
+# already matches the record.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -192,6 +193,7 @@ ROUTED_NONE='(none)'
 
 DECISION_TEXT=''
 DECISION_DIGEST=''
+DECISION_MAX_BYTES=8192
 
 load_decision() {  # <path>; sets DECISION_TEXT and DECISION_DIGEST
   local path=$1 decision
@@ -199,8 +201,8 @@ load_decision() {  # <path>; sets DECISION_TEXT and DECISION_DIGEST
   [ -f "$path" ] || fail "decision file does not exist: $path"
   decision=$(cat "$path")
   [ -n "$decision" ] || fail "decision file must not be empty"
-  [ "$(printf '%s' "$decision" | LC_ALL=C wc -c | tr -d ' ')" -le 8192 ] \
-    || fail "decision file exceeds 8192 bytes"
+  [ "$(printf '%s' "$decision" | LC_ALL=C wc -c | tr -d ' ')" -le "$DECISION_MAX_BYTES" ] \
+    || fail "decision file exceeds $DECISION_MAX_BYTES bytes"
   DECISION_TEXT=$decision
   DECISION_DIGEST=$(sha256_text "$decision")
 }
@@ -321,6 +323,7 @@ parse_resolution_record() {  # <hold-body>
   decision=${tail%"$routed_marker"*}
   routed_work=${tail##*"$routed_marker"}
   [ -n "$decision" ] || return 1
+  [ "$(printf '%s' "$decision" | LC_ALL=C wc -c | tr -d ' ')" -le "$DECISION_MAX_BYTES" ] || return 1
 
   line=${metadata%%$'\n'*}
   if [ "$line" != "$metadata" ]; then metadata=${metadata#*$'\n'}; else metadata=''; fi
@@ -391,15 +394,22 @@ EOF
 }
 
 legacy_resolution_meta_identity_valid() (  # <origin-id> <decision-key>
-  local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key
-  expected_meta="$STATE/$origin.meta"
+  local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key links
+  expected_meta="$DECISION_STATE/$origin.meta"
   [ -f "$expected_meta" ] && [ ! -L "$expected_meta" ] || return 1
+  links=$(file_link_count "$expected_meta") || return 1
+  [ "$links" = 1 ] || return 1
   [ "$(meta_value "$expected_meta" decisions_reviewed)" = 1 ] || return 1
   list_has_key "$(meta_value "$expected_meta" decision_keys)" "$key" || return 1
   expected_id="${origin}-decision-${key}"
+  case "$expected_id" in *-decision-*-decision-*) return 1 ;; esac
+  [ "${expected_id%%-decision-*}" = "$origin" ] || return 1
+  [ "${expected_id#*-decision-}" = "$key" ] || return 1
   shopt -s nullglob dotglob
-  for candidate_meta in "$STATE"/*.meta; do
+  for candidate_meta in "$DECISION_STATE"/*.meta; do
     [ -f "$candidate_meta" ] && [ ! -L "$candidate_meta" ] || return 1
+    links=$(file_link_count "$candidate_meta") || return 1
+    [ "$links" = 1 ] || return 1
     candidate_origin=${candidate_meta##*/}
     candidate_origin=${candidate_origin%.meta}
     case "$candidate_origin" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
@@ -419,7 +429,11 @@ EOF
 
 legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id
+  authoritative_state_path
   id="${origin}-decision-${key}"
+  case "$id" in *-decision-*-decision-*) return 1 ;; esac
+  [ "${id%%-decision-*}" = "$origin" ] || return 1
+  [ "${id#*-decision-}" = "$key" ] || return 1
   legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
     && return 0
   legacy_resolution_meta_identity_valid "$origin" "$key"
@@ -509,12 +523,89 @@ tasks_config_string() {  # <config-path> <table> <key>
   ' "$path"
 }
 
+DECISION_STATE=''
+authoritative_state_path() {
+  local physical_home expected_state physical_expected physical_state
+  DECISION_STATE=''
+  [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
+  physical_home=$(cd "$FM_HOME" && pwd -P) \
+    || fail "could not resolve active home: $FM_HOME"
+  expected_state="$FM_HOME/state"
+  [ -d "$expected_state" ] && [ ! -L "$expected_state" ] \
+    || fail "authoritative state directory is unsafe: $expected_state"
+  physical_expected=$(cd "$expected_state" && pwd -P) \
+    || fail "could not resolve authoritative state directory: $expected_state"
+  [ "$physical_expected" = "$physical_home/state" ] \
+    || fail "authoritative state directory escapes the active home: $expected_state"
+  [ -d "$STATE" ] && [ ! -L "$STATE" ] \
+    || fail "configured state directory is unsafe: $STATE"
+  physical_state=$(cd "$STATE" && pwd -P) \
+    || fail "could not resolve configured state directory: $STATE"
+  [ "$physical_state" = "$physical_expected" ] \
+    || fail "configured state directory is outside the active home: $STATE"
+  DECISION_STATE=$physical_state
+}
+
+NORMALIZED_HOME_PATH=''
+normalize_home_owned_path() {  # <path> <logical-home> <physical-home>
+  local path=$1 logical_home=$2 physical_home=$3 relative component last_index joined
+  local -a components=()
+  NORMALIZED_HOME_PATH=''
+  [ "$logical_home" = / ] || logical_home=${logical_home%/}
+  case "$path" in
+    /*)
+      case "$path" in
+        "$logical_home") relative='' ;;
+        "$logical_home"/*) relative=${path#"$logical_home"/} ;;
+        "$physical_home") relative='' ;;
+        "$physical_home"/*) relative=${path#"$physical_home"/} ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) relative=$path ;;
+  esac
+  while [ -n "$relative" ]; do
+    component=${relative%%/*}
+    if [ "$component" = "$relative" ]; then relative=''; else relative=${relative#*/}; fi
+    case "$component" in
+      ''|.) ;;
+      ..)
+        [ "${#components[@]}" -gt 0 ] || return 1
+        last_index=$((${#components[@]} - 1))
+        unset "components[$last_index]"
+        ;;
+      *) components+=("$component") ;;
+    esac
+  done
+  [ "${#components[@]}" -gt 0 ] || return 1
+  joined=$(IFS=/; printf '%s' "${components[*]}")
+  NORMALIZED_HOME_PATH="$physical_home/$joined"
+}
+
+contained_archive_parent_safe() {  # <physical-home> <archive-parent>
+  local physical_home=$1 archive_parent=$2 relative component current
+  case "$archive_parent" in
+    "$physical_home") return 0 ;;
+    "$physical_home"/*) relative=${archive_parent#"$physical_home"/} ;;
+    *) return 1 ;;
+  esac
+  current=$physical_home
+  while [ -n "$relative" ]; do
+    component=${relative%%/*}
+    if [ "$component" = "$relative" ]; then relative=''; else relative=${relative#*/}; fi
+    current="$current/$component"
+    if [ -e "$current" ] || [ -L "$current" ]; then
+      [ -d "$current" ] && [ ! -L "$current" ] || return 1
+    fi
+  done
+}
+
 DECISION_ARCHIVE=''
 DECISION_DATA=''
 authoritative_archive_path() {
   local physical_home expected_data physical_expected physical_data project_config home_config
   local archive_value='' backlog_value='' configured_backlog configured_archive archive_dir archive_name
-  local physical_backlog_dir physical_archive_dir rc
+  local physical_backlog_dir rc
   DECISION_ARCHIVE=''
   DECISION_DATA=''
   [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
@@ -564,30 +655,27 @@ authoritative_archive_path() {
     fi
   fi
 
-  case "$backlog_value" in /*) configured_backlog=$backlog_value ;; *) configured_backlog="$FM_HOME/$backlog_value" ;; esac
+  normalize_home_owned_path "$backlog_value" "$FM_HOME" "$physical_home" \
+    || fail "configured backlog is outside the active home: $backlog_value"
+  configured_backlog=$NORMALIZED_HOME_PATH
+  [ "$configured_backlog" = "$physical_data/backlog.md" ] \
+    || fail "configured backlog is outside the authoritative data directory: $configured_backlog"
   [ -f "$configured_backlog" ] && [ ! -L "$configured_backlog" ] \
     || fail "configured backlog is not an ordinary file: $configured_backlog"
-  physical_backlog_dir=$(cd "${configured_backlog%/*}" && pwd -P) \
-    || fail "could not resolve configured backlog directory: ${configured_backlog%/*}"
-  [ "$physical_backlog_dir/${configured_backlog##*/}" = "$physical_data/backlog.md" ] \
-    || fail "configured backlog is outside the authoritative data directory: $configured_backlog"
+  physical_backlog_dir=$physical_data
 
   if [ -n "$archive_value" ]; then
-    case "$archive_value" in /*) configured_archive=$archive_value ;; *) configured_archive="$FM_HOME/$archive_value" ;; esac
+    normalize_home_owned_path "$archive_value" "$FM_HOME" "$physical_home" \
+      || fail "configured decision archive is outside the active home: $archive_value"
+    configured_archive=$NORMALIZED_HOME_PATH
   else
     configured_archive="$physical_backlog_dir/done-archive.md"
   fi
   archive_dir=${configured_archive%/*}
   archive_name=${configured_archive##*/}
-  [ -n "$archive_name" ] && [ -d "$archive_dir" ] && [ ! -L "$archive_dir" ] \
+  [ -n "$archive_name" ] && contained_archive_parent_safe "$physical_home" "$archive_dir" \
     || fail "configured decision archive directory is unsafe: $archive_dir"
-  physical_archive_dir=$(cd "$archive_dir" && pwd -P) \
-    || fail "could not resolve configured decision archive directory: $archive_dir"
-  case "$physical_archive_dir" in
-    "$physical_home"|"$physical_home"/*) ;;
-    *) fail "configured decision archive is outside the active home: $configured_archive" ;;
-  esac
-  DECISION_ARCHIVE="$physical_archive_dir/$archive_name"
+  DECISION_ARCHIVE="$archive_dir/$archive_name"
   [ "$DECISION_ARCHIVE" != "$physical_data/backlog.md" ] \
     || fail "configured decision archive is the active backlog: $DECISION_ARCHIVE"
 }
@@ -894,6 +982,9 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   if [ "$state" = queued ] && [ "$held" = yes ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ]; then
     active_hold_body_valid "$body" "$origin" "$key" \
       || fail "captain decision $id has malformed or mismatched active provenance"
+    if resolution_record_valid "$body" "$origin" "$key"; then
+      persist_parsed_legacy_resolution "$id" "$origin" "$key"
+    fi
     return 0
   fi
   if [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \

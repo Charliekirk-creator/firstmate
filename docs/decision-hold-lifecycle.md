@@ -19,9 +19,11 @@ It accepts `--none` as an explicit semantic inventory result, not as inferred ab
 It verifies every listed identity against tasks-axi before recording completion.
 When normal configured retention has moved an older Done identity out of `data/backlog.md`, it reads that identity's exact record from the `[markdown].archive` path used by tasks-axi without restoring it.
 The configured archive and backlog must resolve under the active `FM_HOME` through ordinary physical paths; a foreign data override or symlinked data parent cannot supply history.
+A configured archive may have not-yet-created nested parents, which are normalized under the physical home and accepted only while every existing ancestor is an ordinary directory; tasks-axi remains responsible for creating them during normal pruning.
 Only one ordinary, single-linked archived record whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; parsing stops at the canonical metadata boundary, so title text is never provenance.
-Its resolution block must bind the exact origin and decision key, recompute to the recorded captain-answer digest, enforce resolution-mode routing, and list the same routed identities in both structured routing fields.
-Released-version records without embedded origin and key remain compatible when live reviewed metadata uniquely binds the composed hold identity and atomically persists an exact record attestation under the authoritative data directory before teardown.
+Its resolution block must bind the exact origin and decision key, contain no more than the decision-file limit of 8192 captain-answer bytes, recompute to the recorded captain-answer digest, enforce resolution-mode routing, and list the same routed identities in both structured routing fields.
+Released-version records without embedded origin and key remain compatible only when the composed hold id has one origin/key decomposition and live reviewed metadata from the authoritative, non-symlinked state directory atomically persists an exact record attestation under the authoritative data directory before teardown.
+The same migration runs for a queued legacy resolution left by an interrupted close, so teardown cannot erase the identity needed for an exact retry.
 Later checks require that single-linked ordinary attestation to match the same hold id, origin, key, and complete resolution-record digest; only the legacy routed format may omit `Resolution mode:`.
 Absence, duplicate or ambiguous identity, unsafe archive files, non-absence backlog read errors, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
 For an open keyed status decision, it appends a `captain-held [key=<key>]: ...` transfer event only after the matching backlog hold is durable.
@@ -110,7 +112,8 @@ An unanswered decision still blocks completion and teardown, and neither `declin
 A retained-history regression resolves two synthetic decisions, proves retained released-version metadata first, moves both records into a non-default configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
 After normal teardown removes origin metadata, repeated completion still recognizes the exact legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
-Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, attempt to repair that collision, spoof captain metadata in an ordinary captain-kind title, mismatch resolution modes, digests, and routed-work lists, and point archive reads across home boundaries; none can masquerade as historical resolution.
+Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, attempt to migrate or repair that collision, spoof captain metadata in an ordinary captain-kind title, exceed the captain decision size bound, mismatch resolution modes, digests, and routed-work lists, and point archive or legacy state reads across home boundaries; none can masquerade as historical resolution.
+A queued released-version resolution is separately verified through teardown and then retried after its ephemeral metadata is gone.
 
 Three answer-time closure regressions run against the published poll response shape, with synthetic `sample` identities.
 A bound source whose origin exposes six holds captures one review carrying five structured choices plus one freeform message, and the runner feeds it through a fixture adapter that is not the review adapter at all, so what is proven is that any bound channel with an `answers` command gets closure rather than that one channel is wired specially.
@@ -132,6 +135,9 @@ ok - captain holds are idempotent, distinct, teardown-safe, Bearings-visible, an
 ok - completion and verification validate origins before constructing paths
 ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
+ok - queued legacy resolution identity survives teardown and retry
+ok - legacy migration requires unambiguous home-bound metadata
+ok - retained resolutions enforce the captain decision size bound
 ok - pruned-history fallback rejects missing, malformed, and mismatched decisions
 ok - historical resolution proof is exact, structured, and home-bound
 ok - resolved findings and decision-like prose do not create false holds
