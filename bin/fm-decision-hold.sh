@@ -20,7 +20,8 @@
 #   fm-decision-hold.sh id <origin-id> <decision-key>
 #   fm-decision-hold.sh hold <origin-id> <decision-key> \
 #     --title <title> --reason <reason> [--repo <repo>]
-#   fm-decision-hold.sh complete <origin-id> (--none | <decision-key>...)
+#   fm-decision-hold.sh complete <origin-id> (--none | <decision-key>...) \
+#     [--resolved <decision-key>]...
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
 #     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
@@ -33,15 +34,18 @@
 #   fm-decision-hold.sh repair <origin-id> <decision-key> --decision-file <path>
 #
 # `complete` is the shared investigation and visual-review completion gate.
-# `--none` is an explicit semantic attestation that the just-reviewed surface has
-# no unresolved captain decision. Later review passes may add keys; a live task's
-# metadata inventory is unioned idempotently. A resolved historical key may be
-# proven by its structured record in tasks-axi's configured archive after normal
-# bounded Done retention prunes it; the gate never restores archived rows. A
-# missing key with no valid archived resolution still fails. A post-teardown visual review
-# can complete against the surviving report and holds without recreating task
-# state. `verify` is called by scout teardown so teardown cannot erase a source
-# before this gate has succeeded.
+# Positional keys are the unresolved decisions in the just-reviewed surface and
+# must have active holds; `--none` explicitly attests that there are none.
+# `--resolved` identifies an older key that must have exact durable resolution
+# proof, which lets post-teardown reviews carry historical provenance without
+# consulting status text. Later review passes may add keys; a live task's metadata
+# inventory is unioned idempotently. A resolved historical key may be proven by
+# its structured record in tasks-axi's configured archive after normal bounded
+# Done retention prunes it; the gate never restores archived rows. A missing key
+# with no valid archived resolution still fails. A post-teardown visual review can
+# complete against the surviving report and holds without recreating task state.
+# `verify` is called by scout teardown so teardown cannot erase a source before
+# this gate has succeeded.
 #
 # `resolve`, `answer`, and `decline` close active holds; `repair` attests a hold
 # already closed outside this script. All four paths require a non-empty captain
@@ -49,10 +53,10 @@
 # the hold body, and store the origin, decision key, decision digest, and routed
 # identities so an exact retry is idempotent while a changed identity, decision,
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
-# mode:` naming their path. A legacy record remains valid when an exact durable
-# identity attestation already matches it, or when live reviewed metadata is the
-# sole durable owner among its composed id's valid decompositions and creates
-# that attestation before teardown.
+# mode:` naming their path. A legacy record remains valid when its composed hold
+# id has one possible origin/key decomposition or an exact durable identity
+# attestation already matches the complete record. Ambiguous ids are never bound
+# from a later claimant's live metadata.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -270,16 +274,6 @@ list_has_key() {  # <comma-list> <key>
   esac
 }
 
-status_decisions_have_key() {  # <structured-decisions> <key>
-  local decisions=$1 expected=$2 key
-  while IFS=$'\t' read -r key _verb _summary; do
-    [ "$key" = "$expected" ] && return 0
-  done <<EOF
-$decisions
-EOF
-  return 1
-}
-
 sorted_key_union() {  # <comma-list> <newline-or-space-separated-new-keys>
   local existing=$1 new=$2
   {
@@ -419,51 +413,15 @@ EOF
   RESOLUTION_RECORD_DIGEST=$(sha256_text "$body")
 }
 
-legacy_resolution_meta_identity_valid() (  # <origin-id> <decision-key>
-  local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key candidate_key_from_meta links
-  expected_meta="$DECISION_STATE/$origin.meta"
-  [ -f "$expected_meta" ] && [ ! -L "$expected_meta" ] || return 1
-  links=$(file_link_count "$expected_meta") || return 1
-  [ "$links" = 1 ] || return 1
-  [ "$(meta_value "$expected_meta" decisions_reviewed)" = 1 ] || return 1
-  candidate_keys=$(meta_value "$expected_meta" decision_keys)
-  while IFS= read -r candidate_key; do
-    [ -n "$candidate_key" ] || continue
-    case "$candidate_key" in *[!A-Za-z0-9._-]*) return 1 ;; esac
-  done <<EOF
-$(printf '%s\n' "$candidate_keys" | tr ',' '\n')
-EOF
-  list_has_key "$candidate_keys" "$key" || return 1
-
-  expected_id="${origin}-decision-${key}"
-  candidate_origin=${expected_id%%-decision-*}
-  candidate_key=${expected_id#*-decision-}
-  while :; do
-    if { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; } \
-      && origin_exists_here "$candidate_origin"; then
-      candidate_meta="$DECISION_STATE/$candidate_origin.meta"
-      [ -f "$candidate_meta" ] && [ ! -L "$candidate_meta" ] || return 1
-      links=$(file_link_count "$candidate_meta") || return 1
-      [ "$links" = 1 ] || return 1
-      [ "$(meta_value "$candidate_meta" decisions_reviewed)" = 1 ] || return 1
-      candidate_keys=$(meta_value "$candidate_meta" decision_keys)
-      while IFS= read -r candidate_key_from_meta; do
-        [ -n "$candidate_key_from_meta" ] || continue
-        case "$candidate_key_from_meta" in *[!A-Za-z0-9._-]*) return 1 ;; esac
-      done <<EOF
-$(printf '%s\n' "$candidate_keys" | tr ',' '\n')
-EOF
-      list_has_key "$candidate_keys" "$candidate_key" && return 1
-    fi
-    case "$candidate_key" in
-      *-decision-*)
-        candidate_origin="${candidate_origin}-decision-${candidate_key%%-decision-*}"
-        candidate_key=${candidate_key#*-decision-}
-        ;;
-      *) break ;;
-    esac
-  done
-)
+legacy_resolution_identity_unambiguous() {  # <hold-id> <origin-id> <decision-key>
+  local id=$1 origin=$2 key=$3 remainder
+  [ "$id" = "${origin}-decision-${key}" ] || return 1
+  remainder=${id#*-decision-}
+  case "$remainder" in
+    *-decision-*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 
 legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id
@@ -471,7 +429,7 @@ legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
   id="${origin}-decision-${key}"
   legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
     && return 0
-  legacy_resolution_meta_identity_valid "$origin" "$key"
+  legacy_resolution_identity_unambiguous "$id" "$origin" "$key"
 }
 
 resolution_record_valid() {  # <hold-body> [<origin-id> <decision-key>]
@@ -1037,6 +995,29 @@ verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   body_has_resolution_record "$body" "$origin" "$key"
 }
 
+verify_hold_historical() {  # <origin-id> <decision-key>
+  local origin=$1 key=$2 id show state kind hold_kind body
+  id=$(hold_id "$origin" "$key")
+  if task_show_optional "$id"; then
+    show=$TASK_SHOW_OUTPUT
+    state=$(show_field "$show" state)
+    kind=$(show_field "$show" kind)
+    hold_kind=$(show_field "$show" hold_kind)
+    body=$(show_field "$show" body)
+    if [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
+      && body_has_resolution_record "$body" "$origin" "$key"; then
+      persist_parsed_legacy_resolution "$id" "$origin" "$key"
+      return 0
+    fi
+    fail "captain decision $id is not durably resolved"
+  fi
+  if archived_hold_resolved "$id" "$origin" "$key"; then
+    persist_parsed_legacy_resolution "$id" "$origin" "$key"
+    return 0
+  fi
+  fail "captain decision $id is absent from $FM_HOME/data/backlog.md and is not durably resolved in its archive"
+}
+
 verify_hold_durable() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id show state held kind hold_kind body
   id=$(hold_id "$origin" "$key")
@@ -1139,7 +1120,8 @@ command_hold() {
 }
 
 command_complete() {
-  local origin=${1:-} meta previous='' supplied='' keys='' key status_file open raw_open key_seen=0 has_meta=0
+  local origin=${1:-} meta previous='' supplied='' resolved='' supplied_csv='' resolved_csv=''
+  local keys='' key status_file open raw_open key_seen=0 has_meta=0 none=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
   authoritative_state_path
@@ -1156,33 +1138,61 @@ command_complete() {
   fi
   require_tasks_axi
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
-  if [ "$#" -eq 1 ] && [ "$1" = --none ]; then
-    supplied=''
-  else
-    while [ "$#" -gt 0 ]; do
-      [ "$1" != --none ] || fail "--none cannot be combined with decision keys"
-      validate_slug decision-key "$1"
-      supplied="${supplied}${supplied:+ }$1"
-      shift
-    done
-  fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --none) none=1 ;;
+      --resolved)
+        shift
+        [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+        validate_slug decision-key "$1"
+        resolved="${resolved}${resolved:+ }$1"
+        ;;
+      --*) usage >&2; exit 2 ;;
+      *)
+        validate_slug decision-key "$1"
+        supplied="${supplied}${supplied:+ }$1"
+        ;;
+    esac
+    shift
+  done
+  [ "$none" -eq 0 ] || [ -z "$supplied" ] \
+    || fail "--none cannot be combined with unresolved decision keys"
+  [ "$none" -eq 1 ] || [ -n "$supplied" ] \
+    || fail "use --none when the reviewed surface has no unresolved decision keys"
+  supplied_csv=$(printf '%s\n' "$supplied" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)
+  resolved_csv=$(printf '%s\n' "$resolved" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    list_has_key "$supplied_csv" "$key" \
+      && fail "decision key $key cannot be both unresolved and resolved"
+  done <<EOF
+$(printf '%s\n' "$resolved_csv" | tr ',' '\n')
+EOF
   if [ "$has_meta" = 1 ]; then
     previous=$(meta_value "$meta" decision_keys)
   fi
-  keys=$(sorted_key_union "$previous" "$supplied")
+  keys=$(sorted_key_union "$previous" "$supplied $resolved")
   raw_open=$(status_open_decisions "$status_file")
-  if [ -n "$keys" ]; then
-    while IFS= read -r key; do
-      [ -n "$key" ] || continue
-      if [ "$has_meta" = 1 ] && status_decisions_have_key "$raw_open" "$key"; then
-        verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
-      else
-        verify_hold_durable "$origin" "$key"
-      fi
-    done <<EOF
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
+  done <<EOF
+$(printf '%s\n' "$supplied_csv" | tr ',' '\n')
+EOF
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    verify_hold_historical "$origin" "$key"
+  done <<EOF
+$(printf '%s\n' "$resolved_csv" | tr ',' '\n')
+EOF
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    list_has_key "$supplied_csv" "$key" && continue
+    list_has_key "$resolved_csv" "$key" && continue
+    verify_hold_durable "$origin" "$key"
+  done <<EOF
 $(printf '%s\n' "$keys" | tr ',' '\n')
 EOF
-  fi
 
   open=$(origin_open_decisions "$origin")
   while IFS=$'\t' read -r key _verb _summary; do
@@ -1209,7 +1219,7 @@ EOF
     # session; an append failure still fails this command loudly.
     while IFS=$'\t' read -r key _verb _summary; do
       [ -n "$key" ] || continue
-      list_has_key "$keys" "$key" || continue
+      list_has_key "$supplied_csv" "$key" || continue
       transfer_rc=0
       fm_wake_status_append_self_announced "$STATE" "$status_file" \
         "captain-held [key=$key]: tracked by $(hold_id "$origin" "$key")" || transfer_rc=$?

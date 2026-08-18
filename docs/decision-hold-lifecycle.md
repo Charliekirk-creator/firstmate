@@ -15,22 +15,23 @@ It rejects an identity collision, a changed title, and attempts to reopen an alr
 
 The `complete` subcommand unions the reviewed keys into `decision_keys=` and appends `decisions_reviewed=1` while originating task metadata is live.
 A post-teardown visual review can complete against the surviving report and durable holds without recreating volatile task metadata.
-It accepts `--none` as an explicit semantic inventory result, not as inferred absence.
+Positional keys are the explicit current unresolved inventory and always require active holds, independent of status text; `--none` explicitly records an empty current inventory, and repeated `--resolved <key>` arguments carry older keys that must have exact durable resolution proof when no live metadata remains.
 It verifies every listed identity against tasks-axi before recording completion.
 When normal configured retention has moved an older Done identity out of `data/backlog.md`, it reads that identity's exact record from the `[markdown].archive` path used by tasks-axi without restoring it.
 The configured archive and backlog must resolve under the active `FM_HOME` through ordinary physical paths; a foreign data override or symlinked data parent cannot supply history.
 A configured archive may have not-yet-created nested parents, which are normalized under the physical home and accepted only while every existing ancestor is an ordinary directory; tasks-axi remains responsible for creating them during normal pruning.
 Only one ordinary, single-linked archived record inside a canonical `## Archived YYYY-MM-DD` retention section whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; rows under notes or other prose sections are not history, and parsing stops at the canonical metadata boundary, so title text is never provenance.
 Its resolution block must bind the exact origin and decision key, contain no more than the decision-file limit of 8192 captain-answer bytes, recompute to the recorded captain-answer digest, enforce resolution-mode routing, and list the same routed identities in both structured routing fields.
-Released-version records without embedded origin and key remain compatible when an existing exact attestation matches, or when live reviewed metadata from the authoritative, non-symlinked state directory is the sole durable owner among every valid decomposition of the composed hold id and atomically persists an exact record attestation under the authoritative data directory before teardown.
-The same migration runs for a queued legacy resolution left by an interrupted close, so teardown cannot erase the identity needed for an exact retry.
-Later checks require that ordinary attestation to match the same hold id, origin, key, and complete resolution-record digest; a publication interrupted after its no-clobber link is recoverable only through its matching private staging link, while unrelated hardlinks remain invalid. Only the legacy routed format may omit `Resolution mode:`.
+Released-version records without embedded origin and key remain compatible directly when the composed hold id has exactly one valid origin/key decomposition, or through an existing exact record attestation when the id is ambiguous.
+Claimant metadata cannot bind an ambiguous legacy row after its original owner is gone; later checks require an ordinary attestation to match the same hold id, origin, key, and complete resolution-record digest.
+Unambiguous legacy verification may atomically persist that exact attestation under the authoritative data directory before teardown, and the same path covers a queued legacy resolution left by an interrupted close so an exact retry remains deterministic.
+A publication interrupted after its no-clobber link is recoverable only through its matching private staging link, while unrelated hardlinks remain invalid. Only the legacy routed format may omit `Resolution mode:`.
 Absence, duplicate or ambiguous identity, unsafe archive files, non-absence backlog read errors, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
 For any keyed status decision it will transfer, including one followed by a terminal status line, it requires the matching active backlog hold before appending a `captain-held [key=<key>]: ...` event; archived history cannot own a new transfer.
 `bin/fm-classify-lib.sh` recognizes that transfer as closing the live status copy without claiming that the captain has answered it.
 
 Scout teardown calls the script's `verify` subcommand after checking for the report and before removing any source state.
-Verification never changes the backlog or archive; it may atomically persist a matching legacy identity attestation so deleting ephemeral metadata cannot make released-version history ambiguous.
+Verification never changes the backlog or archive; it may atomically persist an exact attestation for a uniquely decomposable legacy record, while ambiguous history remains dependent on proof that was already bound to its owner.
 The `--force` path remains the explicit captain-approved discard escape hatch.
 
 The `resolve`, `answer`, and `decline` subcommands close active holds, while `repair` attests a hold already closed outside the script.
@@ -110,7 +111,8 @@ An unanswered decision still blocks completion and teardown, and neither `declin
 `repair` also refuses a closed captain-kind task that was never held for the captain.
 
 A retained-history regression resolves two synthetic decisions, proves retained released-version metadata first, moves both records into a non-default configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
-After normal teardown removes origin metadata, repeated completion still recognizes the exact legacy record and a hold retry cannot recreate it.
+The same explicit unresolved inventory is required to have an active hold even when no matching status event exists, so status text cannot select historical fallback.
+After normal teardown removes origin metadata and its generated attestation is removed to reproduce a pre-upgrade home, repeated completion still recognizes the uniquely decomposable legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
 Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, attempt to migrate or repair that collision, spoof captain metadata in an ordinary captain-kind title, exceed the captain decision size bound, mismatch resolution modes, digests, and routed-work lists, and point archive or legacy state reads across home boundaries; none can masquerade as historical resolution.
 A queued released-version resolution is separately verified through teardown and then retried after its ephemeral metadata is gone.
@@ -137,7 +139,7 @@ ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
 ok - queued legacy resolution identity survives teardown and retry
 ok - legacy migration rejects conflicting and foreign ownership
-ok - sole-owner legacy ids migrate and interrupted publication recovers
+ok - legacy identity compatibility is unambiguous or pre-attested
 ok - only canonical retention sections prove archived decisions
 ok - retained resolutions enforce the captain decision size bound
 ok - pruned-history fallback rejects missing, malformed, and mismatched decisions

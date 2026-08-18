@@ -464,6 +464,12 @@ test_pruned_resolved_history_does_not_block_later_review() {
   assert_no_grep "captain-held [key=old-a]" "$home/state/$id.status" \
     "failed active ownership check transferred the terminal decision"
   printf 'done: historical ownership guard verified\n' > "$home/state/$id.status"
+  if run_decisions "$home" complete "$id" old-a \
+    > "$home/no-status-current.out" 2> "$home/no-status-current.err"; then
+    fail "explicit unresolved inventory accepted archive proof without an active hold"
+  fi
+  assert_grep "captain hold $old_a is absent" "$home/no-status-current.err" \
+    "explicit unresolved ownership depended on status text"
 
   cp "$home/.tasks.toml" "$home/.tasks.toml.safe"
   awk '{ if ($0 == "backend = \"markdown\"") print "backend = \"unavailable\""; else print }' \
@@ -499,7 +505,7 @@ test_pruned_resolved_history_does_not_block_later_review() {
   printf 'Captain resolved the later choice.\n' > "$home/later.txt"
   run_decisions "$home" answer "$id" later-choice --decision-file "$home/later.txt" >/dev/null \
     || fail "could not resolve the later decision"
-  run_decisions "$home" complete "$id" later-choice >/dev/null \
+  run_decisions "$home" complete "$id" --none >/dev/null \
     || fail "completed later decision did not coexist with pruned history"
   run_decisions "$home" verify "$id" >/dev/null \
     || fail "resolved later decision did not verify"
@@ -509,10 +515,11 @@ test_pruned_resolved_history_does_not_block_later_review() {
   run_teardown "$home" "$id" >/dev/null 2> "$home/legacy-teardown.err" \
     || fail "legacy history did not survive normal teardown: $(cat "$home/legacy-teardown.err")"
   assert_absent "$home/state/$id.meta" "normal teardown retained ephemeral origin metadata"
+  rm -rf "$home/data/decision-resolution-attestations"
   before=$(shasum -a 256 "$home/data/backlog.md" "$archive")
-  run_decisions "$home" complete "$id" old-a >/dev/null \
+  run_decisions "$home" complete "$id" --none --resolved old-a >/dev/null \
     || fail "post-teardown review could not verify the pruned released-version decision"
-  run_decisions "$home" complete "$id" old-a >/dev/null \
+  run_decisions "$home" complete "$id" --none --resolved old-a >/dev/null \
     || fail "repeated post-teardown legacy verification was not idempotent"
   if run_decisions "$home" hold "$id" old-a \
     --title "Choose old sample A" --reason "captain old a pending" --repo sample \
@@ -600,7 +607,7 @@ test_legacy_migration_rejects_conflicting_or_foreign_owners() {
   done
   assert_grep "- [x] $collision -" "$home/data/done-archive.md" \
     "ambiguous legacy record was not pruned normally"
-  if run_decisions "$home" complete "$victim" later \
+  if run_decisions "$home" complete "$victim" --none --resolved later \
     > "$home/ambiguous.out" 2> "$home/ambiguous.err"; then
     fail "claimant metadata rebound ambiguous legacy history"
   fi
@@ -631,7 +638,7 @@ test_legacy_migration_rejects_conflicting_or_foreign_owners() {
   printf 'decisions_reviewed=1\ndecision_keys=old-answer\n' >> "$foreign/state/$id.meta"
   if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
     FM_HOME="$home" FM_STATE_OVERRIDE="$foreign/state" FM_DATA_OVERRIDE="$home/data" \
-    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-decision-hold.sh" complete "$id" old-answer \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-decision-hold.sh" complete "$id" --none --resolved old-answer \
     > "$foreign/state-override.out" 2> "$foreign/state-override.err"; then
     fail "foreign state metadata authorized legacy migration"
   fi
@@ -641,7 +648,7 @@ test_legacy_migration_rejects_conflicting_or_foreign_owners() {
   ln -s "$foreign/state" "$home/state"
   if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
     FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
-    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-decision-hold.sh" complete "$id" old-answer \
+    FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-decision-hold.sh" complete "$id" --none --resolved old-answer \
     > "$foreign/state-symlink.out" 2> "$foreign/state-symlink.err"; then
     fail "symlinked state metadata authorized legacy migration"
   fi
@@ -650,61 +657,81 @@ test_legacy_migration_rejects_conflicting_or_foreign_owners() {
   pass "legacy migration rejects conflicting and foreign ownership"
 }
 
-test_ambiguous_legacy_ids_migrate_for_the_sole_durable_owner() {
-  local home origin key alternate hold decision digest body attestation stage
-  while read -r origin key; do
-    home=$(make_home "compatible-$origin-$key")
-    tasks_in "$home" add "$origin" "Review compatible legacy identity" \
-      --kind scout --repo sample --start >/dev/null \
-      || fail "could not create compatible legacy origin $origin"
-    write_origin_meta "$home" "$origin"
-    if [ "$origin" = sample ]; then alternate=sample-decision-route; else alternate=sample; fi
-    tasks_in "$home" add "$alternate" "Review an unrelated alternate identity" \
-      --kind scout --repo sample --start >/dev/null \
-      || fail "could not create unrelated alternate origin $alternate"
-    write_origin_meta "$home" "$alternate"
-    run_decisions "$home" complete "$alternate" --none >/dev/null \
-      || fail "could not review unrelated alternate origin $alternate"
-    hold=$(run_decisions "$home" hold "$origin" "$key" \
-      --title "Choose the compatible legacy answer" \
-      --reason "captain compatible answer pending" --repo sample) \
-      || fail "could not create compatible legacy hold for $origin/$key"
-    run_decisions "$home" complete "$origin" "$key" >/dev/null \
-      || fail "could not inventory compatible legacy hold for $origin/$key"
-    decision="Captain resolved compatible legacy identity $origin/$key."
-    printf '%s\n' "$decision" > "$home/compatible-answer.txt"
-    run_decisions "$home" answer "$origin" "$key" \
-      --decision-file "$home/compatible-answer.txt" >/dev/null \
-      || fail "could not resolve compatible legacy hold for $origin/$key"
-    digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
-    body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
-      "$digest" "$decision")
-    tasks_in "$home" update "$hold" --body "$body" >/dev/null \
-      || fail "could not preserve compatible released-version history for $origin/$key"
-    run_decisions "$home" verify "$origin" >/dev/null \
-      || fail "reviewed metadata did not migrate compatible legacy identity $origin/$key"
-    attestation="$home/data/decision-resolution-attestations/$hold.attestation"
-    assert_present "$attestation" "compatible legacy migration did not persist exact identity"
+test_legacy_identity_compatibility_is_unambiguous_or_attested() {
+  local home origin key hold decision digest body attestation stage record_digest
+  home=$(make_home compatible-unambiguous-legacy)
+  origin=sample-compatible-review
+  key=old-answer
+  tasks_in "$home" add "$origin" "Review compatible legacy identity" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create compatible legacy origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the compatible legacy answer" \
+    --reason "captain compatible answer pending" --repo sample) \
+    || fail "could not create compatible legacy hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory compatible legacy hold"
+  decision='Captain resolved the compatible legacy identity.'
+  printf '%s\n' "$decision" > "$home/compatible-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/compatible-answer.txt" >/dev/null \
+    || fail "could not resolve compatible legacy hold"
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not preserve unambiguous released-version history"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "unambiguous released-version identity required ephemeral proof"
+  attestation="$home/data/decision-resolution-attestations/$hold.attestation"
+  assert_present "$attestation" "compatible legacy verification did not persist exact identity"
+  stage="$home/data/decision-resolution-attestations/.attestation.interrupted"
+  ln "$attestation" "$stage" \
+    || fail "could not reproduce interrupted attestation publication"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "interrupted attestation publication was not recoverable"
+  assert_absent "$stage" "attestation retry retained its interrupted staging link"
+  rm -f "$home/state/$origin.meta" "$attestation"
+  run_decisions "$home" complete "$origin" --none --resolved "$key" >/dev/null \
+    || fail "unambiguous legacy identity depended on metadata or attestation"
 
-    if [ "$origin" = sample ]; then
-      stage="$home/data/decision-resolution-attestations/.attestation.interrupted"
-      ln "$attestation" "$stage" \
-        || fail "could not reproduce interrupted attestation publication"
-      run_decisions "$home" verify "$origin" >/dev/null \
-        || fail "interrupted attestation publication was not recoverable"
-      assert_absent "$stage" "attestation retry retained its interrupted staging link"
-      run_decisions "$home" verify "$origin" >/dev/null \
-        || fail "recovered attestation was not idempotent"
-    fi
-
-    rm -f "$home/state/$origin.meta"
-    run_decisions "$home" complete "$origin" "$key" >/dev/null \
-      || fail "exact attestation did not preserve ambiguous legacy identity $origin/$key"
-  done <<'EOF'
-sample route-decision-later
-sample-decision-route later
-EOF
-  pass "sole-owner legacy ids migrate and interrupted publication recovers"
+  home=$(make_home compatible-attested-ambiguous-legacy)
+  origin=sample
+  key=route-decision-later
+  tasks_in "$home" add "$origin" "Review attested ambiguous legacy identity" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create ambiguous legacy origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the attested legacy answer" \
+    --reason "captain attested answer pending" --repo sample) \
+    || fail "could not create ambiguous legacy hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory ambiguous legacy hold"
+  decision='Captain resolved the attested ambiguous identity.'
+  printf '%s\n' "$decision" > "$home/attested-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/attested-answer.txt" >/dev/null \
+    || fail "could not resolve ambiguous legacy hold"
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not preserve ambiguous released-version history"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/unattested.out" 2> "$home/unattested.err"; then
+    fail "ambiguous legacy identity was rebound from claimant metadata"
+  fi
+  record_digest=$(printf '%s' "$body" | shasum -a 256 | awk '{print $1}')
+  mkdir -m 700 "$home/data/decision-resolution-attestations"
+  attestation="$home/data/decision-resolution-attestations/$hold.attestation"
+  printf 'schema=fm-decision-legacy-resolution.v1\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
+    "$hold" "$origin" "$key" "$record_digest" > "$attestation"
+  chmod 0600 "$attestation"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "exact pre-existing attestation did not preserve ambiguous legacy identity"
+  pass "legacy identity compatibility is unambiguous or pre-attested"
 }
 
 test_nonarchive_rows_cannot_prove_pruned_history() {
@@ -980,7 +1007,7 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   assert_contains "$show" "Origin: $source" "rejected repair changed the resolved origin"
   assert_contains "$show" "Decision key: route-decision-later" \
     "rejected repair changed the resolved decision key"
-  if run_decisions "$home" complete "$victim" later > "$home/retained-collision.out" 2> "$home/retained-collision.err"; then
+  if run_decisions "$home" complete "$victim" --none --resolved later > "$home/retained-collision.out" 2> "$home/retained-collision.err"; then
     fail "a retained resolution proved a different origin and key with the same concatenated id"
   fi
 
@@ -1015,10 +1042,10 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
     "collision record was not pruned into historical proof"
   assert_grep "- [x] $spoof -" "$home/data/done-archive.md" \
     "title-spoof record was not pruned into historical proof"
-  if run_decisions "$home" complete "$victim" later > "$home/archived-collision.out" 2> "$home/archived-collision.err"; then
+  if run_decisions "$home" complete "$victim" --none --resolved later > "$home/archived-collision.out" 2> "$home/archived-collision.err"; then
     fail "an archived resolution proved a different origin and key with the same concatenated id"
   fi
-  if run_decisions "$home" complete "$spoof_origin" fake > "$home/title-spoof.out" 2> "$home/title-spoof.err"; then
+  if run_decisions "$home" complete "$spoof_origin" --none --resolved fake > "$home/title-spoof.out" 2> "$home/title-spoof.err"; then
     fail "captain metadata words in an ordinary archived title forged hold provenance"
   fi
   assert_grep "mismatched archived captain-hold provenance" "$home/title-spoof.err" \
@@ -1032,7 +1059,7 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   ' "$home/data/done-archive.md" > "$home/data/done-archive.md.tmp" \
     && mv "$home/data/done-archive.md.tmp" "$home/data/done-archive.md" \
     || fail "could not create malformed archived hold provenance"
-  if run_decisions "$home" complete "$spoof_origin" fake \
+  if run_decisions "$home" complete "$spoof_origin" --none --resolved fake \
     > "$home/empty-hold-spoof.out" 2> "$home/empty-hold-spoof.err"; then
     fail "an empty hold token forged archived captain-hold provenance"
   fi
@@ -1043,7 +1070,7 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   write_origin_meta "$foreign" "$source"
   if PATH="$foreign/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
     FM_HOME="$foreign" FM_STATE_OVERRIDE="$foreign/state" FM_DATA_OVERRIDE="$home/data" \
-    FM_CONFIG_OVERRIDE="$foreign/config" "$ROOT/bin/fm-decision-hold.sh" complete "$source" route-decision-later \
+    FM_CONFIG_OVERRIDE="$foreign/config" "$ROOT/bin/fm-decision-hold.sh" complete "$source" --none --resolved route-decision-later \
     > "$foreign/foreign.out" 2> "$foreign/foreign.err"; then
     fail "a foreign FM_DATA_OVERRIDE supplied another home's archived resolution"
   fi
@@ -1054,7 +1081,7 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   write_origin_meta "$symlink_home" "$source"
   rm -rf "$symlink_home/data"
   ln -s "$home/data" "$symlink_home/data"
-  if run_decisions "$symlink_home" complete "$source" route-decision-later \
+  if run_decisions "$symlink_home" complete "$source" --none --resolved route-decision-later \
     > "$symlink_home/symlink-parent.out" 2> "$symlink_home/symlink-parent.err"; then
     fail "a symlinked data parent supplied another home's archived resolution"
   fi
@@ -1100,7 +1127,7 @@ test_retained_history_rejects_unsafe_state_and_status() {
   printf 'done: foreign status\n' > "$foreign/state/$origin.status"
   if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
     FM_HOME="$home" FM_STATE_OVERRIDE="$foreign/state" FM_DATA_OVERRIDE="$home/data" \
-    "$ROOT/bin/fm-decision-hold.sh" complete "$origin" "$key" \
+    "$ROOT/bin/fm-decision-hold.sh" complete "$origin" --none --resolved "$key" \
     > "$home/foreign-state-complete.out" 2> "$home/foreign-state-complete.err"; then
     fail "current-format history accepted foreign completion state"
   fi
@@ -1117,7 +1144,7 @@ test_retained_history_rejects_unsafe_state_and_status() {
 
   mv "$home/state/$origin.status" "$home/status-target"
   ln -s "$home/status-target" "$home/state/$origin.status"
-  if run_decisions "$home" complete "$origin" "$key" \
+  if run_decisions "$home" complete "$origin" --none --resolved "$key" \
     > "$home/symlink-status-complete.out" 2> "$home/symlink-status-complete.err"; then
     fail "archived history hid a symlinked current status during completion"
   fi
@@ -1880,7 +1907,7 @@ test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_conflicting_or_foreign_owners
-test_ambiguous_legacy_ids_migrate_for_the_sole_durable_owner
+test_legacy_identity_compatibility_is_unambiguous_or_attested
 test_nonarchive_rows_cannot_prove_pruned_history
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
