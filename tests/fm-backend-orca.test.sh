@@ -474,6 +474,63 @@ test_worktree_create_removes_worktree_when_path_missing() {
   pass "fm_backend_orca_worktree_create: removes created worktree when path is missing"
 }
 
+test_worktree_create_preserves_terminal_when_close_is_unconfirmed() {
+  local out status
+  orca_case lifecycle-unconfirmed-terminal-close
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-live-terminal"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-live-terminal"},"terminal":{"handle":"term-live-terminal"}}}\n' > "$RESP/3.out"
+  printf '{"ok":false,"error":{"code":"terminal_close_failed","message":"terminal remains live"}}\n' > "$RESP/4.out"
+  printf '1\n' > "$RESP/4.exit"
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" 2>&1)
+  status=$?
+  [ "$status" -eq 2 ] || fail "unconfirmed terminal cleanup should preserve exact resources, got status $status"
+  assert_contains "$out" "wt-live-terminal" \
+    "unconfirmed terminal cleanup lost the exact worktree id"
+  assert_contains "$out" "term-live-terminal" \
+    "unconfirmed terminal cleanup lost the exact terminal id"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1fworktree\x1frm' \
+    "pathless cleanup removed the worktree while its terminal could still be live"
+  pass "fm_backend_orca_worktree_create: unconfirmed terminal cleanup preserves exact resources"
+}
+
+test_terminal_create_timeout_remains_resumable() {
+  local response operation status_file out status i creates
+  orca_case terminal-timeout-resume
+  response="$CASE_DIR/terminal-response.json"
+  operation="$CASE_DIR/terminal-operation"
+  status_file="$CASE_DIR/helper-status"
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-timeout-resume"}}}\n' > "$RESP/1.out"
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_BLOCK="$CASE_DIR/terminal-returned" \
+    FM_ORCA_TERMINAL_CREATE_AFTER_OUTPUT_RELEASE="$CASE_DIR/terminal-release" \
+    FM_ORCA_TERMINAL_POLLS=1 FM_ORCA_TERMINAL_INTERVAL=0 \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_terminal_create_durable wt-timeout fm-task "$1" "$2"; printf "%s\n" "$?" > "$3"' \
+      "$ROOT" "$response" "$operation" "$status_file" >/dev/null 2>&1
+  status=$(cat "$status_file")
+  [ "$status" -eq 124 ] || fail "in-flight terminal creation should return typed status 124, got $status"
+  for i in $(seq 1 200); do
+    [ ! -f "$CASE_DIR/terminal-returned" ] || break
+    sleep 0.02
+  done
+  assert_present "$CASE_DIR/terminal-returned" \
+    "typed terminal timeout did not preserve its live creation"
+  assert_absent "$operation.status" \
+    "typed terminal timeout published a terminal failure while creation was live"
+  : > "$CASE_DIR/terminal-release"
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_TERMINAL_POLLS=200 FM_ORCA_TERMINAL_INTERVAL=0.01 \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_terminal_create_durable wt-timeout fm-task "$1" "$2"' \
+      "$ROOT" "$response" "$operation") \
+    || fail "timed-out terminal creation did not resume to its exact result"
+  [ "$out" = term-timeout-resume ] \
+    || fail "resumed terminal creation returned '$out' instead of its exact terminal"
+  creates=$(grep -c $'orca\x1fterminal\x1fcreate' "$LOG")
+  [ "$creates" -eq 1 ] || fail "terminal timeout recovery created $creates terminals"
+  pass "fm_backend_orca_terminal_create_durable: in-flight timeout remains resumable"
+}
+
 test_spawn_retries_after_compensated_pathless_worktree() {
   local proj wt data state config id out status creates
   id="orcacompensatedz7"
@@ -1686,6 +1743,8 @@ test_dispatcher_sources_orca_and_routes_primitives
 test_json_get_ignores_undocumented_terminal_id_shapes
 test_worktree_and_terminal_helpers_parse_json
 test_worktree_create_removes_worktree_when_path_missing
+test_worktree_create_preserves_terminal_when_close_is_unconfirmed
+test_terminal_create_timeout_remains_resumable
 test_spawn_retries_after_compensated_pathless_worktree
 test_spawn_recovers_compensated_pathless_response_after_creator_crash
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails

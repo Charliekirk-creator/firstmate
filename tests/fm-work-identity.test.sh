@@ -520,7 +520,6 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   assert_contains "$out" "in-progress work identity dispatch" \
     "handoff refusal did not identify the prepared dispatch"
 
-  cp "$home/data/$task/brief.md" "$launch"
   hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
   fm_write_meta "$home/state/$task.meta" \
     "window=firstmate:fm-$task" "endpoint_task_id=$task" \
@@ -736,7 +735,7 @@ test_spawn_does_not_resend_inflight_worktree_request() {
 }
 
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
-  local home task launch first second transaction hash
+  local home task launch first second transaction hash links
   home=$(make_home prepared-dispatch-retry)
   task=prepared-dispatch-retry
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
@@ -754,7 +753,14 @@ test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
   [ "$(printf '%s' "$first" | jq -r '.instructions_sha256')" = \
     "$(printf '%s' "$second" | jq -r '.instructions_sha256')" ] \
     || fail "pre-metadata retry changed the prepared instruction binding"
-  cp "$home/data/$task/brief.md" "$launch"
+  cmp -s "$home/data/$task/brief.md" "$launch" \
+    || fail "dispatch owner did not publish the exact validated instructions"
+  if [ "$(uname)" = Darwin ]; then
+    links=$(stat -f '%l' "$launch")
+  else
+    links=$(stat -c '%h' "$launch")
+  fi
+  [ "$links" = 1 ] || fail "dispatch owner published hardlinked instructions"
   hash=$(printf '%s' "$second" | jq -r '.instructions_sha256')
   fm_write_meta "$home/state/$task.meta" \
     "window=firstmate:fm-$task" "endpoint_task_id=$task" \
@@ -779,8 +785,6 @@ test_dispatch_publish_refuses_unstable_metadata_without_publication() {
   binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
     --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
     --transaction "$transaction") || fail "could not prepare atomic dispatch publication"
-  cp "$home/data/$task/brief.md" "$launch"
-  chmod 400 "$launch"
   hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
   candidate="$home/state/.$task.meta.candidate"
   fm_write_meta "$candidate" \
@@ -837,8 +841,6 @@ test_replacement_dispatch_recovers_prior_retirement() {
   old_binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
     --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
     --transaction "$old_transaction") || fail "could not prepare original dispatch"
-  cp "$home/data/$task/brief.md" "$launch"
-  chmod 400 "$launch"
   old_hash=$(printf '%s' "$old_binding" | jq -r '.instructions_sha256')
   old_candidate="$home/state/.$task.meta.original"
   fm_write_meta "$old_candidate" \
@@ -897,6 +899,93 @@ SH
   assert_absent "$home/data/$task/work-identity-dispatch-prior.md" \
     "recovered replacement dispatch retained prior instructions"
   pass "replacement dispatch retires prior instructions before completion"
+}
+
+test_replacement_dispatch_resumes_before_metadata_publication() {
+  local home task launch original_tx original_binding original_hash original_candidate draft replacement_tx replacement_binding replacement_hash retry candidate
+  home=$(make_home replacement-pre-metadata-recovery)
+  task=replacement-pre-metadata-recovery
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold interrupted replacement fixture"
+  launch="$home/state/$task.launch-brief.md"
+  original_tx=replacement-pre-metadata-original
+  original_binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$original_tx") || fail "could not prepare original dispatch"
+  original_hash=$(printf '%s' "$original_binding" | jq -r '.instructions_sha256')
+  original_candidate="$home/state/.$task.meta.original"
+  fm_write_meta "$original_candidate" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$original_hash" "work_identity_dispatch_transaction=$original_tx" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
+    --brief "$launch" --meta "$original_candidate" --transaction "$original_tx" \
+    || fail "could not publish original dispatch"
+
+  draft="$home/state/.$task.launch-replacement"
+  cp "$launch" "$draft"
+  chmod 600 "$draft"
+  printf '\nResume this replacement exactly.\n' >> "$draft"
+  replacement_tx=replacement-pre-metadata-next
+  replacement_binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$draft" --instructions-path "$launch" --transaction "$replacement_tx" \
+    --meta "$home/state/$task.meta" --prior-brief "$launch") \
+    || fail "could not prepare replacement before interruption"
+  replacement_hash=$(printf '%s' "$replacement_binding" | jq -r '.instructions_sha256')
+  [ "$(sha256_file_for_test "$launch")" = "$replacement_hash" ] \
+    || fail "replacement prepare did not atomically publish its validated instructions"
+  jq -e --arg previous "$original_tx" '
+    .state == "prepared" and .replacement == true
+      and .previous_transaction_id == $previous
+  ' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "replacement receipt did not preserve the exact prior metadata transaction"
+
+  retry=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$draft" --instructions-path "$launch" --transaction replacement-retry-process \
+    --meta "$home/state/$task.meta" --prior-brief "$launch") \
+    || fail "replacement retry mistook prior metadata for new publication"
+  [ "$(printf '%s' "$retry" | jq -r '.transaction_id')" = "$replacement_tx" ] \
+    || fail "replacement retry did not resume the prepared transaction"
+  candidate="$home/state/.$task.meta.replacement"
+  awk -F= -v hash="$replacement_hash" -v transaction="$replacement_tx" '
+    $1 == "launch_brief_sha256" { print "launch_brief_sha256=" hash; next }
+    $1 == "work_identity_dispatch_transaction" { print "work_identity_dispatch_transaction=" transaction; next }
+    { print }
+  ' "$home/state/$task.meta" > "$candidate"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
+    --brief "$launch" --meta "$candidate" --transaction "$replacement_tx" \
+    || fail "resumed replacement did not publish metadata"
+  jq -e '.state == "completed"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
+    || fail "resumed replacement remained incomplete"
+  pass "replacement dispatch resumes across pre-metadata interruption"
+}
+
+test_unlinked_reservation_blocks_late_intake() {
+  local home task manifest first second out rc=0
+  home=$(make_home persistent-secondmate-reservation)
+  task=persistent-secondmate-reservation
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  first=$(FM_HOME="$home" "$WORK_IDENTITY" reserve-unlinked "$task" \
+    --reason persistent-secondmate) || fail "could not reserve persistent secondmate identity"
+  second=$(FM_HOME="$home" "$WORK_IDENTITY" reserve-unlinked "$task" \
+    --reason persistent-secondmate) || fail "unlinked reservation was not idempotent"
+  [ "$first" = "$second" ] || fail "idempotent unlinked reservation changed its projection"
+  printf '%s' "$first" | jq -e '
+    .status == "unlinked" and .reason == "explicitly-unlinked"
+  ' >/dev/null || fail "unlinked reservation was not explicit"
+  rc=0
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "late intake linked a reserved persistent secondmate"
+  assert_contains "$out" "permanently reserved as an unlinked persistent secondmate" \
+    "late intake refusal did not identify the durable applicability boundary"
+  assert_absent "$home/data/$task/work-identity.json" \
+    "late intake partially published a linked identity"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e '.status == "unlinked"' >/dev/null \
+    || fail "reserved persistent secondmate did not remain explicitly unlinked"
+  pass "persistent secondmate reservation excludes concurrent linked intake"
 }
 
 test_metadata_validation_uses_one_stable_capture() {
@@ -970,8 +1059,6 @@ test_snapshot_preflight_and_dispatch_recovery() {
   binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
     --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
     --transaction "$transaction") || fail "could not prepare recoverable dispatch"
-  cp "$home/data/$task/brief.md" "$launch"
-  chmod 400 "$launch"
   hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
   fm_write_meta "$home/state/$task.meta" \
     "window=firstmate:fm-$task" "endpoint_task_id=$task" \
@@ -1940,6 +2027,8 @@ test_spawn_does_not_resend_inflight_worktree_request
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt
 test_dispatch_publish_refuses_unstable_metadata_without_publication
 test_replacement_dispatch_recovers_prior_retirement
+test_replacement_dispatch_resumes_before_metadata_publication
+test_unlinked_reservation_blocks_late_intake
 test_metadata_validation_uses_one_stable_capture
 test_snapshot_preflight_and_dispatch_recovery
 test_namespace_separation_and_contract_rejections

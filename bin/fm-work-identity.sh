@@ -23,6 +23,7 @@
 #   fm-work-identity.sh dispatch-abort <task-id> --transaction <id>
 #   fm-work-identity.sh dispatch-retire-preflight <task-id>
 #   fm-work-identity.sh dispatch-retire <task-id>
+#   fm-work-identity.sh reserve-unlinked <task-id> --reason persistent-secondmate
 #   fm-work-identity.sh home-id
 #   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]
 #   fm-work-identity.sh handoff-stage <task-id> --file <transfer.json|->
@@ -110,7 +111,8 @@ FM_HOME_INPUT="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 SCHEMA=fm-work-identity.v1
 HANDOFF_SCHEMA=fm-work-identity-handoff.v1
 HANDOFF_STATE_SCHEMA=fm-work-identity-handoff-state.v1
-DISPATCH_STATE_SCHEMA=fm-work-identity-dispatch-state.v1
+DISPATCH_STATE_SCHEMA=fm-work-identity-dispatch-state.v2
+UNLINKED_GUARD_SCHEMA=fm-work-identity-unlinked-guard.v1
 MAX_BYTES=65536
 HANDOFF_MAX_BYTES=$((MAX_BYTES + 8192))
 MAX_ARRAY=20
@@ -340,6 +342,7 @@ locate_task_dir() {  # <task-id>, read-only
   TARGET_HANDOFF="$TASK_DIR/work-identity-handoff-target.json"
   DISPATCH_STATE="$TASK_DIR/work-identity-dispatch.json"
   DISPATCH_PRIOR="$TASK_DIR/work-identity-dispatch-prior.md"
+  UNLINKED_GUARD="$TASK_DIR/work-identity-unlinked-guard.json"
 }
 
 ensure_task_dir() {  # <task-id>
@@ -944,6 +947,57 @@ dispatch_instructions_path_valid() {
   [ "$parent" = "$STATE_REAL" ]
 }
 
+read_unlinked_guard() {  # <task-id>
+  local task=$1 wrapper
+  safe_regular_file "$UNLINKED_GUARD" "work identity unlinked guard" "$HANDOFF_MAX_BYTES"
+  wrapper=$(jq -e -S -c -s \
+    --arg schema "$UNLINKED_GUARD_SCHEMA" --arg home "$FM_HOME_REAL" \
+    --arg home_id "$FM_HOME_ID" --arg task "$task" '
+      def exact_keys($ks): (keys | sort) == ($ks | sort);
+      select(length == 1) | .[0] | select(
+        type == "object" and exact_keys(["schema","binding","reason"])
+        and .schema == $schema
+        and .binding == {home:$home,home_id:$home_id,task_id:$task}
+        and .reason == "persistent-secondmate")
+    ' "$UNLINKED_GUARD" 2>/dev/null) \
+    || die "work identity unlinked guard is malformed or mismatched: $UNLINKED_GUARD"
+  printf '%s\n' "$wrapper" | cmp -s "$UNLINKED_GUARD" - \
+    || die "work identity unlinked guard is not canonical: $UNLINKED_GUARD"
+  [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] \
+    || die "unlinked work identity guard conflicts with a linked record for task $task"
+}
+
+validate_unlinked_guard() {  # <task-id>
+  if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
+    ensure_home_identity
+    read_unlinked_guard "$1"
+  fi
+}
+
+write_unlinked_guard() {  # <task-id> <reason>
+  local task=$1 reason=$2 payload
+  ensure_home_identity
+  payload=$(jq -n -S -c --arg schema "$UNLINKED_GUARD_SCHEMA" \
+    --arg home "$FM_HOME_REAL" --arg home_id "$FM_HOME_ID" --arg task "$task" \
+    --arg reason "$reason" \
+    '{schema:$schema,binding:{home:$home,home_id:$home_id,task_id:$task},reason:$reason}') \
+    || die "cannot build work identity unlinked guard"
+  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-unlinked-guard.XXXXXX") \
+    || die "cannot create work identity unlinked guard"
+  printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity unlinked guard"
+  chmod 600 "$TMP" || die "cannot protect work identity unlinked guard"
+  if ln "$TMP" "$UNLINKED_GUARD" 2>/dev/null; then
+    rm -f -- "$TMP"
+    TMP=
+  else
+    rm -f -- "$TMP"
+    TMP=
+    [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ] \
+      || die "cannot publish work identity unlinked guard"
+  fi
+  read_unlinked_guard "$task"
+}
+
 read_dispatch_state() {  # <task-id>
   local task=$1 wrapper
   safe_regular_file "$DISPATCH_STATE" "work identity dispatch state" "$HANDOFF_MAX_BYTES"
@@ -951,7 +1005,7 @@ read_dispatch_state() {  # <task-id>
     def exact_keys($ks): (keys | sort) == ($ks | sort);
     select(length == 1) | .[0] | . as $wrapper | select(
       type == "object"
-      and exact_keys(["schema","state","transaction_id","binding","instructions","identity","replacement","previous_instructions_sha256"])
+      and exact_keys(["schema","state","transaction_id","binding","instructions","identity","replacement","previous_transaction_id","previous_instructions_sha256"])
       and .schema == $schema and (.state == "prepared" or .state == "completed")
       and (.transaction_id | type) == "string"
       and (.binding | type == "object" and exact_keys(["home","home_id","task_id"])
@@ -964,9 +1018,13 @@ read_dispatch_state() {  # <task-id>
         and ((.status == "linked" and (.sha256 | type) == "string" and (.sha256 | test("^[0-9a-f]{64}$")))
           or (.status == "unlinked" and .sha256 == null)))
       and (.replacement | type) == "boolean"
-      and ((.replacement == true and (.previous_instructions_sha256 | type) == "string"
+      and ((.replacement == true
+            and (.previous_transaction_id | type) == "string"
+            and (.previous_transaction_id | test("^[A-Za-z0-9._:-]{1,128}$"))
+            and (.previous_instructions_sha256 | type) == "string"
             and (.previous_instructions_sha256 | test("^[0-9a-f]{64}$")))
-        or (.replacement == false and .previous_instructions_sha256 == null))
+        or (.replacement == false and .previous_transaction_id == null
+            and .previous_instructions_sha256 == null))
     ) | $wrapper
   ' "$DISPATCH_STATE" 2>/dev/null) || die "work identity dispatch state is malformed: $DISPATCH_STATE"
   printf '%s\n' "$wrapper" | cmp -s "$DISPATCH_STATE" - \
@@ -980,6 +1038,7 @@ read_dispatch_state() {  # <task-id>
   DISPATCH_IDENTITY_STATUS=$(printf '%s' "$wrapper" | jq -r '.identity.status')
   DISPATCH_IDENTITY_SHA=$(printf '%s' "$wrapper" | jq -r '.identity.sha256 // ""')
   DISPATCH_REPLACEMENT=$(printf '%s' "$wrapper" | jq -r '.replacement')
+  DISPATCH_PREVIOUS_TRANSACTION=$(printf '%s' "$wrapper" | jq -r '.previous_transaction_id // ""')
   DISPATCH_PREVIOUS_SHA=$(printf '%s' "$wrapper" | jq -r '.previous_instructions_sha256 // ""')
   ensure_home_identity
   [ "$DISPATCH_HOME" = "$FM_HOME_REAL" ] && [ "$DISPATCH_HOME_ID" = "$FM_HOME_ID" ] \
@@ -991,21 +1050,23 @@ read_dispatch_state() {  # <task-id>
   DISPATCH_CANONICAL=$wrapper
 }
 
-write_dispatch_state() {  # <prepared|completed> <task> <transaction> <path> <brief-sha> <linked|unlinked> <identity-sha> <replacement> <previous-sha>
-  local state=$1 task=$2 transaction=$3 path=$4 brief_sha=$5 identity_status=$6 identity_sha=$7 replacement=$8 previous_sha=$9 payload
+write_dispatch_state() {  # <prepared|completed> <task> <transaction> <path> <brief-sha> <linked|unlinked> <identity-sha> <replacement> <previous-transaction> <previous-sha>
+  local state=$1 task=$2 transaction=$3 path=$4 brief_sha=$5 identity_status=$6 identity_sha=$7 replacement=$8 previous_transaction=$9 previous_sha=${10} payload
   ensure_home_identity
   payload=$(jq -n -S -c \
     --arg schema "$DISPATCH_STATE_SCHEMA" --arg state "$state" --arg transaction "$transaction" \
     --arg home "$FM_HOME_REAL" --arg home_id "$FM_HOME_ID" --arg task "$task" \
     --arg path "$path" --arg brief_sha "$brief_sha" --arg contract "$SCHEMA" \
     --arg identity_status "$identity_status" --arg identity_sha "$identity_sha" \
-    --argjson replacement "$replacement" --arg previous_sha "$previous_sha" '
+    --argjson replacement "$replacement" --arg previous_transaction "$previous_transaction" \
+    --arg previous_sha "$previous_sha" '
       {schema:$schema,state:$state,transaction_id:$transaction,
        binding:{home:$home,home_id:$home_id,task_id:$task},
        instructions:{path:$path,sha256:$brief_sha},
        identity:{schema:$contract,status:$identity_status,
          sha256:(if $identity_status == "linked" then $identity_sha else null end)},
        replacement:$replacement,
+       previous_transaction_id:(if $replacement then $previous_transaction else null end),
        previous_instructions_sha256:(if $replacement then $previous_sha else null end)}') \
     || die "cannot build work identity dispatch state"
   TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-dispatch.XXXXXX") \
@@ -1066,6 +1127,7 @@ validate_completed_dispatch() {  # <task-id> [meta]
 
 reject_handoff_guard() {  # <task-id>
   local task=$1
+  validate_unlinked_guard "$task"
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
     read_handoff_state "$SOURCE_HANDOFF" source "$task"
     die "work identity ownership was handed off for task $task"
@@ -1084,6 +1146,11 @@ reject_handoff_guard() {  # <task-id>
 record_ownership_guard() {  # <task-id> [meta]
   local task=$1
   RECORD_HANDOFF_TRANSITION=0
+  if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
+    ensure_home_identity
+    read_unlinked_guard "$task"
+    die "task $task is permanently reserved as an unlinked persistent secondmate"
+  fi
   RECORD_HANDOFF_TRANSFER=
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
     read_handoff_state "$SOURCE_HANDOFF" source "$task"
@@ -1175,6 +1242,11 @@ reject_ownership_guard() {  # <task-id> [meta]
 
 reject_dispatch_for_handoff() {  # <task-id>
   local task=$1 meta="$STATE_REAL/$1.meta"
+  if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
+    ensure_home_identity
+    read_unlinked_guard "$task"
+    die "persistent secondmate control task $task cannot be handed off as backlog"
+  fi
   if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
     read_dispatch_state "$task"
     [ "$DISPATCH_STATUS" = completed ] \
@@ -1567,7 +1639,10 @@ render_identity_projection_locked() {  # <task-id> [brief] [meta] [meta-brief-pa
   fi
   [ -z "$brief" ] || validate_brief_binding "$brief" unlinked
   [ -z "$meta" ] || validate_meta_binding "$meta" unlinked "" "$BRIEF_HASH" "$meta_brief_path"
-  if [ "$META_PROVENANCE" = metadata ] || [ "$BRIEF_PROVENANCE" = generated-instructions ]; then
+  if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
+    validate_unlinked_guard "$task"
+    reason=explicitly-unlinked
+  elif [ "$META_PROVENANCE" = metadata ] || [ "$BRIEF_PROVENANCE" = generated-instructions ]; then
     reason=explicitly-unlinked
   else
     reason=legacy-no-record
@@ -1624,6 +1699,42 @@ project_identity() {  # <task-id> [brief] [meta]
   printf '%s\n' "$IDENTITY_PROJECTION"
 }
 
+reserve_unlinked() {  # <task-id> <reason>
+  local task=$1 reason=$2 meta="$STATE_REAL/$1.meta" projection
+  [ "$reason" = persistent-secondmate ] || die "unsupported unlinked reservation reason"
+  identity_mutation_lock_acquire "$task"
+  reject_handoff_guard "$task"
+  if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
+    read_dispatch_state "$task"
+    [ "$DISPATCH_IDENTITY_STATUS" = unlinked ] \
+      || die "persistent secondmate control task $task cannot carry a linked work identity"
+    if [ "$DISPATCH_STATUS" = completed ]; then
+      validate_completed_dispatch "$task" "$meta"
+    fi
+  elif [ -e "$meta" ] || [ -L "$meta" ]; then
+    capture_identity_projection_locked "$task" "" "$meta"
+    [ "$(printf '%s' "$IDENTITY_PROJECTION" | jq -r '.status')" = unlinked ] \
+      || die "persistent secondmate control task $task cannot carry a linked work identity"
+  elif [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+    validate_sidecar "$SIDECAR" "$task"
+    die "persistent secondmate control task $task cannot carry a linked work identity"
+  fi
+  if [ ! -e "$UNLINKED_GUARD" ] && [ ! -L "$UNLINKED_GUARD" ]; then
+    write_unlinked_guard "$task" "$reason"
+  else
+    read_unlinked_guard "$task"
+  fi
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    capture_identity_projection_locked "$task" "" "$meta"
+  else
+    capture_identity_projection_locked "$task"
+  fi
+  projection=$IDENTITY_PROJECTION
+  [ "$(printf '%s' "$projection" | jq -r '.status')" = unlinked ] \
+    || die "persistent secondmate control task $task cannot carry a linked work identity"
+  printf '%s\n' "$projection"
+}
+
 brief_publish() {  # <task-id> <draft>
   local task=$1 draft=$2
   safe_regular_file "$draft" "generated instruction draft"
@@ -1668,9 +1779,97 @@ dispatch_projection_matches_state() {  # <projection-json> <brief-sha>
     || die "dispatch identity digest is stale or mismatched"
 }
 
+capture_dispatch_draft_locked() {  # <task-id> <brief>
+  RETAIN_BRIEF_CAPTURE=1
+  capture_identity_projection_locked "$1" "$2"
+  RETAIN_BRIEF_CAPTURE=0
+  [ -n "$BRIEF_VALIDATED_CAPTURE" ] || die "cannot retain validated dispatch instructions"
+}
+
+publish_dispatch_instructions_locked() {  # <task-id>
+  local task=$1 current_hash=
+  if [ -e "$DISPATCH_INSTRUCTIONS" ] || [ -L "$DISPATCH_INSTRUCTIONS" ]; then
+    safe_regular_file "$DISPATCH_INSTRUCTIONS" "dispatch instructions"
+    current_hash=$(sha256_file "$DISPATCH_INSTRUCTIONS") \
+      || die "SHA-256 is unavailable for dispatch instructions"
+    if [ "$current_hash" = "$DISPATCH_INSTRUCTIONS_SHA" ]; then
+      rm -f -- "$BRIEF_VALIDATED_CAPTURE"
+      BRIEF_VALIDATED_CAPTURE=
+      return 0
+    fi
+    [ "$DISPATCH_REPLACEMENT" = true ] && [ "$current_hash" = "$DISPATCH_PREVIOUS_SHA" ] \
+      || die "dispatch instructions path contains stale or mismatched bytes"
+  else
+    [ "$DISPATCH_REPLACEMENT" = false ] \
+      || die "replacement dispatch instructions are unexpectedly absent"
+  fi
+  TMP=$(umask 077; mktemp "$STATE_REAL/.$task.launch-brief-publish.XXXXXX") \
+    || die "cannot create authoritative dispatch instructions"
+  cp -- "$BRIEF_VALIDATED_CAPTURE" "$TMP" \
+    || die "cannot capture authoritative dispatch instructions"
+  chmod 400 "$TMP" || die "cannot protect authoritative dispatch instructions"
+  mv -f -- "$TMP" "$DISPATCH_INSTRUCTIONS" \
+    || die "cannot publish authoritative dispatch instructions"
+  TMP=
+  rm -f -- "$BRIEF_VALIDATED_CAPTURE"
+  BRIEF_VALIDATED_CAPTURE=
+}
+
+dispatch_metadata_transaction_locked() {  # <meta>
+  local meta=$1 rc=0 transaction
+  capture_metadata "$meta"
+  meta_field_exact "$meta" work_identity_dispatch_transaction || rc=$?
+  [ "$rc" -eq 0 ] || {
+    [ "$rc" -eq 1 ] \
+      && die "task metadata has no work identity dispatch transaction: $meta"
+    die "task metadata has duplicate work identity dispatch transactions: $meta"
+  }
+  transaction=$META_VALUE
+  finish_metadata_capture "$meta"
+  printf '%s\n' "$transaction"
+}
+
+validate_prior_dispatch_metadata_locked() {  # <task-id> <meta>
+  local task=$1 meta=$2 rc=0 value
+  capture_metadata "$meta"
+  for value in \
+    "work_identity_dispatch_transaction=$DISPATCH_PREVIOUS_TRANSACTION" \
+    "launch_brief=$DISPATCH_INSTRUCTIONS" \
+    "launch_brief_sha256=$DISPATCH_PREVIOUS_SHA" \
+    "work_identity_schema=$SCHEMA" \
+    "work_identity_status=$DISPATCH_IDENTITY_STATUS"
+  do
+    rc=0
+    meta_field_exact "$meta" "${value%%=*}" || rc=$?
+    [ "$rc" -eq 0 ] && [ "$META_VALUE" = "${value#*=}" ] \
+      || die "prior dispatch metadata is stale or mismatched: $meta"
+  done
+  rc=0
+  meta_field_exact "$meta" endpoint_task_id || rc=$?
+  [ "$rc" -eq 0 ] && [ "$META_VALUE" = "$task" ] \
+    || die "prior dispatch metadata task binding is stale or mismatched: $meta"
+  rc=0
+  meta_field_exact "$meta" work_identity_sha256 || rc=$?
+  if [ "$DISPATCH_IDENTITY_STATUS" = linked ]; then
+    [ "$rc" -eq 0 ] && [ "$META_VALUE" = "$DISPATCH_IDENTITY_SHA" ] \
+      || die "prior dispatch metadata identity digest is stale or mismatched: $meta"
+  else
+    [ "$rc" -eq 1 ] \
+      || die "prior unlinked dispatch metadata carries an identity digest: $meta"
+  fi
+  finish_metadata_capture "$meta"
+}
+
+emit_dispatch_binding() {  # <transaction> <projection>
+  jq -n -S -c --arg transaction "$1" --arg hash "$DISPATCH_INSTRUCTIONS_SHA" \
+    --argjson identity "$2" \
+    '{transaction_id:$transaction,instructions_sha256:$hash,work_identity:$identity}'
+}
+
 dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction> [meta] [prior-brief] [resume]
   local task=$1 brief=$2 instructions_path=$3 transaction=$4 meta=${5:-} prior_brief=${6:-} resume=${7:-false}
-  local projection previous_hash= identity_status identity_sha existing_status= existing_path= existing_sha= recovery_meta
+  local projection previous_hash= previous_transaction= identity_status identity_sha
+  local existing_status= existing_path= existing_sha= recovery_meta recovery_transaction
   dispatch_transaction_valid "$transaction" || die "dispatch transaction is malformed"
   safe_regular_file "$brief" "dispatch instruction draft"
   dispatch_instructions_path_valid "$instructions_path" || die "dispatch instructions path is unsafe"
@@ -1682,36 +1881,28 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
     existing_path=$DISPATCH_INSTRUCTIONS
     existing_sha=$DISPATCH_INSTRUCTIONS_SHA
     if [ "$existing_status" = prepared ]; then
-      if [ "$DISPATCH_TRANSACTION" = "$transaction" ]; then
-        capture_identity_projection_locked "$task" "$brief"
-        projection=$IDENTITY_PROJECTION
-        dispatch_projection_matches_state "$projection" "$BRIEF_HASH"
-        jq -n -S -c --arg transaction "$transaction" --arg hash "$BRIEF_HASH" \
-          --argjson identity "$projection" \
-          '{transaction_id:$transaction,instructions_sha256:$hash,work_identity:$identity}'
-        return 0
-      fi
+      [ "$instructions_path" = "$DISPATCH_INSTRUCTIONS" ] \
+        || die "task $task has a different in-progress work identity dispatch"
+      capture_dispatch_draft_locked "$task" "$brief"
+      projection=$IDENTITY_PROJECTION
+      dispatch_projection_matches_state "$projection" "$BRIEF_HASH"
       recovery_meta="$STATE_REAL/$task.meta"
-      if [ ! -e "$recovery_meta" ] && [ ! -L "$recovery_meta" ]; then
-        [ "$instructions_path" = "$DISPATCH_INSTRUCTIONS" ] \
-          || die "task $task has a different in-progress work identity dispatch"
-        capture_identity_projection_locked "$task" "$brief"
-        projection=$IDENTITY_PROJECTION
-        dispatch_projection_matches_state "$projection" "$BRIEF_HASH"
-        if [ -e "$DISPATCH_INSTRUCTIONS" ] || [ -L "$DISPATCH_INSTRUCTIONS" ]; then
-          capture_identity_projection_locked "$task" "$DISPATCH_INSTRUCTIONS"
-          dispatch_projection_matches_state "$IDENTITY_PROJECTION" "$BRIEF_HASH"
+      if [ -e "$recovery_meta" ] || [ -L "$recovery_meta" ]; then
+        recovery_transaction=$(dispatch_metadata_transaction_locked "$recovery_meta")
+        if [ "$recovery_transaction" = "$DISPATCH_TRANSACTION" ]; then
+          publish_dispatch_instructions_locked "$task"
+          complete_prepared_dispatch_locked "$task" "$DISPATCH_INSTRUCTIONS" "$recovery_meta"
+          emit_dispatch_binding "$DISPATCH_TRANSACTION" "$projection"
+          return 0
         fi
-        jq -n -S -c --arg transaction "$DISPATCH_TRANSACTION" \
-          --arg hash "$DISPATCH_INSTRUCTIONS_SHA" --argjson identity "$projection" \
-          '{transaction_id:$transaction,instructions_sha256:$hash,work_identity:$identity}'
-        return 0
+        [ "$DISPATCH_REPLACEMENT" = true ] \
+          && [ "$recovery_transaction" = "$DISPATCH_PREVIOUS_TRANSACTION" ] \
+          || die "task $task has metadata for a different work identity dispatch"
+        validate_prior_dispatch_metadata_locked "$task" "$recovery_meta"
       fi
-      complete_prepared_dispatch_locked "$task" "$DISPATCH_INSTRUCTIONS" "$recovery_meta"
-      read_dispatch_state "$task"
-      existing_status=$DISPATCH_STATUS
-      existing_path=$DISPATCH_INSTRUCTIONS
-      existing_sha=$DISPATCH_INSTRUCTIONS_SHA
+      publish_dispatch_instructions_locked "$task"
+      emit_dispatch_binding "$DISPATCH_TRANSACTION" "$projection"
+      return 0
     fi
     validate_completed_dispatch "$task"
     retire_dispatch_prior_locked
@@ -1719,11 +1910,10 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
       capture_identity_projection_locked "$task" "$brief" "$STATE_REAL/$task.meta" "$instructions_path"
       projection=$IDENTITY_PROJECTION
       dispatch_projection_matches_state "$projection" "$BRIEF_HASH"
-      jq -n -S -c --arg transaction "$DISPATCH_TRANSACTION" \
-        --arg hash "$DISPATCH_INSTRUCTIONS_SHA" --argjson identity "$projection" \
-        '{transaction_id:$transaction,instructions_sha256:$hash,work_identity:$identity}'
+      emit_dispatch_binding "$DISPATCH_TRANSACTION" "$projection"
       return 0
     fi
+    previous_transaction=$DISPATCH_TRANSACTION
   fi
   if [ -n "$meta" ] || [ -n "$prior_brief" ]; then
     [ -n "$meta" ] && [ -n "$prior_brief" ] \
@@ -1754,17 +1944,18 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
     [ ! -e "$instructions_path" ] && [ ! -L "$instructions_path" ] \
       || die "fresh dispatch found existing launch instructions"
   fi
-  capture_identity_projection_locked "$task" "$brief"
+  capture_dispatch_draft_locked "$task" "$brief"
   projection=$IDENTITY_PROJECTION
   identity_status=$(printf '%s' "$projection" | jq -er '.status') \
     || die "dispatch identity status is malformed"
   identity_sha=$(printf '%s' "$projection" | jq -r '.sha256 // ""')
   write_dispatch_state prepared "$task" "$transaction" "$instructions_path" "$BRIEF_HASH" \
-    "$identity_status" "$identity_sha" "$([ -n "$previous_hash" ] && printf true || printf false)" "$previous_hash"
+    "$identity_status" "$identity_sha" "$([ -n "$previous_hash" ] && printf true || printf false)" \
+    "$previous_transaction" "$previous_hash"
   DISPATCH_PRIOR_CLEANUP=0
-  jq -n -S -c --arg transaction "$transaction" --arg hash "$BRIEF_HASH" \
-    --argjson identity "$projection" \
-    '{transaction_id:$transaction,instructions_sha256:$hash,work_identity:$identity}'
+  read_dispatch_state "$task"
+  publish_dispatch_instructions_locked "$task"
+  emit_dispatch_binding "$transaction" "$projection"
 }
 
 validate_dispatch_metadata_receipt() {  # <meta>
@@ -1806,7 +1997,7 @@ complete_prepared_dispatch_locked() {  # <task-id> <brief> <meta>
   retire_dispatch_prior_locked
   write_dispatch_state completed "$task" "$DISPATCH_TRANSACTION" "$DISPATCH_INSTRUCTIONS" \
     "$DISPATCH_INSTRUCTIONS_SHA" "$DISPATCH_IDENTITY_STATUS" "$DISPATCH_IDENTITY_SHA" \
-    "$DISPATCH_REPLACEMENT" "$DISPATCH_PREVIOUS_SHA"
+    "$DISPATCH_REPLACEMENT" "$DISPATCH_PREVIOUS_TRANSACTION" "$DISPATCH_PREVIOUS_SHA"
 }
 
 dispatch_commit_preflight() {  # <task-id> <brief> <meta> <transaction>
@@ -1951,7 +2142,8 @@ publication_preflight_locked() {
     for guarded_path in \
       "$task_dir/work-identity-handoff-source.json" \
       "$task_dir/work-identity-handoff-target.json" \
-      "$task_dir/work-identity-dispatch.json"
+      "$task_dir/work-identity-dispatch.json" \
+      "$task_dir/work-identity-unlinked-guard.json"
     do
       if [ -e "$guarded_path" ] || [ -L "$guarded_path" ]; then guarded=1; fi
     done
@@ -1960,6 +2152,7 @@ publication_preflight_locked() {
     fm_pr_task_id_valid "$task" || die "work identity ownership guard has an invalid task id: $task"
     locate_task_dir "$task"
     identity_lock_acquire "$task"
+    validate_unlinked_guard "$task"
     if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
       read_handoff_state "$SOURCE_HANDOFF" source "$task"
       [ "$HANDOFF_STATE" = completed ] \
@@ -2006,7 +2199,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections|publication-run) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|reserve-unlinked|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -2202,6 +2395,11 @@ case "$COMMAND" in
   dispatch-retire)
     [ "$#" -eq 0 ] || die "dispatch-retire accepts only a task id"
     dispatch_retire "$TASK"
+    ;;
+  reserve-unlinked)
+    [ "$#" -eq 2 ] && [ "$1" = --reason ] \
+      || die "reserve-unlinked usage: fm-work-identity.sh reserve-unlinked <task-id> --reason persistent-secondmate"
+    reserve_unlinked "$TASK" "$2"
     ;;
   handoff-prepare)
     [ "$#" -eq 4 ] || [ "$#" -eq 5 ] \

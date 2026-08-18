@@ -151,6 +151,24 @@ fm_backend_orca_file_link_count() {
   fi
 }
 
+fm_backend_orca_terminal_close_exact() {  # <terminal-id> [--absent-ok]
+  local terminal=${1:-} absent_ok=${2:-} out rc code
+  [ -n "$terminal" ] || return 1
+  case "$absent_ok" in ''|--absent-ok) ;; *) return 1 ;; esac
+  fm_backend_orca_tool_check || return 1
+  if out=$(orca terminal close --terminal "$terminal" --json); then
+    rc=0
+  else
+    rc=$?
+  fi
+  code=$(printf '%s' "$out" | fm_backend_orca_json_error_code 2>/dev/null || true)
+  if [ "$absent_ok" = --absent-ok ]; then
+    case "$code" in terminal_not_found|not_found) return 0 ;; esac
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  printf '%s' "$out" | fm_backend_orca_json_ok
+}
+
 fm_backend_orca_worktree_response_parse() {  # <response-path> <name>
   local response=$1 name=$2 out wt_id wt_path terminal links bytes
   [ -f "$response" ] && [ ! -L "$response" ] || return 1
@@ -167,7 +185,11 @@ fm_backend_orca_worktree_response_parse() {  # <response-path> <name>
   terminal=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-terminal-handle 2>/dev/null || true)
   wt_path=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-path) || {
     echo "error: orca worktree create did not return a path for $name" >&2
-    [ -z "$terminal" ] || fm_backend_orca_kill "$terminal" >/dev/null 2>&1 || true
+    if [ -n "$terminal" ] \
+       && ! fm_backend_orca_terminal_close_exact "$terminal" --absent-ok >/dev/null; then
+      printf '%s\t\t%s' "$wt_id" "$terminal"
+      return 2
+    fi
     if fm_backend_orca_remove_worktree "$wt_id" --absent-ok >/dev/null; then
       return 3
     fi
@@ -358,10 +380,7 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
     fi
 
     i=$((i + 1))
-    [ "$i" -lt "$max" ] || {
-      echo "error: Orca terminal creation is still in progress for $title" >&2
-      return 1
-    }
+    [ "$i" -lt "$max" ] || return 124
     sleep "$interval"
   done
 }

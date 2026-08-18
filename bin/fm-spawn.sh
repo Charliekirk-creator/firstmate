@@ -452,7 +452,9 @@ spawn_remote_secondmate() {
   fm_task_id_creation_valid "$id" || { echo "error: invalid task id" >&2; return 2; }
   mkdir -p "$STATE" || { echo "error: could not create parent state directory" >&2; return 1; }
   SPAWN_TASK_LOCK="$STATE/.spawn-$id.lock"
-  if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
+  if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
+    SPAWN_TASK_LOCK_HELD=0
+  elif ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
     echo "error: another spawn is already creating task $id" >&2
     return 1
   fi
@@ -471,6 +473,27 @@ spawn_remote_secondmate() {
   host=$(secondmate_registry_field "$DATA/secondmates.md" "$id" host)
   root=$(secondmate_registry_field "$DATA/secondmates.md" "$id" root)
   home=$(secondmate_registry_field "$DATA/secondmates.md" "$id" home)
+  fm_lock_release "$registry_lock" || {
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    return 1
+  }
+  if ! reserve_secondmate_work_identity; then
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    return 1
+  fi
+  if ! fm_lock_acquire_wait "$registry_lock"; then
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    return 1
+  fi
+  [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" remote 2>/dev/null || true)" = 1 ] \
+    && [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" host 2>/dev/null || true)" = "$host" ] \
+    && [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" root 2>/dev/null || true)" = "$root" ] \
+    && [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" home 2>/dev/null || true)" = "$home" ] || {
+      fm_lock_release "$registry_lock" || true
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: remote secondmate $id route changed during identity reservation" >&2
+      return 1
+    }
   positional=${POS[1]:-}
   if [ "${#POS[@]}" -gt 2 ]; then
     fm_lock_release "$registry_lock" || true
@@ -1029,6 +1052,7 @@ spawn_orca_operation_helper() {
     terminal=$(fm_backend_orca_terminal_create_durable "$wt_id" "$W" \
       "$terminal_response" "$SPAWN_ORCA_OPERATION/terminal-create")
     rc=$?
+    [ "$rc" -ne 124 ] || exit 124
     [ "$rc" -eq 0 ] || failure_reason=terminal
   fi
   if [ "$rc" -eq 0 ] && [ -n "$wt_id" ] && [ -n "$wt_path" ] && [ -n "$terminal" ]; then
@@ -1572,26 +1596,25 @@ if [ "$RELAUNCH" -eq 0 ]; then
 fi
 SECONDMATE_WORK_IDENTITY_SCHEMA=
 SECONDMATE_WORK_IDENTITY_STATUS=
-if [ "$KIND" = secondmate ]; then
-  secondmate_identity_args=(project "$ID")
-  if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
-    secondmate_identity_args+=(--meta "$STATE/$ID.meta")
-  fi
+reserve_secondmate_work_identity() {
   SECONDMATE_WORK_IDENTITY_JSON=$(
     FM_HOME="$FM_HOME" \
       FM_DATA_OVERRIDE="$DATA" \
       FM_STATE_OVERRIDE="$STATE" \
       FM_ROOT_OVERRIDE="$FM_ROOT" \
-      "$SCRIPT_DIR/fm-work-identity.sh" "${secondmate_identity_args[@]}"
-  ) || exit 1
+      "$SCRIPT_DIR/fm-work-identity.sh" reserve-unlinked "$ID" \
+        --reason persistent-secondmate
+  ) || return 1
   SECONDMATE_WORK_IDENTITY_SCHEMA=$(printf '%s' "$SECONDMATE_WORK_IDENTITY_JSON" | jq -er '.schema') \
-    || { echo "error: persistent secondmate work identity projection is malformed for $ID" >&2; exit 1; }
+    || { echo "error: persistent secondmate work identity projection is malformed for $ID" >&2; return 1; }
   SECONDMATE_WORK_IDENTITY_STATUS=$(printf '%s' "$SECONDMATE_WORK_IDENTITY_JSON" | jq -er '.status') \
-    || { echo "error: persistent secondmate work identity projection is malformed for $ID" >&2; exit 1; }
+    || { echo "error: persistent secondmate work identity projection is malformed for $ID" >&2; return 1; }
   [ "$SECONDMATE_WORK_IDENTITY_STATUS" = unlinked ] || {
     echo "error: persistent secondmate control task $ID cannot carry a linked work identity; route exact work units to tasks in the secondmate home" >&2
-    exit 1
+    return 1
   }
+}
+if [ "$KIND" = secondmate ]; then
   if spawn_remote_secondmate "$ID"; then
     exit 0
   else
@@ -1740,6 +1763,19 @@ else
   ARG3=${POS[2]:-}
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
+if [ "$KIND" = secondmate ]; then
+  reserve_secondmate_work_identity || exit 1
+  if [ "$RELAUNCH" -eq 1 ] && [ -n "$(fm_meta_get "$RELAUNCH_META" remote_host)" ]; then
+    if spawn_remote_secondmate "$ID"; then
+      exit 0
+    else
+      remote_spawn_rc=$?
+    fi
+    [ "$remote_spawn_rc" -eq 3 ] || exit "$remote_spawn_rc"
+    echo "error: task $ID records a remote secondmate endpoint but has no remote registry route" >&2
+    exit 1
+  fi
+fi
 
 shell_quote() {
   printf "'"
@@ -2420,8 +2456,8 @@ SPAWN_IDENTITY_HOME=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.binding.home'
   || { echo "error: work identity projection has no physical home binding for $ID" >&2; exit 1; }
 SPAWN_IDENTITY_HOME_ID=$(printf '%s' "$WORK_IDENTITY_JSON" | jq -er '.binding.home_id') \
   || { echo "error: work identity projection has no home binding for $ID" >&2; exit 1; }
-mv -f "$SPAWN_BRIEF_TMP" "$BRIEF_SNAPSHOT" \
-  || { echo "error: could not publish launch brief snapshot" >&2; exit 1; }
+rm -f -- "$SPAWN_BRIEF_TMP" \
+  || { echo "error: could not retire validated launch brief candidate" >&2; exit 1; }
 SPAWN_BRIEF_TMP=
 BRIEF=$BRIEF_SNAPSHOT
 SPAWN_BRIEF_BODY=$(cat "$BRIEF" || exit $?; printf '\034') \
