@@ -21,12 +21,14 @@ When normal configured retention has moved an older Done identity out of `data/b
 The configured archive and backlog must resolve under the active `FM_HOME` through ordinary physical paths; a foreign data override or symlinked data parent cannot supply history.
 Only one ordinary, single-linked archived record whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; parsing stops at the canonical metadata boundary, so title text is never provenance.
 Its resolution block must bind the exact origin and decision key, recompute to the recorded captain-answer digest, enforce resolution-mode routing, and list the same routed identities in both structured routing fields.
-Released-version records without embedded origin and key remain compatible only when existing reviewed metadata uniquely binds the composed hold identity; only their routed format may omit `Resolution mode:`.
+Released-version records without embedded origin and key remain compatible when live reviewed metadata uniquely binds the composed hold identity and atomically persists an exact record attestation under the authoritative data directory before teardown.
+Later checks require that single-linked ordinary attestation to match the same hold id, origin, key, and complete resolution-record digest; only the legacy routed format may omit `Resolution mode:`.
 Absence, duplicate or ambiguous identity, unsafe archive files, non-absence backlog read errors, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
 For an open keyed status decision, it appends a `captain-held [key=<key>]: ...` transfer event only after the matching backlog hold is durable.
 `bin/fm-classify-lib.sh` recognizes that transfer as closing the live status copy without claiming that the captain has answered it.
 
-Scout teardown calls the script's read-only `verify` subcommand after checking for the report and before removing any source state.
+Scout teardown calls the script's `verify` subcommand after checking for the report and before removing any source state.
+Verification never changes the backlog or archive; it may atomically persist a matching legacy identity attestation so deleting ephemeral metadata cannot make released-version history ambiguous.
 The `--force` path remains the explicit captain-approved discard escape hatch.
 
 The `resolve`, `answer`, and `decline` subcommands close active holds, while `repair` attests a hold already closed outside the script.
@@ -44,7 +46,7 @@ Every candidate found in the listing prefilter is confirmed against its own stru
 
 The `repair` subcommand records the resolution block on a hold that was already closed outside the script, such as by a direct `tasks-axi done`, so an origin whose decision was genuinely answered stops failing `verify`.
 It refuses a hold that is still actively held, never reopens a closed hold, and never clears a dependency edge, so an unanswered decision keeps blocking teardown until the captain's word closes it.
-It also requires the identity to carry the captain-hold provenance that tasks-axi preserves through a close, so an ordinary captain-kind task that was never held cannot be repaired into a resolved decision.
+It also requires the identity to carry the captain-hold provenance that tasks-axi preserves through a close and requires the surviving body to match the requested origin and key before any update, so neither an ordinary captain-kind task nor a colliding composed id can be repaired into another decision.
 
 ## Answer-time closure
 
@@ -106,8 +108,9 @@ An unanswered decision still blocks completion and teardown, and neither `declin
 `repair` also refuses a closed captain-kind task that was never held for the captain.
 
 A retained-history regression resolves two synthetic decisions, proves retained released-version metadata first, moves both records into a non-default configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
+After normal teardown removes origin metadata, repeated completion still recognizes the exact legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
-Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, spoof captain metadata in an ordinary captain-kind title, mismatch resolution modes, digests, and routed-work lists, and point archive reads across home boundaries; none can masquerade as historical resolution.
+Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, attempt to repair that collision, spoof captain metadata in an ordinary captain-kind title, mismatch resolution modes, digests, and routed-work lists, and point archive reads across home boundaries; none can masquerade as historical resolution.
 
 Three answer-time closure regressions run against the published poll response shape, with synthetic `sample` identities.
 A bound source whose origin exposes six holds captures one review carrying five structured choices plus one freeform message, and the runner feeds it through a fixture adapter that is not the review adapter at all, so what is proven is that any bound channel with an `answers` command gets closure rather than that one channel is wired specially.

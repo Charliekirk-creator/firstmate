@@ -501,10 +501,26 @@ test_pruned_resolved_history_does_not_block_later_review() {
   run_decisions "$home" verify "$id" >/dev/null \
     || fail "resolved later decision did not verify"
 
-  # Existing metadata has only the original decision_keys inventory. No
-  # migration field or hand-restored row is required for compatibility.
   assert_grep 'decision_keys=later-choice,old-a,old-b' "$home/state/$id.meta" \
     "existing metadata inventory was not preserved compatibly"
+  run_teardown "$home" "$id" >/dev/null 2> "$home/legacy-teardown.err" \
+    || fail "legacy history did not survive normal teardown: $(cat "$home/legacy-teardown.err")"
+  assert_absent "$home/state/$id.meta" "normal teardown retained ephemeral origin metadata"
+  before=$(shasum -a 256 "$home/data/backlog.md" "$archive")
+  run_decisions "$home" complete "$id" old-a >/dev/null \
+    || fail "post-teardown review could not verify the pruned released-version decision"
+  run_decisions "$home" complete "$id" old-a >/dev/null \
+    || fail "repeated post-teardown legacy verification was not idempotent"
+  if run_decisions "$home" hold "$id" old-a \
+    --title "Choose old sample A" --reason "captain old a pending" --repo sample \
+    > "$home/post-teardown-reuse.out" 2> "$home/post-teardown-reuse.err"; then
+    fail "post-teardown retry recreated a pruned released-version decision"
+  fi
+  assert_grep "already durably resolved" "$home/post-teardown-reuse.err" \
+    "durable legacy identity did not reserve its key after origin teardown"
+  after=$(shasum -a 256 "$home/data/backlog.md" "$archive")
+  [ "$before" = "$after" ] \
+    || fail "post-teardown compatibility changed the backlog or configured archive"
   pass "pruned resolved history permits later decisions without retention oscillation"
 }
 
@@ -597,7 +613,7 @@ test_pruned_history_fallback_rejects_unproven_decisions() {
 # bodies with false digests or routing lists can satisfy the public gate.
 test_historical_resolution_proof_is_exact_and_home_bound() {
   local home digest_origin route_origin hold decision digest body source victim collision spoof_origin spoof
-  local foreign symlink_home n show
+  local foreign symlink_home n show before after
   home=$(make_home exact-history-proof)
 
   digest_origin=sample-digest-review
@@ -687,6 +703,19 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   printf 'Captain chose the source route.\n' > "$home/source-route.txt"
   run_decisions "$home" answer "$source" route-decision-later --decision-file "$home/source-route.txt" >/dev/null \
     || fail "could not resolve source collision hold"
+  before=$(shasum -a 256 "$home/data/backlog.md")
+  if run_decisions "$home" repair "$victim" later --decision-file "$home/source-route.txt" \
+    > "$home/repair-collision.out" 2> "$home/repair-collision.err"; then
+    fail "repair rebound a resolved hold to a colliding origin and key"
+  fi
+  assert_grep "mismatched repair provenance" "$home/repair-collision.err" \
+    "repair did not reject the colliding origin provenance"
+  after=$(shasum -a 256 "$home/data/backlog.md")
+  [ "$before" = "$after" ] || fail "rejected colliding repair mutated the resolved hold"
+  show=$(tasks_in "$home" show "$collision" --full)
+  assert_contains "$show" "Origin: $source" "rejected repair changed the resolved origin"
+  assert_contains "$show" "Decision key: route-decision-later" \
+    "rejected repair changed the resolved decision key"
   if run_decisions "$home" complete "$victim" later > "$home/retained-collision.out" 2> "$home/retained-collision.err"; then
     fail "a retained resolution proved a different origin and key with the same concatenated id"
   fi

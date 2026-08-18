@@ -40,8 +40,8 @@
 # bounded Done retention prunes it; the gate never restores archived rows. A
 # missing key with no valid archived resolution still fails. A post-teardown visual review
 # can complete against the surviving report and holds without recreating task
-# state. `verify` is read-only and is called by scout teardown so teardown cannot
-# erase a source before this gate has succeeded.
+# state. `verify` is called by scout teardown so teardown cannot erase a source
+# before this gate has succeeded.
 #
 # `resolve`, `answer`, and `decline` close active holds; `repair` attests a hold
 # already closed outside this script. All four paths require a non-empty captain
@@ -49,8 +49,9 @@
 # the hold body, and store the origin, decision key, decision digest, and routed
 # identities so an exact retry is idempotent while a changed identity, decision,
 # or, for `resolve`, routed set is rejected. New records include a `Resolution
-# mode:` naming their path. Legacy records remain valid only when the existing
-# reviewed inventory uniquely binds their origin and key.
+# mode:` naming their path. A legacy record remains valid when live reviewed
+# metadata uniquely binds it and creates an exact durable identity attestation
+# before teardown, or when that attestation already matches the record.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -289,6 +290,7 @@ RESOLUTION_DIGEST=''
 RESOLUTION_ROUTES=''
 RESOLUTION_MODE=''
 RESOLUTION_DECISION=''
+RESOLUTION_RECORD_DIGEST=''
 
 parse_resolution_record() {  # <hold-body>
   local encoded=$1 body rest metadata tail line digest routes decision routed_work
@@ -300,6 +302,7 @@ parse_resolution_record() {  # <hold-body>
   RESOLUTION_ROUTES=''
   RESOLUTION_MODE=''
   RESOLUTION_DECISION=''
+  RESOLUTION_RECORD_DIGEST=''
 
   case "$encoded" in
     \"*) body=$(printf '%s\n' "$encoded" | jq -Rer 'fromjson | strings') || return 1 ;;
@@ -384,9 +387,10 @@ EOF
   RESOLUTION_DIGEST=$digest
   RESOLUTION_ROUTES=$routes
   RESOLUTION_DECISION=$decision
+  RESOLUTION_RECORD_DIGEST=$(sha256_text "$body")
 }
 
-legacy_resolution_identity_valid() (  # <origin-id> <decision-key>
+legacy_resolution_meta_identity_valid() (  # <origin-id> <decision-key>
   local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key
   expected_meta="$STATE/$origin.meta"
   [ -f "$expected_meta" ] && [ ! -L "$expected_meta" ] || return 1
@@ -412,6 +416,14 @@ $(printf '%s\n' "$candidate_keys" | tr ',' '\n')
 EOF
   done
 )
+
+legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
+  local origin=$1 key=$2 id
+  id="${origin}-decision-${key}"
+  legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
+    && return 0
+  legacy_resolution_meta_identity_valid "$origin" "$key"
+}
 
 resolution_record_valid() {  # <hold-body> [<origin-id> <decision-key>]
   parse_resolution_record "$1" || return 1
@@ -498,11 +510,13 @@ tasks_config_string() {  # <config-path> <table> <key>
 }
 
 DECISION_ARCHIVE=''
+DECISION_DATA=''
 authoritative_archive_path() {
   local physical_home expected_data physical_expected physical_data project_config home_config
   local archive_value='' backlog_value='' configured_backlog configured_archive archive_dir archive_name
   local physical_backlog_dir physical_archive_dir rc
   DECISION_ARCHIVE=''
+  DECISION_DATA=''
   [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
   physical_home=$(cd "$FM_HOME" && pwd -P) \
     || fail "could not resolve active home: $FM_HOME"
@@ -519,6 +533,7 @@ authoritative_archive_path() {
     || fail "could not resolve configured data directory: $DATA"
   [ "$physical_data" = "$physical_expected" ] \
     || fail "configured data directory is outside the active home: $DATA"
+  DECISION_DATA=$physical_data
 
   project_config="$FM_HOME/.tasks.toml"
   home_config="${HOME:-}/.tasks-axi/config.toml"
@@ -575,6 +590,82 @@ authoritative_archive_path() {
   DECISION_ARCHIVE="$physical_archive_dir/$archive_name"
   [ "$DECISION_ARCHIVE" != "$physical_data/backlog.md" ] \
     || fail "configured decision archive is the active backlog: $DECISION_ARCHIVE"
+}
+
+LEGACY_ATTESTATION_SCHEMA=fm-decision-legacy-resolution.v1
+LEGACY_ATTESTATION_DIR=''
+
+legacy_resolution_attestation_dir() {  # <create: 0|1>
+  local create=$1 dir physical_dir
+  LEGACY_ATTESTATION_DIR=''
+  authoritative_archive_path
+  dir="$DECISION_DATA/decision-resolution-attestations"
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+    [ "$create" = 1 ] || return 1
+    if ! (umask 077; mkdir "$dir") && [ ! -d "$dir" ]; then
+      fail "could not create decision resolution attestation directory: $dir"
+    fi
+  fi
+  [ -d "$dir" ] && [ ! -L "$dir" ] \
+    || fail "decision resolution attestation directory is unsafe: $dir"
+  physical_dir=$(cd "$dir" && pwd -P) \
+    || fail "could not resolve decision resolution attestation directory: $dir"
+  [ "$physical_dir" = "$DECISION_DATA/decision-resolution-attestations" ] \
+    || fail "decision resolution attestation directory escapes the active home: $dir"
+  LEGACY_ATTESTATION_DIR=$physical_dir
+}
+
+legacy_resolution_attestation_content() {  # <hold-id> <origin-id> <decision-key> <record-digest>
+  printf 'schema=%s\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
+    "$LEGACY_ATTESTATION_SCHEMA" "$1" "$2" "$3" "$4"
+}
+
+legacy_resolution_attestation_valid() {  # <hold-id> <origin-id> <decision-key> <record-digest>
+  local id=$1 origin=$2 key=$3 record_digest=$4 dir path links actual expected
+  legacy_resolution_attestation_dir 0 || return 1
+  dir=$LEGACY_ATTESTATION_DIR
+  path="$dir/$id.attestation"
+  [ -e "$path" ] || [ -L "$path" ] || return 1
+  [ -f "$path" ] && [ ! -L "$path" ] \
+    || fail "decision resolution attestation is not an ordinary file: $path"
+  links=$(file_link_count "$path") \
+    || fail "could not inspect decision resolution attestation link count: $path"
+  [ "$links" = 1 ] || fail "decision resolution attestation is hardlinked: $path"
+  actual=$(cat "$path") || fail "could not read decision resolution attestation: $path"
+  expected=$(legacy_resolution_attestation_content "$id" "$origin" "$key" "$record_digest")
+  [ "$actual" = "$expected" ] \
+    || fail "decision resolution attestation does not match $origin/$key: $path"
+}
+
+persist_legacy_resolution_attestation() {  # <hold-id> <origin-id> <decision-key> <record-digest>
+  local id=$1 origin=$2 key=$3 record_digest=$4 dir path tmp
+  legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest" && return 0
+  legacy_resolution_attestation_dir 1
+  dir=$LEGACY_ATTESTATION_DIR
+  path="$dir/$id.attestation"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest"
+    return
+  fi
+  tmp=$(umask 077; mktemp "$dir/.attestation.XXXXXX") \
+    || fail "could not stage decision resolution attestation for $origin/$key"
+  if ! legacy_resolution_attestation_content "$id" "$origin" "$key" "$record_digest" > "$tmp" \
+    || ! chmod 0600 "$tmp"; then
+    rm -f -- "$tmp"
+    fail "could not stage decision resolution attestation for $origin/$key"
+  fi
+  if ln "$tmp" "$path" 2>/dev/null; then
+    rm -f -- "$tmp"
+    return 0
+  fi
+  rm -f -- "$tmp"
+  legacy_resolution_attestation_valid "$id" "$origin" "$key" "$record_digest" \
+    || fail "could not record decision resolution attestation for $origin/$key"
+}
+
+persist_parsed_legacy_resolution() {  # <hold-id> <origin-id> <decision-key>
+  [ -z "$RESOLUTION_ORIGIN" ] && [ -z "$RESOLUTION_KEY" ] || return 0
+  persist_legacy_resolution_attestation "$1" "$2" "$3" "$RESOLUTION_RECORD_DIGEST"
 }
 
 archived_header_has_captain_provenance() {  # <header> <hold-id>
@@ -789,7 +880,10 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   if task_show_optional "$id"; then
     show=$TASK_SHOW_OUTPUT
   else
-    archived_hold_resolved "$id" "$origin" "$key" && return 0
+    if archived_hold_resolved "$id" "$origin" "$key"; then
+      persist_parsed_legacy_resolution "$id" "$origin" "$key"
+      return 0
+    fi
     fail "captain decision $id is absent from $FM_HOME/data/backlog.md and is not durably resolved in its archive"
   fi
   state=$(show_field "$show" state)
@@ -804,6 +898,7 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   fi
   if [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
     && body_has_resolution_record "$body" "$origin" "$key"; then
+    persist_parsed_legacy_resolution "$id" "$origin" "$key"
     return 0
   fi
   fail "captain decision $id is neither actively held nor durably resolved"
@@ -1259,6 +1354,8 @@ command_repair() {
     || fail "backlog item $id was never held for the captain; repair records a captain decision only on a captain hold"
   state=$(show_field "$show" state)
   hold_body=$(show_field "$show" body)
+  active_hold_body_valid "$hold_body" "$origin" "$key" \
+    || fail "captain hold $id has malformed or mismatched repair provenance"
   if [ "$state" = "done" ] && body_has_resolution_record "$hold_body" "$origin" "$key"; then
     verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
     printf 'repaired: %s\n' "$id"
