@@ -599,18 +599,34 @@ EOF
   [ "${#PARSED_MOVE_KEYS[@]}" -gt 0 ]
 }
 
+EXPECTED_MOVE_KEYS=()
 RESOLVED_MOVE_KEYS=()
+MOVE_PLAN_SOURCE_HASH=
+MOVE_PLAN_TARGET_HASH=
+MOVE_PLAN_TARGET_PRESENT=0
 resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
-  local source=$1 target=$2 result
+  local source=$1 target=$2 result task
   shift 2
+  EXPECTED_MOVE_KEYS=()
   RESOLVED_MOVE_KEYS=()
+  MOVE_PLAN_SOURCE_HASH=
+  MOVE_PLAN_TARGET_HASH=
+  MOVE_PLAN_TARGET_PRESENT=0
   [ "$#" -gt 0 ] || return 0
+  for task in "$@"; do
+    task_array_contains "$task" "${EXPECTED_MOVE_KEYS[@]}" || EXPECTED_MOVE_KEYS+=("$task")
+  done
   HANDOFF_PLAN_DIR=$(umask 077; mktemp -d "$STATE/.backlog-handoff-plan.XXXXXX") || return 1
   cp -p -- "$source" "$HANDOFF_PLAN_DIR/source.md" || return 1
   if [ -f "$target" ] && [ ! -L "$target" ]; then
     cp -p -- "$target" "$HANDOFF_PLAN_DIR/target.md" || return 1
+    MOVE_PLAN_TARGET_PRESENT=1
   else
     seed_backlog_scaffold "$HANDOFF_PLAN_DIR/target.md"
+  fi
+  MOVE_PLAN_SOURCE_HASH=$(sha256_file "$HANDOFF_PLAN_DIR/source.md") || return 1
+  if [ "$MOVE_PLAN_TARGET_PRESENT" -eq 1 ]; then
+    MOVE_PLAN_TARGET_HASH=$(sha256_file "$HANDOFF_PLAN_DIR/target.md") || return 1
   fi
   if ! result=$(tasks-axi mv "$@" --file "$HANDOFF_PLAN_DIR/source.md" \
     --to "$HANDOFF_PLAN_DIR/target.md" --json 2>&1); then
@@ -619,14 +635,28 @@ resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
     HANDOFF_PLAN_DIR=
     return 1
   fi
-  parse_tasks_axi_move_result "$result" || {
+  parse_tasks_axi_move_result "$result" \
+    && task_sets_match EXPECTED_MOVE_KEYS PARSED_MOVE_KEYS || {
     rm -rf -- "$HANDOFF_PLAN_DIR"
     HANDOFF_PLAN_DIR=
     return 1
   }
-  RESOLVED_MOVE_KEYS=("${PARSED_MOVE_KEYS[@]}")
+  RESOLVED_MOVE_KEYS=("${EXPECTED_MOVE_KEYS[@]}")
   rm -rf -- "$HANDOFF_PLAN_DIR"
   HANDOFF_PLAN_DIR=
+}
+
+move_plan_inputs_unchanged() { # <source> <target>
+  local source=$1 target=$2 current
+  current=$(sha256_file "$source") || return 1
+  [ "$current" = "$MOVE_PLAN_SOURCE_HASH" ] || return 1
+  if [ "$MOVE_PLAN_TARGET_PRESENT" -eq 1 ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] || return 1
+    current=$(sha256_file "$target") || return 1
+    [ "$current" = "$MOVE_PLAN_TARGET_HASH" ] || return 1
+  else
+    [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+  fi
 }
 
 task_sets_match() { # <expected-array-name> <actual-array-name>
@@ -1047,6 +1077,12 @@ remote_handoff() { # <secondmate-id> <keys...>
     echo "error: exact work identity preparation failed; nothing new was handed off" >&2
     return 1
   }
+  if [ "${#to_move[@]}" -gt 0 ] \
+     && ! move_plan_inputs_unchanged "$MAIN_BACKLOG" "$outbox"; then
+    reconcile_remote_handoff_identities "$id" "$outbox" || true
+    echo "error: backlog revisions changed after identity preparation; nothing new was handed off" >&2
+    return 1
+  fi
   seed_backlog_scaffold "$outbox"
   if [ "${#to_move[@]}" -gt 0 ]; then
     if ! mv_out=$(tasks-axi mv "${to_move[@]}" --file "$MAIN_BACKLOG" --to "$outbox" --json 2>&1); then
@@ -1302,8 +1338,13 @@ if [ "${#TO_MOVE[@]}" -eq 0 ]; then
   exit 0
 fi
 
+if ! move_plan_inputs_unchanged "$MAIN_BACKLOG" "$SUB_BACKLOG"; then
+  rollback_local_handoff_identities "$SUB_HOME" "$SUB_BACKLOG" || true
+  echo "error: backlog revisions changed after identity preparation; nothing was moved." >&2
+  exit 1
+fi
 receiver_wake_mark_prepared "$ID" "$REQUESTED_BATCH" || {
-  rollback_local_handoff_identities "$SUB_HOME" || true
+  rollback_local_handoff_identities "$SUB_HOME" "$SUB_BACKLOG" || true
   echo "error: receiver wake state for secondmate $ID could not be recorded; nothing was moved" >&2
   exit 1
 }

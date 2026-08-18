@@ -447,7 +447,7 @@ test_worktree_create_removes_worktree_when_path_missing() {
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" 2>&1 )
   status=$?
-  [ "$status" -ne 0 ] || fail "worktree helper should fail when Orca omits the worktree path"
+  [ "$status" -eq 3 ] || fail "worktree helper should report fully compensated pathless creation, got status $status"
   assert_contains "$out" "orca worktree create did not return a path for fm-task" \
     "worktree helper did not explain the missing path"
   assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-no-path'$'\x1f''--json' \
@@ -455,6 +455,54 @@ test_worktree_create_removes_worktree_when_path_missing() {
   assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-no-path'$'\x1f''--force'$'\x1f''--json' \
     "worktree helper did not remove the pathless Orca worktree"
   pass "fm_backend_orca_worktree_create: removes created worktree when path is missing"
+}
+
+test_spawn_retries_after_compensated_pathless_worktree() {
+  local proj wt data state config id out status creates
+  id="orcacompensatedz7"
+  proj="$TMP_ROOT/compensated-project"
+  wt="$TMP_ROOT/compensated-wt"
+  data="$TMP_ROOT/compensated-data"
+  state="$TMP_ROOT/compensated-state"
+  config="$TMP_ROOT/compensated-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case compensated-pathless
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-compensated"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-compensated-pathless"},"terminal":{"handle":"term-compensated-pathless"}}}\n' > "$RESP/3.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "pathless compensated Orca spawn should report its failed attempt"
+  assert_contains "$out" "failed without leaving resources" \
+    "compensated Orca failure did not report its retryable outcome"
+  assert_absent "$state/$id.spawn-endpoint.json" \
+    "compensated Orca failure retained its endpoint receipt"
+  assert_absent "$state/$id.spawn-orca-operation" \
+    "compensated Orca failure retained its operation journal"
+  assert_absent "$data/$id/work-identity-dispatch.json" \
+    "compensated Orca failure retained its prepared identity dispatch"
+  assert_absent "$state/$id.launch-brief.md" \
+    "compensated Orca failure retained its prepared launch instructions"
+
+  printf '{"ok":true,"result":{"repo":{"id":"repo-compensated"}}}\n' > "$RESP/6.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-compensated","path":"%s"},"terminal":{"handle":"term-compensated"}}}\n' "$wt" > "$RESP/7.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 ) \
+    || fail "retry after compensated Orca creation remained wedged: $out"
+  creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
+  [ "$creates" -eq 2 ] || fail "compensated Orca retry issued $creates worktree creations"
+  assert_grep 'orca_worktree_id=wt-compensated' "$state/$id.meta" \
+    "retry after compensation lost the successful worktree identity"
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh --backend orca: compensated creation retires recovery state and permits retry"
 }
 
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
@@ -1395,6 +1443,7 @@ test_dispatcher_sources_orca_and_routes_primitives
 test_json_get_ignores_undocumented_terminal_id_shapes
 test_worktree_and_terminal_helpers_parse_json
 test_worktree_create_removes_worktree_when_path_missing
+test_spawn_retries_after_compensated_pathless_worktree
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness
 test_spawn_recovers_orca_creation_after_parent_kill

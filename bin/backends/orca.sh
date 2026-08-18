@@ -141,7 +141,7 @@ fm_backend_orca_worktree_create() {  # <project-path> <name>
     echo "error: orca worktree create did not return a path for $name" >&2
     [ -z "$terminal" ] || fm_backend_orca_kill "$terminal" >/dev/null 2>&1 || true
     if fm_backend_orca_remove_worktree "$wt_id" >/dev/null; then
-      return 1
+      return 3
     fi
     if [ -n "$terminal" ]; then
       printf '%s\t\t%s' "$wt_id" "$terminal"

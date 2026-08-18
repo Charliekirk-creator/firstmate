@@ -999,7 +999,9 @@ spawn_orca_operation_helper() {
       if [ "$rest" != "$wt_path" ]; then terminal=${rest#*$'\t'}; fi
     fi
   fi
-  if [ "$rc" -ne 0 ] && [ -n "$wt_id" ] && [ -z "$wt_path" ]; then
+  if [ "$rc" -eq 3 ] && [ -z "$raw" ]; then
+    failure_reason=compensated
+  elif [ "$rc" -ne 0 ] && [ -n "$wt_id" ] && [ -z "$wt_path" ]; then
     failure_reason=path
   fi
   if [ "$rc" -eq 0 ] && [ -n "$wt_id" ] && [ -n "$wt_path" ]; then
@@ -1106,8 +1108,12 @@ spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator
           and .schema == "fm-spawn-orca-operation-failure.v1"
           and .binding == {home:$home,home_id:$home_id,task_id:$task}
           and .transaction_id == $transaction and .project == $project and .label == $label
-          and (.reason == "creation" or .reason == "isolation" or .reason == "path" or .reason == "terminal")
+          and (.reason == "creation" or .reason == "isolation" or .reason == "path"
+            or .reason == "terminal" or .reason == "compensated")
           and ([.worktree_id,.worktree,.terminal] | all(. == null or (type == "string" and length > 0)))
+          and (if .reason == "compensated" then
+            .worktree_id == null and .worktree == null and .terminal == null
+          else true end)
         ) | $r
       ' "$file" 2>/dev/null) || return 1
     printf '%s\n' "$canonical" | cmp -s "$file" - || return 1
@@ -1117,6 +1123,7 @@ spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator
     failure_reason=$(printf '%s' "$canonical" | jq -r '.reason') || return 1
     [ -z "$ORCA_WORKTREE_ID" ] || ORCA_ABORT_CLEANUP=1
     case "$failure_reason" in
+      compensated) return 5 ;;
       isolation)
         echo "error: orca worktree create did not yield an isolated worktree (resolved '$WT'; primary '$PROJ_ABS')" >&2
         ;;
@@ -1142,7 +1149,7 @@ spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator
 }
 
 spawn_orca_operation_wait() {
-  local status started=0 creator_exited=0 i=0 max=${FM_SPAWN_ORCA_CREATE_POLLS:-600} interval=${FM_SPAWN_ORCA_CREATE_INTERVAL:-0.1}
+  local status dispatch_abort_rc=0 started=0 creator_exited=0 i=0 max=${FM_SPAWN_ORCA_CREATE_POLLS:-600} interval=${FM_SPAWN_ORCA_CREATE_INTERVAL:-0.1}
   while [ "$i" -lt "$max" ]; do
     set +e
     spawn_orca_operation_load
@@ -1164,6 +1171,30 @@ spawn_orca_operation_wait() {
           echo "error: Orca endpoint creator stopped without a recoverable result for $ID" >&2
           return 1
         fi
+        ;;
+      5)
+        [ ! -s "$SPAWN_ORCA_OPERATION/helper.err" ] || cat "$SPAWN_ORCA_OPERATION/helper.err" >&2
+        spawn_orca_operation_retire || {
+          echo "error: compensated Orca endpoint journal could not be retired for $ID" >&2
+          return 1
+        }
+        rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+          echo "error: compensated Orca endpoint receipt could not be retired for $ID" >&2
+          return 1
+        }
+        FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+          FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+          dispatch-abort "$ID" --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null 2>&1 \
+          || dispatch_abort_rc=$?
+        case "$dispatch_abort_rc" in
+          0) SPAWN_DISPATCH_PENDING=0 ;;
+          *)
+            echo "error: compensated Orca work identity dispatch requires reconciliation for $ID" >&2
+            return 1
+            ;;
+        esac
+        echo "error: Orca endpoint creation failed without leaving resources; rerun spawn to retry" >&2
+        return 1
         ;;
       *) return 1 ;;
     esac
@@ -3211,8 +3242,13 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
 
       worktree_request_idle=0
       case "$BACKEND" in
-        tmux|herdr)
+        tmux)
           [ "$(fm_backend_agent_state "$BACKEND" "$T")" != dead ] || worktree_request_idle=1
+          ;;
+        herdr)
+          if fm_backend_herdr_pane_idle_shell_pid "$HERDR_SES" "$HERDR_PANE_ID" >/dev/null; then
+            worktree_request_idle=1
+          fi
           ;;
         zellij|cmux)
           [ "$project_shell_observed" -ne 1 ] || worktree_request_idle=1
