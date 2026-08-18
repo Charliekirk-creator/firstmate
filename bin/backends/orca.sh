@@ -128,10 +128,23 @@ fm_backend_orca_repo_ensure() {  # <project-path>
   printf '%s' "$repo_id"
 }
 
-fm_backend_orca_worktree_create() {  # <project-path> <name>
-  local project=$1 name=$2 repo_id out wt_id wt_path terminal
-  repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
-  out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) || return 1
+fm_backend_orca_file_link_count() {
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%l' "$1" 2>/dev/null
+  else
+    stat -c '%h' "$1" 2>/dev/null
+  fi
+}
+
+fm_backend_orca_worktree_response_parse() {  # <response-path> <name>
+  local response=$1 name=$2 out wt_id wt_path terminal links bytes
+  [ -f "$response" ] && [ ! -L "$response" ] || return 1
+  links=$(fm_backend_orca_file_link_count "$response") || return 1
+  [ "$links" = 1 ] || return 1
+  bytes=$(LC_ALL=C wc -c < "$response" | tr -d ' ')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 65536 ] || return 1
+  out=$(cat "$response") || return 1
   wt_id=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-id) || {
     echo "error: orca worktree create did not return a worktree id for $name" >&2
     return 1
@@ -152,6 +165,51 @@ fm_backend_orca_worktree_create() {  # <project-path> <name>
   }
   printf '%s\t%s' "$wt_id" "$wt_path"
   [ -z "$terminal" ] || printf '\t%s' "$terminal"
+}
+
+fm_backend_orca_worktree_response_ready() {  # <response-path>
+  local response=$1 out links bytes
+  [ -f "$response" ] && [ ! -L "$response" ] || return 1
+  links=$(fm_backend_orca_file_link_count "$response") || return 1
+  [ "$links" = 1 ] || return 1
+  bytes=$(LC_ALL=C wc -c < "$response" | tr -d ' ')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 65536 ] || return 1
+  out=$(cat "$response") || return 1
+  printf '%s' "$out" | fm_backend_orca_json_get worktree-id >/dev/null 2>&1 \
+    && printf '%s' "$out" | fm_backend_orca_json_get worktree-path >/dev/null 2>&1
+}
+
+fm_backend_orca_worktree_create() {  # <project-path> <name>
+  local project=$1 name=$2 repo_id response rc
+  repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
+  response=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-orca-worktree.XXXXXX") || return 1
+  if orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json > "$response"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    fm_backend_orca_worktree_response_parse "$response" "$name"
+    rc=$?
+  fi
+  rm -f -- "$response"
+  return "$rc"
+}
+
+fm_backend_orca_worktree_create_durable() {  # <project-path> <name> <response-path>
+  local project=$1 name=$2 response=$3 repo_id creator rc
+  [ ! -e "$response" ] && [ ! -L "$response" ] || return 1
+  repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
+  (
+    umask 077
+    set -C
+    exec orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json > "$response"
+  ) &
+  creator=$!
+  if wait "$creator"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  fm_backend_orca_worktree_response_parse "$response" "$name"
 }
 
 fm_backend_orca_terminal_create() {  # <worktree-id> <title>

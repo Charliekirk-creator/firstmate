@@ -689,6 +689,14 @@ remote_secondmate_teardown() {
   return 0
 }
 
+teardown_dispatch_retire_preflight() {  # <home> <data> <state> <task-id>
+  local home=$1 data=$2 state=$3 task=$4 receipt="$2/$4/work-identity-dispatch.json"
+  [ -e "$receipt" ] || [ -L "$receipt" ] || return 0
+  FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_STATE_OVERRIDE="$state" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+    dispatch-retire-preflight "$task"
+}
+
 remote_secondmate_teardown_locked() {
   local rc
   [ -n "$(fm_meta_get "$META" remote_host)" ] || return 3
@@ -708,6 +716,8 @@ remote_secondmate_teardown_locked() {
   remote_teardown_locks_release
   return "$rc"
 }
+
+teardown_dispatch_retire_preflight "$FM_HOME" "$DATA" "$STATE" "$ID" || exit 1
 
 if remote_secondmate_teardown_locked; then
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
@@ -2290,6 +2300,7 @@ validate_firstmate_home_children_removal() {
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
+    teardown_dispatch_retire_preflight "$home" "$home/data" "$sub_state" "$child_id" || return 1
     fm_backend_validate_task_endpoint "$child_meta" "$child_id" || return 1
     validate_pr_poll_cleanup "$sub_state" "$child_id" || return 1
     child_wt=$(meta_value "$child_meta" worktree)

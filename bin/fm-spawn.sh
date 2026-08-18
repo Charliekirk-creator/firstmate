@@ -979,7 +979,7 @@ spawn_orca_operation_publish() {  # <result|failure> <payload>
 }
 
 spawn_orca_operation_helper() {
-  local claim_tmp raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation
+  local claim_tmp create_response raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation
   set +e
   claim_tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.claim.XXXXXX") || exit 1
   printf '%s\n' "${BASHPID:-$$}" > "$claim_tmp" || { rm -f -- "$claim_tmp"; exit 1; }
@@ -989,8 +989,14 @@ spawn_orca_operation_helper() {
   fi
   rm -f -- "$claim_tmp"
 
-  raw=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
-  rc=$?
+  create_response="$SPAWN_ORCA_OPERATION/create-response.json"
+  if [ -e "$create_response" ] || [ -L "$create_response" ]; then
+    raw=$(fm_backend_orca_worktree_response_parse "$create_response" "$W")
+    rc=$?
+  else
+    raw=$(fm_backend_orca_worktree_create_durable "$PROJ_ABS" "$W" "$create_response")
+    rc=$?
+  fi
   if [ -n "$raw" ]; then
     wt_id=${raw%%$'\t'*}
     if [ "$raw" != "$wt_id" ]; then
@@ -1066,8 +1072,8 @@ spawn_orca_operation_start() {
     </dev/null >/dev/null 2>"$error_file" &
 }
 
-spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator exited
-  local file canonical links pid failure_reason
+spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator exited, 6=recoverable response
+  local file canonical links pid failure_reason create_response_ready=0
   file="$SPAWN_ORCA_OPERATION/result.json"
   if [ -e "$file" ] || [ -L "$file" ]; then
     [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -1137,6 +1143,14 @@ spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator
     return 1
   fi
 
+  file="$SPAWN_ORCA_OPERATION/create-response.json"
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    links=$(spawn_file_link_count "$file") || return 1
+    [ "$links" = 1 ] || return 1
+    fm_backend_orca_worktree_response_ready "$file" && create_response_ready=1
+  fi
+
   file="$SPAWN_ORCA_OPERATION/claim"
   if [ ! -e "$file" ] && [ ! -L "$file" ]; then return 3; fi
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -1145,6 +1159,7 @@ spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator
   pid=$(tr -d '[:space:]' < "$file")
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   if kill -0 "$pid" 2>/dev/null; then return 2; fi
+  [ "$create_response_ready" -eq 0 ] || return 6
   return 4
 }
 
@@ -1171,6 +1186,12 @@ spawn_orca_operation_wait() {
           echo "error: Orca endpoint creator stopped without a recoverable result for $ID" >&2
           return 1
         fi
+        ;;
+      6)
+        rm -f -- "$SPAWN_ORCA_OPERATION/claim" || return 1
+        spawn_orca_operation_start || return 1
+        started=1
+        creator_exited=0
         ;;
       5)
         [ ! -s "$SPAWN_ORCA_OPERATION/helper.err" ] || cat "$SPAWN_ORCA_OPERATION/helper.err" >&2
@@ -1206,12 +1227,14 @@ spawn_orca_operation_wait() {
 }
 
 spawn_orca_operation_retire() {
+  local retired
   [ -n "$SPAWN_ORCA_OPERATION" ] || return 0
   if [ ! -e "$SPAWN_ORCA_OPERATION" ] && [ ! -L "$SPAWN_ORCA_OPERATION" ]; then return 0; fi
   [ -d "$SPAWN_ORCA_OPERATION" ] && [ ! -L "$SPAWN_ORCA_OPERATION" ] || return 1
-  rm -f -- "$SPAWN_ORCA_OPERATION/result.json" "$SPAWN_ORCA_OPERATION/failure.json" \
-    "$SPAWN_ORCA_OPERATION/claim" "$SPAWN_ORCA_OPERATION/helper.err" 2>/dev/null || return 1
-  rmdir "$SPAWN_ORCA_OPERATION" 2>/dev/null
+  retired=$(umask 077; mktemp -d "$STATE/.$ID.spawn-orca-retired.XXXXXX") || return 1
+  rmdir -- "$retired" || return 1
+  mv -- "$SPAWN_ORCA_OPERATION" "$retired" || return 1
+  rm -rf -- "$retired" 2>/dev/null || true
 }
 
 spawn_abort_cleanup() {
@@ -3018,12 +3041,14 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_RECOVERED" = 0 ]; then
     echo "error: could not publish endpoint recovery receipt for $ID" >&2
     exit 1
   }
-  if [ "$BACKEND" = orca ]; then
-    spawn_orca_operation_retire \
-      || echo "warning: exact Orca creation journal could not be retired; endpoint receipt remains authoritative" >&2
-  fi
   HERDR_PROJECTION_ABORT_CLEANUP=0
   ORCA_ABORT_CLEANUP=0
+  if [ "$BACKEND" = orca ]; then
+    spawn_orca_operation_retire || {
+      echo "error: exact Orca creation journal could not be retired; endpoint receipt remains authoritative" >&2
+      exit 1
+    }
+  fi
 fi
 if [ "$RELAUNCH" -eq 0 ] && { [ "$KIND" = secondmate ] || [ "$BACKEND" = orca ]; }; then
   spawn_endpoint_receipt_publish worktree-ready "$WT" || {
@@ -3655,16 +3680,13 @@ fi
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
-SPAWN_META_PATH="$STATE/$ID.meta"
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
   fm_lock_acquire_wait "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=1
 fi
-if [ "$RELAUNCH" -eq 1 ]; then
-  SPAWN_META_TMP="$STATE/.$ID.meta.relaunch.${BASHPID:-$$}"
-else
-  SPAWN_META_TMP="$STATE/.$ID.meta.spawn.${BASHPID:-$$}"
+SPAWN_META_TMP=$(umask 077; mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
+if [ "$RELAUNCH" -eq 0 ]; then
   SPAWN_FRESH_COMMIT_PENDING=1
 fi
 SPAWN_META_PATH=$SPAWN_META_TMP
@@ -3737,13 +3759,15 @@ preserve_relaunch_meta() {
   echo "error: task record for $ID could not be prepared at $SPAWN_META_PATH" >&2
   exit 1
 }
-if [ "$RELAUNCH" -eq 0 ]; then
-  if ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE"; then
-    echo "error: task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
-    exit 1
-  fi
-  SPAWN_META_TMP=
-fi
+chmod 600 "$SPAWN_META_PATH" || exit 1
+FM_HOME="$FM_HOME" \
+  FM_DATA_OVERRIDE="$DATA" \
+  FM_STATE_OVERRIDE="$STATE" \
+  FM_ROOT_OVERRIDE="$FM_ROOT" \
+  "$SCRIPT_DIR/fm-work-identity.sh" dispatch-commit-preflight "$ID" \
+    --brief "$BRIEF" --meta "$SPAWN_META_PATH" \
+    --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null \
+  || exit 1
 
 # Fuse the backlog In-flight transition into the publication that just created
 # the record (bin/fm-backlog-transition-lib.sh owns the invariant). It runs under
@@ -3755,16 +3779,18 @@ spawn_commit_backlog_transition() {
   fm_backlog_atomic_transition dispatch "$STATE/$ID.meta" "$DATA" "$ID" "$STATE"
 }
 
-if [ "$RELAUNCH" -eq 1 ]; then
-  SPAWN_META_PUBLISH_STARTED=1
-  if ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE"; then
+SPAWN_META_PUBLISH_STARTED=1
+if ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE"; then
+  if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: replacement task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
-    exit 1
+  else
+    echo "error: task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
   fi
-  RELAUNCH_REPLACEMENT_PENDING=0
-  SPAWN_META_PUBLISH_STARTED=0
-  SPAWN_META_TMP=
+  exit 1
 fi
+[ "$RELAUNCH" -ne 1 ] || RELAUNCH_REPLACEMENT_PENDING=0
+SPAWN_META_PUBLISH_STARTED=0
+SPAWN_META_TMP=
 FM_HOME="$FM_HOME" \
   FM_DATA_OVERRIDE="$DATA" \
   FM_STATE_OVERRIDE="$STATE" \
@@ -3775,16 +3801,16 @@ FM_HOME="$FM_HOME" \
   || exit 1
 SPAWN_DISPATCH_PENDING=0
 if [ "$RELAUNCH" -eq 0 ]; then
-  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
-    echo "error: could not retire endpoint recovery receipt for $ID" >&2
-    exit 1
-  }
   if [ "$BACKEND" = orca ]; then
     spawn_orca_operation_retire || {
       echo "error: could not retire Orca endpoint operation journal for $ID" >&2
       exit 1
     }
   fi
+  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+    echo "error: could not retire endpoint recovery receipt for $ID" >&2
+    exit 1
+  }
 fi
 # A dispatch or relaunch keeps the per-task meta lock through launch delivery.
 # The backlog mutation is deliberately the final fallible commit below, so

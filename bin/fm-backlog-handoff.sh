@@ -773,6 +773,33 @@ stage_local_handoff_identities() { # <target-home> <target-home-id> <target-back
   done
 }
 
+rollback_remote_handoff_identities() { # <secondmate-id> <outbox>
+  local id=$1 outbox=$2 i task payload created rc failed=0 preserved=0
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    created=${HANDOFF_IDENTITY_CREATED[$i]}
+    if backlog_key_section "$outbox" "$task" >/dev/null 2>&1; then
+      preserved=1
+    elif [ "$created" = true ]; then
+      set +e
+      remote_target_handoff_action "$id" abort "$task" "$payload"
+      rc=$?
+      set -e
+      case "$rc" in
+        0) source_handoff_action cancel "$task" "$payload" || failed=1 ;;
+        4) source_handoff_action complete "$task" "$payload" || failed=1 ;;
+        *) failed=1 ;;
+      esac
+    else
+      preserved=1
+    fi
+    i=$((i + 1))
+  done
+  [ "$failed" -eq 0 ] && [ "$preserved" -eq 0 ]
+}
+
 reconcile_remote_handoff_identities() { # <secondmate-id> <outbox>
   local id=$1 outbox=$2 i task payload created target_state state_rc failed=0 preserved=0
   i=0
@@ -1077,9 +1104,14 @@ remote_handoff() { # <secondmate-id> <keys...>
     echo "error: exact work identity preparation failed; nothing new was handed off" >&2
     return 1
   }
+  stage_prepared_remote_handoff_identities "$id" || {
+    rollback_remote_handoff_identities "$id" "$outbox" || true
+    echo "error: remote exact work identity reservation failed; nothing new was handed off" >&2
+    return 1
+  }
   if [ "${#to_move[@]}" -gt 0 ] \
      && ! move_plan_inputs_unchanged "$MAIN_BACKLOG" "$outbox"; then
-    reconcile_remote_handoff_identities "$id" "$outbox" || true
+    rollback_remote_handoff_identities "$id" "$outbox" || true
     echo "error: backlog revisions changed after identity preparation; nothing new was handed off" >&2
     return 1
   fi
@@ -1093,7 +1125,7 @@ remote_handoff() { # <secondmate-id> <keys...>
       done
       if [ "$persisted" -eq 1 ]; then
         echo "error: atomic outbox staging completion is uncertain; identity preparation and outbox are preserved" >&2
-      elif ! reconcile_remote_handoff_identities "$id" "$outbox"; then
+      elif ! rollback_remote_handoff_identities "$id" "$outbox"; then
         echo "error: atomic outbox staging failed and identity preparation needs recovery" >&2
       else
         echo "error: atomic outbox staging failed; nothing new was handed off" >&2
@@ -1116,10 +1148,6 @@ remote_handoff() { # <secondmate-id> <keys...>
   # persist. The outbox is already authoritative in that state, so converge by
   # deleting only duplicates that tasks-axi itself confirms are dependency-safe.
   remove_interrupted_source_duplicates "$outbox" "${delivery_keys[@]}" || return 1
-  stage_prepared_remote_handoff_identities "$id" || {
-    echo "error: remote exact work identity preparation is unavailable; outbox preserved at $outbox" >&2
-    return 1
-  }
   remote_deliver_outbox "$id" "$outbox" || return 1
   finish_remote_handoff "$id" "$outbox" || return 1
   echo "handed off ${#requested[@]} item(s) to remote secondmate $id: ${requested[*]}"

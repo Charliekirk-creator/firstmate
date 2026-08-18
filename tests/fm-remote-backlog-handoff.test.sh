@@ -126,6 +126,12 @@ case "${FM_FAKE_SSH_MODE:-normal}:$command_name" in
 esac
 SH
 chmod +x "$FAKEBIN/fake-ssh"
+cat > "$FAKEBIN/quota-axi" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" != --version ] || printf '%s\n' '0.1.25'
+exit 0
+SH
+chmod +x "$FAKEBIN/quota-axi"
 
 handoff_env() {
   FM_HOME="$PARENT" \
@@ -317,6 +323,37 @@ assert_no_grep 'serialized-b' "$PARENT/data/backlog.md" "second serialized hando
 assert_absent "$PARENT/data/handoff/ios.outbox.md" "serialized handoffs left a pending outbox"
 pass "concurrent handoffs serialize staging through confirmed cleanup"
 
+conflict_task=target-conflict
+write_backlog '- [ ] target-conflict - target identity conflict (repo: alpha)'
+FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" template "$conflict_task" \
+  | jq '.initiative.id="source-project" | .plan_id.id="source-plan" | .stage.id="source-stage"
+      | .work_units[0].id="source-unit" | .sources[0].id="source-issue"' \
+  > "$TMP_ROOT/source-conflict.json"
+FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" record "$conflict_task" \
+  --file "$TMP_ROOT/source-conflict.json" >/dev/null
+FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-work-identity.sh" template "$conflict_task" \
+  | jq '.initiative.id="target-project" | .plan_id.id="target-plan" | .stage.id="target-stage"
+      | .work_units[0].id="target-unit" | .sources[0].id="target-issue"' \
+  > "$TMP_ROOT/target-conflict.json"
+FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-work-identity.sh" record "$conflict_task" \
+  --file "$TMP_ROOT/target-conflict.json" >/dev/null
+rc=0
+handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios "$conflict_task" \
+  > "$TMP_ROOT/target-conflict.out" 2>&1 || rc=$?
+[ "$rc" -ne 0 ] || fail "remote handoff moved a row before detecting its target identity conflict"
+assert_grep "$conflict_task" "$PARENT/data/backlog.md" \
+  "target identity conflict removed the source backlog row"
+assert_absent "$PARENT/data/handoff/ios.outbox.md" \
+  "target identity conflict published a remote outbox"
+assert_absent "$PARENT/data/$conflict_task/work-identity-handoff-source.json" \
+  "target identity conflict retained a source reservation after exact compensation"
+assert_absent "$REMOTE/data/$conflict_task/work-identity-handoff-target.json" \
+  "target identity conflict published a destination reservation"
+FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-work-identity.sh" verify "$conflict_task" \
+  | jq -e '.status == "linked" and .initiative.id == "target-project"' >/dev/null \
+  || fail "target identity conflict changed the pre-existing exact target relation"
+pass "remote handoff reserves target identity before moving source backlog rows"
+
 write_backlog '- [ ] linked-remote - linked remote handoff (repo: alpha)'
 manifest="$PARENT/linked-remote.json"
 FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" template linked-remote \
@@ -394,7 +431,7 @@ assert_grep 'stale-lock-item' "$REMOTE/data/backlog.md" "stale-lock receipt lost
 assert_absent "$REMOTE/data/backlog.md.lock" "stale destination lock survived successful receipt"
 pass "receiver removes one proven dead stale lock and retries once"
 
-# Unreachable delivery keeps the backlog-format outbox visible to bootstrap.
+# An unreachable target cannot reserve identity, so source backlog mutation never starts.
 write_backlog '- [ ] pending-offline - waits for the remote Mac (repo: alpha)'
 set +e
 FM_FAKE_SSH_MODE=unreachable handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios pending-offline \
@@ -402,13 +439,14 @@ FM_FAKE_SSH_MODE=unreachable handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios p
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "offline handoff claimed success"
-bootstrap_out=$(FM_HOME="$PARENT" FM_ROOT_OVERRIDE="$ROOT" FM_BACKEND=tmux \
-  FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1)
-assert_contains "$bootstrap_out" 'SECONDMATE_HANDOFF: secondmate ios: pending delivery: 1 item(s)' \
-  "bootstrap did not surface the pending outbox count"
-handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending >/dev/null \
-  || fail "pending bootstrap-visible outbox did not later converge"
-pass "bootstrap detects pending outbox handoffs without transport retries"
+assert_grep 'pending-offline' "$PARENT/data/backlog.md" \
+  "offline identity reservation removed the source backlog row"
+assert_absent "$PARENT/data/handoff/ios.outbox.md" \
+  "offline identity reservation published an unreserved outbox"
+jq -e '.role == "source" and .state == "prepared"' \
+  "$PARENT/data/pending-offline/work-identity-handoff-source.json" >/dev/null \
+  || fail "offline identity reservation lost its unknown-completion recovery receipt"
+pass "offline target reservation preserves recovery without source backlog mutation"
 
 write_backlog '- [ ] remote-wake-fail - receiver failure stays recoverable (repo: alpha)'
 set +e
@@ -517,7 +555,7 @@ FRESH="$TMP_ROOT/fresh"
 mkdir -p "$FRESH/data" "$FRESH/state"
 : > "$SSH_COUNT"
 fresh_out=$(FM_HOME="$FRESH" FM_ROOT_OVERRIDE="$ROOT" FM_BACKEND=tmux \
-  FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1)
+  FM_BOOTSTRAP_DETECT_ONLY=1 PATH="$FAKEBIN:$PATH" "$ROOT/bin/fm-bootstrap.sh" 2>&1)
 assert_not_contains "$fresh_out" 'SECONDMATE_HANDOFF:' "unconfigured bootstrap emitted a remote handoff diagnostic"
 [ ! -s "$SSH_COUNT" ] || fail "unconfigured bootstrap touched SSH"
 pass "unconfigured bootstrap has no remote handoff behavior"

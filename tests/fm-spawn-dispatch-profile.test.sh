@@ -789,6 +789,47 @@ test_non_claude_harness_ignores_config_dir() {
   pass "non-claude harnesses do not receive the claude CLAUDE_CONFIG_DIR prefix"
 }
 
+test_fresh_metadata_interruption_never_publishes_partial_record() {
+  local rec id out status temp_meta
+  id=profile-atomic-meta-z20
+  rec=$(make_spawn_case profile-atomic-meta claude "$id")
+  read_case_record "$rec"
+  cat > "$FAKEBIN_DIR/mv" <<'SH'
+#!/usr/bin/env bash
+last=
+for arg in "$@"; do last=$arg; done
+if [ "$last" = "${FM_TEST_META_PUBLISH_TARGET:-}" ] \
+   && [ ! -e "${FM_TEST_META_PUBLISH_KILLED:-}" ]; then
+  : > "$FM_TEST_META_PUBLISH_KILLED"
+  kill -KILL "$PPID"
+  exit 99
+fi
+exec "${REAL_MV_FOR_TEST:?}" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/mv"
+
+  out=$(REAL_MV_FOR_TEST="$(command -v mv)" \
+    FM_TEST_META_PUBLISH_TARGET="$HOME_DIR/state/$id.meta" \
+    FM_TEST_META_PUBLISH_KILLED="$CASE_DIR/meta-publish-killed" \
+    run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  [ "$status" -ne 0 ] || fail "fresh metadata interruption fixture did not stop publication"
+  assert_present "$CASE_DIR/meta-publish-killed" \
+    "fresh spawn never reached atomic metadata publication"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "interrupted fresh spawn exposed task metadata at its authoritative path"
+  temp_meta=$(find "$HOME_DIR/state" -maxdepth 1 -type f -name ".$id.meta.*" -print -quit)
+  [ -n "$temp_meta" ] || fail "interrupted fresh spawn retained no recoverable complete metadata candidate"
+  assert_grep "endpoint_task_id=$id" "$temp_meta" \
+    "interrupted metadata candidate was incomplete"
+  jq -e '.state == "prepared"' "$HOME_DIR/data/$id/work-identity-dispatch.json" >/dev/null \
+    || fail "interrupted metadata publication did not preserve its prepared dispatch"
+  assert_present "$HOME_DIR/state/$id.spawn-endpoint.json" \
+    "interrupted metadata publication lost its endpoint recovery receipt"
+  rm -rf "/tmp/fm-$id"
+  pass "fresh spawn metadata publication is atomic across interruption"
+}
+
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
   local rec id sm out status
   id=profile-secondmate-z16
@@ -837,6 +878,7 @@ test_batch_forwards_shared_profile_flags
 test_claude_forwards_firstmate_config_dir_when_set
 test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
+test_fresh_metadata_interruption_never_publishes_partial_record
 test_active_dispatch_profile_does_not_block_secondmate_launch
 
 echo "# all fm-spawn-dispatch-profile tests passed"

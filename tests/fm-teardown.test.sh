@@ -585,6 +585,40 @@ test_local_only_fork_remote_allows() {
   pass "local-only worktree with HEAD on a fork remote is torn down and the home summary is refreshed"
 }
 
+test_malformed_dispatch_receipt_refuses_before_teardown_side_effects() {
+  local case_dir rc
+  case_dir=$(make_case malformed-dispatch-preflight)
+  write_meta "$case_dir" local-only ship
+  mkdir -p "$case_dir/data/task-x1"
+  printf 'launch brief\n' > "$case_dir/state/task-x1.launch-brief.md"
+  printf '{}\n' > "$case_dir/data/task-x1/work-identity-dispatch.json"
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TEST_TREEHOUSE_LOG:?}"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$case_dir/state" FM_DATA_OVERRIDE="$case_dir/data" \
+    FM_CONFIG_OVERRIDE="$case_dir/config" FM_TEST_TREEHOUSE_LOG="$case_dir/treehouse.log" \
+    PATH="$case_dir/fakebin:$PATH" "$TEARDOWN" task-x1 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "malformed dispatch receipt should refuse teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "work identity dispatch state is malformed" \
+    "teardown did not surface owner-backed dispatch receipt validation"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "malformed dispatch receipt was validated only after metadata deletion"
+  assert_present "$case_dir/state/task-x1.launch-brief.md" \
+    "malformed dispatch receipt allowed launch-instruction deletion"
+  assert_absent "$case_dir/treehouse.log" \
+    "malformed dispatch receipt allowed worktree return before refusal"
+  pass "teardown preflights dispatch ownership before destructive cleanup"
+}
+
 test_teardown_closes_the_backlog_item_itself() {
   local case_dir out
   case_dir=$(make_case tasks-axi-close)
@@ -2606,6 +2640,7 @@ EOF
 }
 
 test_local_only_fork_remote_allows
+test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses
