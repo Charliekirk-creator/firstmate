@@ -460,6 +460,27 @@ test_pruned_resolved_history_does_not_block_later_review() {
   assert_grep "already durably resolved" "$home/reused-key.err" \
     "pruned historical identity did not remain reserved"
 
+  body=$(printf 'Origin: %s\nDecision key: old-a\nState: awaiting captain decision.' "$id")
+  tasks_in "$home" add "$old_a" "Choose old sample A" \
+    --kind captain --repo sample --body "$body" >/dev/null \
+    || fail "could not reproduce a pre-upgrade reused decision identity"
+  tasks_in "$home" hold "$old_a" --reason "captain reused key pending" --kind captain >/dev/null \
+    || fail "could not activate the pre-upgrade reused decision identity"
+  if run_decisions "$home" complete "$id" old-a \
+    > "$home/reused-generation.out" 2> "$home/reused-generation.err"; then
+    fail "completion accepted an active decision with an older archived generation"
+  fi
+  assert_grep "both backlog and archived generations" "$home/reused-generation.err" \
+    "active ownership did not reject a reused archived decision identity"
+  if run_decisions "$home" verify "$id" \
+    > "$home/reused-generation-verify.out" 2> "$home/reused-generation-verify.err"; then
+    fail "verification accepted an active decision with an older archived generation"
+  fi
+  assert_grep "both backlog and archived generations" "$home/reused-generation-verify.err" \
+    "durable ownership did not reject a reused archived decision identity"
+  tasks_in "$home" rm "$old_a" >/dev/null \
+    || fail "could not remove the pre-upgrade reused decision fixture"
+
   printf 'needs-decision [key=old-a]: choose old sample A again\ndone: later review pass complete\n' \
     > "$home/state/$id.status"
   if run_decisions "$home" complete "$id" old-a > "$home/reopened-old.out" 2> "$home/reopened-old.err"; then
@@ -886,7 +907,7 @@ SH
 }
 
 test_nonarchive_rows_cannot_prove_pruned_history() {
-  local home origin key hold n archive
+  local home origin key hold n archive decision
   home=$(make_home nonarchive-history-row)
   origin=sample-nonarchive-review
   key=old-answer
@@ -914,6 +935,8 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     "nonarchive fixture did not leave the bounded Done window"
   assert_grep "- [x] $hold -" "$archive" \
     "nonarchive fixture was not pruned by configured retention"
+  cp "$archive" "$archive.canonical" \
+    || fail "could not preserve the canonical retention archive"
   awk '
     /^## Archived [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
       print "## Notes"
@@ -928,6 +951,60 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   fi
   assert_grep "not durably resolved in its archive" "$home/nonarchive.err" \
     "nonarchive row did not fail as absent retained history"
+
+  cp "$archive.canonical" "$archive" \
+    || fail "could not restore the canonical retention archive"
+  awk '
+    /^## Archived [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ && !inserted {
+      print
+      print "### Notes"
+      inserted = 1
+      next
+    }
+    { print }
+  ' "$archive" > "$archive.tmp" && mv "$archive.tmp" "$archive" \
+    || fail "could not create an archive subsection counterfactual"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/subsection.out" 2> "$home/subsection.err"; then
+    fail "a resolution-shaped row under an archive subsection proved retained history"
+  fi
+  assert_grep "malformed archived record" "$home/subsection.err" \
+    "an archive subsection did not invalidate the following noncanonical row"
+
+  home=$(make_home note-archive-history-row)
+  origin=sample-note-archive-review
+  key=old-answer
+  tasks_in "$home" add "$origin" "Review note archive history" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create note-archive origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the note archive answer" \
+    --reason "captain note archive answer pending" --repo sample) \
+    || fail "could not create note-archive decision hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory note-archive decision hold"
+  decision="$home/note-archive-answer.txt"
+  printf 'Captain resolved the note-archive fixture.\n' > "$decision"
+  run_decisions "$home" answer "$origin" "$key" --decision-file "$decision" >/dev/null \
+    || fail "could not resolve note-archive decision hold"
+  tasks_in "$home" update "$hold" --body "Superseded decision snapshot." --archive-body >/dev/null \
+    || fail "could not archive a superseded decision body"
+  tasks_in "$home" rm "$hold" >/dev/null \
+    || fail "could not remove the superseded live decision record"
+  assert_grep "- [x] $hold -" "$home/data/note-archive.md" \
+    "tasks-axi did not preserve the superseded Done snapshot in its note archive"
+  awk '
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/note-archive.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not reproduce a note archive configured as Done retention"
+  if run_decisions "$home" complete "$origin" --none --resolved "$key" \
+    > "$home/note-archive.out" 2> "$home/note-archive.err"; then
+    fail "a superseded note snapshot proved normal Done retention"
+  fi
+  assert_grep "aliases the tasks-axi note archive" "$home/note-archive.err" \
+    "the configured note archive alias did not fail its retention boundary"
   pass "only canonical retention sections prove archived decisions"
 }
 

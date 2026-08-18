@@ -769,7 +769,7 @@ DECISION_DATA=''
 authoritative_archive_path() {
   local physical_home expected_data physical_data project_config home_config
   local archive_value='' backlog_value='' configured_backlog configured_archive archive_dir archive_name
-  local physical_backlog_dir rc
+  local physical_backlog_dir note_archive rc
   DECISION_ARCHIVE=''
   DECISION_DATA=''
   [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
@@ -836,6 +836,9 @@ authoritative_archive_path() {
   DECISION_ARCHIVE="$archive_dir/$archive_name"
   [ "$DECISION_ARCHIVE" != "$physical_data/backlog.md" ] \
     || fail "configured decision archive is the active backlog: $DECISION_ARCHIVE"
+  note_archive="$physical_backlog_dir/note-archive.md"
+  [ "$DECISION_ARCHIVE" != "$note_archive" ] \
+    || fail "configured decision archive aliases the tasks-axi note archive: $DECISION_ARCHIVE"
 }
 
 LEGACY_ATTESTATION_SCHEMA=fm-decision-legacy-resolution.v1
@@ -1078,19 +1081,22 @@ archived_hold_body() {  # <hold-id>
   [ "$links" = 1 ] || fail "decision archive is hardlinked: $archive"
 
   if record=$(LC_ALL=C awk -v id="$id" '
-    BEGIN { prefix = "- [x] " id " - "; found = 0; capture = 0; archived = 0 }
+    BEGIN { prefix = "- [x] " id " - "; found = 0; capture = 0; entry = 0; archived = 0; bad = 0 }
     /^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/ {
       capture = 0
+      entry = 0
       archived = 1
       next
     }
     /^## / {
       capture = 0
+      entry = 0
       archived = 0
       next
     }
     /^- \[[ x]\] / {
       capture = 0
+      entry = archived
       if (archived && index($0, prefix) == 1) {
         found++
         if (found > 1) exit 2
@@ -1101,10 +1107,16 @@ archived_hold_body() {  # <hold-id>
     }
     capture {
       if ($0 == "") { print "B"; next }
-      if (substr($0, 1, 2) != "  ") exit 3
+      if (substr($0, 1, 2) != "  ") { bad = 1; exit }
       print "B" substr($0, 3)
+      next
     }
-    END { if (found == 0) exit 1 }
+    archived && entry && substr($0, 1, 2) == "  " { next }
+    archived && $0 != "" { bad = 1; exit }
+    END {
+      if (bad) exit 3
+      if (found == 0) exit 1
+    }
   ' "$archive"); then
     :
   else
@@ -1140,6 +1152,13 @@ archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   archived_hold_body "$id" || return 1
   resolution_record_valid "$ARCHIVED_HOLD_BODY" "$origin" "$key" \
     || fail "captain decision $id has a malformed or mismatched archived resolution"
+}
+
+reject_archived_generation_collision() {  # <hold-id>
+  local id=$1
+  if archived_hold_body "$id"; then
+    fail "captain decision $id has both backlog and archived generations"
+  fi
 }
 
 resolution_body() {  # <origin-id> <decision-key> <mode> <routed-csv> [routed-task-id...]
@@ -1209,6 +1228,7 @@ verify_hold_active() {  # <hold-id> <origin-id> <decision-key>
   [ "$hold_kind" = captain ] || fail "backlog item $id is not held for the captain"
   queued_hold_body_valid "$body" "$origin" "$key" \
     || fail "captain hold $id has malformed or mismatched active provenance"
+  reject_archived_generation_collision "$id"
 }
 
 verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
@@ -1221,7 +1241,8 @@ verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   [ "$state" = "done" ] || return 1
   [ "$kind" = captain ] || return 1
   [ "$hold_kind" = captain ] || return 1
-  body_has_resolution_record "$body" "$origin" "$key"
+  body_has_resolution_record "$body" "$origin" "$key" || return 1
+  reject_archived_generation_collision "$id"
 }
 
 verify_hold_historical() {  # <origin-id> <decision-key>
@@ -1235,6 +1256,7 @@ verify_hold_historical() {  # <origin-id> <decision-key>
     body=$(show_field "$show" body)
     if [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
       && body_has_resolution_record "$body" "$origin" "$key"; then
+      reject_archived_generation_collision "$id"
       persist_parsed_legacy_resolution "$id" "$origin" "$key"
       return 0
     fi
@@ -1267,6 +1289,7 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   if [ "$state" = queued ] && [ "$held" = yes ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ]; then
     queued_hold_body_valid "$body" "$origin" "$key" \
       || fail "captain decision $id has malformed or mismatched active provenance"
+    reject_archived_generation_collision "$id"
     if resolution_record_valid "$body" "$origin" "$key"; then
       persist_parsed_legacy_resolution "$id" "$origin" "$key"
     fi
@@ -1274,6 +1297,7 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   fi
   if [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
     && body_has_resolution_record "$body" "$origin" "$key"; then
+    reject_archived_generation_collision "$id"
     persist_parsed_legacy_resolution "$id" "$origin" "$key"
     return 0
   fi
@@ -1322,6 +1346,7 @@ command_migrate_legacy() {
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
   id=$(hold_id "$origin" "$key")
   if task_show_optional "$id"; then
+    reject_archived_generation_collision "$id"
     show=$TASK_SHOW_OUTPUT
     state=$(show_field "$show" state)
     held=$(show_field "$show" held)
@@ -1399,6 +1424,7 @@ command_hold() {
     [ "$existing_title" = "$title" ] || fail "existing captain hold $id has a different title"
     queued_hold_body_valid "$body" "$origin" "$key" \
       || fail "existing captain hold $id has malformed or mismatched active provenance"
+    reject_archived_generation_collision "$id"
   else
     if archived_hold_resolved "$id" "$origin" "$key"; then
       fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
@@ -1847,6 +1873,7 @@ command_repair() {
   require_tasks_axi
   id=$(hold_id "$origin" "$key")
   show=$(task_show "$id") || fail "captain decision $id is absent from $FM_HOME/data/backlog.md"
+  reject_archived_generation_collision "$id"
   kind=$(show_field "$show" kind)
   [ "$kind" = captain ] || fail "backlog item $id is not kind captain"
   # tasks-axi keeps hold_kind after a close, so it is the surviving proof that
