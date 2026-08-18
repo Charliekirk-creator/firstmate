@@ -67,7 +67,15 @@ make_fakebin() {  # <dir>
 #!/usr/bin/env bash
 set -u
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_HOME:?}}"; exit 0 ;;
+  *"#{pane_current_path}"*)
+    if [ -n "${FM_TEST_TREEHOUSE_SUCCESS_MARKER:-}" ] \
+       && [ ! -f "$FM_TEST_TREEHOUSE_SUCCESS_MARKER" ]; then
+      printf '%s\n' "${FM_TEST_PROJECT_PATH:?}"
+    else
+      printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_HOME:?}}"
+    fi
+    exit 0
+    ;;
   *"#{pane_current_command}"*) printf '%s\n' "${FM_FAKE_PANE_COMMAND:-codex}"; exit 0 ;;
 esac
 case "${1:-}" in
@@ -85,12 +93,28 @@ case "${1:-}" in
       printf 'MUTATED_SOURCE_BRIEF\n' > "$FM_TEST_MUTATE_BRIEF"
     fi
     [ -z "${FM_TEST_ENDPOINT_CREATE_LOG:-}" ] || printf 'created\n' >> "$FM_TEST_ENDPOINT_CREATE_LOG"
+    if [ -n "${FM_TEST_ENDPOINT_KILL_MARKER:-}" ] \
+       && [ ! -f "$FM_TEST_ENDPOINT_KILL_MARKER" ]; then
+      : > "$FM_TEST_ENDPOINT_KILL_MARKER"
+      kill -KILL "$PPID"
+      sleep 1
+      exit 137
+    fi
     printf '%%99\n'
     exit 0
     ;;
   send-keys)
     literal=0
     for arg in "$@"; do [ "$arg" != -l ] || literal=1; done
+    if [ "$literal" -eq 0 ] && [ -n "${FM_TEST_TREEHOUSE_SUCCESS_MARKER:-}" ] \
+       && printf '%s\n' "$*" | grep -Fq 'treehouse get'; then
+      if [ -n "${FM_TEST_TREEHOUSE_FAIL_MARKER:-}" ] \
+         && [ ! -f "$FM_TEST_TREEHOUSE_FAIL_MARKER" ]; then
+        : > "$FM_TEST_TREEHOUSE_FAIL_MARKER"
+        exit 1
+      fi
+      : > "$FM_TEST_TREEHOUSE_SUCCESS_MARKER"
+    fi
     if [ "$literal" -eq 1 ] && [ -n "${FM_TEST_MUTATE_LAUNCH_BRIEF:-}" ]; then
       printf 'MUTATED_LAUNCH_BRIEF\n' > "$FM_TEST_MUTATE_LAUNCH_BRIEF.replacement"
       mv -f "$FM_TEST_MUTATE_LAUNCH_BRIEF.replacement" "$FM_TEST_MUTATE_LAUNCH_BRIEF"
@@ -585,6 +609,78 @@ test_spawn_recovers_exact_created_endpoint() {
   jq -e '.state == "completed"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
     || fail "endpoint recovery did not complete its original identity dispatch"
   pass "spawn retries adopt one exact endpoint creation receipt"
+}
+
+test_spawn_recovers_creation_intent_after_endpoint_side_effect() {
+  local home task project wt fakebin manifest out rc=0 creates
+  home=$(make_home endpoint-intent-recovery)
+  task=endpoint-intent-recovery
+  project="$home/project"
+  wt="$home/worker-copy"
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  record_and_brief "$home" "$task" "$manifest"
+  fm_git_worktree "$project" "$wt" endpoint-intent-copy
+  fakebin=$(make_fakebin "$home/endpoint-intent-fakes")
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=bash \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    FM_TEST_ENDPOINT_KILL_MARKER="$home/endpoint-killed" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "endpoint intent fixture unexpectedly survived its injected kill"
+  jq -e '.schema == "fm-spawn-endpoint.v1" and .phase == "endpoint-creating"
+      and .endpoint.label == "fm-endpoint-intent-recovery"' \
+    "$home/state/$task.spawn-endpoint.json" >/dev/null \
+    || fail "endpoint creation side effect had no durable prior intent: $out"
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=bash \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    FM_TEST_ENDPOINT_KILL_MARKER="$home/endpoint-killed" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) \
+    || fail "spawn could not recover the endpoint created after durable intent: $out"
+  creates=$(wc -l < "$home/endpoint-creates" | tr -d ' ')
+  [ "$creates" = 1 ] || fail "creation-intent recovery created a duplicate endpoint"
+  assert_absent "$home/state/$task.spawn-endpoint.json" \
+    "successful creation-intent recovery retained its receipt"
+  pass "spawn adopts an endpoint created after durable creation intent"
+}
+
+test_spawn_resumes_unsent_worktree_request() {
+  local home task project wt fakebin manifest out rc=0 creates
+  home=$(make_home worktree-request-recovery)
+  task=worktree-request-recovery
+  project="$home/project"
+  wt="$home/worker-copy"
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  record_and_brief "$home" "$task" "$manifest"
+  fm_git_worktree "$project" "$wt" worktree-request-copy
+  fakebin=$(make_fakebin "$home/worktree-request-fakes")
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=bash FM_TEST_PROJECT_PATH="$project" \
+    FM_TEST_TREEHOUSE_FAIL_MARKER="$home/treehouse-failed" \
+    FM_TEST_TREEHOUSE_SUCCESS_MARKER="$home/treehouse-succeeded" \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "worktree request fixture unexpectedly completed its failed send"
+  jq -e '.phase == "worktree-requested" and .worktree == null' \
+    "$home/state/$task.spawn-endpoint.json" >/dev/null \
+    || fail "failed worktree send did not retain its resumable request phase: $out"
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_FAKE_WORKTREE="$wt" FM_FAKE_PANE_COMMAND=bash FM_TEST_PROJECT_PATH="$project" \
+    FM_TEST_TREEHOUSE_FAIL_MARKER="$home/treehouse-failed" \
+    FM_TEST_TREEHOUSE_SUCCESS_MARKER="$home/treehouse-succeeded" \
+    FM_TEST_ENDPOINT_LABEL="fm-$task" FM_TEST_ENDPOINT_CREATE_LOG="$home/endpoint-creates" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$task" "$project" \
+    --mode no-mistakes --yolo off 2>&1) \
+    || fail "spawn did not resend an interrupted worktree request: $out"
+  assert_present "$home/treehouse-succeeded" "retry did not send the pending treehouse request"
+  creates=$(wc -l < "$home/endpoint-creates" | tr -d ' ')
+  [ "$creates" = 1 ] || fail "worktree request recovery created a duplicate endpoint"
+  pass "spawn resumes a worktree request interrupted before send"
 }
 
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
@@ -1172,6 +1268,56 @@ EOF
   pass "linked handoff rebinds identity for delegated decision summaries and Bearings"
 }
 
+test_completed_unlinked_handoff_accepts_exact_intake() {
+  local source target task transfer manifest out
+  source=$(make_home post-handoff-intake-source)
+  target="$TMP_ROOT/post-handoff-intake-target"
+  task=post-handoff-intake
+  mkdir -p "$target/data" "$target/state" "$target/config" "$target/projects"
+  printf 'intake-target\n' > "$target/.fm-secondmate-home"
+  transfer=$(FM_HOME="$source" "$WORK_IDENTITY" handoff-prepare "$task" \
+    --to-home "$target" --to-home-id secondmate:intake-target)
+  printf '%s\n' "$transfer" | FM_HOME="$target" "$WORK_IDENTITY" \
+    handoff-stage "$task" --file - >/dev/null
+  printf '%s\n' "$transfer" | FM_HOME="$target" "$WORK_IDENTITY" \
+    handoff-commit "$task" --file - >/dev/null
+  printf '%s\n' "$transfer" | FM_HOME="$source" "$WORK_IDENTITY" \
+    handoff-complete "$task" --file - >/dev/null
+  manifest="$target/manifest.json"
+  make_manifest "$target" "$task" "$manifest"
+  FM_HOME="$target" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null \
+    || fail "completed unlinked handoff refused destination intake"
+  jq -e '.role == "target" and .state == "intake-completed"
+      and .transfer.identity.status == "unlinked"' \
+    "$target/data/$task/work-identity-handoff-target.json" >/dev/null \
+    || fail "post-handoff intake did not record its explicit ownership transition"
+  FM_HOME="$target" "$WORK_IDENTITY" verify "$task" | jq -e \
+    '.status == "linked" and .binding.home_id == "secondmate:intake-target"' >/dev/null \
+    || fail "post-handoff intake left the destination identity unverifiable"
+  out=$(FM_HOME="$target" "$WORK_IDENTITY" record "$task" --file "$manifest") \
+    || fail "post-handoff intake was not idempotent"
+  assert_contains "$out" "(unchanged)" "post-handoff intake retry did not converge"
+  printf '%s\n' "$transfer" | FM_HOME="$target" "$WORK_IDENTITY" \
+    handoff-target-state "$task" --file - | grep -qx completed \
+    || fail "post-handoff intake changed the completed transfer receipt"
+  pass "completed unlinked handoff records one explicit intake transition"
+}
+
+test_missing_state_directory_is_created_before_locking() {
+  local home task manifest
+  home="$TMP_ROOT/missing-state-home"
+  task=missing-state-intake
+  mkdir -p "$home/data" "$home/config" "$home/projects"
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null \
+    || fail "identity intake did not create its missing lock directory"
+  [ -d "$home/state" ] || fail "identity intake did not create the state directory"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e '.status == "linked"' >/dev/null \
+    || fail "identity intake with a newly created state directory was not verifiable"
+  pass "identity locking creates and validates its missing state directory"
+}
+
 test_handoff_preparation_is_durable_and_rollback_safe() {
   local parent mate task_a task_b task_c race manifest transfer out rc
   command -v tasks-axi >/dev/null 2>&1 || { pass "handoff transaction coverage skipped without tasks-axi"; return; }
@@ -1605,6 +1751,8 @@ test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
 test_spawn_recovers_exact_created_endpoint
+test_spawn_recovers_creation_intent_after_endpoint_side_effect
+test_spawn_resumes_unsent_worktree_request
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt
 test_metadata_validation_uses_one_stable_capture
 test_snapshot_preflight_and_dispatch_recovery
@@ -1614,6 +1762,8 @@ test_stale_and_changed_relations_refuse
 test_legacy_and_fuzzy_fallbacks_are_unlinked
 test_delegated_secondmate_projection
 test_handoff_rebinds_identity_and_decision_surfaces
+test_completed_unlinked_handoff_accepts_exact_intake
+test_missing_state_directory_is_created_before_locking
 test_handoff_preparation_is_durable_and_rollback_safe
 test_unsafe_publication_setup_uses_integrity_exit
 test_delegated_integrity_failure_stops_parent_publication

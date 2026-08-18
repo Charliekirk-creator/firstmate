@@ -121,6 +121,8 @@ ACTIVE_IDENTITY_LOCK=
 ACTIVE_IDENTITY_LOCK_HELD=0
 ACTIVE_PUBLICATION_LOCK=
 ACTIVE_PUBLICATION_LOCK_HELD=0
+RECORD_HANDOFF_TRANSITION=0
+RECORD_HANDOFF_TRANSFER=
 CONTRACT_INPUT_TMP=
 VALIDATION_TMP=
 MANIFEST_CAPTURE_TMP=
@@ -292,6 +294,23 @@ ensure_data_dir() {
     mkdir -p -- "$DATA_INPUT" || die "cannot create data directory: $DATA_INPUT"
   fi
   DATA_REAL=$(resolve_existing_dir data "$DATA_INPUT")
+}
+
+ensure_state_dir() {
+  if [ -e "$STATE_INPUT" ] || [ -L "$STATE_INPUT" ]; then
+    [ ! -L "$STATE_INPUT" ] || die "state directory is symlinked: $STATE_INPUT"
+    [ -d "$STATE_INPUT" ] || die "state path is not a directory: $STATE_INPUT"
+  else
+    mkdir -p -- "$STATE_INPUT" || die "cannot create state directory: $STATE_INPUT"
+  fi
+  STATE_REAL=$(resolve_existing_dir state "$STATE_INPUT")
+}
+
+lock_parent_preflight() {  # <directory> <label>
+  local directory=$1 label=$2 probe
+  probe=$(umask 077; mktemp -d "$directory/.work-identity-lock-check.XXXXXX" 2>/dev/null) \
+    || die "$label lock directory is not writable: $directory"
+  rmdir -- "$probe" 2>/dev/null || die "$label lock directory cannot remove temporary owners: $directory"
 }
 
 locate_task_dir() {  # <task-id>, read-only
@@ -747,6 +766,7 @@ validate_projection_set() {  # <path> <expected-home> <expected-home-id>
 }
 
 ensure_lock_lib() {
+  ensure_state_dir
   if ! type fm_lock_acquire_wait >/dev/null 2>&1; then
     STATE=$STATE_REAL
     # shellcheck source=bin/fm-wake-lib.sh
@@ -759,6 +779,7 @@ publication_lock_acquire() {
   [ "$ACTIVE_PUBLICATION_LOCK_HELD" -eq 0 ] || return 0
   ensure_data_dir
   ensure_lock_lib
+  lock_parent_preflight "$DATA_REAL" "work identity publication"
   ACTIVE_PUBLICATION_LOCK="$DATA_REAL/.work-identity-publication.lock"
   fm_lock_acquire_wait "$ACTIVE_PUBLICATION_LOCK"
   ACTIVE_PUBLICATION_LOCK_HELD=1
@@ -767,6 +788,7 @@ publication_lock_acquire() {
 identity_lock_acquire() {  # <task-id>
   local task=$1 lock_key
   ensure_lock_lib
+  lock_parent_preflight "$STATE_REAL" "work identity task"
   lock_key=$(printf '%s' "$task" | sha256_stream) \
     || die "SHA-256 is unavailable for work identity task lock"
   case "$lock_key" in ''|*[!A-Fa-f0-9]*) die "work identity task lock digest is invalid" ;; esac
@@ -878,7 +900,8 @@ read_handoff_state() {  # <path> <source|target> <task-id>; sets HANDOFF_STATE/H
     type == "object" and exact_keys(["schema","role","state","transfer"])
     and .schema == $schema and .role == $role
     and (if $role == "source" then (.state == "prepared" or .state == "completed")
-         else (.state == "prepared" or .state == "completed") end)
+         else (.state == "prepared" or .state == "completed"
+           or .state == "intake-prepared" or .state == "intake-completed") end)
     and (.transfer | type) == "object"
     ) | $wrapper
   ' "$path" 2>/dev/null) || die "work identity handoff state is malformed: $path"
@@ -1026,11 +1049,77 @@ reject_handoff_guard() {  # <task-id>
   fi
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
     read_handoff_state "$TARGET_HANDOFF" target "$task"
-    [ "$HANDOFF_STATE" = completed ] \
-      || die "work identity ownership handoff is incomplete for task $task"
     handoff_target_matches_current
-    validate_committed_target "$task"
+    case "$HANDOFF_STATE" in
+      completed) validate_committed_target "$task" ;;
+      intake-completed) validate_relinked_target "$task" ;;
+      *) die "work identity ownership handoff is incomplete for task $task" ;;
+    esac
   fi
+}
+
+record_ownership_guard() {  # <task-id> [meta]
+  local task=$1
+  RECORD_HANDOFF_TRANSITION=0
+  RECORD_HANDOFF_TRANSFER=
+  if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
+    read_handoff_state "$SOURCE_HANDOFF" source "$task"
+    die "work identity ownership was handed off for task $task"
+  fi
+  if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
+    read_handoff_state "$TARGET_HANDOFF" target "$task"
+    handoff_target_matches_current
+    case "$HANDOFF_STATE" in
+      completed)
+        validate_committed_target "$task"
+        if [ "$HANDOFF_STATUS" = unlinked ]; then
+          RECORD_HANDOFF_TRANSITION=1
+          RECORD_HANDOFF_TRANSFER=$HANDOFF_TRANSFER
+        fi
+        ;;
+      intake-prepared)
+        [ "$HANDOFF_STATUS" = unlinked ] \
+          || die "linked handoff target has an invalid intake transition"
+        if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
+          validate_relinked_target "$task"
+        else
+          validate_committed_target "$task"
+        fi
+        RECORD_HANDOFF_TRANSITION=1
+        RECORD_HANDOFF_TRANSFER=$HANDOFF_TRANSFER
+        ;;
+      intake-completed) validate_relinked_target "$task" ;;
+      *) die "work identity ownership handoff is incomplete for task $task" ;;
+    esac
+  fi
+  reject_dispatch_guard "$@"
+}
+
+record_handoff_transition_prepare() {  # <task-id>
+  local task=$1
+  [ "$RECORD_HANDOFF_TRANSITION" -eq 1 ] || return 0
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
+  [ "$HANDOFF_TRANSFER" = "$RECORD_HANDOFF_TRANSFER" ] \
+    || die "work identity handoff changed during intake"
+  case "$HANDOFF_STATE" in
+    completed) write_handoff_state "$TARGET_HANDOFF" target intake-prepared "$HANDOFF_TRANSFER" ;;
+    intake-prepared) ;;
+    intake-completed) RECORD_HANDOFF_TRANSITION=0 ;;
+    *) die "work identity ownership handoff is incomplete for task $task" ;;
+  esac
+}
+
+record_handoff_transition_complete() {  # <task-id>
+  local task=$1
+  [ "$RECORD_HANDOFF_TRANSITION" -eq 1 ] || return 0
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
+  [ "$HANDOFF_TRANSFER" = "$RECORD_HANDOFF_TRANSFER" ] \
+    || die "work identity handoff changed during intake"
+  [ "$HANDOFF_STATE" = intake-prepared ] \
+    || die "work identity intake transition is not prepared for task $task"
+  validate_relinked_target "$task"
+  write_handoff_state "$TARGET_HANDOFF" target intake-completed "$HANDOFF_TRANSFER"
+  RECORD_HANDOFF_TRANSITION=0
 }
 
 reject_dispatch_guard() {  # <task-id> [meta]
@@ -1169,10 +1258,12 @@ handoff_prepare() {  # <task-id> <target-home> <target-home-id> [transfer|result
   reject_dispatch_for_handoff "$task"
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
     read_handoff_state "$TARGET_HANDOFF" target "$task"
-    [ "$HANDOFF_STATE" = completed ] \
-      || die "task $task has an incomplete incoming work identity handoff"
     handoff_target_matches_current
-    validate_committed_target "$task"
+    case "$HANDOFF_STATE" in
+      completed) validate_committed_target "$task" ;;
+      intake-completed) validate_relinked_target "$task" ;;
+      *) die "task $task has an incomplete incoming work identity handoff" ;;
+    esac
   fi
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
     read_handoff_state "$SOURCE_HANDOFF" source "$task"
@@ -1207,6 +1298,8 @@ handoff_stage() {  # <task-id> <transfer-path>
   if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
     read_handoff_state "$TARGET_HANDOFF" target "$task"
     [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task has a different prepared incoming handoff"
+    [ "$HANDOFF_STATE" != intake-prepared ] \
+      || die "task $task has an incomplete post-handoff intake"
     return 0
   fi
   validate_handoff_text "$requested" "$task"
@@ -1251,6 +1344,19 @@ validate_committed_target() {  # <task-id>; HANDOFF_* loaded
   fi
 }
 
+validate_relinked_target() {  # <task-id>; HANDOFF_* loaded
+  local task=$1 meta
+  [ "$HANDOFF_STATUS" = unlinked ] \
+    || die "linked handoff target has an invalid intake transition"
+  meta="$STATE_REAL/$task.meta"
+  [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ] \
+    || die "completed handoff intake record is absent"
+  validate_sidecar "$SIDECAR" "$task"
+  [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
+    || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
+  [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+}
+
 publish_handoff_sidecar() {  # <task-id>; HANDOFF_RECORD/HANDOFF_TARGET_SHA loaded, lock held
   local task=$1
   if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
@@ -1290,6 +1396,12 @@ handoff_commit() {  # <task-id> <transfer-path>
     validate_committed_target "$task"
     return 0
   fi
+  if [ "$HANDOFF_STATE" = intake-completed ]; then
+    validate_relinked_target "$task"
+    return 0
+  fi
+  [ "$HANDOFF_STATE" != intake-prepared ] \
+    || die "task $task has an incomplete post-handoff intake"
   if [ "$HANDOFF_STATUS" = linked ]; then
     publish_handoff_sidecar "$task"
   fi
@@ -1319,6 +1431,12 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
     validate_committed_target "$task"
     return 4
   fi
+  if [ "$HANDOFF_STATE" = intake-completed ]; then
+    validate_relinked_target "$task"
+    return 4
+  fi
+  [ "$HANDOFF_STATE" != intake-prepared ] \
+    || die "task $task has an incomplete post-handoff intake"
   if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
     [ "$HANDOFF_STATUS" = linked ] || die "unlinked handoff target gained a linked record"
     validate_sidecar "$SIDECAR" "$task"
@@ -1357,6 +1475,13 @@ handoff_target_state() {  # <task-id> <transfer-path>
     printf 'completed\n'
     return 0
   fi
+  if [ "$HANDOFF_STATE" = intake-completed ]; then
+    validate_relinked_target "$task"
+    printf 'completed\n'
+    return 0
+  fi
+  [ "$HANDOFF_STATE" != intake-prepared ] \
+    || die "task $task has an incomplete post-handoff intake"
   if [ "$HANDOFF_STATUS" = linked ] && { [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; }; then
     validate_committed_target "$task"
     write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
@@ -1758,10 +1883,12 @@ publication_preflight_locked() {
     fi
     if [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ]; then
       read_handoff_state "$TARGET_HANDOFF" target "$task"
-      [ "$HANDOFF_STATE" = completed ] \
-        || die "work identity ownership handoff is incomplete for task $task"
       handoff_target_matches_current
-      validate_committed_target "$task"
+      case "$HANDOFF_STATE" in
+        completed) validate_committed_target "$task" ;;
+        intake-completed) validate_relinked_target "$task" ;;
+        *) die "work identity ownership handoff is incomplete for task $task" ;;
+      esac
     fi
     if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
       read_dispatch_state "$task"
@@ -1879,7 +2006,7 @@ case "$COMMAND" in
     capture_manifest "$MANIFEST"
     CANONICAL=$(canonicalize_manifest "$MANIFEST_CAPTURE_TMP" "$TASK")
     identity_mutation_lock_acquire "$TASK"
-    reject_ownership_guard "$TASK"
+    record_ownership_guard "$TASK"
     verify_manifest_capture
     rm -f -- "$MANIFEST_CAPTURE_TMP"
     MANIFEST_CAPTURE_TMP=
@@ -1893,6 +2020,7 @@ case "$COMMAND" in
           || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
         [ ! -e "$META" ] && [ ! -L "$META" ] \
           || validate_meta_binding "$META" linked "$WORK_HASH"
+        record_handoff_transition_complete "$TASK"
         printf 'recorded %s task=%s sha256=%s (unchanged)\n' "$SCHEMA" "$TASK" "$WORK_HASH"
         exit 0
       fi
@@ -1900,6 +2028,7 @@ case "$COMMAND" in
     elif [ -e "$BRIEF_DEFAULT" ] || [ -L "$BRIEF_DEFAULT" ] || [ -e "$META" ] || [ -L "$META" ]; then
       die "work identity must be recorded before generated instructions and dispatch"
     fi
+    record_handoff_transition_prepare "$TASK"
     TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity.XXXXXX") || die "cannot create work identity temporary file"
     printf '%s\n' "$CANONICAL" > "$TMP" || die "cannot write work identity temporary file"
     validate_sidecar "$TMP" "$TASK"
@@ -1907,6 +2036,7 @@ case "$COMMAND" in
       rm -f -- "$TMP"
       TMP=
       validate_sidecar "$SIDECAR" "$TASK"
+      record_handoff_transition_complete "$TASK"
       printf 'recorded %s task=%s sha256=%s\n' "$SCHEMA" "$TASK" "$WORK_HASH"
     else
       rm -f -- "$TMP"
@@ -1915,6 +2045,7 @@ case "$COMMAND" in
       validate_sidecar "$SIDECAR" "$TASK"
       [ "$WORK_CANONICAL" = "$CANONICAL" ] \
         || die "work identity is immutable once recorded; changed relation requires a new task id"
+      record_handoff_transition_complete "$TASK"
       printf 'recorded %s task=%s sha256=%s (unchanged)\n' "$SCHEMA" "$TASK" "$WORK_HASH"
     fi
     ;;

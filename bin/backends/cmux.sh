@@ -369,6 +369,32 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
   printf '%s %s' "$wsid" "$sfid"
 }
 
+fm_backend_cmux_recover_task() {  # <label>; 2 means absent
+  local label=$1 title list matches count wsid panes surfaces sfid
+  title=$(fm_backend_cmux_scoped_title "$label")
+  list=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || return 1
+  matches=$(printf '%s' "$list" | jq -r --arg want "$title" \
+    '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null) || return 1
+  count=$(printf '%s\n' "$matches" | grep -c '[^[:space:]]' || true)
+  case "$count" in
+    0) return 2 ;;
+    1) ;;
+    *) echo "error: multiple cmux workspaces '$title' exist" >&2; return 1 ;;
+  esac
+  wsid=${matches%%$'\n'*}
+  panes=$(fm_backend_cmux_cli list-panes --workspace "$wsid" --json --id-format uuids 2>/dev/null) || return 1
+  surfaces=$(printf '%s' "$panes" | jq -r \
+    '[.panes[]? | (.surface_ids[]?, .selected_surface_id?)] | map(select(type == "string" and length > 0)) | unique | .[]' \
+    2>/dev/null) || return 1
+  count=$(printf '%s\n' "$surfaces" | grep -c '[^[:space:]]' || true)
+  [ "$count" -eq 1 ] || {
+    echo "error: cmux workspace '$title' does not have one recoverable surface" >&2
+    return 1
+  }
+  sfid=${surfaces%%$'\n'*}
+  printf '%s %s' "$wsid" "$sfid"
+}
+
 # fm_backend_cmux_parse_target: split "<workspace_uuid>:<surface_uuid>" on the
 # FIRST colon (neither UUID contains a colon, so this is unambiguous). Sets
 # FM_BACKEND_CMUX_WORKSPACE and FM_BACKEND_CMUX_SURFACE for the caller.

@@ -89,7 +89,12 @@ RECEIVER_WAKE_MESSAGE='New routed work is in your backlog. Run bin/fm-session-st
 
 ACTIVE_HANDOFF_LOCK=
 ACTIVE_REGISTRY_LOCK=
+HANDOFF_PLAN_DIR=
 release_remote_locks() {
+  if [ -n "$HANDOFF_PLAN_DIR" ]; then
+    rm -rf -- "$HANDOFF_PLAN_DIR" 2>/dev/null || true
+    HANDOFF_PLAN_DIR=
+  fi
   if [ -n "$ACTIVE_HANDOFF_LOCK" ]; then
     fm_lock_release "$ACTIVE_HANDOFF_LOCK"
     ACTIVE_HANDOFF_LOCK=
@@ -521,16 +526,119 @@ outbox_item_count() { # <path>
   awk '/^- \[[ x]\] / { count++ } END { print count + 0 }' "$1"
 }
 
-outbox_keys() { # <path>
-  awk '
-    /^- \[[ x]\] / {
-      rest=$0
-      sub(/^- \[[ x]\] +/, "", rest)
-      id=rest
-      sub(/[ \t].*/, "", id)
-      if (id != "" && !seen[id]++) print id
+task_array_contains() { # <task-id> [task-id...]
+  local wanted=$1 task
+  shift
+  for task in "$@"; do
+    [ "$task" != "$wanted" ] || return 0
+  done
+  return 1
+}
+
+TASKS_AXI_BACKLOG_IDS=()
+load_tasks_axi_queued_ids() { # <path>
+  local path=$1 output count parsed id state
+  TASKS_AXI_BACKLOG_IDS=()
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  output=$(tasks-axi list --file "$path" --limit 1000000 2>&1) || {
+    [ -z "$output" ] || printf '%s\n' "$output" >&2
+    return 1
+  }
+  count=$(printf '%s\n' "$output" | sed -n 's/^count: \([0-9][0-9]*\)$/\1/p')
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  parsed=$(printf '%s\n' "$output" | awk '
+    /^tasks(\[[0-9]+\])?\{/ { rows=1; next }
+    /^help(\[[0-9]+\])?:/ { rows=0; next }
+    rows && /^  / {
+      line=substr($0, 3)
+      first=index(line, ",")
+      if (!first) exit 2
+      id=substr(line, 1, first-1)
+      line=substr(line, first+1)
+      second=index(line, ",")
+      if (!second) exit 2
+      state=substr(line, 1, second-1)
+      print id "\t" state
     }
-  ' "$1"
+  ') || return 1
+  while IFS=$'\t' read -r id state; do
+    [ -n "$id" ] || continue
+    case "$id" in .*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    [ "$state" = queued ] || {
+      echo "error: pending handoff set contains non-Queued task $id ($state): $path" >&2
+      return 1
+    }
+    task_array_contains "$id" "${TASKS_AXI_BACKLOG_IDS[@]}" && return 1
+    TASKS_AXI_BACKLOG_IDS+=("$id")
+  done <<EOF
+$parsed
+EOF
+  [ "${#TASKS_AXI_BACKLOG_IDS[@]}" -eq "$count" ] || return 1
+}
+
+PARSED_MOVE_KEYS=()
+parse_tasks_axi_move_result() { # <json>
+  local result=$1 parsed task
+  PARSED_MOVE_KEYS=()
+  parsed=$(printf '%s' "$result" | jq -er '
+    select(type == "object" and .ok == true and .action == "mv")
+    | if (has("ids") and (.ids | type) == "array" and (.ids | length) > 0
+          and (.ids | all(.[]; type == "string"))
+          and ((.ids | unique | length) == (.ids | length))) then .ids[]
+      elif (has("id") and (.id | type) == "string") then .id
+      else error("invalid move identity set") end
+  ' 2>/dev/null) || return 1
+  while IFS= read -r task; do
+    [ -n "$task" ] || continue
+    case "$task" in .*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    task_array_contains "$task" "${PARSED_MOVE_KEYS[@]}" && return 1
+    PARSED_MOVE_KEYS+=("$task")
+  done <<EOF
+$parsed
+EOF
+  [ "${#PARSED_MOVE_KEYS[@]}" -gt 0 ]
+}
+
+RESOLVED_MOVE_KEYS=()
+resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
+  local source=$1 target=$2 result
+  shift 2
+  RESOLVED_MOVE_KEYS=()
+  [ "$#" -gt 0 ] || return 0
+  HANDOFF_PLAN_DIR=$(umask 077; mktemp -d "$STATE/.backlog-handoff-plan.XXXXXX") || return 1
+  cp -p -- "$source" "$HANDOFF_PLAN_DIR/source.md" || return 1
+  if [ -f "$target" ] && [ ! -L "$target" ]; then
+    cp -p -- "$target" "$HANDOFF_PLAN_DIR/target.md" || return 1
+  else
+    seed_backlog_scaffold "$HANDOFF_PLAN_DIR/target.md"
+  fi
+  if ! result=$(tasks-axi mv "$@" --file "$HANDOFF_PLAN_DIR/source.md" \
+    --to "$HANDOFF_PLAN_DIR/target.md" --json 2>&1); then
+    [ -z "$result" ] || printf '%s\n' "$result" >&2
+    rm -rf -- "$HANDOFF_PLAN_DIR"
+    HANDOFF_PLAN_DIR=
+    return 1
+  fi
+  parse_tasks_axi_move_result "$result" || {
+    rm -rf -- "$HANDOFF_PLAN_DIR"
+    HANDOFF_PLAN_DIR=
+    return 1
+  }
+  RESOLVED_MOVE_KEYS=("${PARSED_MOVE_KEYS[@]}")
+  rm -rf -- "$HANDOFF_PLAN_DIR"
+  HANDOFF_PLAN_DIR=
+}
+
+task_sets_match() { # <expected-array-name> <actual-array-name>
+  local expected_name=$1 actual_name=$2 task
+  local -a expected actual
+  case "$expected_name:$actual_name" in *[!A-Za-z0-9_:]*) return 1 ;; esac
+  eval "expected=(\"\${$expected_name[@]}\")"
+  eval "actual=(\"\${$actual_name[@]}\")"
+  [ "${#expected[@]}" -eq "${#actual[@]}" ] || return 1
+  for task in "${expected[@]}"; do
+    task_array_contains "$task" "${actual[@]}" || return 1
+  done
 }
 
 HANDOFF_IDENTITY_TASKS=()
@@ -838,9 +946,14 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
 
 remote_handoff() { # <secondmate-id> <keys...>
   local id=$1 outbox section main_section out_section key mv_out target_home persisted
-  local -a requested to_move already missing in_flight done_items not_queued
+  local -a requested unique_requested to_move already missing in_flight done_items not_queued delivery_keys
   shift
   requested=("$@")
+  unique_requested=()
+  for key in "${requested[@]}"; do
+    task_array_contains "$key" "${unique_requested[@]}" || unique_requested+=("$key")
+  done
+  requested=("${unique_requested[@]}")
   outbox="$DATA/handoff/$id.outbox.md"
   validate_backlog_file "main backlog" "$MAIN_BACKLOG" || return 1
   validate_backlog_file "remote handoff outbox" "$outbox" || return 1
@@ -891,13 +1004,14 @@ remote_handoff() { # <secondmate-id> <keys...>
       return 1
     done < <(backlog_key_noncanonical_body_lines "$MAIN_BACKLOG" "$key")
   done
-  # Do not append a fresh handoff to an older recovery batch. In particular, a
-  # confirmed wake can survive when outbox cleanup fails; if new work were
-  # staged into that outbox, the old confirmation would suppress the wake for
-  # the new work. Finish receipt, wake reconciliation, and cleanup for the old
-  # batch first. A failure leaves the fresh items dispatchable in main.
+  # A wake already attempted for an older recovery batch must settle before new
+  # work joins it; otherwise the old confirmation could suppress the new wake.
+  # Before any wake exists, one immutable prepared identity set may safely cover
+  # the existing outbox plus fresh rows and deliver them together.
   if [ "${#to_move[@]}" -gt 0 ] && [ -f "$outbox" ] \
-    && [ "$(outbox_item_count "$outbox")" -gt 0 ]; then
+    && [ "$(outbox_item_count "$outbox")" -gt 0 ] \
+    && { [ -e "$STATE/.backlog-handoff-$id.wake-pending" ] \
+         || [ -L "$STATE/.backlog-handoff-$id.wake-pending" ]; }; then
     resume_remote_outbox "$id" "$outbox" || {
       echo "error: previous remote handoff for secondmate $id could not be completed; nothing new was staged" >&2
       return 1
@@ -908,16 +1022,37 @@ remote_handoff() { # <secondmate-id> <keys...>
     echo "error: remote secondmate $id has no target home for work identity handoff" >&2
     return 1
   }
-  prepare_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "$outbox" "${requested[@]}" || {
+  resolve_tasks_axi_move_keys "$MAIN_BACKLOG" "$outbox" "${to_move[@]}" || {
+    echo "error: tasks-axi could not resolve the exact remote move set; nothing new was handed off" >&2
+    return 1
+  }
+  for key in "${RESOLVED_MOVE_KEYS[@]}"; do
+    while IFS= read -r line; do
+      printf 'error: refusing to hand off %s: non-2-space continuation line: %s\n' "$key" "$line" >&2
+      return 1
+    done < <(backlog_key_noncanonical_body_lines "$MAIN_BACKLOG" "$key")
+  done
+  delivery_keys=()
+  if [ -e "$outbox" ] || [ -L "$outbox" ]; then
+    load_tasks_axi_queued_ids "$outbox" || {
+      echo "error: tasks-axi could not resolve the pending outbox identity set: $outbox" >&2
+      return 1
+    }
+    delivery_keys=("${TASKS_AXI_BACKLOG_IDS[@]}")
+  fi
+  for key in "${RESOLVED_MOVE_KEYS[@]}"; do
+    task_array_contains "$key" "${delivery_keys[@]}" || delivery_keys+=("$key")
+  done
+  prepare_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "$outbox" "${delivery_keys[@]}" || {
     echo "error: exact work identity preparation failed; nothing new was handed off" >&2
     return 1
   }
   seed_backlog_scaffold "$outbox"
   if [ "${#to_move[@]}" -gt 0 ]; then
-    if ! mv_out=$(tasks-axi mv "${to_move[@]}" --file "$MAIN_BACKLOG" --to "$outbox" 2>&1); then
+    if ! mv_out=$(tasks-axi mv "${to_move[@]}" --file "$MAIN_BACKLOG" --to "$outbox" --json 2>&1); then
       [ -z "$mv_out" ] || printf '%s\n' "$mv_out" >&2
       persisted=0
-      for key in "${to_move[@]}"; do
+      for key in "${RESOLVED_MOVE_KEYS[@]}"; do
         backlog_key_section "$outbox" "$key" >/dev/null 2>&1 && persisted=1
       done
       if [ "$persisted" -eq 1 ]; then
@@ -929,11 +1064,22 @@ remote_handoff() { # <secondmate-id> <keys...>
       fi
       return 1
     fi
+    parse_tasks_axi_move_result "$mv_out" \
+      && task_sets_match RESOLVED_MOVE_KEYS PARSED_MOVE_KEYS || {
+      echo "error: tasks-axi moved a different set than its prepared transaction; outbox preserved at $outbox" >&2
+      return 1
+    }
   fi
+  DELIVERY_KEYS=("${delivery_keys[@]}")
+  load_tasks_axi_queued_ids "$outbox" \
+    && task_sets_match DELIVERY_KEYS TASKS_AXI_BACKLOG_IDS || {
+    echo "error: pending outbox changed outside the prepared identity set; outbox preserved at $outbox" >&2
+    return 1
+  }
   # A hard local kill can land tasks-axi's target persist before its source
   # persist. The outbox is already authoritative in that state, so converge by
   # deleting only duplicates that tasks-axi itself confirms are dependency-safe.
-  remove_interrupted_source_duplicates "$outbox" "${requested[@]}" || return 1
+  remove_interrupted_source_duplicates "$outbox" "${delivery_keys[@]}" || return 1
   stage_prepared_remote_handoff_identities "$id" || {
     echo "error: remote exact work identity preparation is unavailable; outbox preserved at $outbox" >&2
     return 1
@@ -942,7 +1088,7 @@ remote_handoff() { # <secondmate-id> <keys...>
   finish_remote_handoff "$id" "$outbox" || return 1
   echo "handed off ${#requested[@]} item(s) to remote secondmate $id: ${requested[*]}"
   [ "${#already[@]}" -eq 0 ] || echo "  already staged (recovered): ${already[*]}"
-  warn_stale_public_commitments "$id" "${requested[@]}"
+  warn_stale_public_commitments "$id" "${delivery_keys[@]}"
 }
 
 with_remote_route_locks() { # <secondmate-id> <function> <args...>
@@ -976,10 +1122,15 @@ resume_remote_outbox() { # <secondmate-id> <outbox-path>
     echo "error: pending outbox has no target home for work identity handoff: $id" >&2
     return 1
   }
-  keys=()
-  while IFS= read -r key; do
-    [ -n "$key" ] && keys+=("$key")
-  done < <(outbox_keys "$outbox")
+  fm_tasks_axi_compatible || {
+    echo "error: a compatible tasks-axi is required to resolve pending handoff identities" >&2
+    return 1
+  }
+  load_tasks_axi_queued_ids "$outbox" || {
+    echo "error: tasks-axi could not resolve the pending outbox identity set: $outbox" >&2
+    return 1
+  }
+  keys=("${TASKS_AXI_BACKLOG_IDS[@]}")
   stage_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "$outbox" "${keys[@]}" || {
     echo "error: pending exact work identity staging failed; outbox preserved at $outbox" >&2
     return 1
@@ -1113,13 +1264,28 @@ if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
       ;;
   esac
 fi
-stage_local_handoff_identities "$SUB_HOME" "secondmate:$ID" "$SUB_BACKLOG" "$@" || {
+resolve_tasks_axi_move_keys "$MAIN_BACKLOG" "$SUB_BACKLOG" "${TO_MOVE[@]}" || {
+  echo "error: tasks-axi could not resolve the exact move set; nothing was moved." >&2
+  exit 1
+}
+for key in "${RESOLVED_MOVE_KEYS[@]}"; do
+  while IFS= read -r line; do
+    printf 'error: refusing to hand off %s: non-2-space continuation line: %s\n' \
+      "$key" "$line" >&2
+    exit 1
+  done < <(backlog_key_noncanonical_body_lines "$MAIN_BACKLOG" "$key")
+done
+LOCAL_IDENTITY_KEYS=()
+for key in "${ALREADY[@]}" "${RESOLVED_MOVE_KEYS[@]}"; do
+  task_array_contains "$key" "${LOCAL_IDENTITY_KEYS[@]}" || LOCAL_IDENTITY_KEYS+=("$key")
+done
+stage_local_handoff_identities "$SUB_HOME" "secondmate:$ID" "$SUB_BACKLOG" "${LOCAL_IDENTITY_KEYS[@]}" || {
   echo "error: exact work identity preparation failed; nothing was moved." >&2
   exit 1
 }
 
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
-  remove_interrupted_source_duplicates "$SUB_BACKLOG" "$@" || exit 1
+  remove_interrupted_source_duplicates "$SUB_BACKLOG" "${LOCAL_IDENTITY_KEYS[@]}" || exit 1
   commit_local_handoff_identities "$SUB_HOME" || {
     echo "error: backlog is already present but exact work identity commit is incomplete." >&2
     exit 1
@@ -1157,9 +1323,9 @@ fi
 # together and, on any failure, neither backlog's content changes - the only
 # cleanup is a scaffold we just created. tasks-axi writes both its success and
 # error output to stdout, so capture it and surface it only on failure.
-if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" 2>&1); then
+if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" --json 2>&1); then
   PERSISTED=0
-  for key in "${TO_MOVE[@]}"; do
+  for key in "${RESOLVED_MOVE_KEYS[@]}"; do
     backlog_key_section "$SUB_BACKLOG" "$key" >/dev/null 2>&1 && PERSISTED=1
   done
   if [ "$SUB_CREATED" -eq 1 ] && [ "$PERSISTED" -eq 0 ]; then
@@ -1181,8 +1347,13 @@ if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BAC
   fi
   exit 1
 fi
+parse_tasks_axi_move_result "$MV_OUT" \
+  && task_sets_match RESOLVED_MOVE_KEYS PARSED_MOVE_KEYS || {
+  echo "error: tasks-axi moved a different set than its prepared transaction; identity preparation is preserved for recovery." >&2
+  exit 1
+}
 
-remove_interrupted_source_duplicates "$SUB_BACKLOG" "$@" || exit 1
+remove_interrupted_source_duplicates "$SUB_BACKLOG" "${LOCAL_IDENTITY_KEYS[@]}" || exit 1
 commit_local_handoff_identities "$SUB_HOME" || {
   echo "error: backlog moved but exact work identity commit is incomplete; rerun the handoff." >&2
   exit 1
@@ -1192,7 +1363,7 @@ complete_source_handoff_identities || {
   exit 1
 }
 
-echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
+echo "handed off ${#RESOLVED_MOVE_KEYS[@]} item(s) to $ID: ${RESOLVED_MOVE_KEYS[*]}"
 echo "  into $SUB_BACKLOG"
 receiver_wake_promote_prepared "$ID" "$REQUESTED_BATCH" || {
   echo "error: handed off work to secondmate $ID, but durable receiver wake state could not be recorded" >&2
@@ -1202,4 +1373,4 @@ wake_pending_secondmate_receiver "$ID" || exit 1
 if [ "${#ALREADY[@]}" -gt 0 ]; then
   echo "  already present (skipped): ${ALREADY[*]}"
 fi
-warn_stale_public_commitments "$ID" "${TO_MOVE[@]}"
+warn_stale_public_commitments "$ID" "${RESOLVED_MOVE_KEYS[@]}"

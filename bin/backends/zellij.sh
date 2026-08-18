@@ -359,6 +359,25 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   printf '%s %s' "$tab_id" "$pane_id"
 }
 
+fm_backend_zellij_recover_task() {  # <session> <label>; 2 means absent
+  local session=$1 label=$2 title tabs matches count tab_id pane_id
+  fm_backend_zellij_session_exists "$session" || return 1
+  title=$(fm_backend_zellij_scoped_title "$label")
+  tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) || return 1
+  matches=$(printf '%s' "$tabs" | jq -r --arg want "$title" \
+    '.[]? | select(.name == $want) | .tab_id' 2>/dev/null) || return 1
+  count=$(printf '%s\n' "$matches" | grep -c '[^[:space:]]' || true)
+  case "$count" in
+    0) return 2 ;;
+    1) ;;
+    *) echo "error: multiple zellij tabs '$title' exist in session '$session'" >&2; return 1 ;;
+  esac
+  tab_id=${matches%%$'\n'*}
+  pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
+  [ -n "$pane_id" ] || return 1
+  printf '%s %s' "$tab_id" "$pane_id"
+}
+
 # fm_backend_zellij_parse_target: split "<session>:<pane_id>" on the FIRST
 # colon (the pane id is a bare integer with no embedded colon, so this is
 # simpler than herdr's equivalent but kept structurally parallel). Sets

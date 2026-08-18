@@ -242,8 +242,10 @@ assert_grep 'ios-b' "$REMOTE/data/backlog.md" "remote atomic receipt did not del
 [ "$(cat "$SSH_COUNT")" -eq 4 ] || fail "transport retried an ambiguously completed command"
 pass "ambiguous receipt leaves one durable outbox and no duplicate dispatchable source"
 
-out=$(handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending)
-assert_contains "$out" 'received: ios moved=0 already=2' "retry did not classify already-delivered keys idempotently"
+write_backlog '- [ ] ios-c - new work joining a pending outbox (repo: alpha)'
+out=$(handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios ios-c)
+assert_contains "$out" 'received: ios moved=1 already=2' \
+  "new handoff did not include every row from the pending outbox"
 [ "$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")" -eq 1 ] \
   || fail "confirmed remote receipt did not wake its supported receiver endpoint exactly once"
 assert_absent "$PARENT/data/handoff/ios.outbox.md" "confirmed retry did not clean the local outbox"
@@ -251,7 +253,15 @@ assert_absent "$PARENT/data/handoff/ios.outbox.md" "confirmed retry did not clea
   || fail "receipt retry duplicated ios-a"
 [ "$(grep -cF -- '- [ ] ios-b - dependent iOS task' "$REMOTE/data/backlog.md")" -eq 1 ] \
   || fail "receipt retry duplicated ios-b"
-pass "re-delivery after unknown completion converges without duplication"
+[ "$(grep -cF -- '- [ ] ios-c - new work joining' "$REMOTE/data/backlog.md")" -eq 1 ] \
+  || fail "new handoff did not deliver ios-c"
+jq -e '.role == "source" and .state == "completed"' \
+  "$PARENT/data/ios-a/work-identity-handoff-source.json" >/dev/null \
+  || fail "new handoff deleted the outbox before completing ios-a source ownership"
+jq -e '.role == "target" and .state == "completed"' \
+  "$REMOTE/data/ios-a/work-identity-handoff-target.json" >/dev/null \
+  || fail "new handoff deleted the outbox before committing ios-a target ownership"
+pass "new remote handoff preserves identities for every pending outbox row"
 
 # A dropped transfer can leave a complete atomically published scratch file but
 # cannot apply half a backlog mutation. The next explicit recovery overwrites

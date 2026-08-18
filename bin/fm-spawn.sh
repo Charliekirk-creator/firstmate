@@ -723,6 +723,7 @@ SPAWN_DISPATCH_PENDING=0
 SPAWN_DISPATCH_TRANSACTION=
 SPAWN_ENDPOINT_RECEIPT=
 SPAWN_ENDPOINT_RECOVERED=0
+SPAWN_ENDPOINT_CREATING_RECOVERY=0
 SPAWN_ENDPOINT_PHASE=
 SPAWN_IDENTITY_HOME=
 SPAWN_IDENTITY_HOME_ID=
@@ -775,9 +776,9 @@ spawn_file_link_count() {
   fi
 }
 
-spawn_endpoint_receipt_publish() {  # <endpoint-created|worktree-requested|worktree-ready> [worktree]
+spawn_endpoint_receipt_publish() {  # <endpoint-creating|endpoint-created|worktree-requested|worktree-ready> [worktree]
   local phase=$1 worktree=${2:-} details payload tmp
-  case "$phase" in endpoint-created|worktree-requested|worktree-ready) ;; *) return 1 ;; esac
+  case "$phase" in endpoint-creating|endpoint-created|worktree-requested|worktree-ready) ;; *) return 1 ;; esac
   case "$BACKEND" in
     tmux)
       details=$(jq -n -S -c --arg session "${SES:-}" --arg window_id "${WT_TARGET:-}" \
@@ -811,12 +812,12 @@ spawn_endpoint_receipt_publish() {  # <endpoint-created|worktree-requested|workt
     --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
     --arg transaction "$SPAWN_DISPATCH_TRANSACTION" \
     --arg instructions_sha256 "$LAUNCH_BRIEF_HASH" --arg backend "$BACKEND" \
-    --arg kind "$KIND" --arg project "$PROJ_ABS" --arg label "$W" --arg target "$T" \
+    --arg kind "$KIND" --arg project "$PROJ_ABS" --arg label "$W" --arg target "${T:-}" \
     --arg worktree "$worktree" --argjson details "$details" \
     '{schema:$schema,phase:$phase,binding:{home:$home,home_id:$home_id,task_id:$task},
       transaction_id:$transaction,instructions_sha256:$instructions_sha256,
       backend:$backend,kind:$kind,project:$project,
-      endpoint:{label:$label,target:$target,details:$details},
+      endpoint:{label:$label,target:(if $phase == "endpoint-creating" and $target == "" then null else $target end),details:$details},
       worktree:(if $worktree == "" then null else $worktree end)}') || return 1
   tmp=$(umask 077; mktemp "$STATE/.$ID.spawn-endpoint.XXXXXX") || return 1
   printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
@@ -845,15 +846,25 @@ spawn_endpoint_receipt_load() {
         type == "object"
         and exact(["schema","phase","binding","transaction_id","instructions_sha256","backend","kind","project","endpoint","worktree"])
         and .schema == "fm-spawn-endpoint.v1"
-        and (.phase == "endpoint-created" or .phase == "worktree-requested" or .phase == "worktree-ready")
+        and (.phase == "endpoint-creating" or .phase == "endpoint-created"
+          or .phase == "worktree-requested" or .phase == "worktree-ready")
         and .binding == {home:$home,home_id:$home_id,task_id:$task}
         and .transaction_id == $transaction and .instructions_sha256 == $instructions_sha256
         and .backend == $backend and .kind == $kind and .project == $project
         and (.endpoint | type == "object" and exact(["label","target","details"])
-          and .label == $label and (.target | type) == "string" and (.target | length) > 0
-          and (.details | type) == "object")
+          and .label == $label
+          and (if .phase == "endpoint-creating" then (.target == null or (.target | type) == "string")
+               else (.target | type) == "string" and (.target | length) > 0 end)
+          and (.details | type) == "object"
+          and (if $backend == "tmux" then (.details | exact(["session","window_id"]))
+               elif $backend == "herdr" then (.details | exact(["session","workspace_id","tab_id","pane_id"]))
+               elif $backend == "zellij" then (.details | exact(["session","tab_id","pane_id"]))
+               elif $backend == "cmux" then (.details | exact(["workspace_id","surface_id"]))
+               elif $backend == "orca" then (.details | exact(["worktree_id","terminal"]))
+               else false end))
         and (.worktree == null or (.worktree | type) == "string")
         and (if .phase == "worktree-ready" then (.worktree | type) == "string" and (.worktree | length) > 0
+             elif .phase == "endpoint-creating" then .worktree == null
              else true end)
       ) | $r
     ' "$receipt" 2>/dev/null) || {
@@ -864,6 +875,11 @@ spawn_endpoint_receipt_load() {
     echo "error: spawn endpoint receipt is not canonical: $receipt" >&2
     return 1
   }
+  SPAWN_ENDPOINT_PHASE=$(printf '%s' "$canonical" | jq -r '.phase') || return 1
+  if [ "$SPAWN_ENDPOINT_PHASE" = endpoint-creating ]; then
+    SPAWN_ENDPOINT_CREATING_RECOVERY=1
+    return 0
+  fi
   target=$(printf '%s' "$canonical" | jq -r '.endpoint.target') || return 1
   worktree=$(printf '%s' "$canonical" | jq -r '.worktree // ""') || return 1
   details=$(printf '%s' "$canonical" | jq -c '.endpoint.details') || return 1
@@ -885,7 +901,6 @@ spawn_endpoint_receipt_load() {
   fi
   T=$target
   WT=$worktree
-  SPAWN_ENDPOINT_PHASE=$(printf '%s' "$canonical" | jq -r '.phase') || return 1
   case "$BACKEND" in
     tmux)
       printf '%s' "$details" | jq -e '(keys | sort) == (["session","window_id"] | sort)' >/dev/null \
@@ -2417,7 +2432,38 @@ case "$BACKEND" in
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
-    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    if [ "$SPAWN_ENDPOINT_CREATING_RECOVERY" = 1 ]; then
+      set +e
+      WID=$(fm_backend_tmux_recover_task "$SES" "$W")
+      ENDPOINT_RECOVERY_STATUS=$?
+      set -e
+      case "$ENDPOINT_RECOVERY_STATUS" in
+        0)
+          [ "$(fm_backend_agent_state tmux "$T")" = dead ] || {
+            echo "error: endpoint creation intent resolved to a non-empty tmux endpoint for $ID" >&2
+            exit 1
+          }
+          ;;
+        2) WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1 ;;
+        *) exit 1 ;;
+      esac
+    else
+      set +e
+      fm_backend_tmux_recover_task "$SES" "$W" >/dev/null
+      ENDPOINT_RECOVERY_STATUS=$?
+      set -e
+      case "$ENDPOINT_RECOVERY_STATUS" in
+        0) echo "error: window $SES:$W already exists" >&2; exit 1 ;;
+        2) ;;
+        *) exit 1 ;;
+      esac
+      T="$SES:$W"
+      spawn_endpoint_receipt_publish endpoint-creating || {
+        echo "error: could not publish endpoint creation intent for $ID" >&2
+        exit 1
+      }
+      WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    fi
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -2589,7 +2635,35 @@ EOF
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    if [ "$SPAWN_ENDPOINT_CREATING_RECOVERY" = 1 ]; then
+      set +e
+      ZELLIJ_TASK_IDS=$(fm_backend_zellij_recover_task "$ZELLIJ_SES" "$W")
+      ENDPOINT_RECOVERY_STATUS=$?
+      set -e
+      case "$ENDPOINT_RECOVERY_STATUS" in
+        0) ;;
+        2) ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1 ;;
+        *) exit 1 ;;
+      esac
+    else
+      set +e
+      fm_backend_zellij_recover_task "$ZELLIJ_SES" "$W" >/dev/null
+      ENDPOINT_RECOVERY_STATUS=$?
+      set -e
+      case "$ENDPOINT_RECOVERY_STATUS" in
+        0)
+          echo "error: zellij endpoint for $W already exists in session '$ZELLIJ_SES'" >&2
+          exit 1
+          ;;
+        2) ;;
+        *) exit 1 ;;
+      esac
+      spawn_endpoint_receipt_publish endpoint-creating || {
+        echo "error: could not publish endpoint creation intent for $ID" >&2
+        exit 1
+      }
+      ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    fi
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -2601,7 +2675,32 @@ EOF
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    if [ "$SPAWN_ENDPOINT_CREATING_RECOVERY" = 1 ]; then
+      set +e
+      CMUX_TASK_IDS=$(fm_backend_cmux_recover_task "$W")
+      ENDPOINT_RECOVERY_STATUS=$?
+      set -e
+      case "$ENDPOINT_RECOVERY_STATUS" in
+        0) ;;
+        2) CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1 ;;
+        *) exit 1 ;;
+      esac
+    else
+      set +e
+      fm_backend_cmux_recover_task "$W" >/dev/null
+      ENDPOINT_RECOVERY_STATUS=$?
+      set -e
+      case "$ENDPOINT_RECOVERY_STATUS" in
+        0) echo "error: cmux endpoint for $W already exists" >&2; exit 1 ;;
+        2) ;;
+        *) exit 1 ;;
+      esac
+      spawn_endpoint_receipt_publish endpoint-creating || {
+        echo "error: could not publish endpoint creation intent for $ID" >&2
+        exit 1
+      }
+      CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    fi
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF
@@ -2794,12 +2893,39 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     fi
     validate_spawn_worktree "recovered endpoint" "$T"
   else
+    candidate=""
+    worktree_request_send=0
     if [ "$SPAWN_ENDPOINT_PHASE" = endpoint-created ]; then
       spawn_endpoint_receipt_publish worktree-requested || {
         echo "error: could not advance endpoint recovery receipt for $ID" >&2
         exit 1
       }
-      spawn_send_text_line "$WT_TARGET" 'treehouse get'
+      worktree_request_send=1
+    elif [ "$SPAWN_ENDPOINT_PHASE" = worktree-requested ]; then
+      resume_candidate=""
+      for _ in $(seq 1 2); do
+        p=$(spawn_current_path "$WT_TARGET" || true)
+        if [ -z "$p" ] || [ "$(real_path_or_raw "$p")" = "$PROJ_ABS_REAL" ]; then
+          candidate=""
+          break
+        fi
+        p_real=$(real_path_or_raw "$p")
+        if [ -n "$resume_candidate" ] && [ "$resume_candidate" = "$p_real" ]; then
+          candidate=$p_real
+        else
+          candidate=""
+          resume_candidate=$p_real
+        fi
+        sleep 0.5
+      done
+      [ -n "$candidate" ] || worktree_request_send=1
+    fi
+    if [ "$worktree_request_send" -eq 1 ]; then
+      candidate=""
+      spawn_send_text_line "$WT_TARGET" 'treehouse get' || {
+        echo "error: could not resume worktree acquisition for $ID; endpoint receipt preserved" >&2
+        exit 1
+      }
     fi
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -2822,7 +2948,6 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # a mismatch just becomes the new candidate rather than resetting the wait, so a
   # pane that is already settled by the first real read only costs the one existing
   # inter-poll sleep as confirmation, not a whole extra cycle on top.
-  candidate=""
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
     if [ -n "$p" ]; then
