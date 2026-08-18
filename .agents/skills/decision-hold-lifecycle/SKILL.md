@@ -21,7 +21,7 @@ After inventorying the whole report and review surface, run `bin/fm-decision-hol
 Every currently unresolved key must still have its valid active captain-held record, but a historical key whose durable resolution later moved from the backlog's bounded Done window into its configured archive remains resolved and must not be restored merely to complete a later review pass.
 Historical proof must remain in the originating home's configured archive and bind the exact origin, decision key, captain answer digest, and routed identities to their matching routed-work records.
 A released-version record that predates embedded origin and key fields remains compatible when its composed hold identity has exactly one valid origin/key decomposition or when an existing exact attestation matches the complete record.
-An ambiguous unattested legacy identity fails closed because mutable claimant metadata and a replayed recorded decision cannot prove which colliding origin and key created it; do not create an attestation from those surfaces.
+An ambiguous unattested legacy identity fails closed until an operator explicitly migrates it with an independently authored identity mapping bound to the exact retained record; mutable claimant metadata and a replayed recorded decision cannot authorize that mapping.
 A missing, malformed, mismatched, or merely presumed active decision record still stops completion, and neither titles, report prose, nor any other unstructured surface can substitute for its structured ownership.
 A completed investigation and an ended visual review use this same owner and completion command; a visual tool, including Lavish, never owns a parallel completion policy.
 Run the command in the originating work's authoritative `FM_HOME`; main-home work creates main-home holds, and secondmate-owned work creates holds in that secondmate home's backlog rather than copying them into the main backlog.
@@ -47,7 +47,7 @@ Bearings reads the resulting structured state and must never compensate by scrap
 5. Relay the choices to the captain as decisions from Bearings' Captain's Call section under `AGENTS.md` section 9; do not use the word hold in captain chat.
 6. If the captain authorizes dependent work, record it with normal tasks-axi commands and block it by the hold identity.
 7. Put the captain's exact durable decision in a file and close the hold with the script's `resolve` command and every routed task, its `answer` command when the captain answered a hold with no routed work behind it, its `decline` command when the answer routes no work at all, or its `repair` command when the hold was already closed outside the script.
-   An ambiguous released-version resolution with no existing origin-bound attestation remains unresolved; do not bind it from surviving metadata or replayed answer text.
+   An ambiguous released-version resolution with no existing origin-bound attestation remains unresolved unless an operator supplies the independent identity mapping required by `migrate-legacy`; do not derive that mapping from surviving metadata or replayed answer text.
    A hold that a channel already closed by feeding its keyed answer needs none of these; confirm it in step 8 instead.
 8. Confirm Bearings no longer shows the closed hold and that any routed work remains in structured backlog state.
 

@@ -138,6 +138,13 @@ write_origin_meta() {  # <home> <id> [kind]
     "mode=$kind"
 }
 
+write_legacy_identity_authorization() {  # <path> <hold-id> <origin-id> <decision-key> <body>
+  local path=$1 id=$2 origin=$3 key=$4 body=$5 record_digest
+  record_digest=$(printf '%s' "$body" | shasum -a 256 | awk '{print $1}')
+  printf 'schema=fm-decision-legacy-identity.v1\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
+    "$id" "$origin" "$key" "$record_digest" > "$path"
+}
+
 test_structured_holds_survive_teardown_and_route_resolution() {
   local home id route_hold access_hold before after json open show
   home=$(make_home durable-lifecycle)
@@ -616,8 +623,8 @@ test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
     > "$home/claimant-migration.out" 2> "$home/claimant-migration.err"; then
     fail "claimant metadata and a replayed answer migrated another owner's legacy history"
   fi
-  assert_grep "ambiguous legacy ownership" "$home/claimant-migration.err" \
-    "ambiguous claimant migration did not require origin-bound proof"
+  assert_grep "requires an independent --identity-file authorization" "$home/claimant-migration.err" \
+    "ambiguous claimant migration did not require independent authorization"
   assert_absent "$home/data/decision-resolution-attestations/$attestation_token.attestation" \
     "refused claimant migration created a durable legacy attestation"
 
@@ -664,8 +671,9 @@ test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
   pass "legacy migration rejects missing, conflicting, and foreign ownership"
 }
 
-test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
+test_legacy_identity_compatibility_is_bounded_and_authorized() {
   local home origin key hold decision digest body attestation stage stage_name alternate token unrelated n
+  local authorization wrong_authorization
   home=$(make_home compatible-unambiguous-legacy)
   origin=sample-compatible-review
   key=old-answer
@@ -755,26 +763,46 @@ test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
   token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
   assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
     "ambiguous reviewed metadata automatically created a durable identity attestation"
-  printf 'decision_keys=later\n' >> "$home/state/$alternate.meta"
-  if run_decisions "$home" migrate-legacy "$origin" "$key" \
-    --decision-file "$home/ambiguous-compatible-answer.txt" \
-    > "$home/competing-migration.out" 2> "$home/competing-migration.err"; then
-    fail "legacy migration ignored a competing reviewed owner"
-  fi
-  assert_grep "ambiguous legacy ownership" "$home/competing-migration.err" \
-    "legacy migration did not require origin-bound proof"
-  assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
-    "failed competing migration created a durable identity attestation"
-  printf 'decision_keys=other\n' >> "$home/state/$alternate.meta"
   if run_decisions "$home" migrate-legacy "$origin" "$key" \
     --decision-file "$home/ambiguous-compatible-answer.txt" \
     > "$home/unattested-migration.out" 2> "$home/unattested-migration.err"; then
-    fail "exact claimant metadata and a replayed answer established ambiguous legacy ownership"
+    fail "surviving metadata and a replayed answer established ambiguous legacy ownership"
   fi
-  assert_grep "ambiguous legacy ownership" "$home/unattested-migration.err" \
-    "unattested ambiguous migration did not fail closed"
+  assert_grep "requires an independent --identity-file authorization" \
+    "$home/unattested-migration.err" "ambiguous legacy migration did not request independent authorization"
   assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
-    "failed ambiguous migration persisted an identity attestation"
+    "unattested ambiguous migration persisted an identity attestation"
+
+  wrong_authorization="$home/wrong-legacy-identity.txt"
+  write_legacy_identity_authorization "$wrong_authorization" "$hold" "$alternate" later "$body"
+  if run_decisions "$home" migrate-legacy "$origin" "$key" \
+    --decision-file "$home/ambiguous-compatible-answer.txt" \
+    --identity-file "$wrong_authorization" \
+    > "$home/wrong-identity.out" 2> "$home/wrong-identity.err"; then
+    fail "a mismatched independent mapping authorized ambiguous legacy history"
+  fi
+  assert_grep "does not match $origin/$key" "$home/wrong-identity.err" \
+    "mismatched identity authorization did not fail against the requested owner"
+  assert_absent "$home/data/decision-resolution-attestations/$token.attestation" \
+    "mismatched identity authorization persisted an attestation"
+
+  authorization="$home/legacy-identity.txt"
+  write_legacy_identity_authorization "$authorization" "$hold" "$origin" "$key" "$body"
+  run_decisions "$home" migrate-legacy "$origin" "$key" \
+    --decision-file "$home/ambiguous-compatible-answer.txt" \
+    --identity-file "$authorization" >/dev/null \
+    || fail "independently authorized ambiguous legacy identity did not migrate"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "authorized ambiguous released-version identity did not verify"
+  assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
+    "authorized ambiguous migration did not persist exact identity"
+  printf 'decision_keys=later\n' >> "$home/state/$alternate.meta"
+  if run_decisions "$home" complete "$alternate" --none --resolved later \
+    > "$home/alternate-owner.out" 2> "$home/alternate-owner.err"; then
+    fail "authorized legacy identity proved a colliding alternate owner"
+  fi
+  assert_grep "does not match $alternate/later" "$home/alternate-owner.err" \
+    "authorized legacy identity was not bound to its exact origin and key"
 
   home=$(make_home compatible-long-legacy)
   origin=sample-
@@ -807,7 +835,7 @@ test_legacy_identity_compatibility_is_bounded_and_fail_closed() {
   token=$(printf '%s' "$hold" | shasum -a 256 | awk '{print $1}')
   assert_present "$home/data/decision-resolution-attestations/$token.attestation" \
     "long legacy verification did not use a bounded attestation filename"
-  pass "legacy compatibility stays bounded and ambiguous ownership fails closed"
+  pass "legacy compatibility stays bounded and ambiguous migration requires independent authorization"
 }
 
 test_option_shaped_keys_and_jq_free_verification() {
@@ -1326,6 +1354,87 @@ test_retained_history_rejects_unsafe_state_and_status() {
   assert_grep "origin status is hardlinked" "$home/hardlink-status.err" \
     "verification did not reject a hardlinked current status"
   pass "retained history requires safe state records"
+}
+
+test_origin_ownership_rejects_linked_evidence() {
+  local home origin hold show
+  home=$(make_home unsafe-origin-ownership)
+  origin=sample-linked-origin
+  write_origin_meta "$home" "$origin"
+  mv "$home/state/$origin.meta" "$home/origin-meta-target"
+  ln -s "$home/origin-meta-target" "$home/state/$origin.meta"
+  if run_decisions "$home" hold "$origin" route \
+    --title "Choose linked route" --reason "captain linked route pending" --repo sample \
+    > "$home/symlink-meta.out" 2> "$home/symlink-meta.err"; then
+    fail "a symlinked metadata leaf established origin ownership"
+  fi
+  assert_grep "decision owner metadata is unsafe" "$home/symlink-meta.err" \
+    "hold did not reject symlinked metadata ownership"
+  assert_no_grep "$origin-decision-route" "$home/data/backlog.md" \
+    "rejected symlinked metadata mutated the backlog"
+
+  rm "$home/state/$origin.meta"
+  ln "$home/origin-meta-target" "$home/state/$origin.meta"
+  if run_decisions "$home" hold "$origin" route \
+    --title "Choose linked route" --reason "captain linked route pending" --repo sample \
+    > "$home/hardlink-meta.out" 2> "$home/hardlink-meta.err"; then
+    fail "a hardlinked metadata leaf established origin ownership"
+  fi
+  assert_grep "decision owner metadata is hardlinked" "$home/hardlink-meta.err" \
+    "hold did not reject hardlinked metadata ownership"
+  assert_no_grep "$origin-decision-route" "$home/data/backlog.md" \
+    "rejected hardlinked metadata mutated the backlog"
+
+  rm -f "$home/state/$origin.meta" "$home/origin-meta-target"
+  mkdir "$home/report-target"
+  printf '# Linked report target\n' > "$home/report-target/report.md"
+  ln -s "$home/report-target" "$home/data/$origin"
+  if run_decisions "$home" hold "$origin" route \
+    --title "Choose linked route" --reason "captain linked route pending" --repo sample \
+    > "$home/symlink-report-parent.out" 2> "$home/symlink-report-parent.err"; then
+    fail "a symlinked report parent established origin ownership"
+  fi
+  assert_grep "origin report directory is unsafe" "$home/symlink-report-parent.err" \
+    "hold did not reject a symlinked report parent"
+  rm "$home/data/$origin"
+  mkdir "$home/data/$origin"
+  ln -s "$home/report-target/report.md" "$home/data/$origin/report.md"
+  if run_decisions "$home" hold "$origin" route \
+    --title "Choose linked route" --reason "captain linked route pending" --repo sample \
+    > "$home/symlink-report.out" 2> "$home/symlink-report.err"; then
+    fail "a symlinked report leaf established origin ownership"
+  fi
+  assert_grep "origin report is not an ordinary readable file" "$home/symlink-report.err" \
+    "hold did not reject a symlinked report leaf"
+  assert_no_grep "$origin-decision-route" "$home/data/backlog.md" \
+    "rejected report ownership mutated the backlog"
+
+  home=$(make_home unsafe-post-teardown-origin)
+  origin=sample-post-teardown-origin
+  tasks_in "$home" add "$origin" "Review post-teardown ownership" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create post-teardown ownership origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" route \
+    --title "Choose post-teardown route" \
+    --reason "captain post-teardown route pending" --repo sample) \
+    || fail "could not create post-teardown ownership hold"
+  tasks_in "$home" rm "$origin" >/dev/null \
+    || fail "could not remove post-teardown origin fixture"
+  rm -f "$home/state/$origin.meta"
+  mkdir "$home/data/$origin"
+  printf '# Hardlinked report target\n' > "$home/report-target.md"
+  ln "$home/report-target.md" "$home/data/$origin/report.md"
+  if run_decisions "$home" complete "$origin" route \
+    > "$home/hardlink-report.out" 2> "$home/hardlink-report.err"; then
+    fail "a hardlinked report leaf established post-teardown ownership"
+  fi
+  assert_grep "origin report is hardlinked" "$home/hardlink-report.err" \
+    "completion did not reject hardlinked report ownership"
+  show=$(tasks_in "$home" show "$hold" --full)
+  assert_contains "$show" "state: queued" "rejected report ownership changed the active hold"
+  assert_contains "$show" "held: yes" "rejected report ownership released the active hold"
+  pass "origin ownership rejects linked metadata and report evidence"
 }
 
 test_contained_operational_overrides_remain_supported() {
@@ -2122,13 +2231,14 @@ test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
-test_legacy_identity_compatibility_is_bounded_and_fail_closed
+test_legacy_identity_compatibility_is_bounded_and_authorized
 test_nonarchive_rows_cannot_prove_pruned_history
 test_queued_repaired_resolution_is_rejected
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
 test_historical_resolution_proof_is_exact_and_home_bound
 test_retained_history_rejects_unsafe_state_and_status
+test_origin_ownership_rejects_linked_evidence
 test_contained_operational_overrides_remain_supported
 test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory

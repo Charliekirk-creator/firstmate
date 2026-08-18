@@ -33,7 +33,7 @@
 #   fm-decision-hold.sh decline <origin-id> <decision-key> --decision-file <path>
 #   fm-decision-hold.sh repair <origin-id> <decision-key> --decision-file <path>
 #   fm-decision-hold.sh migrate-legacy <origin-id> <decision-key> \
-#     --decision-file <path>
+#     --decision-file <path> [--identity-file <path>]
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # Positional keys are the unresolved decisions in the just-reviewed surface and
@@ -58,8 +58,18 @@
 # mode:` naming their path. A legacy record remains valid when its composed hold
 # id has one possible origin/key decomposition or an exact durable identity
 # attestation already matches the complete record. An ambiguous unattested legacy
-# identity fails closed because mutable claimant metadata and a replayed decision
-# cannot prove which origin and key created it.
+# identity requires `migrate-legacy` with an independently authored identity file
+# contained in the active home. That file's exact content is:
+#
+# schema=fm-decision-legacy-identity.v1
+# hold_id=<composed-hold-id>
+# origin=<origin-id>
+# decision_key=<decision-key>
+# record_digest=<sha256-of-the-complete-decoded-resolution-body>
+#
+# The command validates that mapping against the retained record and captain
+# decision before publishing the durable attestation. Claimant metadata and a
+# replayed decision file alone never establish ambiguous ownership.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -270,10 +280,32 @@ show_field() {  # <show-output> <field>
 }
 
 origin_exists_here() {  # <origin-id>
-  local state=${DECISION_STATE:-$STATE}
-  [ -f "$state/$1.meta" ] && return 0
-  [ -f "$DATA/$1/report.md" ] && return 0
-  task_show "$1" >/dev/null 2>&1
+  local origin=$1 meta report_dir report physical_report_dir has_meta=0 has_report=0
+  authoritative_state_path
+  authoritative_archive_path
+  meta="$DECISION_STATE/$origin.meta"
+  report_dir="$DECISION_DATA/$origin"
+  report="$report_dir/report.md"
+
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    require_safe_origin_metadata_file "$meta"
+    has_meta=1
+  fi
+  if [ -e "$report_dir" ] || [ -L "$report_dir" ]; then
+    [ -d "$report_dir" ] && [ ! -L "$report_dir" ] \
+      || fail "origin report directory is unsafe: $report_dir"
+    physical_report_dir=$(cd "$report_dir" && pwd -P) \
+      || fail "could not resolve origin report directory: $report_dir"
+    [ "$physical_report_dir" = "$DECISION_DATA/$origin" ] \
+      || fail "origin report directory escapes the active home: $report_dir"
+    if [ -e "$report" ] || [ -L "$report" ]; then
+      require_safe_origin_report_file "$report"
+      has_report=1
+    fi
+  fi
+  [ "$has_meta" -eq 1 ] && return 0
+  [ "$has_report" -eq 1 ] && return 0
+  task_show_optional "$origin"
 }
 
 list_has_key() {  # <comma-list> <key>
@@ -493,6 +525,15 @@ require_safe_origin_metadata_file() {
   [ "$links" = 1 ] || fail "decision owner metadata is hardlinked: $path"
 }
 
+require_safe_origin_report_file() {
+  local path=$1 links
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] \
+    || fail "origin report is not an ordinary readable file: $path"
+  links=$(file_link_count "$path") \
+    || fail "could not inspect origin report link count: $path"
+  [ "$links" = 1 ] || fail "origin report is hardlinked: $path"
+}
+
 META_DECISION_KEYS=''
 reviewed_decision_inventory() {  # <meta-path>
   local path=$1 keys key canonical
@@ -660,6 +701,49 @@ normalize_home_owned_path() {  # <path> <logical-home> <physical-home>
   [ "${#components[@]}" -gt 0 ] || return 1
   joined=$(IFS=/; printf '%s' "${components[*]}")
   NORMALIZED_HOME_PATH="$physical_home/$joined"
+}
+
+LEGACY_IDENTITY_AUTHORIZATION_SCHEMA=fm-decision-legacy-identity.v1
+
+legacy_identity_authorization_content() {  # <hold-id> <origin-id> <decision-key> <record-digest>
+  printf 'schema=%s\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
+    "$LEGACY_IDENTITY_AUTHORIZATION_SCHEMA" "$1" "$2" "$3" "$4"
+}
+
+require_legacy_identity_authorization() {  # <path> <hold-id> <origin-id> <decision-key> <record-digest>
+  local input=$1 id=$2 origin=$3 key=$4 record_digest=$5 cwd physical_home logical_home input_path
+  local normalized input_parent physical_parent expected_parent links expected actual expected_bytes actual_bytes
+  [ -n "$input" ] || fail "ambiguous legacy ownership requires an independent --identity-file authorization"
+  [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
+  cwd=$(pwd -P) || fail "could not resolve the current directory"
+  physical_home=$(cd "$FM_HOME" && pwd -P) || fail "could not resolve active home: $FM_HOME"
+  case "$FM_HOME" in /*) logical_home=$FM_HOME ;; *) logical_home="$cwd/$FM_HOME" ;; esac
+  case "$input" in /*) input_path=$input ;; *) input_path="$cwd/$input" ;; esac
+  normalize_home_owned_path "$input_path" "$logical_home" "$physical_home" \
+    || fail "legacy identity authorization is outside the active home: $input"
+  normalized=$NORMALIZED_HOME_PATH
+  input_parent=${input_path%/*}
+  expected_parent=${normalized%/*}
+  [ -d "$input_parent" ] && [ ! -L "$input_parent" ] \
+    || fail "legacy identity authorization directory is unsafe: $input"
+  physical_parent=$(cd "$input_parent" && pwd -P) \
+    || fail "could not resolve legacy identity authorization directory: $input"
+  [ "$physical_parent" = "$expected_parent" ] \
+    || fail "legacy identity authorization has an unsafe symlink path: $input"
+  [ -f "$input_path" ] && [ ! -L "$input_path" ] && [ -r "$input_path" ] \
+    || fail "legacy identity authorization is not an ordinary readable file: $input"
+  links=$(file_link_count "$input_path") \
+    || fail "could not inspect legacy identity authorization link count: $input"
+  [ "$links" = 1 ] || fail "legacy identity authorization is hardlinked: $input"
+  expected=$(legacy_identity_authorization_content "$id" "$origin" "$key" "$record_digest")
+  expected_bytes=$(printf '%s\n' "$expected" | LC_ALL=C wc -c | tr -d ' ')
+  actual_bytes=$(LC_ALL=C wc -c < "$input_path" | tr -d ' ')
+  [ "$actual_bytes" = "$expected_bytes" ] \
+    || fail "legacy identity authorization does not match $origin/$key: $input"
+  actual=$(cat "$input_path") \
+    || fail "could not read legacy identity authorization: $input"
+  [ "$actual" = "$expected" ] \
+    || fail "legacy identity authorization does not match $origin/$key: $input"
 }
 
 contained_archive_parent_safe() {  # <physical-home> <archive-parent>
@@ -1207,12 +1291,13 @@ verify_resolution_identity() {  # <hold-id> <origin-id> <decision-key> <body> <d
 }
 
 command_migrate_legacy() {
-  local origin=${1:-} key=${2:-} decision_file='' id meta show state held kind hold_kind body
+  local origin=${1:-} key=${2:-} decision_file='' identity_file='' id meta show state held kind hold_kind body
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   shift 2
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --decision-file) shift; decision_file=${1:-} ;;
+      --identity-file) shift; identity_file=${1:-} ;;
       *) usage >&2; exit 2 ;;
     esac
     shift
@@ -1259,9 +1344,10 @@ command_migrate_legacy() {
     || fail "queued captain decision $id has an impossible repaired resolution"
   [ "$RESOLUTION_DIGEST" = "$DECISION_DIGEST" ] \
     || fail "captain decision $id records a different captain decision"
-  if ! legacy_resolution_identity_unambiguous "$id" "$origin" "$key"; then
-    legacy_resolution_attestation_valid "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST" \
-      || fail "captain decision $id has ambiguous legacy ownership and no origin-bound attestation"
+  if [ -n "$identity_file" ]; then
+    require_legacy_identity_authorization "$identity_file" "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
+  elif ! legacy_resolution_identity_unambiguous "$id" "$origin" "$key"; then
+    fail "captain decision $id has ambiguous legacy ownership and requires an independent --identity-file authorization"
   fi
   persist_legacy_resolution_attestation "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
   fm_lock_release "$DECISION_META_LOCK"
@@ -1310,8 +1396,8 @@ command_hold() {
     if archived_hold_resolved "$id" "$origin" "$key"; then
       fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
     fi
-    if [ -z "$repo" ] && [ -f "$STATE/$origin.meta" ]; then
-      repo=$(meta_value "$STATE/$origin.meta" project)
+    if [ -z "$repo" ] && [ -f "$DECISION_STATE/$origin.meta" ]; then
+      repo=$(meta_value "$DECISION_STATE/$origin.meta" project)
       repo=${repo%/}
       repo=${repo##*/}
     fi
