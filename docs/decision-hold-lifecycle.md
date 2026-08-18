@@ -23,7 +23,7 @@ A configured archive may have not-yet-created nested parents, which are normaliz
 Only one ordinary, single-linked archived record inside a canonical `## Archived YYYY-MM-DD` retention section whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; rows under notes or other prose sections are not history, and parsing stops at the canonical metadata boundary, so title text is never provenance.
 Its resolution block must bind the exact origin and decision key, contain no more than the decision-file limit of 8192 captain-answer bytes, recompute to the recorded captain-answer digest, enforce resolution-mode routing, and list the same routed identities in both structured routing fields.
 Released-version records without embedded origin and key remain compatible directly when the composed hold id has exactly one valid origin/key decomposition, through an existing exact record attestation, or through a one-time migration while exact reviewed owner metadata survives.
-That migration requires the reviewed inventory to claim the key and rejects an alternate decomposition that claims its colliding key or still has a durable origin artifact without reviewed metadata disproving ownership, so later claimant metadata cannot rebind surviving older provenance.
+That migration requires the reviewed inventory to claim the key and every alternate decomposition's reviewed metadata to explicitly exclude its colliding key, so missing alternate-owner proof or later claimant metadata cannot rebind surviving older provenance.
 Successful legacy verification atomically persists an attestation matching the hold id, origin, key, and complete resolution-record digest under the authoritative data directory before teardown, and the same path covers a queued legacy resolution left by an interrupted close so an exact retry remains deterministic.
 A publication interrupted after its no-clobber link is recoverable only through its matching private staging link, while unrelated hardlinks remain invalid. Only the legacy routed format may omit `Resolution mode:`.
 Absence, duplicate or ambiguous identity, unsafe archive files, non-absence backlog read errors, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
@@ -31,7 +31,7 @@ For any keyed status decision it will transfer, including one followed by a term
 `bin/fm-classify-lib.sh` recognizes that transfer as closing the live status copy without claiming that the captain has answered it.
 
 Scout teardown calls the script's `verify` subcommand after checking for the report and before removing any source state.
-Verification never changes the backlog or archive; it may atomically persist an exact attestation for a uniquely decomposable legacy record or an ambiguous record whose surviving reviewed owner passes the alternate-decomposition checks.
+Verification never changes the backlog or archive; it may atomically persist an exact attestation for a uniquely decomposable legacy record or an ambiguous record whose surviving reviewed owner and every alternate reviewed owner pass the decomposition checks.
 The `--force` path remains the explicit captain-approved discard escape hatch.
 
 The `resolve`, `answer`, and `decline` subcommands close active holds, while `repair` attests a hold already closed outside the script.
@@ -139,7 +139,7 @@ ok - completion and verification validate origins before constructing paths
 ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
 ok - queued legacy resolution identity survives teardown and retry
-ok - legacy migration rejects conflicting and foreign ownership
+ok - legacy migration rejects missing, conflicting, and foreign ownership
 ok - legacy identity compatibility migrates reviewed ambiguous ownership
 ok - only canonical retention sections prove archived decisions
 ok - retained resolutions enforce the captain decision size bound

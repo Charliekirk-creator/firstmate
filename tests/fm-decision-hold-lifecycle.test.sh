@@ -571,13 +571,11 @@ test_queued_legacy_resolution_is_attested_before_teardown() {
   pass "queued legacy resolution identity survives teardown and retry"
 }
 
-test_legacy_migration_rejects_conflicting_or_foreign_owners() {
+test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
   local home source victim collision decision digest body foreign id hold n
   home=$(make_home ambiguous-legacy-history)
   source=sample
   victim=sample-decision-route
-  tasks_in "$home" add "$source" "Review an old ambiguous source" --kind scout --repo sample --start >/dev/null \
-    || fail "could not create ambiguous legacy source"
   tasks_in "$home" add "$victim" "Review an ambiguous claimant" --kind scout --repo sample --start >/dev/null \
     || fail "could not create ambiguous legacy claimant"
   write_origin_meta "$home" "$source"
@@ -653,7 +651,7 @@ test_legacy_migration_rejects_conflicting_or_foreign_owners() {
   fi
   assert_grep "authoritative state directory is unsafe" "$foreign/state-symlink.err" \
     "symlinked state metadata did not fail safely"
-  pass "legacy migration rejects conflicting and foreign ownership"
+  pass "legacy migration rejects missing, conflicting, and foreign ownership"
 }
 
 test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership() {
@@ -1943,7 +1941,7 @@ test_origin_slug_validation_precedes_path_construction
 test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_queued_legacy_resolution_is_attested_before_teardown
-test_legacy_migration_rejects_conflicting_or_foreign_owners
+test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
 test_legacy_identity_compatibility_migrates_reviewed_ambiguous_ownership
 test_nonarchive_rows_cannot_prove_pruned_history
 test_retained_resolution_rejects_oversized_decision

@@ -461,41 +461,6 @@ EOF
   META_DECISION_KEYS=$keys
 }
 
-archive_has_task_id() {  # <task-id>
-  local id=$1 archive links
-  authoritative_archive_path
-  archive=$DECISION_ARCHIVE
-  [ -e "$archive" ] || [ -L "$archive" ] || return 1
-  [ ! -L "$archive" ] && [ -f "$archive" ] \
-    || fail "decision archive is not an ordinary file: $archive"
-  links=$(file_link_count "$archive") \
-    || fail "could not inspect decision archive link count: $archive"
-  [ "$links" = 1 ] || fail "decision archive is hardlinked: $archive"
-  LC_ALL=C awk -v id="$id" '
-    BEGIN { prefix = "- [x] " id " - "; archived = 0; found = 0 }
-    /^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/ { archived = 1; next }
-    /^## / { archived = 0; next }
-    archived && index($0, prefix) == 1 { found = 1 }
-    END { exit(found ? 0 : 1) }
-  ' "$archive"
-}
-
-legacy_origin_artifact_exists() {  # <origin-id>
-  local origin=$1 output code
-  [ -e "$DECISION_STATE/$origin.meta" ] || [ -L "$DECISION_STATE/$origin.meta" ] \
-    && return 0
-  authoritative_archive_path
-  [ -e "$DECISION_DATA/$origin/report.md" ] || [ -L "$DECISION_DATA/$origin/report.md" ] \
-    && return 0
-  if output=$(tasks_axi show "$origin" --full 2>&1); then
-    return 0
-  fi
-  code=$(printf '%s\n' "$output" | sed -n 's/^code: //p' | head -1)
-  [ "$code" = NOT_FOUND ] \
-    || fail "could not read possible legacy decision owner $origin"
-  archive_has_task_id "$origin"
-}
-
 legacy_resolution_reviewed_owner_valid() {  # <hold-id> <origin-id> <decision-key>
   local id=$1 origin=$2 key=$3 left right candidate_origin candidate_key candidate_meta
   reviewed_decision_inventory "$DECISION_STATE/$origin.meta" || return 1
@@ -510,11 +475,8 @@ legacy_resolution_reviewed_owner_valid() {  # <hold-id> <origin-id> <decision-ke
       && [[ "$candidate_key" != *[!A-Za-z0-9._-]* ]] \
       && { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; }; then
       candidate_meta="$DECISION_STATE/$candidate_origin.meta"
-      if reviewed_decision_inventory "$candidate_meta"; then
-        list_has_key "$META_DECISION_KEYS" "$candidate_key" && return 1
-      elif legacy_origin_artifact_exists "$candidate_origin"; then
-        return 1
-      fi
+      reviewed_decision_inventory "$candidate_meta" || return 1
+      list_has_key "$META_DECISION_KEYS" "$candidate_key" && return 1
     fi
     case "$right" in
       *-decision-*)
