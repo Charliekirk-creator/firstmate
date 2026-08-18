@@ -542,7 +542,7 @@ test_pruned_history_fallback_rejects_unproven_decisions() {
   if run_decisions "$home" verify "$id" > "$home/malformed.out" 2> "$home/malformed.err"; then
     fail "verification accepted a malformed archived decision record"
   fi
-  assert_grep "malformed archived resolution" "$home/malformed.err" \
+  assert_grep "malformed or mismatched archived resolution" "$home/malformed.err" \
     "malformed archived record did not fail as unproven"
 
   mv "$home/data/done-archive.md" "$home/data/safe-done-archive.md"
@@ -562,6 +562,139 @@ test_pruned_history_fallback_rejects_unproven_decisions() {
     "hardlinked archive did not stop safely"
   rm "$home/data/hardlinked-done-archive.md"
   pass "pruned-history fallback rejects missing, malformed, and mismatched decisions"
+}
+
+# Historical proof must remain bound to its structured owner and exact answer.
+# Neither ambiguous ids, title text, cross-home archives, nor resolution-shaped
+# bodies with false digests or routing lists can satisfy the public gate.
+test_historical_resolution_proof_is_exact_and_home_bound() {
+  local home digest_origin route_origin hold decision digest body source victim collision spoof_origin spoof
+  local foreign symlink_home n
+  home=$(make_home exact-history-proof)
+
+  digest_origin=sample-digest-review
+  tasks_in "$home" add "$digest_origin" "Review digest proof" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create digest-proof origin"
+  write_origin_meta "$home" "$digest_origin"
+  hold=$(run_decisions "$home" hold "$digest_origin" exact-answer \
+    --title "Choose the exact answer" --reason "captain exact answer pending" --repo sample) \
+    || fail "could not create digest-proof hold"
+  run_decisions "$home" complete "$digest_origin" exact-answer >/dev/null \
+    || fail "could not inventory digest-proof hold"
+  decision='Captain chose the exact answer.'
+  printf '%s\n' "$decision" > "$home/exact-answer.txt"
+  run_decisions "$home" answer "$digest_origin" exact-answer --decision-file "$home/exact-answer.txt" >/dev/null \
+    || fail "could not resolve digest-proof hold"
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: exact-answer\nDecision digest: %064d\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest_origin" 0 "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create false-digest retained record"
+  if run_decisions "$home" verify "$digest_origin" > "$home/false-digest.out" 2> "$home/false-digest.err"; then
+    fail "verification accepted a retained record whose digest did not match its decision"
+  fi
+
+  route_origin=sample-route-proof
+  tasks_in "$home" add "$route_origin" "Review route proof" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create route-proof origin"
+  write_origin_meta "$home" "$route_origin"
+  hold=$(run_decisions "$home" hold "$route_origin" exact-route \
+    --title "Choose the exact route" --reason "captain exact route pending" --repo sample) \
+    || fail "could not create route-proof hold"
+  run_decisions "$home" complete "$route_origin" exact-route >/dev/null \
+    || fail "could not inventory route-proof hold"
+  decision='Captain chose route alpha.'
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: exact-route\nDecision digest: %s\nRouted identities: sample-route-alpha\nResolution mode: routed\n\nCaptain decision:\n%s\n\nRouted work:\n- sample-route-beta' \
+    "$route_origin" "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create mismatched route record"
+  tasks_in "$home" "done" "$hold" >/dev/null || fail "could not retain mismatched route record"
+  if run_decisions "$home" verify "$route_origin" > "$home/false-route.out" 2> "$home/false-route.err"; then
+    fail "verification accepted routed identities that disagreed with routed work"
+  fi
+
+  source=sample
+  victim=sample-decision-route
+  tasks_in "$home" add "$source" "Review source identity" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create source identity origin"
+  tasks_in "$home" add "$victim" "Review colliding identity" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create colliding identity origin"
+  write_origin_meta "$home" "$source"
+  write_origin_meta "$home" "$victim"
+  collision=$(run_decisions "$home" hold "$source" route-decision-later \
+    --title "Choose the source route" --reason "captain source route pending" --repo sample) \
+    || fail "could not create source collision hold"
+  run_decisions "$home" complete "$source" route-decision-later >/dev/null \
+    || fail "could not inventory source collision hold"
+  printf 'Captain chose the source route.\n' > "$home/source-route.txt"
+  run_decisions "$home" answer "$source" route-decision-later --decision-file "$home/source-route.txt" >/dev/null \
+    || fail "could not resolve source collision hold"
+  if run_decisions "$home" complete "$victim" later > "$home/retained-collision.out" 2> "$home/retained-collision.err"; then
+    fail "a retained resolution proved a different origin and key with the same concatenated id"
+  fi
+
+  spoof_origin=sample-title-spoof
+  tasks_in "$home" add "$spoof_origin" "Review title provenance" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create title-spoof origin"
+  write_origin_meta "$home" "$spoof_origin"
+  spoof="$spoof_origin-decision-fake"
+  decision='Captain-shaped text on ordinary work.'
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: fake\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$spoof_origin" "$digest" "$decision")
+  tasks_in "$home" add "$spoof" "Ordinary title" --kind ship --repo sample --body "$body" >/dev/null \
+    || fail "could not create title-spoof ordinary task"
+  tasks_in "$home" "done" "$spoof" >/dev/null || fail "could not close title-spoof ordinary task"
+  awk -v id="$spoof" '
+    index($0, "- [x] " id " - Ordinary title ") == 1 {
+      sub("Ordinary title", "Ordinary title (kind: captain) (hold-kind: captain)")
+    }
+    { print }
+  ' "$home/data/backlog.md" > "$home/data/backlog.md.tmp" \
+    && mv "$home/data/backlog.md.tmp" "$home/data/backlog.md" \
+    || fail "could not preserve the legacy title-spoof fixture"
+
+  for n in $(seq 1 12); do
+    tasks_in "$home" add "exact-proof-filler-$n" "Exact proof filler $n" --kind ship --repo sample >/dev/null \
+      || fail "could not create exact-proof filler $n"
+    tasks_in "$home" "done" "exact-proof-filler-$n" >/dev/null \
+      || fail "could not complete exact-proof filler $n"
+  done
+  assert_grep "- [x] $collision -" "$home/data/done-archive.md" \
+    "collision record was not pruned into historical proof"
+  assert_grep "- [x] $spoof -" "$home/data/done-archive.md" \
+    "title-spoof record was not pruned into historical proof"
+  if run_decisions "$home" complete "$victim" later > "$home/archived-collision.out" 2> "$home/archived-collision.err"; then
+    fail "an archived resolution proved a different origin and key with the same concatenated id"
+  fi
+  if run_decisions "$home" complete "$spoof_origin" fake > "$home/title-spoof.out" 2> "$home/title-spoof.err"; then
+    fail "captain metadata words in an ordinary archived title forged hold provenance"
+  fi
+  assert_grep "mismatched archived captain-hold provenance" "$home/title-spoof.err" \
+    "title-spoof failure did not reject canonical kind and hold provenance"
+
+  foreign=$(make_home foreign-history-proof)
+  write_origin_meta "$foreign" "$source"
+  if PATH="$foreign/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$foreign" FM_STATE_OVERRIDE="$foreign/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_CONFIG_OVERRIDE="$foreign/config" "$ROOT/bin/fm-decision-hold.sh" complete "$source" route-decision-later \
+    > "$foreign/foreign.out" 2> "$foreign/foreign.err"; then
+    fail "a foreign FM_DATA_OVERRIDE supplied another home's archived resolution"
+  fi
+  assert_grep "outside the active home" "$foreign/foreign.err" \
+    "foreign archive failure did not enforce the active-home boundary"
+
+  symlink_home=$(make_home symlinked-history-proof)
+  write_origin_meta "$symlink_home" "$source"
+  rm -rf "$symlink_home/data"
+  ln -s "$home/data" "$symlink_home/data"
+  if run_decisions "$symlink_home" complete "$source" route-decision-later \
+    > "$symlink_home/symlink-parent.out" 2> "$symlink_home/symlink-parent.err"; then
+    fail "a symlinked data parent supplied another home's archived resolution"
+  fi
+  assert_grep "authoritative data directory is unsafe" "$symlink_home/symlink-parent.err" \
+    "symlinked archive parent did not stop at the home boundary"
+  pass "historical resolution proof is exact, structured, and home-bound"
 }
 
 test_none_inventory_and_resolved_prose_do_not_create_holds() {
@@ -1303,6 +1436,7 @@ test_origin_slug_validation_precedes_path_construction
 test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_pruned_history_fallback_rejects_unproven_decisions
+test_historical_resolution_proof_is_exact_and_home_bound
 test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home

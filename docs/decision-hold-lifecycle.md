@@ -18,7 +18,10 @@ A post-teardown visual review can complete against the surviving report and dura
 It accepts `--none` as an explicit semantic inventory result, not as inferred absence.
 It verifies every listed identity against tasks-axi before recording completion.
 When normal configured retention has moved an older Done identity out of `data/backlog.md`, it reads that identity's exact record from `data/done-archive.md` without restoring it.
-Only one ordinary, single-linked archived kind-captain record with captain-hold provenance and a structurally valid resolution block satisfies that historical check; absence, duplicate identity, unsafe archive files, malformed resolution records, and malformed or mismatched active provenance remain hard failures.
+The archive must resolve under the active `FM_HOME` through its ordinary physical `data` directory; a foreign data override or symlinked data parent cannot supply history.
+Only one ordinary, single-linked archived record whose canonical trailing fields parse as kind captain with captain-hold provenance satisfies the historical header check; title text is never provenance.
+Its resolution block must bind the exact origin and decision key, recompute to the recorded captain-answer digest, and list the same routed identities in both structured routing fields.
+Absence, duplicate identity, unsafe archive files, malformed or mismatched resolution records, and malformed or mismatched active provenance remain hard failures.
 For an open keyed status decision, it appends a `captain-held [key=<key>]: ...` transfer event only after the matching backlog hold is durable.
 `bin/fm-classify-lib.sh` recognizes that transfer as closing the live status copy without claiming that the captain has answered it.
 
@@ -26,7 +29,7 @@ Scout teardown calls the script's read-only `verify` subcommand after checking f
 The `--force` path remains the explicit captain-approved discard escape hatch.
 
 The `resolve`, `answer`, and `decline` subcommands close active holds, while `repair` attests a hold already closed outside the script.
-All four require a non-empty captain decision file and record the same resolution block in the hold body with the decision digest, routed identities, and a `Resolution mode:` naming the path.
+All four require a non-empty captain decision file and record the same resolution block in the hold body with the origin, decision key, decision digest, routed identities, and a `Resolution mode:` naming the path.
 An exact retry is idempotent, while a changed decision or, for `resolve`, a changed routed-task set is rejected.
 
 The `resolve` subcommand is the routed path and additionally requires at least one existing dependent task whose structured `blocked-by` edge points to the hold.
@@ -103,7 +106,7 @@ An unanswered decision still blocks completion and teardown, and neither `declin
 
 A retained-history regression resolves two synthetic decisions, proves the existing retained-row path first, moves both records into the configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
-Companion failure cases remove an active decision record, mismatch an active record's origin and key, and normally prune an out-of-band close with no resolution block; none can masquerade as historical resolution.
+Companion failure cases remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, spoof captain metadata in an ordinary title, mismatch digests and routed-work lists, and point archive reads across home boundaries; none can masquerade as historical resolution.
 
 Three answer-time closure regressions run against the published poll response shape, with synthetic `sample` identities.
 A bound source whose origin exposes six holds captures one review carrying five structured choices plus one freeform message, and the runner feeds it through a fixture adapter that is not the review adapter at all, so what is proven is that any bound channel with an `answers` command gets closure rather than that one channel is wired specially.
@@ -126,6 +129,7 @@ ok - completion and verification validate origins before constructing paths
 ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
 ok - pruned-history fallback rejects missing, malformed, and mismatched decisions
+ok - historical resolution proof is exact, structured, and home-bound
 ok - resolved findings and decision-like prose do not create false holds
 ok - terminal single-owner stale status decisions do not block empty inventory
 ok - main-home and secondmate-home captain holds remain correctly routed

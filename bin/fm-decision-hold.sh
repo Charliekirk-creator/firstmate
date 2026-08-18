@@ -46,10 +46,10 @@
 # `resolve`, `answer`, and `decline` close active holds; `repair` attests a hold
 # already closed outside this script. All four paths require a non-empty captain
 # decision file of at most 8192 bytes, record the same durable resolution block in
-# the hold body, and store the decision digest plus routed identities so an exact
-# retry is idempotent while a changed decision or, for `resolve`, routed set is
-# rejected. New records include a `Resolution mode:` naming their path; older
-# routed records remain valid.
+# the hold body, and store the origin, decision key, decision digest, and routed
+# identities so an exact retry is idempotent while a changed identity, decision,
+# or, for `resolve`, routed set is rejected. New records include a `Resolution
+# mode:` naming their path.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -204,11 +204,16 @@ load_decision() {  # <path>; sets DECISION_TEXT and DECISION_DIGEST
 }
 
 tasks_axi() {
-  (cd "$FM_HOME" && tasks-axi "$@")
+  (
+    cd "$FM_HOME"
+    unset TASKS_AXI_FILE TASKS_AXI_BACKEND
+    tasks-axi "$@"
+  )
 }
 
 require_tasks_axi() {
   fm_tasks_axi_compatible || fail "compatible tasks-axi is required"
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
   tasks-axi hold --help 2>&1 | grep -F -- '--kind captain' >/dev/null \
     || fail "tasks-axi does not expose the captain-hold contract"
 }
@@ -264,47 +269,116 @@ origin_open_decisions() {  # <origin-id>
   printf '%s' "$open"
 }
 
-resolution_record_valid() {  # <hold-body, with literal \\n separators>
-  local body=$1 fields digest routed decision route
-  case "$body" in
-    \"*\") body=${body#\"}; body=${body%\"} ;;
+RESOLUTION_ORIGIN=''
+RESOLUTION_KEY=''
+RESOLUTION_DIGEST=''
+RESOLUTION_ROUTES=''
+RESOLUTION_MODE=''
+RESOLUTION_DECISION=''
+
+parse_resolution_record() {  # <hold-body>
+  local encoded=$1 body rest metadata tail line digest routes decision routed_work
+  local captain_marker=$'\n\nCaptain decision:\n' routed_marker=$'\n\nRouted work:\n'
+  local expected_work='' canonical_routes route
+  RESOLUTION_ORIGIN=''
+  RESOLUTION_KEY=''
+  RESOLUTION_DIGEST=''
+  RESOLUTION_ROUTES=''
+  RESOLUTION_MODE=''
+  RESOLUTION_DECISION=''
+
+  case "$encoded" in
+    \"*) body=$(printf '%s\n' "$encoded" | jq -Rer 'fromjson | strings') || return 1 ;;
+    *) body=$encoded ;;
   esac
   case "$body" in
-    'Resolution recorded by fm-decision-hold.\nDecision digest: '*)
-      fields=${body#'Resolution recorded by fm-decision-hold.\nDecision digest: '}
+    'Resolution recorded by fm-decision-hold.'$'\n'*)
+      rest=${body#'Resolution recorded by fm-decision-hold.'$'\n'}
       ;;
     *) return 1 ;;
   esac
-  digest=${fields%%\\n*}
-  [ "${#digest}" -eq 64 ] || return 1
-  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
-  case "$fields" in
-    *'\nRouted identities: '*'\n\nCaptain decision:\n'*'\n\nRouted work:\n'*) : ;;
+  case "$rest" in *"$captain_marker"*) : ;; *) return 1 ;; esac
+  metadata=${rest%%"$captain_marker"*}
+  tail=${rest#*"$captain_marker"}
+  case "$tail" in *"$routed_marker"*) : ;; *) return 1 ;; esac
+  decision=${tail%"$routed_marker"*}
+  routed_work=${tail##*"$routed_marker"}
+  [ -n "$decision" ] || return 1
+
+  line=${metadata%%$'\n'*}
+  if [ "$line" != "$metadata" ]; then metadata=${metadata#*$'\n'}; else metadata=''; fi
+  case "$line" in
+    'Origin: '*)
+      RESOLUTION_ORIGIN=${line#'Origin: '}
+      case "$RESOLUTION_ORIGIN" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+      [ -n "$metadata" ] || return 1
+      line=${metadata%%$'\n'*}
+      if [ "$line" != "$metadata" ]; then metadata=${metadata#*$'\n'}; else metadata=''; fi
+      case "$line" in 'Decision key: '*) RESOLUTION_KEY=${line#'Decision key: '} ;; *) return 1 ;; esac
+      case "$RESOLUTION_KEY" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+      [ -n "$metadata" ] || return 1
+      line=${metadata%%$'\n'*}
+      if [ "$line" != "$metadata" ]; then metadata=${metadata#*$'\n'}; else metadata=''; fi
+      ;;
+    'Decision digest: '*) : ;;
     *) return 1 ;;
   esac
-  routed=${fields#*\\nRouted identities: }
-  routed=${routed%%\\n*}
-  [ -n "$routed" ] || return 1
-  if [ "$routed" != "$ROUTED_NONE" ]; then
+  case "$line" in 'Decision digest: '*) digest=${line#'Decision digest: '} ;; *) return 1 ;; esac
+  [ "${#digest}" -eq 64 ] || return 1
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+
+  [ -n "$metadata" ] || return 1
+  line=${metadata%%$'\n'*}
+  if [ "$line" != "$metadata" ]; then metadata=${metadata#*$'\n'}; else metadata=''; fi
+  case "$line" in 'Routed identities: '*) routes=${line#'Routed identities: '} ;; *) return 1 ;; esac
+  [ -n "$routes" ] || return 1
+  if [ -n "$metadata" ]; then
+    case "$metadata" in *$'\n'*) return 1 ;; esac
+    case "$metadata" in
+      'Resolution mode: routed') RESOLUTION_MODE=routed ;;
+      'Resolution mode: answered') RESOLUTION_MODE=answered ;;
+      'Resolution mode: declined') RESOLUTION_MODE=declined ;;
+      'Resolution mode: repaired') RESOLUTION_MODE=repaired ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  if [ "$routes" = "$ROUTED_NONE" ]; then
+    [ "$routed_work" = "$ROUTED_NONE" ] || return 1
+  else
+    case "$routes" in ,*|*,|*,,*) return 1 ;; esac
     while IFS= read -r route; do
       case "$route" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+      expected_work="${expected_work}${expected_work:+$'\n'}- $route"
     done <<EOF
-$(printf '%s\n' "$routed" | tr ',' '\n')
+$(printf '%s\n' "$routes" | tr ',' '\n')
 EOF
+    canonical_routes=$(printf '%s\n' "$routes" | tr ',' '\n' | LC_ALL=C sort -u | paste -sd, -)
+    [ "$routes" = "$canonical_routes" ] || return 1
+    [ "$routed_work" = "$expected_work" ] || return 1
   fi
-  decision=${fields#*\\n\\nCaptain decision:\\n}
-  decision=${decision%%\\n\\nRouted work:\\n*}
-  [ -n "$decision" ]
+  [ "$(sha256_text "$decision")" = "$digest" ] || return 1
+
+  RESOLUTION_DIGEST=$digest
+  RESOLUTION_ROUTES=$routes
+  RESOLUTION_DECISION=$decision
 }
 
-body_has_resolution_record() {  # <hold-body>
-  resolution_record_valid "$1"
+resolution_record_valid() {  # <hold-body> [<origin-id> <decision-key>]
+  parse_resolution_record "$1" || return 1
+  if [ "$#" -eq 3 ]; then
+    [ "$RESOLUTION_ORIGIN" = "$2" ] && [ "$RESOLUTION_KEY" = "$3" ] || return 1
+  fi
+}
+
+body_has_resolution_record() {  # <hold-body> [<origin-id> <decision-key>]
+  resolution_record_valid "$@"
 }
 
 active_hold_body_valid() {  # <hold-body> <origin-id> <decision-key>
   local expected
   expected="\"Origin: $2\\nDecision key: $3\\nState: awaiting captain decision.\""
-  [ "$1" = "$expected" ] || resolution_record_valid "$1"
+  [ "$1" = "$expected" ] || resolution_record_valid "$1" "$2" "$3"
 }
 
 file_link_count() {  # <path>
@@ -315,12 +389,88 @@ file_link_count() {  # <path>
   fi
 }
 
+DECISION_ARCHIVE=''
+authoritative_archive_path() {
+  local physical_home expected_data physical_expected physical_data
+  DECISION_ARCHIVE=''
+  [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
+  physical_home=$(cd "$FM_HOME" && pwd -P) \
+    || fail "could not resolve active home: $FM_HOME"
+  expected_data="$FM_HOME/data"
+  [ -d "$expected_data" ] && [ ! -L "$expected_data" ] \
+    || fail "authoritative data directory is unsafe: $expected_data"
+  physical_expected=$(cd "$expected_data" && pwd -P) \
+    || fail "could not resolve authoritative data directory: $expected_data"
+  [ "$physical_expected" = "$physical_home/data" ] \
+    || fail "authoritative data directory escapes the active home: $expected_data"
+  [ -d "$DATA" ] && [ ! -L "$DATA" ] \
+    || fail "configured data directory is unsafe: $DATA"
+  physical_data=$(cd "$DATA" && pwd -P) \
+    || fail "could not resolve configured data directory: $DATA"
+  [ "$physical_data" = "$physical_expected" ] \
+    || fail "configured data directory is outside the active home: $DATA"
+  DECISION_ARCHIVE="$physical_expected/done-archive.md"
+}
+
+archived_header_has_captain_provenance() {  # <header> <hold-id>
+  local header=$1 id=$2 rest kind='' hold_kind='' value
+  local kind_seen=0 hold_kind_seen=0 hold_seen=0
+  local re_dep='^(.*)[[:space:]]+(blocked-by|parent|discovered-from):[[:space:]]+[A-Za-z0-9][A-Za-z0-9._-]*([[:space:]]+-[[:space:]].*)?[[:space:]]*$'
+  local re_repo='^(.*)[[:space:]]+\(repo:[[:space:]]*([^)]*)\)[[:space:]]*$'
+  local re_kind='^(.*)[[:space:]]+\(kind:[[:space:]]*([^)]*)\)[[:space:]]*$'
+  local re_priority='^(.*)[[:space:]]+\(priority:[[:space:]]*[0-4]\)[[:space:]]*$'
+  local re_since='^(.*)[[:space:]]+\(since[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}\)[[:space:]]*$'
+  local re_closed='^(.*)[[:space:]]+\((merged|reported|done|closed)[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}\)[[:space:]]*$'
+  local re_hold_until='^(.*)[[:space:]]+\(hold-until:[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}\)[[:space:]]*$'
+  local re_hold_kind='^(.*)[[:space:]]+\(hold-kind:[[:space:]]*(captain|external|load|parked|future)\)[[:space:]]*$'
+  local re_hold='^(.*)[[:space:]]+\(hold:[[:space:]]*([^()]*)\)[[:space:]]*$'
+  case "$header" in "- [x] $id - "*) rest=${header#"- [x] $id - "} ;; *) return 1 ;; esac
+  while :; do
+    if [[ "$rest" =~ $re_dep ]]; then
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_repo ]]; then
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_kind ]]; then
+      if [ "$kind_seen" -eq 0 ]; then
+        value=${BASH_REMATCH[2]}
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        kind=$value
+        kind_seen=1
+      fi
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_priority ]]; then
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_since ]]; then
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_closed ]]; then
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_hold_until ]]; then
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_hold_kind ]]; then
+      if [ "$hold_kind_seen" -eq 0 ]; then
+        hold_kind=${BASH_REMATCH[2]}
+        hold_kind_seen=1
+      fi
+      rest=${BASH_REMATCH[1]}
+    elif [[ "$rest" =~ $re_hold ]]; then
+      [ "$hold_seen" -eq 1 ] || hold_seen=1
+      rest=${BASH_REMATCH[1]}
+    else
+      break
+    fi
+  done
+  [ "$kind" = captain ] && [ "$hold_kind" = captain ] && [ "$hold_seen" -eq 1 ]
+}
+
 # Load one normally pruned Done record without moving it back into the bounded
 # backlog window. The archive path is the tracked tasks-axi configuration's
 # durable history owner. Only an exact, single, ordinary captain-hold record with
 # this owner's resolution body can prove a historical decision.
-archived_hold_resolved() {  # <hold-id>
-  local id=$1 archive="$DATA/done-archive.md" links record rc header='' body='' line
+archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
+  local id=$1 origin=$2 key=$3 archive links record rc header='' body='' line body_started=0
+  authoritative_archive_path
+  archive=$DECISION_ARCHIVE
   [ -e "$archive" ] || [ -L "$archive" ] || return 1
   [ ! -L "$archive" ] && [ -f "$archive" ] \
     || fail "decision archive is not an ordinary file: $archive"
@@ -361,31 +511,30 @@ archived_hold_resolved() {  # <hold-id>
   while IFS= read -r line; do
     case "$line" in
       H*) header=${line#H} ;;
-      B*) body="${body}${body:+\\n}${line#B}" ;;
+      B*)
+        [ "$body_started" -eq 0 ] || body="${body}"$'\n'
+        body="${body}${line#B}"
+        body_started=1
+        ;;
       *) fail "captain decision $id has a malformed archived record" ;;
     esac
   done <<EOF
 $record
 EOF
-  case "$header" in
-    *' (kind: captain)'*) : ;;
-    *) fail "captain decision $id has mismatched archived kind" ;;
-  esac
-  case "$header" in
-    *' (hold-kind: captain)'*) : ;;
-    *) fail "captain decision $id has mismatched archived hold provenance" ;;
-  esac
-  resolution_record_valid "$body" \
-    || fail "captain decision $id has a malformed archived resolution"
+  while [ "${body%$'\n'}" != "$body" ]; do body=${body%$'\n'}; done
+  archived_header_has_captain_provenance "$header" "$id" \
+    || fail "captain decision $id has mismatched archived captain-hold provenance"
+  resolution_record_valid "$body" "$origin" "$key" \
+    || fail "captain decision $id has a malformed or mismatched archived resolution"
 }
 
-resolution_body() {  # <mode> <routed-csv> [routed-task-id...]
-  local mode=$1 routed_csv=$2 body dep
-  shift 2
+resolution_body() {  # <origin-id> <decision-key> <mode> <routed-csv> [routed-task-id...]
+  local origin=$1 key=$2 mode=$3 routed_csv=$4 body dep
+  shift 4
   # Command substitution strips the trailing newline, so restore it before the
   # routed-work list to keep each entry on its own durable backlog line.
-  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: %s\nResolution mode: %s\n\nCaptain decision:\n%s\n\nRouted work:' \
-    "$DECISION_DIGEST" "$routed_csv" "$mode" "$DECISION_TEXT")
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: %s\nDecision digest: %s\nRouted identities: %s\nResolution mode: %s\n\nCaptain decision:\n%s\n\nRouted work:' \
+    "$origin" "$key" "$DECISION_DIGEST" "$routed_csv" "$mode" "$DECISION_TEXT")
   body="${body}"$'\n'
   if [ "$#" -eq 0 ]; then
     body="${body}${ROUTED_NONE}"$'\n'
@@ -450,8 +599,8 @@ verify_hold_active() {  # <hold-id> <origin-id> <decision-key>
     || fail "captain hold $id has malformed or mismatched active provenance"
 }
 
-verify_hold_resolved() {  # <hold-id>
-  local id=$1 show state kind hold_kind body
+verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
+  local id=$1 origin=$2 key=$3 show state kind hold_kind body
   show=$(task_show "$id") || return 1
   state=$(show_field "$show" state)
   kind=$(show_field "$show" kind)
@@ -460,14 +609,14 @@ verify_hold_resolved() {  # <hold-id>
   [ "$state" = "done" ] || return 1
   [ "$kind" = captain ] || return 1
   [ "$hold_kind" = captain ] || return 1
-  body_has_resolution_record "$body"
+  body_has_resolution_record "$body" "$origin" "$key"
 }
 
 verify_hold_durable() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id show state held kind hold_kind body
   id=$(hold_id "$origin" "$key")
   if ! show=$(task_show "$id"); then
-    archived_hold_resolved "$id" && return 0
+    archived_hold_resolved "$id" "$origin" "$key" && return 0
     fail "captain decision $id is absent from $FM_HOME/data/backlog.md and is not durably resolved in its archive"
   fi
   state=$(show_field "$show" state)
@@ -481,29 +630,19 @@ verify_hold_durable() {  # <origin-id> <decision-key>
     return 0
   fi
   if [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
-    && body_has_resolution_record "$body"; then
+    && body_has_resolution_record "$body" "$origin" "$key"; then
     return 0
   fi
   fail "captain decision $id is neither actively held nor durably resolved"
 }
 
-verify_resolution_identity() {
-  local id=$1 hold_body=$2 decision_digest=$3 routed_csv=$4 resolution_prefix resolution_fields recorded_digest recorded_routes
-  resolution_prefix='"Resolution recorded by fm-decision-hold.\nDecision digest: '
-  case "$hold_body" in
-    "$resolution_prefix"*) resolution_fields=${hold_body#"$resolution_prefix"} ;;
-    *) fail "captain hold $id has no retry identity record" ;;
-  esac
-  case "$resolution_fields" in
-    *'\nRouted identities: '*'\n\nCaptain decision:'*) : ;;
-    *) fail "captain hold $id has an invalid retry identity record" ;;
-  esac
-  recorded_digest=${resolution_fields%%\\n*}
-  resolution_fields=${resolution_fields#*\\nRouted identities: }
-  recorded_routes=${resolution_fields%%\\n*}
-  [ "$recorded_digest" = "$decision_digest" ] \
+verify_resolution_identity() {  # <hold-id> <origin-id> <decision-key> <body> <digest> <routed-csv>
+  local id=$1 origin=$2 key=$3 hold_body=$4 decision_digest=$5 routed_csv=$6
+  resolution_record_valid "$hold_body" "$origin" "$key" \
+    || fail "captain hold $id has an invalid or mismatched retry identity record"
+  [ "$RESOLUTION_DIGEST" = "$decision_digest" ] \
     || fail "captain hold $id records a different captain decision"
-  [ "$recorded_routes" = "$routed_csv" ] \
+  [ "$RESOLUTION_ROUTES" = "$routed_csv" ] \
     || fail "captain hold $id records different routed work"
 }
 
@@ -541,7 +680,7 @@ command_hold() {
     [ "$kind" = captain ] || fail "existing backlog identity $id is not kind captain"
     [ "$existing_title" = "$title" ] || fail "existing captain hold $id has a different title"
   else
-    if archived_hold_resolved "$id"; then
+    if archived_hold_resolved "$id" "$origin" "$key"; then
       fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
     fi
     if [ -z "$repo" ] && [ -f "$STATE/$origin.meta" ]; then
@@ -689,10 +828,10 @@ command_resolve() {
   routed_csv=$(printf '%s\n' "$routed" | tr ' ' ',')
   require_tasks_axi
   id=$(hold_id "$origin" "$key")
-  if verify_hold_resolved "$id"; then
+  if verify_hold_resolved "$id" "$origin" "$key"; then
     hold_show=$(task_show "$id")
     hold_body=$(show_field "$hold_show" body)
-    verify_resolution_identity "$id" "$hold_body" "$DECISION_DIGEST" "$routed_csv"
+    verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$routed_csv"
     printf 'resolved: %s\n' "$id"
     return 0
   fi
@@ -701,7 +840,7 @@ command_resolve() {
   hold_body=$(show_field "$hold_show" body)
   case "$hold_body" in
     *"Resolution recorded by fm-decision-hold."*)
-      verify_resolution_identity "$id" "$hold_body" "$DECISION_DIGEST" "$routed_csv"
+      verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$routed_csv"
       resolution_recorded=1
       ;;
   esac
@@ -721,7 +860,7 @@ command_resolve() {
   done
 
   # shellcheck disable=SC2086  # routed is a validated space-separated slug list.
-  body=$(resolution_body routed "$routed_csv" $routed)
+  body=$(resolution_body "$origin" "$key" routed "$routed_csv" $routed)
   tasks_axi update "$id" --body "$body" >/dev/null \
     || fail "could not record the captain decision on $id"
   for dep in $routed; do
@@ -732,7 +871,7 @@ command_resolve() {
     fi
   done
   tasks_axi "done" "$id" >/dev/null || fail "could not close resolved captain hold $id"
-  verify_hold_resolved "$id" || fail "captain hold $id did not retain its durable resolution record"
+  verify_hold_resolved "$id" "$origin" "$key" || fail "captain hold $id did not retain its durable resolution record"
   printf 'resolved: %s -> %s\n' "$id" "$routed"
 }
 
@@ -762,10 +901,10 @@ close_unrouted_hold() {  # <mode> <outcome-word> <origin-id> <decision-key> <fla
   load_decision "$decision_file"
   require_tasks_axi
   id=$(hold_id "$origin" "$key")
-  if verify_hold_resolved "$id"; then
+  if verify_hold_resolved "$id" "$origin" "$key"; then
     hold_show=$(task_show "$id")
     hold_body=$(show_field "$hold_show" body)
-    verify_resolution_identity "$id" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
+    verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
     printf '%s: %s\n' "$outcome" "$id"
     return 0
   fi
@@ -777,17 +916,17 @@ close_unrouted_hold() {  # <mode> <outcome-word> <origin-id> <decision-key> <fla
   hold_body=$(show_field "$hold_show" body)
   case "$hold_body" in
     *"Resolution recorded by fm-decision-hold."*)
-      verify_resolution_identity "$id" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
+      verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
       ;;
   esac
   dependents=$(tasks_blocked_by "$id") || exit 1
   [ -z "$dependents" ] \
     || fail "captain hold $id still blocks routed work ($dependents); use resolve to record that work"
-  body=$(resolution_body "$mode" "$ROUTED_NONE")
+  body=$(resolution_body "$origin" "$key" "$mode" "$ROUTED_NONE")
   tasks_axi update "$id" --body "$body" >/dev/null \
     || fail "could not record the captain decision on $id"
   tasks_axi "done" "$id" >/dev/null || fail "could not close $mode captain hold $id"
-  verify_hold_resolved "$id" || fail "captain hold $id did not retain its durable resolution record"
+  verify_hold_resolved "$id" "$origin" "$key" || fail "captain hold $id did not retain its durable resolution record"
   printf '%s: %s\n' "$outcome" "$id"
 }
 
@@ -942,19 +1081,19 @@ command_repair() {
     || fail "backlog item $id was never held for the captain; repair records a captain decision only on a captain hold"
   state=$(show_field "$show" state)
   hold_body=$(show_field "$show" body)
-  if [ "$state" = "done" ] && body_has_resolution_record "$hold_body"; then
-    verify_resolution_identity "$id" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
+  if [ "$state" = "done" ] && body_has_resolution_record "$hold_body" "$origin" "$key"; then
+    verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
     printf 'repaired: %s\n' "$id"
     return 0
   fi
   [ "$state" = "done" ] \
     || fail "captain hold $id is still open (state=$state); use resolve or decline to close it with the captain's decision"
-  body=$(resolution_body repaired "$ROUTED_NONE")
+  body=$(resolution_body "$origin" "$key" repaired "$ROUTED_NONE")
   tasks_axi update "$id" --body "$body" >/dev/null \
     || fail "could not record the captain decision on $id"
   show=$(task_show "$id") || fail "captain decision $id disappeared while recording the repair"
   [ "$(show_field "$show" state)" = "done" ] || fail "repairing $id reopened a closed captain decision"
-  verify_hold_resolved "$id" || fail "captain hold $id did not retain its durable resolution record"
+  verify_hold_resolved "$id" "$origin" "$key" || fail "captain hold $id did not retain its durable resolution record"
   printf 'repaired: %s\n' "$id"
 }
 
