@@ -304,6 +304,8 @@ fm_backend_orca_operation_scalar_publish() {  # <path> <value>
   return "$rc"
 }
 
+FM_BACKEND_ORCA_TERMINAL_CREATE_IN_PROGRESS=200
+
 fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-path> <operation-prefix>
   local worktree_id=$1 title=$2 response=$3 operation=$4
   local pid_file="${operation}.pid" start_file="${operation}.start" status_file="${operation}.status"
@@ -380,7 +382,7 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
     fi
 
     i=$((i + 1))
-    [ "$i" -lt "$max" ] || return 124
+    [ "$i" -lt "$max" ] || return "$FM_BACKEND_ORCA_TERMINAL_CREATE_IN_PROGRESS"
     sleep "$interval"
   done
 }

@@ -509,7 +509,7 @@ test_terminal_create_timeout_remains_resumable() {
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_terminal_create_durable wt-timeout fm-task "$1" "$2"; printf "%s\n" "$?" > "$3"' \
       "$ROOT" "$response" "$operation" "$status_file" >/dev/null 2>&1
   status=$(cat "$status_file")
-  [ "$status" -eq 124 ] || fail "in-flight terminal creation should return typed status 124, got $status"
+  [ "$status" -eq 200 ] || fail "in-flight terminal creation should return typed status 200, got $status"
   for i in $(seq 1 200); do
     [ ! -f "$CASE_DIR/terminal-returned" ] || break
     sleep 0.02
@@ -529,6 +529,32 @@ test_terminal_create_timeout_remains_resumable() {
   creates=$(grep -c $'orca\x1fterminal\x1fcreate' "$LOG")
   [ "$creates" -eq 1 ] || fail "terminal timeout recovery created $creates terminals"
   pass "fm_backend_orca_terminal_create_durable: in-flight timeout remains resumable"
+}
+
+test_terminal_child_exit_124_remains_a_failure() {
+  local response operation out status
+  orca_case terminal-child-124
+  response="$CASE_DIR/terminal-response.json"
+  operation="$CASE_DIR/terminal-operation"
+  printf '124\n' > "$RESP/1.exit"
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_TERMINAL_POLLS=200 FM_ORCA_TERMINAL_INTERVAL=0.01 \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_terminal_create_durable wt-124 fm-task "$1" "$2"' \
+      "$ROOT" "$response" "$operation" 2>&1)
+  status=$?
+  [ "$status" -eq 124 ] \
+    || fail "terminal child exit 124 was not preserved as a failure (status=$status): $out"
+  [ "$(cat "$operation.status")" = 124 ] \
+    || fail "terminal child exit 124 was not durably journaled"
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_terminal_create_durable wt-124 fm-task "$1" "$2"' \
+      "$ROOT" "$response" "$operation" 2>&1)
+  status=$?
+  [ "$status" -eq 124 ] \
+    || fail "journaled terminal child exit 124 was mistaken for in-progress (status=$status): $out"
+  [ "$(grep -c $'orca\x1fterminal\x1fcreate' "$LOG")" -eq 1 ] \
+    || fail "terminal child exit 124 retried terminal creation"
+  pass "fm_backend_orca_terminal_create_durable: child exit 124 stays a failure"
 }
 
 test_spawn_retries_after_compensated_pathless_worktree() {
@@ -1745,6 +1771,7 @@ test_worktree_and_terminal_helpers_parse_json
 test_worktree_create_removes_worktree_when_path_missing
 test_worktree_create_preserves_terminal_when_close_is_unconfirmed
 test_terminal_create_timeout_remains_resumable
+test_terminal_child_exit_124_remains_a_failure
 test_spawn_retries_after_compensated_pathless_worktree
 test_spawn_recovers_compensated_pathless_response_after_creator_crash
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails

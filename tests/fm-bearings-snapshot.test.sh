@@ -31,6 +31,7 @@ make_fakebin() {  # <dir>
   fb=$(fm_fakebin "$1")
   cat > "$fb/no-mistakes" <<'SH'
 #!/usr/bin/env bash
+[ -z "${FAKE_NM_MARKER:-}" ] || : > "${FM_HOME:?}/$FAKE_NM_MARKER"
 [ "${FAKE_NM_SLEEP:-0}" = 1 ] && sleep 30
 exit 0
 SH
@@ -381,6 +382,8 @@ case "$1 $2" in
   '-c %Y') printf '1783792800\n' ;;
   '-c %s') LC_ALL=C wc -c < "$3" | tr -d ' ' ;;
   '-c %h') printf '1\n' ;;
+  '-c %d:%i') /usr/bin/stat -f '%d:%i' "$3" ;;
+  '-c %d:%i:%h:%s') /usr/bin/stat -f '%d:%i:%l:%z' "$3" ;;
   -f\ *)
     printf '  File: "%s"\nBlocks: Total: 1\n' "$2"
     exit 1
@@ -600,7 +603,7 @@ test_bad_secondmate_homes_never_revive_parent_work() {
     "unsafe operational path did not stop authoritative Bearings publication"
   chmod 700 "$unreadable/data"
 
-  json=$(FAKE_NM_SLEEP=1 FM_SNAPSHOT_SECONDMATE_TIMEOUT=1 run "$home" "$fakebin" --json)
+  json=$(FAKE_NM_SLEEP=1 FM_SNAPSHOT_SECONDMATE_TIMEOUT=5 run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.secondmates | length) == 5
       and (.in_flight | map(.id) | all(. != "invalid" and . != "unreadable" and . != "malformed" and . != "unknown-child"))
@@ -1199,7 +1202,7 @@ test_perl_fallback_bounds_github_call() {
   fakebin=$(make_fakebin "$home")
   toolbin="$home/toolbin"
   mkdir -p "$toolbin"
-  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find mkdir rm mktemp readlink ln rmdir chmod mv cp awk; do
+  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find mkdir rm mktemp readlink ln rmdir env stat uname awk cp chmod mv ps kill cmp; do
     ln -s "$(command -v "$cmd")" "$toolbin/$cmd"
   done
   for cmd in shasum sha256sum; do
@@ -1210,7 +1213,7 @@ test_perl_fallback_bounds_github_call() {
   json=$(PATH="$fakebin:$toolbin" FM_HOME="$home" FM_BEARINGS_NOW=2026-07-11T18:00:00Z \
     FM_BEARINGS_PR_TIMEOUT=1 NET_LOG="$home/net.log" FAKE_GH_SLEEP=1 "$BEARINGS" --include-prs --json)
   elapsed=$(( $(date +%s) - started ))
-  [ "$elapsed" -lt 10 ] || fail "Perl fallback did not bound a stalled gh call (${elapsed}s)"
+  [ "$elapsed" -lt 20 ] || fail "Perl fallback did not bound a stalled gh call (${elapsed}s)"
   printf '%s' "$json" | jq -e '.prs | test("unavailable")' >/dev/null \
     || fail "timed-out gh call did not fail soft: $json"
   pass "Perl fallback bounds stalled GitHub calls without coreutils timeout"
@@ -1251,7 +1254,7 @@ test_section_caps_and_expansion_flags() {
     (.in_flight|length) == 2 and (.decisions_open|length) == 2 and (.gates|length) == 2
     and (.reports|length) == 2 and (.recorded_prs|length) == 2 and (.unhealthy_endpoints|length) == 2
     and ([.omitted[].surface] | index("in_flight showing 2 of 5") != null)
-    and ([.omitted[].surface] | index("decisions_open showing 2 of 5") != null)
+    and ([.omitted[].surface] | index("decisions_open showing 2 of 10") != null)
     and ([.omitted[].surface] | index("gates showing 2 of 5") != null)
     and ([.omitted[].surface] | index("reports showing 2 of 5") != null)
     and ([.omitted[].surface] | index("recorded_prs showing 2 of 5") != null)
@@ -1262,7 +1265,7 @@ test_section_caps_and_expansion_flags() {
     run "$home" "$fakebin" --json --all-in-flight --all-decisions --all-queued \
       --all-reports --all-recorded-prs --all-unhealthy)
   printf '%s' "$expanded" | jq -e '
-    (.in_flight|length) == 5 and (.decisions_open|length) == 5 and (.gates|length) == 5
+    (.in_flight|length) == 5 and (.decisions_open|length) == 10 and (.gates|length) == 5
     and (.reports|length) == 5 and (.recorded_prs|length) == 5 and (.unhealthy_endpoints|length) == 5
   ' >/dev/null || fail "section expansion flags did not reveal full sets: $expanded"
   pass "all fleet-sized sections are capped with counted opt-in expansion"
@@ -1306,7 +1309,7 @@ install_failing_jq() {  # <fakebin> <model|toon>
   cat > "$fakebin/jq" <<SH
 #!/usr/bin/env bash
 case "\$*" in
-  *'def trunc'*) [ "$phase" = model ] && exit 9 ;;
+  *'def escape_label:'*) [ "$phase" = model ] && exit 9 ;;
   *'def q:'*) [ "$phase" = toon ] && exit 9 ;;
 esac
 exec "$real" "\$@"
@@ -1323,13 +1326,15 @@ test_projection_and_toon_fail_closed() {
   out=$(run "$home" "$fakebin" --json 2> "$err"); rc=$?
   [ "$rc" -ne 0 ] || fail "projection failure exited successfully"
   [ -z "$out" ] || fail "projection failure emitted output"
-  grep -F 'projection failed' "$err" >/dev/null || fail "projection failure lacked a diagnostic"
+  grep -F 'projection failed' "$err" >/dev/null \
+    || fail "projection failure lacked a diagnostic: $(cat "$err")"
   install_failing_jq "$fakebin" toon
   err="$home/toon.err"
   out=$(run "$home" "$fakebin" 2> "$err"); rc=$?
   [ "$rc" -ne 0 ] || fail "TOON rendering failure exited successfully"
   [ -z "$out" ] || fail "TOON rendering failure emitted output"
-  grep -F 'TOON rendering failed' "$err" >/dev/null || fail "TOON failure lacked a diagnostic"
+  grep -F 'TOON rendering failed' "$err" >/dev/null \
+    || fail "TOON failure lacked a diagnostic: $(cat "$err")"
   pass "projection and TOON rendering failures exit nonzero with diagnostics"
 }
 

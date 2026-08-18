@@ -477,10 +477,6 @@ spawn_remote_secondmate() {
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     return 1
   }
-  if ! reserve_secondmate_work_identity; then
-    fm_lock_release "$SPAWN_TASK_LOCK" || true
-    return 1
-  fi
   if ! fm_lock_acquire_wait "$registry_lock"; then
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     return 1
@@ -590,6 +586,12 @@ spawn_remote_secondmate() {
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     echo "error: remote secondmate $id inheritance transaction could not be locked" >&2
+    return 1
+  fi
+  if ! reserve_secondmate_work_identity; then
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
     return 1
   fi
   remote_generation=$(fm_remote_inherit_generation_next "$STATE" "$id" 2>/dev/null || true)
@@ -1052,7 +1054,8 @@ spawn_orca_operation_helper() {
     terminal=$(fm_backend_orca_terminal_create_durable "$wt_id" "$W" \
       "$terminal_response" "$SPAWN_ORCA_OPERATION/terminal-create")
     rc=$?
-    [ "$rc" -ne 124 ] || exit 124
+    [ "$rc" -ne "$FM_BACKEND_ORCA_TERMINAL_CREATE_IN_PROGRESS" ] \
+      || exit "$FM_BACKEND_ORCA_TERMINAL_CREATE_IN_PROGRESS"
     [ "$rc" -eq 0 ] || failure_reason=terminal
   fi
   if [ "$rc" -eq 0 ] && [ -n "$wt_id" ] && [ -n "$wt_path" ] && [ -n "$terminal" ]; then
@@ -1764,7 +1767,6 @@ else
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
 if [ "$KIND" = secondmate ]; then
-  reserve_secondmate_work_identity || exit 1
   if [ "$RELAUNCH" -eq 1 ] && [ -n "$(fm_meta_get "$RELAUNCH_META" remote_host)" ]; then
     if spawn_remote_secondmate "$ID"; then
       exit 0
@@ -2335,6 +2337,28 @@ if [ "$KIND" = secondmate ]; then
     fi
     SECONDMATE_PROJECTS=$SECONDMATE_REGISTRY_MATCH_PROJECTS
   fi
+  if [ -f "$PROJ_ABS/data/charter.md" ]; then
+    BRIEF="$PROJ_ABS/data/charter.md"
+  else
+    BRIEF="$DATA/$ID/brief.md"
+  fi
+  [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+  mkdir -p "$PROJ_ABS/state" || {
+    echo "error: could not create secondmate state directory for $PROJ_ABS" >&2
+    exit 1
+  }
+  if [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
+    CONFIG_INHERIT_LOCK=$(fm_config_inherit_lock_path "$PROJ_ABS") || {
+      echo "error: could not resolve secondmate inheritance lock for $PROJ_ABS" >&2
+      exit 1
+    }
+    if ! fm_lock_acquire_wait "$CONFIG_INHERIT_LOCK"; then
+      echo "error: could not acquire secondmate inheritance lock for $PROJ_ABS" >&2
+      exit 1
+    fi
+    CONFIG_INHERIT_LOCK_HELD=1
+  fi
+  reserve_secondmate_work_identity || exit 1
   WT="$PROJ_ABS"
   # Local-HEAD sync: before launch, fast-forward this secondmate's worktree to the
   # PRIMARY checkout's current default-branch commit, so a freshly spawned or
@@ -2356,30 +2380,12 @@ if [ "$KIND" = secondmate ]; then
   else
     echo "warning: secondmate $ID sync skipped before launch: primary default-branch commit cannot be resolved" >&2
   fi
-  mkdir -p "$PROJ_ABS/state" || {
-    echo "error: could not create secondmate state directory for $PROJ_ABS" >&2
-    exit 1
-  }
   if [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
-    CONFIG_INHERIT_LOCK=$(fm_config_inherit_lock_path "$PROJ_ABS") || {
-      echo "error: could not resolve secondmate inheritance lock for $PROJ_ABS" >&2
-      exit 1
-    }
-    if ! fm_lock_acquire_wait "$CONFIG_INHERIT_LOCK"; then
-      echo "error: could not acquire secondmate inheritance lock for $PROJ_ABS" >&2
-      exit 1
-    fi
-    CONFIG_INHERIT_LOCK_HELD=1
     # Inheritance propagation: push the primary-authoritative live-safe local inheritance
     # surface into this secondmate home (fm-config-inherit-lib.sh).
     FM_CONFIG_INHERIT_LIVE=1 \
       propagate_secondmate_inheritance "$FM_HOME" "$PROJ_ABS" "$CONFIG" "$DATA" \
       || echo "warning: secondmate $ID inheritance failed for $PROJ_ABS" >&2
-  fi
-  if [ -f "$PROJ_ABS/data/charter.md" ]; then
-    BRIEF="$PROJ_ABS/data/charter.md"
-  else
-    BRIEF="$DATA/$ID/brief.md"
   fi
 else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
@@ -3313,7 +3319,6 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     worktree_request_round=0
     while [ "$worktree_request_round" -lt 2 ] && [ -z "$WT" ]; do
       candidate=""
-      project_shell_observed=0
       for _ in $(seq 1 "$worktree_poll_max"); do
         p=$(spawn_current_path "$WT_TARGET" || true)
         if [ -n "$p" ]; then
@@ -3326,7 +3331,6 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
             candidate="$p_real"
           else
             candidate=""
-            case "$BACKEND" in zellij|cmux) project_shell_observed=1 ;; esac
           fi
         else
           candidate=""
@@ -3346,9 +3350,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
             worktree_request_idle=1
           fi
           ;;
-        zellij|cmux)
-          [ "$project_shell_observed" -ne 1 ] || worktree_request_idle=1
-          ;;
+        zellij|cmux) ;;
       esac
       [ "$worktree_request_idle" -eq 1 ] || break
       if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then

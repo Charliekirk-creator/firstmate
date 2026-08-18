@@ -221,11 +221,11 @@ state/home-summary.json is fetched concurrently under one FM_SNAPSHOT_BUDGET
 (default 5 seconds), with a valid prior copy under FM_SNAPSHOT_CACHE_DIR used
 when the live read fails, is invalid, or consumes the budget. A home with neither
 a valid ledger nor a valid cached copy is reported unreadable with the reason;
-collection never computes a summary in that home. Exact identity batches use
-FM_SNAPSHOT_SECONDMATE_TIMEOUT. Each local per-task current-state read is bounded
-by FM_SNAPSHOT_CREW_STATE_TIMEOUT (default 10 seconds); a read that hits the
-bound reports state unknown. Remote secondmate endpoint liveness is not probed by
-this command.
+collection never computes a summary in that home. Exact identity streams share
+one fleet-wide FM_SNAPSHOT_SECONDMATE_TIMEOUT deadline. Each local per-task
+current-state read is bounded by FM_SNAPSHOT_CREW_STATE_TIMEOUT (default 10
+seconds); a read that hits the bound reports state unknown. Remote secondmate
+endpoint liveness is not probed by this command.
 Terminal contradiction evidence uses
 FM_SNAPSHOT_TERMINAL_LINES, FM_SNAPSHOT_TERMINAL_BYTES, and
 FM_SNAPSHOT_TERMINAL_TIMEOUT and never becomes canonical current state.
@@ -276,6 +276,13 @@ if [ "${FM_WORK_IDENTITY_PUBLICATION_GUARDED_HOME:-}" != "$SNAPSHOT_PUBLICATION_
       "$SCRIPT_DIR/fm-fleet-snapshot.sh" "${SNAPSHOT_ARGS[@]}"
   exit $?
 fi
+
+SECONDMATE_DEADLINE_EPOCH=
+snapshot_secondmate_remaining() {
+  local remaining=$((SECONDMATE_DEADLINE_EPOCH - $(date +%s)))
+  [ "$remaining" -gt 0 ] || return 1
+  printf '%s\n' "$remaining"
+}
 
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-snapshot: jq not found" >&2; exit 1; }
 WORK_IDENTITY_LIMITS=$(
@@ -1041,7 +1048,7 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
 
 fetch_secondmate_work_identities_json() {  # <id> <home> <remote> <summary-json>
   local id=$1 home=$2 remote=$3 summary=$4 home_id index ids_raw rc tmp stream_tmp page_tmp
-  local bytes max_stream_bytes header records expected offset end task deadline now remaining first_page
+  local bytes max_stream_bytes header records expected offset end task remaining first_page
   home_id="secondmate:$id"
   local -a task_ids
   index=$(printf '%s' "$summary" | jq -c '.work_identity_index') \
@@ -1083,15 +1090,12 @@ EOF
   if [ "$remote" = true ]; then
     page_tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-parent-work-identity-page.XXXXXX") \
       || { rm -f -- "$tmp" "$stream_tmp"; return 1; }
-    deadline=$(($(date +%s) + FM_SNAPSHOT_SECONDMATE_TIMEOUT))
     offset=0
     first_page=1
     while [ "$offset" -lt "${#task_ids[@]}" ]; do
       end=$((offset + WORK_IDENTITY_BATCH_SIZE))
       [ "$end" -le "${#task_ids[@]}" ] || end=${#task_ids[@]}
-      now=$(date +%s)
-      remaining=$((deadline - now))
-      if [ "$remaining" -le 0 ]; then
+      if ! remaining=$(snapshot_secondmate_remaining); then
         rc=124
         break
       fi
@@ -1122,17 +1126,21 @@ EOF
     done
     rm -f -- "$page_tmp"
   else
-    fm_run_timed "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" env \
-      FM_ROOT_OVERRIDE="$FM_ROOT" \
-      FM_HOME="$home" \
-      FM_STATE_OVERRIDE="$home/state" \
-      FM_DATA_OVERRIDE="$home/data" \
-      FM_CONFIG_OVERRIDE="$home/config" \
-      FM_PROJECTS_OVERRIDE="$home/projects" \
-      FM_SNAPSHOT_NOW="$SNAPSHOT_NOW" \
-      FM_SNAPSHOT_NOW_EPOCH="$SNAPSHOT_EPOCH" \
-      "$SCRIPT_DIR/fm-fleet-snapshot.sh" --secondmate-home-identity-stream \
-        "${task_ids[@]}" > "$stream_tmp" 2>/dev/null || rc=$?
+    if remaining=$(snapshot_secondmate_remaining); then
+      fm_run_timed "$remaining" env \
+        FM_ROOT_OVERRIDE="$FM_ROOT" \
+        FM_HOME="$home" \
+        FM_STATE_OVERRIDE="$home/state" \
+        FM_DATA_OVERRIDE="$home/data" \
+        FM_CONFIG_OVERRIDE="$home/config" \
+        FM_PROJECTS_OVERRIDE="$home/projects" \
+        FM_SNAPSHOT_NOW="$SNAPSHOT_NOW" \
+        FM_SNAPSHOT_NOW_EPOCH="$SNAPSHOT_EPOCH" \
+        "$SCRIPT_DIR/fm-fleet-snapshot.sh" --secondmate-home-identity-stream \
+          "${task_ids[@]}" > "$stream_tmp" 2>/dev/null || rc=$?
+    else
+      rc=124
+    fi
   fi
   if [ "$rc" -ne 0 ]; then
     rm -f -- "$tmp" "$stream_tmp"
@@ -2049,6 +2057,7 @@ if [ "$OUTPUT_MODE" = secondmate-home-identities ] || [ "$OUTPUT_MODE" = secondm
 fi
 
 BACKLOG_JSON=$(backlog_json) || { echo "fm-fleet-snapshot: backlog read failed" >&2; exit 1; }
+SECONDMATE_DEADLINE_EPOCH=$(($(date +%s) + FM_SNAPSHOT_SECONDMATE_TIMEOUT))
 TASKS_RC=0
 TASKS_JSON=$(task_json_lines) || TASKS_RC=$?
 [ "$TASKS_RC" -eq 0 ] || {

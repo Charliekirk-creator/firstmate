@@ -428,6 +428,50 @@ test_concurrent_idempotence_and_explicit_unlinked() {
   pass "concurrent identical records converge and intentional unlinked intake stays explicit"
 }
 
+test_no_clobber_publications_recover_after_interruption() {
+  local home task manifest sidecar brief guard out links
+  home=$(make_home publication-recovery)
+  task=publication-recovery-linked
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null \
+    || fail "could not record publication recovery fixture"
+  sidecar="$home/data/$task/work-identity.json"
+  ln "$sidecar" "$sidecar.publishing" || fail "could not simulate interrupted sidecar publication"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest") \
+    || fail "record retry did not recover interrupted no-clobber publication"
+  assert_contains "$out" "(unchanged)" \
+    "sidecar publication recovery did not converge idempotently"
+  assert_absent "$sidecar.publishing" "sidecar publication recovery retained its staging link"
+
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not publish brief recovery fixture"
+  brief="$home/data/$task/brief.md"
+  ln "$brief" "$brief.publishing" || fail "could not simulate interrupted brief publication"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" >/dev/null \
+    || fail "verification did not recover interrupted brief publication"
+  assert_absent "$brief.publishing" "brief publication recovery retained its staging link"
+
+  task=publication-recovery-unlinked
+  FM_HOME="$home" "$WORK_IDENTITY" reserve-unlinked "$task" \
+    --reason persistent-secondmate >/dev/null \
+    || fail "could not publish unlinked guard recovery fixture"
+  guard="$home/data/$task/work-identity-unlinked-guard.json"
+  ln "$guard" "$guard.publishing" || fail "could not simulate interrupted guard publication"
+  FM_HOME="$home" "$WORK_IDENTITY" reserve-unlinked "$task" \
+    --reason persistent-secondmate >/dev/null \
+    || fail "reservation retry did not recover interrupted guard publication"
+  assert_absent "$guard.publishing" "guard publication recovery retained its staging link"
+
+  if [ "$(uname)" = Darwin ]; then
+    links=$(stat -f '%l' "$sidecar")
+  else
+    links=$(stat -c '%h' "$sidecar")
+  fi
+  [ "$links" = 1 ] || fail "recovered sidecar publication did not restore one link"
+  pass "no-clobber identity publications recover interrupted staging links"
+}
+
 test_projection_serializes_identity_ownership() {
   local home task lock lock_key entered release holder projection wait_count
   home=$(make_home projection-lock)
@@ -2017,6 +2061,7 @@ test_spawn_delivers_validated_brief_snapshot
 test_sidecar_validation_hashes_captured_bytes
 test_manifest_capture_rejects_same_size_rewrite
 test_concurrent_idempotence_and_explicit_unlinked
+test_no_clobber_publications_recover_after_interruption
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff

@@ -790,7 +790,7 @@ test_non_claude_harness_ignores_config_dir() {
 }
 
 test_fresh_metadata_interruption_never_publishes_partial_record() {
-  local rec id out status temp_meta
+  local rec id out status meta_publish_target
   id=profile-atomic-meta-z20
   rec=$(make_spawn_case profile-atomic-meta claude "$id")
   read_case_record "$rec"
@@ -808,8 +808,9 @@ exec "${REAL_MV_FOR_TEST:?}" "$@"
 SH
   chmod +x "$FAKEBIN_DIR/mv"
 
+  meta_publish_target="$(cd "$HOME_DIR/state" && pwd -P)/$id.meta"
   out=$(REAL_MV_FOR_TEST="$(command -v mv)" \
-    FM_TEST_META_PUBLISH_TARGET="$HOME_DIR/state/$id.meta" \
+    FM_TEST_META_PUBLISH_TARGET="$meta_publish_target" \
     FM_TEST_META_PUBLISH_KILLED="$CASE_DIR/meta-publish-killed" \
     run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
   status=$?
@@ -818,16 +819,31 @@ SH
     "fresh spawn never reached atomic metadata publication"
   assert_absent "$HOME_DIR/state/$id.meta" \
     "interrupted fresh spawn exposed task metadata at its authoritative path"
-  temp_meta=$(find "$HOME_DIR/state" -maxdepth 1 -type f -name ".$id.meta.*" -print -quit)
-  [ -n "$temp_meta" ] || fail "interrupted fresh spawn retained no recoverable complete metadata candidate"
-  assert_grep "endpoint_task_id=$id" "$temp_meta" \
-    "interrupted metadata candidate was incomplete"
   jq -e '.state == "prepared"' "$HOME_DIR/data/$id/work-identity-dispatch.json" >/dev/null \
     || fail "interrupted metadata publication did not preserve its prepared dispatch"
   assert_present "$HOME_DIR/state/$id.spawn-endpoint.json" \
     "interrupted metadata publication lost its endpoint recovery receipt"
   rm -rf "/tmp/fm-$id"
   pass "fresh spawn metadata publication is atomic across interruption"
+}
+
+test_invalid_secondmate_launch_does_not_reserve_identity() {
+  local rec id sm out status
+  id=profile-invalid-secondmate-z21
+  rec=$(make_spawn_case profile-invalid-secondmate codex "$id")
+  read_case_record "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$sm" unsupported-harness --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "invalid secondmate harness unexpectedly launched"
+  assert_contains "$out" "unknown harness 'unsupported-harness'" \
+    "invalid secondmate launch did not fail during harness validation"
+  assert_absent "$HOME_DIR/data/$id/work-identity-unlinked-guard.json" \
+    "invalid secondmate launch permanently reserved an unapplied task id"
+  pass "secondmate identity reservation follows non-mutating launch validation"
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
@@ -879,6 +895,7 @@ test_claude_forwards_firstmate_config_dir_when_set
 test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
 test_fresh_metadata_interruption_never_publishes_partial_record
+test_invalid_secondmate_launch_does_not_reserve_identity
 test_active_dispatch_profile_does_not_block_secondmate_launch
 
 echo "# all fm-spawn-dispatch-profile tests passed"

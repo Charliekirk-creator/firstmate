@@ -144,6 +144,7 @@ RETAIN_BRIEF_CAPTURE=0
 PROJECTION_TMP=
 DISPATCH_PRIOR_TMP=
 DISPATCH_PRIOR_CLEANUP=0
+PUBLICATION_STAGING=
 TMP=
 
 work_identity_cleanup() {
@@ -158,6 +159,7 @@ work_identity_cleanup() {
   [ -z "${BRIEF_VALIDATED_CAPTURE:-}" ] || rm -f -- "$BRIEF_VALIDATED_CAPTURE" 2>/dev/null || true
   [ -z "${PROJECTION_TMP:-}" ] || rm -f -- "$PROJECTION_TMP" 2>/dev/null || true
   [ -z "${DISPATCH_PRIOR_TMP:-}" ] || rm -f -- "$DISPATCH_PRIOR_TMP" 2>/dev/null || true
+  [ -z "${PUBLICATION_STAGING:-}" ] || rm -f -- "$PUBLICATION_STAGING" 2>/dev/null || true
   if [ "${DISPATCH_PRIOR_CLEANUP:-0}" -eq 1 ]; then
     DISPATCH_PRIOR_CLEANUP=0
     rm -f -- "${DISPATCH_PRIOR:-}" 2>/dev/null || true
@@ -235,6 +237,14 @@ file_identity() {  # <path>
   fi
 }
 
+file_inode_identity() {  # <path>
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
 sha256_file() {  # <path>
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
@@ -264,6 +274,64 @@ safe_regular_file() {  # <path> <label> [max-bytes]
   bytes=$(file_size "$path") || die "cannot inspect $label size: $path"
   case "$bytes" in ''|*[!0-9]*) die "$label has an invalid size: $path" ;; esac
   [ "$bytes" -le "$max" ] || die "$label exceeds $max bytes: $path"
+}
+
+recover_no_clobber_target() {  # <target> <label>
+  local target=$1 label=$2 staging target_links staging_links target_inode staging_inode
+  staging="${target}.publishing"
+  [ -e "$staging" ] || [ -L "$staging" ] || return 0
+  [ ! -L "$staging" ] || die "$label publication staging path is symlinked: $staging"
+  [ -f "$staging" ] || die "$label publication staging path is not a regular file: $staging"
+  staging_links=$(file_link_count "$staging") \
+    || die "cannot inspect $label publication staging link count: $staging"
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    [ "$staging_links" = 1 ] \
+      || die "$label publication staging path is unexpectedly hardlinked: $staging"
+    rm -f -- "$staging" || die "cannot retire incomplete $label publication staging path: $staging"
+    return 0
+  fi
+  [ ! -L "$target" ] || die "$label is symlinked: $target"
+  [ -f "$target" ] || die "$label is not a regular file: $target"
+  target_links=$(file_link_count "$target") || die "cannot inspect $label link count: $target"
+  [ "$target_links" = 2 ] && [ "$staging_links" = 2 ] \
+    || die "$label publication has an invalid recovery link count: $target"
+  target_inode=$(file_inode_identity "$target") || die "cannot inspect $label inode: $target"
+  staging_inode=$(file_inode_identity "$staging") \
+    || die "cannot inspect $label publication staging inode: $staging"
+  [ "$target_inode" = "$staging_inode" ] \
+    || die "$label publication staging path does not own the authoritative record: $staging"
+  rm -f -- "$staging" || die "cannot complete $label publication recovery: $staging"
+  target_links=$(file_link_count "$target") || die "cannot reinspect $label link count: $target"
+  [ "$target_links" = 1 ] || die "$label publication recovery did not restore one link: $target"
+}
+
+recover_no_clobber_publications() {
+  recover_no_clobber_target "$SIDECAR" "work identity record"
+  recover_no_clobber_target "$BRIEF_DEFAULT" "generated instructions"
+  recover_no_clobber_target "$UNLINKED_GUARD" "work identity unlinked guard"
+}
+
+publish_no_clobber() {  # <source> <target> <label>; 2 means target already exists
+  local source=$1 target=$2 label=$3 staging rc
+  [ ! -e "$target" ] && [ ! -L "$target" ] || return 2
+  staging="${target}.publishing"
+  [ ! -e "$staging" ] && [ ! -L "$staging" ] \
+    || die "$label publication staging path already exists: $staging"
+  mv -- "$source" "$staging" || die "cannot stage $label publication: $target"
+  [ "${TMP:-}" != "$source" ] || TMP=
+  PUBLICATION_STAGING=$staging
+  if ln "$staging" "$target" 2>/dev/null; then
+    rm -f -- "$staging" || die "cannot complete $label publication: $target"
+    PUBLICATION_STAGING=
+    return 0
+  fi
+  rc=$?
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    rm -f -- "$staging" || die "cannot retire conflicting $label publication staging path: $staging"
+    PUBLICATION_STAGING=
+    return 2
+  fi
+  die "cannot publish $label: $target (link status $rc)"
 }
 
 home_id_literal_valid() {  # <main|secondmate:id>
@@ -803,6 +871,7 @@ identity_lock_acquire() {  # <task-id>
   fm_lock_acquire_wait "$ACTIVE_IDENTITY_LOCK"
   ACTIVE_IDENTITY_LOCK_HELD=1
   locate_task_dir "$task"
+  [ ! -d "$TASK_DIR" ] || recover_no_clobber_publications
 }
 
 identity_lock_release() {
@@ -986,11 +1055,8 @@ write_unlinked_guard() {  # <task-id> <reason>
     || die "cannot create work identity unlinked guard"
   printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity unlinked guard"
   chmod 600 "$TMP" || die "cannot protect work identity unlinked guard"
-  if ln "$TMP" "$UNLINKED_GUARD" 2>/dev/null; then
-    rm -f -- "$TMP"
-    TMP=
-  else
-    rm -f -- "$TMP"
+  if ! publish_no_clobber "$TMP" "$UNLINKED_GUARD" "work identity unlinked guard"; then
+    [ -z "$TMP" ] || rm -f -- "$TMP"
     TMP=
     [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ] \
       || die "cannot publish work identity unlinked guard"
@@ -1464,11 +1530,8 @@ publish_handoff_sidecar() {  # <task-id>; HANDOFF_RECORD/HANDOFF_TARGET_SHA load
     || die "cannot create handoff work identity record"
   printf '%s\n' "$HANDOFF_RECORD" > "$TMP" || die "cannot write handoff work identity record"
   validate_sidecar "$TMP" "$task"
-  if ln "$TMP" "$SIDECAR" 2>/dev/null; then
-    rm -f -- "$TMP"
-    TMP=
-  else
-    rm -f -- "$TMP"
+  if ! publish_no_clobber "$TMP" "$SIDECAR" "handoff work identity record"; then
+    [ -z "$TMP" ] || rm -f -- "$TMP"
     TMP=
     [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ] || die "cannot publish handoff work identity record"
   fi
@@ -1757,11 +1820,8 @@ brief_publish() {  # <task-id> <draft>
   rm -f -- "$BRIEF_VALIDATED_CAPTURE"
   BRIEF_VALIDATED_CAPTURE=
   chmod 600 "$TMP" || die "cannot protect generated instructions"
-  if ln "$TMP" "$BRIEF_DEFAULT" 2>/dev/null; then
-    rm -f -- "$TMP"
-    TMP=
-  else
-    rm -f -- "$TMP"
+  if ! publish_no_clobber "$TMP" "$BRIEF_DEFAULT" "generated instructions"; then
+    [ -z "$TMP" ] || rm -f -- "$TMP"
     TMP=
     [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
       || die "generated instructions already exist: $BRIEF_DEFAULT"
@@ -2310,14 +2370,12 @@ case "$COMMAND" in
     TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity.XXXXXX") || die "cannot create work identity temporary file"
     printf '%s\n' "$CANONICAL" > "$TMP" || die "cannot write work identity temporary file"
     validate_sidecar "$TMP" "$TASK"
-    if ln "$TMP" "$SIDECAR" 2>/dev/null; then
-      rm -f -- "$TMP"
-      TMP=
+    if publish_no_clobber "$TMP" "$SIDECAR" "work identity record"; then
       validate_sidecar "$SIDECAR" "$TASK"
       record_handoff_transition_complete "$TASK"
       printf 'recorded %s task=%s sha256=%s\n' "$SCHEMA" "$TASK" "$WORK_HASH"
     else
-      rm -f -- "$TMP"
+      [ -z "$TMP" ] || rm -f -- "$TMP"
       TMP=
       [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ] || die "cannot publish work identity record"
       validate_sidecar "$SIDECAR" "$TASK"
