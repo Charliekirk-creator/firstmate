@@ -651,13 +651,20 @@ test_legacy_migration_rejects_conflicting_or_foreign_owners() {
 }
 
 test_ambiguous_legacy_ids_migrate_for_the_sole_durable_owner() {
-  local home origin key hold decision digest body attestation stage
+  local home origin key alternate hold decision digest body attestation stage
   while read -r origin key; do
     home=$(make_home "compatible-$origin-$key")
     tasks_in "$home" add "$origin" "Review compatible legacy identity" \
       --kind scout --repo sample --start >/dev/null \
       || fail "could not create compatible legacy origin $origin"
     write_origin_meta "$home" "$origin"
+    if [ "$origin" = sample ]; then alternate=sample-decision-route; else alternate=sample; fi
+    tasks_in "$home" add "$alternate" "Review an unrelated alternate identity" \
+      --kind scout --repo sample --start >/dev/null \
+      || fail "could not create unrelated alternate origin $alternate"
+    write_origin_meta "$home" "$alternate"
+    run_decisions "$home" complete "$alternate" --none >/dev/null \
+      || fail "could not review unrelated alternate origin $alternate"
     hold=$(run_decisions "$home" hold "$origin" "$key" \
       --title "Choose the compatible legacy answer" \
       --reason "captain compatible answer pending" --repo sample) \
@@ -920,6 +927,13 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   if run_decisions "$home" verify "$route_origin" > "$home/empty-route.out" 2> "$home/empty-route.err"; then
     fail "verification accepted routed mode without routed identities"
   fi
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nOrigin: %s\nDecision key: exact-route\nDecision digest: %s\nRouted identities: -ghost\nResolution mode: routed\n\nCaptain decision:\n%s\n\nRouted work:\n- -ghost' \
+    "$route_origin" "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not create invalid routed-identity record"
+  if run_decisions "$home" verify "$route_origin" > "$home/invalid-route.out" 2> "$home/invalid-route.err"; then
+    fail "verification accepted a routed identity that tasks-axi cannot own"
+  fi
   body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: sample-route-alpha\n\nCaptain decision:\n%s\n\nRouted work:\n- sample-route-alpha' \
     "$digest" "$decision")
   tasks_in "$home" update "$hold" --body "$body" >/dev/null \
@@ -1009,6 +1023,21 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   fi
   assert_grep "mismatched archived captain-hold provenance" "$home/title-spoof.err" \
     "title-spoof failure did not reject canonical kind and hold provenance"
+  awk -v id="$spoof" '
+    index($0, "- [x] " id " - ") == 1 {
+      print $0 " (hold:) (hold-kind: captain)"
+      next
+    }
+    { print }
+  ' "$home/data/done-archive.md" > "$home/data/done-archive.md.tmp" \
+    && mv "$home/data/done-archive.md.tmp" "$home/data/done-archive.md" \
+    || fail "could not create malformed archived hold provenance"
+  if run_decisions "$home" complete "$spoof_origin" fake \
+    > "$home/empty-hold-spoof.out" 2> "$home/empty-hold-spoof.err"; then
+    fail "an empty hold token forged archived captain-hold provenance"
+  fi
+  assert_grep "mismatched archived captain-hold provenance" "$home/empty-hold-spoof.err" \
+    "empty archived hold provenance did not fail as malformed"
 
   foreign=$(make_home foreign-history-proof)
   write_origin_meta "$foreign" "$source"
@@ -1032,6 +1061,83 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   assert_grep "authoritative data directory is unsafe" "$symlink_home/symlink-parent.err" \
     "symlinked archive parent did not stop at the home boundary"
   pass "historical resolution proof is exact, structured, and home-bound"
+}
+
+test_retained_history_rejects_unsafe_state_and_status() {
+  local home foreign origin key hold n
+  home=$(make_home retained-history-state-safety)
+  origin=sample-state-safety-review
+  key=old-answer
+  tasks_in "$home" add "$origin" "Review retained state safety" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create retained state-safety origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: retained state-safety review complete\n' > "$home/state/$origin.status"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the retained state answer" \
+    --reason "captain retained state answer pending" --repo sample) \
+    || fail "could not create retained state-safety hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory retained state-safety hold"
+  printf 'Captain resolved the retained state answer.\n' > "$home/state-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" --decision-file "$home/state-answer.txt" >/dev/null \
+    || fail "could not resolve retained state-safety hold"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "state-safety-filler-$n" "State safety filler $n" \
+      --kind ship --repo sample >/dev/null \
+      || fail "could not create state-safety filler $n"
+    tasks_in "$home" "done" "state-safety-filler-$n" >/dev/null \
+      || fail "could not complete state-safety filler $n"
+  done
+  assert_no_grep "- [x] $hold -" "$home/data/backlog.md" \
+    "state-safety decision remained in the retained Done window"
+  assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
+    "state-safety decision was not pruned through configured retention"
+
+  foreign=$(make_home retained-history-foreign-state)
+  write_origin_meta "$foreign" "$origin"
+  printf 'decisions_reviewed=1\ndecision_keys=%s\n' "$key" >> "$foreign/state/$origin.meta"
+  printf 'done: foreign status\n' > "$foreign/state/$origin.status"
+  if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$foreign/state" FM_DATA_OVERRIDE="$home/data" \
+    "$ROOT/bin/fm-decision-hold.sh" complete "$origin" "$key" \
+    > "$home/foreign-state-complete.out" 2> "$home/foreign-state-complete.err"; then
+    fail "current-format history accepted foreign completion state"
+  fi
+  assert_grep "configured state directory is outside the active home" \
+    "$home/foreign-state-complete.err" "completion did not enforce its state-home boundary"
+  if PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" \
+    FM_HOME="$home" FM_STATE_OVERRIDE="$foreign/state" FM_DATA_OVERRIDE="$home/data" \
+    "$ROOT/bin/fm-decision-hold.sh" verify "$origin" \
+    > "$home/foreign-state-verify.out" 2> "$home/foreign-state-verify.err"; then
+    fail "current-format history accepted foreign verification state"
+  fi
+  assert_grep "configured state directory is outside the active home" \
+    "$home/foreign-state-verify.err" "verification did not enforce its state-home boundary"
+
+  mv "$home/state/$origin.status" "$home/status-target"
+  ln -s "$home/status-target" "$home/state/$origin.status"
+  if run_decisions "$home" complete "$origin" "$key" \
+    > "$home/symlink-status-complete.out" 2> "$home/symlink-status-complete.err"; then
+    fail "archived history hid a symlinked current status during completion"
+  fi
+  assert_grep "origin status is not an ordinary file" "$home/symlink-status-complete.err" \
+    "completion did not reject a symlinked current status"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/symlink-status-verify.out" 2> "$home/symlink-status-verify.err"; then
+    fail "archived history hid a symlinked current status during verification"
+  fi
+  assert_grep "origin status is not an ordinary file" "$home/symlink-status-verify.err" \
+    "verification did not reject a symlinked current status"
+  rm "$home/state/$origin.status"
+  ln "$home/status-target" "$home/state/$origin.status"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/hardlink-status.out" 2> "$home/hardlink-status.err"; then
+    fail "archived history hid a hardlinked current status"
+  fi
+  assert_grep "origin status is hardlinked" "$home/hardlink-status.err" \
+    "verification did not reject a hardlinked current status"
+  pass "retained history requires authoritative state and safe current status"
 }
 
 test_none_inventory_and_resolved_prose_do_not_create_holds() {
@@ -1779,6 +1885,7 @@ test_nonarchive_rows_cannot_prove_pruned_history
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions
 test_historical_resolution_proof_is_exact_and_home_bound
+test_retained_history_rejects_unsafe_state_and_status
 test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home

@@ -163,6 +163,18 @@ validate_slug() {  # <label> <value>
   esac
 }
 
+task_id_valid() {
+  case "$1" in
+    ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+validate_task_id() {
+  local label=$1 value=$2
+  task_id_valid "$value" || fail "$label must be a valid task id: $value"
+}
+
 validate_one_line() {  # <label> <value>
   local label=$1 value=$2
   [ -n "$value" ] || fail "$label must not be empty"
@@ -245,7 +257,8 @@ show_field() {  # <show-output> <field>
 }
 
 origin_exists_here() {  # <origin-id>
-  [ -f "$STATE/$1.meta" ] && return 0
+  local state=${DECISION_STATE:-$STATE}
+  [ -f "$state/$1.meta" ] && return 0
   [ -f "$DATA/$1/report.md" ] && return 0
   task_show "$1" >/dev/null 2>&1
 }
@@ -280,7 +293,10 @@ meta_value() {  # <meta> <key>
 }
 
 origin_open_decisions() {  # <origin-id>
-  local origin=$1 meta="$STATE/$1.meta" status_file="$STATE/$1.status" open kind last verb
+  local origin=$1 state=${DECISION_STATE:-$STATE} meta status_file open kind last verb
+  meta="$state/$1.meta"
+  status_file="$state/$1.status"
+  require_safe_status_file "$status_file"
   open=$(status_open_decisions "$status_file")
   [ -n "$open" ] || return 0
   [ -f "$meta" ] || { printf '%s' "$open"; return 0; }
@@ -378,7 +394,7 @@ parse_resolution_record() {  # <hold-body>
   else
     case "$routes" in ,*|*,|*,,*) return 1 ;; esac
     while IFS= read -r route; do
-      case "$route" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+      task_id_valid "$route" || return 1
       expected_work="${expected_work}${expected_work:+$'\n'}- $route"
     done <<EOF
 $(printf '%s\n' "$routes" | tr ',' '\n')
@@ -403,14 +419,41 @@ EOF
   RESOLUTION_RECORD_DIGEST=$(sha256_text "$body")
 }
 
-legacy_resolution_alternate_owner_exists() {  # <hold-id> <origin-id> <decision-key>
-  local id=$1 origin=$2 key=$3 candidate_origin candidate_key
-  candidate_origin=${id%%-decision-*}
-  candidate_key=${id#*-decision-}
+legacy_resolution_meta_identity_valid() (  # <origin-id> <decision-key>
+  local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key candidate_key_from_meta links
+  expected_meta="$DECISION_STATE/$origin.meta"
+  [ -f "$expected_meta" ] && [ ! -L "$expected_meta" ] || return 1
+  links=$(file_link_count "$expected_meta") || return 1
+  [ "$links" = 1 ] || return 1
+  [ "$(meta_value "$expected_meta" decisions_reviewed)" = 1 ] || return 1
+  candidate_keys=$(meta_value "$expected_meta" decision_keys)
+  while IFS= read -r candidate_key; do
+    [ -n "$candidate_key" ] || continue
+    case "$candidate_key" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+  done <<EOF
+$(printf '%s\n' "$candidate_keys" | tr ',' '\n')
+EOF
+  list_has_key "$candidate_keys" "$key" || return 1
+
+  expected_id="${origin}-decision-${key}"
+  candidate_origin=${expected_id%%-decision-*}
+  candidate_key=${expected_id#*-decision-}
   while :; do
     if { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; } \
       && origin_exists_here "$candidate_origin"; then
-      return 0
+      candidate_meta="$DECISION_STATE/$candidate_origin.meta"
+      [ -f "$candidate_meta" ] && [ ! -L "$candidate_meta" ] || return 1
+      links=$(file_link_count "$candidate_meta") || return 1
+      [ "$links" = 1 ] || return 1
+      [ "$(meta_value "$candidate_meta" decisions_reviewed)" = 1 ] || return 1
+      candidate_keys=$(meta_value "$candidate_meta" decision_keys)
+      while IFS= read -r candidate_key_from_meta; do
+        [ -n "$candidate_key_from_meta" ] || continue
+        case "$candidate_key_from_meta" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+      done <<EOF
+$(printf '%s\n' "$candidate_keys" | tr ',' '\n')
+EOF
+      list_has_key "$candidate_keys" "$candidate_key" && return 1
     fi
     case "$candidate_key" in
       *-decision-*)
@@ -419,39 +462,6 @@ legacy_resolution_alternate_owner_exists() {  # <hold-id> <origin-id> <decision-
         ;;
       *) break ;;
     esac
-  done
-  return 1
-}
-
-legacy_resolution_meta_identity_valid() (  # <origin-id> <decision-key>
-  local origin=$1 key=$2 expected_meta expected_id candidate_meta candidate_origin candidate_keys candidate_key links
-  expected_meta="$DECISION_STATE/$origin.meta"
-  [ -f "$expected_meta" ] && [ ! -L "$expected_meta" ] || return 1
-  links=$(file_link_count "$expected_meta") || return 1
-  [ "$links" = 1 ] || return 1
-  [ "$(meta_value "$expected_meta" decisions_reviewed)" = 1 ] || return 1
-  list_has_key "$(meta_value "$expected_meta" decision_keys)" "$key" || return 1
-  expected_id="${origin}-decision-${key}"
-  legacy_resolution_alternate_owner_exists "$expected_id" "$origin" "$key" && return 1
-  shopt -s nullglob dotglob
-  for candidate_meta in "$DECISION_STATE"/*.meta; do
-    [ -f "$candidate_meta" ] && [ ! -L "$candidate_meta" ] || return 1
-    links=$(file_link_count "$candidate_meta") || return 1
-    [ "$links" = 1 ] || return 1
-    candidate_origin=${candidate_meta##*/}
-    candidate_origin=${candidate_origin%.meta}
-    case "$candidate_origin" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
-    candidate_keys=$(meta_value "$candidate_meta" decision_keys)
-    while IFS= read -r candidate_key; do
-      [ -n "$candidate_key" ] || continue
-      case "$candidate_key" in *[!A-Za-z0-9._-]*) return 1 ;; esac
-      if [ "${candidate_origin}-decision-${candidate_key}" = "$expected_id" ] \
-        && { [ "$candidate_origin" != "$origin" ] || [ "$candidate_key" != "$key" ]; }; then
-        return 1
-      fi
-    done <<EOF
-$(printf '%s\n' "$candidate_keys" | tr ',' '\n')
-EOF
   done
 )
 
@@ -491,6 +501,18 @@ file_link_count() {  # <path>
   else
     stat -c %h "$1" 2>/dev/null
   fi
+}
+
+require_safe_status_file() {
+  local path=$1 links
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] \
+    || fail "origin status is not an ordinary file: $path"
+  [ -r "$path" ] || fail "origin status is unreadable: $path"
+  links=$(file_link_count "$path") || fail "could not inspect origin status link count: $path"
+  [ "$links" = 1 ] || fail "origin status is hardlinked: $path"
 }
 
 tasks_config_string() {  # <config-path> <table> <key>
@@ -845,6 +867,10 @@ archived_header_has_captain_provenance() {  # <header> <hold-id>
       fi
       rest=${BASH_REMATCH[1]}
     elif [[ "$rest" =~ $re_hold ]]; then
+      value=${BASH_REMATCH[2]}
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      [ -n "$value" ] || return 1
       [ "$hold_seen" -eq 1 ] || hold_seen=1
       rest=${BASH_REMATCH[1]}
     else
@@ -972,9 +998,7 @@ tasks_blocked_by() {  # <hold-id>
     candidate=${candidate// /}
     [ -n "$candidate" ] || continue
     [ "$candidate" != "$id" ] || continue
-    case "$candidate" in
-      *[!A-Za-z0-9._-]*) continue ;;
-    esac
+    task_id_valid "$candidate" || continue
     show=$(task_show "$candidate") || continue
     list_has_key "$(normalized_blocked_by "$show")" "$id" || continue
     found="${found}${found:+ }$candidate"
@@ -1118,8 +1142,11 @@ command_complete() {
   local origin=${1:-} meta previous='' supplied='' keys='' key status_file open raw_open key_seen=0 has_meta=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
+  authoritative_state_path
   shift
-  meta="$STATE/$origin.meta"
+  meta="$DECISION_STATE/$origin.meta"
+  status_file="$DECISION_STATE/$origin.status"
+  require_safe_status_file "$status_file"
   [ -f "$meta" ] && has_meta=1
   if [ "$has_meta" = 1 ]; then
     DECISION_META_LOCK=$(fm_meta_lock_path "$meta") || fail "could not resolve task metadata lock"
@@ -1143,7 +1170,6 @@ command_complete() {
     previous=$(meta_value "$meta" decision_keys)
   fi
   keys=$(sorted_key_union "$previous" "$supplied")
-  status_file="$STATE/$origin.status"
   raw_open=$(status_open_decisions "$status_file")
   if [ -n "$keys" ]; then
     while IFS= read -r key; do
@@ -1198,11 +1224,14 @@ EOF
 }
 
 command_verify() {
-  local origin=${1:-} meta reviewed keys key open
+  local origin=${1:-} meta status_file reviewed keys key open
   [ "$#" -eq 1 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
-  meta="$STATE/$origin.meta"
+  authoritative_state_path
+  meta="$DECISION_STATE/$origin.meta"
+  status_file="$DECISION_STATE/$origin.status"
   [ -f "$meta" ] || fail "origin metadata is absent: $meta"
+  require_safe_status_file "$status_file"
   require_tasks_axi
   reviewed=$(meta_value "$meta" decisions_reviewed)
   [ "$reviewed" = 1 ] || fail "origin $origin has no completed unresolved-decision inventory"
@@ -1234,7 +1263,7 @@ command_resolve() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --decision-file) shift; decision_file=${1:-} ;;
-      --routed-to) shift; validate_slug routed-task "${1:-}"; routed="${routed}${routed:+ }${1:-}" ;;
+      --routed-to) shift; validate_task_id routed-task "${1:-}"; routed="${routed}${routed:+ }${1:-}" ;;
       *) usage >&2; exit 2 ;;
     esac
     shift
