@@ -815,9 +815,9 @@ spawn_file_link_count() {
   fi
 }
 
-spawn_endpoint_receipt_publish() {  # <endpoint-creating|endpoint-created|worktree-requesting|worktree-requested|worktree-ready> [worktree]
+spawn_endpoint_receipt_publish() {  # <endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-ready> [worktree]
   local phase=$1 worktree=${2:-} details payload tmp
-  case "$phase" in endpoint-creating|endpoint-created|worktree-requesting|worktree-requested|worktree-ready) ;; *) return 1 ;; esac
+  case "$phase" in endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-ready) ;; *) return 1 ;; esac
   case "$BACKEND" in
     tmux)
       details=$(jq -n -S -c --arg session "${SES:-}" --arg window_id "${WT_TARGET:-}" \
@@ -889,8 +889,8 @@ spawn_endpoint_receipt_load() {
         and exact(["schema","phase","binding","transaction_id","instructions_sha256","backend","kind","project","endpoint","worktree"])
         and .schema == "fm-spawn-endpoint.v1"
         and (.phase == "endpoint-creating" or .phase == "endpoint-created"
-          or .phase == "worktree-requesting" or .phase == "worktree-requested"
-          or .phase == "worktree-ready")
+          or .phase == "worktree-unsent" or .phase == "worktree-requesting"
+          or .phase == "worktree-requested" or .phase == "worktree-ready")
         and .binding == {home:$home,home_id:$home_id,task_id:$task}
         and .transaction_id == $transaction and .instructions_sha256 == $instructions_sha256
         and .backend == $backend and .kind == $kind and .project == $project
@@ -3380,17 +3380,30 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
           echo "error: could not publish worktree request intent for $ID" >&2
           exit 1
         }
-        spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || {
+        worktree_send_rc=0
+        spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
+        if [ "$worktree_send_rc" -ne 0 ]; then
+          case "$BACKEND:$worktree_send_rc" in
+            zellij:3|cmux:3)
+              spawn_endpoint_receipt_publish worktree-unsent || {
+                echo "error: could not preserve the definitely unsent worktree request for $ID" >&2
+                exit 1
+              }
+              ;;
+          esac
           echo "error: could not send worktree acquisition for $ID; request intent preserved" >&2
           exit 1
-        }
+        fi
         spawn_endpoint_receipt_publish worktree-requested || {
           echo "error: could not confirm the sent worktree request for $ID" >&2
           exit 1
         }
         ;;
-      worktree-requesting|worktree-requested)
+      worktree-unsent)
         worktree_request_recovery=1
+        ;;
+      worktree-requesting|worktree-requested)
+        case "$BACKEND" in zellij|cmux) ;; *) worktree_request_recovery=1 ;; esac
         ;;
       *)
         echo "error: endpoint receipt has no valid worktree acquisition phase for $ID" >&2
@@ -3434,7 +3447,9 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
             worktree_request_idle=1
           fi
           ;;
-        zellij|cmux) worktree_request_idle=1 ;;
+        zellij|cmux)
+          [ "$SPAWN_ENDPOINT_PHASE" = worktree-unsent ] && worktree_request_idle=1
+          ;;
       esac
       [ "$worktree_request_idle" -eq 1 ] || break
       if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
@@ -3446,10 +3461,20 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
         echo "error: could not republish worktree request intent for $ID" >&2
         exit 1
       }
-      spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || {
+      worktree_send_rc=0
+      spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
+      if [ "$worktree_send_rc" -ne 0 ]; then
+        case "$BACKEND:$worktree_send_rc" in
+          zellij:3|cmux:3)
+            spawn_endpoint_receipt_publish worktree-unsent || {
+              echo "error: could not preserve the definitely unsent worktree request for $ID" >&2
+              exit 1
+            }
+            ;;
+        esac
         echo "error: could not resume failed worktree acquisition for $ID; request intent preserved" >&2
         exit 1
-      }
+      fi
       spawn_endpoint_receipt_publish worktree-requested || {
         echo "error: could not confirm the resumed worktree request for $ID" >&2
         exit 1
