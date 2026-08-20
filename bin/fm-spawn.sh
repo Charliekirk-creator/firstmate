@@ -3246,6 +3246,90 @@ spawn_current_path() {  # <target>
     cmux) fm_backend_cmux_current_path "$1" "$W" ;;
   esac
 }
+spawn_worktree_request_send() {  # <target> <text>
+  case "$BACKEND" in
+    zellij) fm_backend_zellij_worktree_request_send "$1" "$2" "$WORKTREE_REQUEST_ACK" "$W" ;;
+    cmux) fm_backend_cmux_worktree_request_send "$1" "$2" "$WORKTREE_REQUEST_ACK" "$W" ;;
+    *) spawn_send_text_line "$1" "$2" ;;
+  esac
+}
+spawn_worktree_request_ack_state() {
+  local accepted="$WORKTREE_REQUEST_ACK/accepted" links bytes
+  if [ ! -e "$WORKTREE_REQUEST_ACK" ] && [ ! -L "$WORKTREE_REQUEST_ACK" ]; then
+    printf 'absent'
+    return 0
+  fi
+  [ -d "$WORKTREE_REQUEST_ACK" ] && [ ! -L "$WORKTREE_REQUEST_ACK" ] || return 1
+  if [ ! -e "$accepted" ] && [ ! -L "$accepted" ]; then
+    printf 'sending'
+    return 0
+  fi
+  [ -f "$accepted" ] && [ ! -L "$accepted" ] || return 1
+  links=$(spawn_file_link_count "$accepted") || return 1
+  [ "$links" = 1 ] || return 1
+  bytes=$(LC_ALL=C wc -c < "$accepted" | tr -d ' ')
+  [ "$bytes" = 9 ] || return 1
+  printf 'accepted\n' | cmp -s "$accepted" - || return 1
+  printf 'accepted'
+}
+spawn_worktree_request_result_load() {
+  local result="$WORKTREE_REQUEST_MARKER/result" links bytes lines status value
+  [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
+    if [ ! -e "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ]; then return 1; fi
+    return 3
+  }
+  if [ ! -e "$result" ] && [ ! -L "$result" ]; then return 1; fi
+  [ -f "$result" ] && [ ! -L "$result" ] || return 3
+  links=$(spawn_file_link_count "$result") || return 3
+  [ "$links" = 1 ] || return 3
+  bytes=$(LC_ALL=C wc -c < "$result" | tr -d ' ')
+  case "$bytes" in ''|*[!0-9]*) return 3 ;; esac
+  [ "$bytes" -le 16384 ] || return 3
+  lines=$(LC_ALL=C wc -l < "$result" | tr -d ' ')
+  [ "$lines" = 2 ] || return 3
+  status=$(head -n 1 "$result") || return 3
+  value=$(tail -n 1 "$result") || return 3
+  case "$status" in
+    ok)
+      case "$value" in /*) ;; *) return 3 ;; esac
+      printf '%s' "$value"
+      ;;
+    failed)
+      case "$value" in ''|*[!0-9]*) return 3 ;; esac
+      return 2
+      ;;
+    *) return 3 ;;
+  esac
+}
+spawn_worktree_request_cleanup() {
+  local entry links
+  if [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ]; then
+    for entry in "$WORKTREE_REQUEST_MARKER"/* "$WORKTREE_REQUEST_MARKER"/.[!.]* "$WORKTREE_REQUEST_MARKER"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      case "${entry##*/}" in result|.result.tmp) ;; *) return 1 ;; esac
+      [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+      links=$(spawn_file_link_count "$entry") || return 1
+      [ "$links" = 1 ] || return 1
+      rm -f -- "$entry" || return 1
+    done
+    rmdir -- "$WORKTREE_REQUEST_MARKER" || return 1
+  elif [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
+    return 1
+  fi
+  if [ -d "$WORKTREE_REQUEST_ACK" ] && [ ! -L "$WORKTREE_REQUEST_ACK" ]; then
+    for entry in "$WORKTREE_REQUEST_ACK"/* "$WORKTREE_REQUEST_ACK"/.[!.]* "$WORKTREE_REQUEST_ACK"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      case "${entry##*/}" in accepted|.accepted.[A-Za-z0-9]*) ;; *) return 1 ;; esac
+      [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+      links=$(spawn_file_link_count "$entry") || return 1
+      [ "$links" = 1 ] || return 1
+      rm -f -- "$entry" || return 1
+    done
+    rmdir -- "$WORKTREE_REQUEST_ACK" || return 1
+  elif [ -e "$WORKTREE_REQUEST_ACK" ] || [ -L "$WORKTREE_REQUEST_ACK" ]; then
+    return 1
+  fi
+}
 spawn_send_literal() {  # <target> <text>
   case "$BACKEND" in
     tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
@@ -3359,21 +3443,42 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     validate_spawn_worktree "recovered endpoint" "$T"
     WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || exit 1
     WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
+    WORKTREE_REQUEST_ACK="$WORKTREE_REQUEST_MARKER.send"
     if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
       [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
         echo "error: exact worktree request marker is unsafe for $ID" >&2
         exit 1
       }
     fi
+    case "$BACKEND" in
+      zellij|cmux)
+        spawn_worktree_request_cleanup || {
+          echo "error: exact worktree request acknowledgement is unsafe for $ID" >&2
+          exit 1
+        }
+        ;;
+    esac
   else
     WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || exit 1
     WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
-    WORKTREE_REQUEST_COMMAND="mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { treehouse get; rc=\$?; if [ \"\$rc\" -ne 0 ]; then rmdir $(shell_quote "$WORKTREE_REQUEST_MARKER") 2>/dev/null || true; fi; [ \"\$rc\" -eq 0 ]; }"
+    WORKTREE_REQUEST_ACK="$WORKTREE_REQUEST_MARKER.send"
+    case "$BACKEND" in
+      zellij|cmux)
+        result_path="$WORKTREE_REQUEST_MARKER/result"
+        result_tmp="$WORKTREE_REQUEST_MARKER/.result.tmp"
+        lease_holder="firstmate-$WORKTREE_REQUEST_DIGEST"
+        WORKTREE_REQUEST_COMMAND="umask 077; mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { wt=\$(treehouse get --lease --lease-holder $(shell_quote "$lease_holder")); rc=\$?; if [ \"\$rc\" -eq 0 ] && [ -n \"\$wt\" ] && cd -- \"\$wt\"; then printf 'ok\\n%s\\n' \"\$(pwd -P)\" > $(shell_quote "$result_tmp") && chmod 600 $(shell_quote "$result_tmp") && mv -- $(shell_quote "$result_tmp") $(shell_quote "$result_path"); else [ \"\$rc\" -ne 0 ] || rc=1; printf 'failed\\n%s\\n' \"\$rc\" > $(shell_quote "$result_tmp") && chmod 600 $(shell_quote "$result_tmp") && mv -- $(shell_quote "$result_tmp") $(shell_quote "$result_path"); fi; true; }"
+        ;;
+      *)
+        WORKTREE_REQUEST_COMMAND="mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { treehouse get; rc=\$?; if [ \"\$rc\" -ne 0 ]; then rmdir $(shell_quote "$WORKTREE_REQUEST_MARKER") 2>/dev/null || true; fi; [ \"\$rc\" -eq 0 ]; }"
+        ;;
+    esac
     worktree_request_recovery=0
     case "$SPAWN_ENDPOINT_PHASE" in
       endpoint-created)
-        if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
-          echo "error: stale worktree request marker exists before dispatch: $WORKTREE_REQUEST_MARKER" >&2
+        if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ] \
+           || [ -e "$WORKTREE_REQUEST_ACK" ] || [ -L "$WORKTREE_REQUEST_ACK" ]; then
+          echo "error: stale worktree request acknowledgement exists before dispatch for $ID" >&2
           exit 1
         fi
         spawn_endpoint_receipt_publish worktree-requesting || {
@@ -3381,7 +3486,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
           exit 1
         }
         worktree_send_rc=0
-        spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
+        spawn_worktree_request_send "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
         if [ "$worktree_send_rc" -ne 0 ]; then
           case "$BACKEND:$worktree_send_rc" in
             zellij:3|cmux:3)
@@ -3400,10 +3505,46 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
         }
         ;;
       worktree-unsent)
+        case "$BACKEND" in
+          zellij|cmux)
+            ack_state=$(spawn_worktree_request_ack_state) || {
+              echo "error: worktree request acknowledgement is unsafe for $ID" >&2
+              exit 1
+            }
+            [ "$ack_state" = absent ] || {
+              echo "error: definitely unsent worktree request has an inconsistent backend acknowledgement for $ID" >&2
+              exit 1
+            }
+            ;;
+        esac
         worktree_request_recovery=1
         ;;
-      worktree-requesting|worktree-requested)
-        case "$BACKEND" in zellij|cmux) ;; *) worktree_request_recovery=1 ;; esac
+      worktree-requesting)
+        case "$BACKEND" in
+          zellij|cmux)
+            ack_state=$(spawn_worktree_request_ack_state) || {
+              echo "error: worktree request acknowledgement is unsafe for $ID" >&2
+              exit 1
+            }
+            [ "$ack_state" != absent ] || worktree_request_recovery=1
+            ;;
+          *) worktree_request_recovery=1 ;;
+        esac
+        ;;
+      worktree-requested)
+        case "$BACKEND" in
+          zellij|cmux)
+            ack_state=$(spawn_worktree_request_ack_state) || {
+              echo "error: worktree request acknowledgement is unsafe for $ID" >&2
+              exit 1
+            }
+            [ "$ack_state" != absent ] || {
+              echo "error: accepted worktree request has no backend acknowledgement for $ID" >&2
+              exit 1
+            }
+            ;;
+          *) worktree_request_recovery=1 ;;
+        esac
         ;;
       *)
         echo "error: endpoint receipt has no valid worktree acquisition phase for $ID" >&2
@@ -3414,26 +3555,42 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     worktree_poll_max=${FM_SPAWN_WORKTREE_POLLS:-60}
     worktree_poll_interval=${FM_SPAWN_WORKTREE_INTERVAL:-1}
     worktree_request_round=0
+    worktree_request_failed=0
     while [ "$worktree_request_round" -lt 2 ] && [ -z "$WT" ]; do
       candidate=""
       for _ in $(seq 1 "$worktree_poll_max"); do
-        p=$(spawn_current_path "$WT_TARGET" || true)
-        if [ -n "$p" ]; then
-          p_real=$(real_path_or_raw "$p")
-          if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
-            if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-              WT="$p"
-              break
+        case "$BACKEND" in
+          zellij|cmux)
+            result_rc=0
+            p=$(spawn_worktree_request_result_load) || result_rc=$?
+            case "$result_rc" in
+              0) WT=$p; break ;;
+              1) ;;
+              2) worktree_request_failed=1; break ;;
+              *) echo "error: worktree request result is unsafe for $ID" >&2; exit 1 ;;
+            esac
+            ;;
+          *)
+            p=$(spawn_current_path "$WT_TARGET" || true)
+            if [ -n "$p" ]; then
+              p_real=$(real_path_or_raw "$p")
+              if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
+                if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
+                  WT="$p"
+                  break
+                fi
+                candidate="$p_real"
+              else
+                candidate=""
+              fi
+            else
+              candidate=""
             fi
-            candidate="$p_real"
-          else
-            candidate=""
-          fi
-        else
-          candidate=""
-        fi
+            ;;
+        esac
         sleep "$worktree_poll_interval"
       done
+      [ "$worktree_request_failed" -eq 0 ] || break
       [ -z "$WT" ] || break
       [ "$worktree_request_recovery" -eq 1 ] || break
 
@@ -3447,9 +3604,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
             worktree_request_idle=1
           fi
           ;;
-        zellij|cmux)
-          [ "$SPAWN_ENDPOINT_PHASE" = worktree-unsent ] && worktree_request_idle=1
-          ;;
+        zellij|cmux) worktree_request_idle=1 ;;
       esac
       [ "$worktree_request_idle" -eq 1 ] || break
       if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
@@ -3462,7 +3617,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
         exit 1
       }
       worktree_send_rc=0
-      spawn_send_text_line "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
+      spawn_worktree_request_send "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
       if [ "$worktree_send_rc" -ne 0 ]; then
         case "$BACKEND:$worktree_send_rc" in
           zellij:3|cmux:3)
@@ -3482,6 +3637,10 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       worktree_request_recovery=0
       worktree_request_round=$((worktree_request_round + 1))
     done
+    if [ "$worktree_request_failed" -eq 1 ]; then
+      echo "error: treehouse get failed; completed request preserved for $ID at $T" >&2
+      exit 1
+    fi
     if [ -z "$WT" ]; then
       echo "error: treehouse get did not enter a worktree; in-flight request preserved for $ID at $T" >&2
       exit 1
@@ -3492,12 +3651,22 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       echo "error: could not bind the recovered endpoint worktree for $ID" >&2
       exit 1
     }
-    if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
-      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
-        echo "error: worktree request marker is unsafe: $WORKTREE_REQUEST_MARKER" >&2
-        exit 1
-      }
-    fi
+    case "$BACKEND" in
+      zellij|cmux)
+        spawn_worktree_request_cleanup || {
+          echo "error: could not retire the exact worktree request acknowledgement for $ID" >&2
+          exit 1
+        }
+        ;;
+      *)
+        if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
+          [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
+            echo "error: worktree request marker is unsafe: $WORKTREE_REQUEST_MARKER" >&2
+            exit 1
+          }
+        fi
+        ;;
+    esac
   fi
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then

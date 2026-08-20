@@ -146,6 +146,9 @@ exit 0
 SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
+case "$*" in
+  *--lease*) printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_TEST_ZELLIJ_WT:-}}" ;;
+esac
 exit 0
 SH
   cat > "$fakebin/no-mistakes" <<'SH'
@@ -888,6 +891,7 @@ case "$*" in
     exit 0
     ;;
   *' action dump-screen '*)
+    [ -z "${FM_TEST_ZELLIJ_PROBES:-}" ] || printf 'probe\n' >> "$FM_TEST_ZELLIJ_PROBES"
     path=$FM_TEST_ZELLIJ_PROJECT
     [ ! -e "$FM_TEST_ZELLIJ_WORKTREE" ] || path=$FM_TEST_ZELLIJ_WT
     printf '__FM_ZELLIJ_CWD_BEGIN__\n%s\n__FM_ZELLIJ_CWD_END__\n' "$path"
@@ -912,6 +916,10 @@ SH
   jq -e '.phase == "worktree-unsent" and .worktree == null' \
     "$home/state/$task.spawn-endpoint.json" >/dev/null \
     || fail "zellij failed send did not preserve a definitely-unsent request: $out"
+  jq -S -c '.phase = "worktree-requesting"' "$home/state/$task.spawn-endpoint.json" \
+    > "$home/state/$task.spawn-endpoint.next"
+  mv "$home/state/$task.spawn-endpoint.next" "$home/state/$task.spawn-endpoint.json"
+  export FM_TEST_ZELLIJ_PROBES="$home/zellij-probes"
 
   rc=0
   out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
@@ -945,7 +953,11 @@ SH
   [ "$rc" -ne 0 ] || fail "in-flight zellij retry unexpectedly completed"
   sends=$(wc -l < "$home/zellij-sends" | tr -d ' ')
   [ "$sends" = 1 ] || fail "zellij resent an accepted worktree request: $out"
+  assert_absent "$home/zellij-probes" \
+    "zellij recovery injected a cwd probe into an accepted worktree request"
 
+  PATH="$fakebin:$PATH" FM_TEST_ZELLIJ_WT="$wt" bash -c "$(cat "$home/zellij-input")" \
+    || fail "could not complete the command-published zellij worktree result"
   : > "$home/zellij-worktree"
   out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
     FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
@@ -963,6 +975,7 @@ SH
   [ "$sends" = 1 ] || fail "zellij recovery executed $sends worktree requests"
   assert_contains "$out" "spawned $task" \
     "zellij worktree request recovery did not complete spawn"
+  unset FM_TEST_ZELLIJ_PROBES
   pass "zellij distinguishes unsent and accepted worktree requests"
 }
 

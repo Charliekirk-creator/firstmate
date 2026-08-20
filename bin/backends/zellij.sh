@@ -495,6 +495,22 @@ fm_backend_zellij_send_text_line() {  # <target> <text> [expected-label]
   return 2
 }
 
+fm_backend_zellij_worktree_request_send() {  # <target> <text> <ack-dir> [expected-label]
+  local target=$1 text=$2 ack_dir=$3 expected_label=${4:-} rc=0 tmp
+  [ ! -e "$ack_dir" ] && [ ! -L "$ack_dir" ] || return 1
+  mkdir -m 700 -- "$ack_dir" || return 1
+  fm_backend_zellij_send_text_line "$target" "$text" "$expected_label" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 3 ]; then
+      rmdir -- "$ack_dir" 2>/dev/null || return 1
+    fi
+    return "$rc"
+  fi
+  tmp=$(umask 077; mktemp "$ack_dir/.accepted.XXXXXX") || return 2
+  printf 'accepted\n' > "$tmp" && chmod 600 "$tmp" \
+    && mv -- "$tmp" "$ack_dir/accepted" || { rm -f -- "$tmp"; return 2; }
+}
+
 # fm_backend_zellij_capture: bounded plain-text pane capture. Mirrors
 # fm-peek.sh's/fm-watch.sh's `tmux capture-pane -p -t T -S -N`. `dump-screen`
 # has no --lines bound, so routine 40-line-or-smaller reads use the current
