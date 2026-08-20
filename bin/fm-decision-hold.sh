@@ -38,15 +38,15 @@
 # `complete` is the shared investigation and visual-review completion gate.
 # Positional keys are the unresolved decisions in the just-reviewed surface and
 # must have active holds on first completion; `--none` explicitly attests that
-# there are none. An exact positional retry after resolution is accepted only when
-# live metadata already records that this completion verified the key as current.
+# there are none. An exact positional retry after resolution is accepted when
+# completion provenance records that this review verified the key as current.
 # `--resolved` identifies an older key that must have exact durable resolution
 # proof, which lets post-teardown reviews carry historical provenance without
-# consulting status text. Later review passes may add keys; a live task's metadata
-# inventory is unioned idempotently with current-versus-historical provenance.
-# A nonempty released-version inventory without that provenance must be migrated
-# explicitly by supplying every prior key as positional or `--resolved`; `verify`
-# never guesses from the records that happen to remain. A resolved historical key
+# consulting status text. Later review passes may add keys; completion provenance
+# is unioned idempotently with current-versus-historical ownership. Released-version
+# metadata is upgraded automatically only for source-verifiable active or retained
+# Done records; archive-only generations require explicit current or `--resolved`
+# classification. A resolved historical key
 # may be proven by its structured record in tasks-axi's configured archive after
 # normal bounded Done retention prunes it; the gate never restores archived rows.
 # A missing key with no valid archived resolution still fails. A post-teardown
@@ -184,11 +184,16 @@ fail() {
   exit 1
 }
 
+slug_valid() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 validate_slug() {  # <label> <value>
   local label=$1 value=$2
-  case "$value" in
-    ''|*[!A-Za-z0-9._-]*) fail "$label must be a non-empty privacy-safe slug: $value" ;;
-  esac
+  slug_valid "$value" || fail "$label must be a non-empty privacy-safe slug: $value"
 }
 
 task_id_valid() {
@@ -473,13 +478,24 @@ EOF
 }
 
 legacy_resolution_identity_unambiguous() {  # <hold-id> <origin-id> <decision-key>
-  local id=$1 origin=$2 key=$3 remainder
+  local id=$1 origin=$2 key=$3 remainder prefix='' part candidate_origin candidate_key
+  local count=0 matched=0
   [ "$id" = "${origin}-decision-${key}" ] || return 1
-  remainder=${id#*-decision-}
-  case "$remainder" in
-    *-decision-*) return 1 ;;
-    *) return 0 ;;
-  esac
+  remainder=$id
+  while [[ "$remainder" == *-decision-* ]]; do
+    part=${remainder%%-decision-*}
+    candidate_origin="$prefix$part"
+    candidate_key=${remainder#*-decision-}
+    if slug_valid "$candidate_origin" && slug_valid "$candidate_key"; then
+      count=$((count + 1))
+      if [ "$candidate_origin" = "$origin" ] && [ "$candidate_key" = "$key" ]; then
+        matched=1
+      fi
+    fi
+    prefix="${candidate_origin}-decision-"
+    remainder=$candidate_key
+  done
+  [ "$count" -eq 1 ] && [ "$matched" -eq 1 ]
 }
 
 legacy_resolution_identity_valid() {  # <origin-id> <decision-key>
@@ -636,6 +652,11 @@ EOF
 reviewed_decision_inventory() {  # <meta-path>
   completion_metadata_inventory "$1"
   [ "$META_DECISIONS_REVIEWED" = 1 ]
+}
+
+append_completion_inventory() {  # <path> <keys> <current> <historical> <last-current> <last-historical>
+  printf 'decisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\n' \
+    "$2" "$COMPLETION_INVENTORY_SCHEMA" "$3" "$4" "$5" "$6" >> "$1"
 }
 
 file_link_count() {  # <path>
@@ -923,6 +944,93 @@ authoritative_archive_path() {
   note_archive="$physical_backlog_dir/note-archive.md"
   [ "$DECISION_ARCHIVE" != "$note_archive" ] \
     || fail "configured decision archive aliases the tasks-axi note archive: $DECISION_ARCHIVE"
+}
+
+COMPLETION_INVENTORY_DIR=''
+COMPLETION_INVENTORY_PATH=''
+
+completion_inventory_dir() {  # <create: 0|1>
+  local create=$1 dir physical_dir
+  COMPLETION_INVENTORY_DIR=''
+  authoritative_archive_path
+  dir="$DECISION_DATA/decision-completion-inventories"
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+    [ "$create" = 1 ] || return 1
+    if ! (umask 077; mkdir "$dir") && [ ! -d "$dir" ]; then
+      fail "could not create decision completion inventory directory: $dir"
+    fi
+  fi
+  [ -d "$dir" ] && [ ! -L "$dir" ] \
+    || fail "decision completion inventory directory is unsafe: $dir"
+  physical_dir=$(cd "$dir" && pwd -P) \
+    || fail "could not resolve decision completion inventory directory: $dir"
+  [ "$physical_dir" = "$DECISION_DATA/decision-completion-inventories" ] \
+    || fail "decision completion inventory directory escapes the active home: $dir"
+  COMPLETION_INVENTORY_DIR=$physical_dir
+}
+
+completion_inventory_path() {  # <directory> <origin-id>
+  local token
+  token=$(sha256_text "$2")
+  printf '%s/%s.inventory\n' "$1" "$token"
+}
+
+completion_inventory_content() {  # <origin-id> <keys> <current> <historical> <last-current> <last-historical>
+  printf 'origin=%s\ndecisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\n' \
+    "$1" "$2" "$COMPLETION_INVENTORY_SCHEMA" "$3" "$4" "$5" "$6"
+}
+
+completion_inventory_lock_acquire() {  # <origin-id>
+  local token
+  completion_inventory_dir 1
+  token=$(sha256_text "$1")
+  COMPLETION_INVENTORY_PATH=$(completion_inventory_path "$COMPLETION_INVENTORY_DIR" "$1")
+  DECISION_META_LOCK="$COMPLETION_INVENTORY_DIR/.completion-$token.lock"
+  fm_lock_acquire_wait "$DECISION_META_LOCK"
+  DECISION_META_LOCK_HELD=1
+}
+
+completion_inventory_load_locked() {  # <origin-id>
+  local origin=$1 path=$COMPLETION_INVENTORY_PATH links expected actual
+  [ -e "$path" ] || [ -L "$path" ] || return 1
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] \
+    || fail "decision completion inventory is unsafe: $path"
+  links=$(file_link_count "$path") \
+    || fail "could not inspect decision completion inventory link count: $path"
+  [ "$links" = 1 ] || fail "decision completion inventory is hardlinked: $path"
+  completion_metadata_inventory "$path"
+  [ "$META_DECISIONS_REVIEWED" = 1 ] && [ "$META_DECISION_INVENTORY_VERSIONED" = 1 ] \
+    || fail "decision completion inventory is malformed: $path"
+  [ "$(meta_value "$path" origin)" = "$origin" ] \
+    || fail "decision completion inventory has mismatched origin ownership: $path"
+  expected=$(completion_inventory_content "$origin" "$META_DECISION_KEYS" \
+    "$META_DECISION_CURRENT_KEYS" "$META_DECISION_HISTORICAL_KEYS" \
+    "$META_DECISION_LAST_CURRENT_KEYS" "$META_DECISION_LAST_HISTORICAL_KEYS")
+  actual=$(cat "$path") || fail "could not read decision completion inventory: $path"
+  [ "$actual" = "$expected" ] || fail "decision completion inventory is malformed: $path"
+}
+
+completion_inventory_persist_locked() {  # <origin-id> <keys> <current> <historical> <last-current> <last-historical>
+  local origin=$1 path=$COMPLETION_INVENTORY_PATH tmp links
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] \
+      || fail "decision completion inventory is unsafe: $path"
+    links=$(file_link_count "$path") \
+      || fail "could not inspect decision completion inventory link count: $path"
+    [ "$links" = 1 ] || fail "decision completion inventory is hardlinked: $path"
+  fi
+  tmp=$(umask 077; mktemp "$COMPLETION_INVENTORY_DIR/.completion.XXXXXX") \
+    || fail "could not stage decision completion inventory for $origin"
+  if ! completion_inventory_content "$origin" "$2" "$3" "$4" "$5" "$6" > "$tmp" \
+    || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    fail "could not persist decision completion inventory for $origin"
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] \
+    || fail "decision completion inventory is unsafe: $path"
+  links=$(file_link_count "$path") \
+    || fail "could not inspect decision completion inventory link count: $path"
+  [ "$links" = 1 ] || fail "decision completion inventory is hardlinked: $path"
 }
 
 LEGACY_ATTESTATION_SCHEMA=fm-decision-legacy-resolution.v1
@@ -1388,6 +1496,47 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   fail "captain decision $id is neither actively held nor durably resolved"
 }
 
+LEGACY_SOURCE_CURRENT_KEYS=''
+LEGACY_SOURCE_UNCLASSIFIED_KEYS=''
+
+classify_legacy_source_generations() {  # <origin-id> <comma-keys>
+  local origin=$1 keys=$2 key id show state held kind hold_kind body
+  LEGACY_SOURCE_CURRENT_KEYS=''
+  LEGACY_SOURCE_UNCLASSIFIED_KEYS=''
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    id=$(hold_id "$origin" "$key")
+    if ! task_show_optional "$id"; then
+      LEGACY_SOURCE_UNCLASSIFIED_KEYS=$(sorted_key_union "$LEGACY_SOURCE_UNCLASSIFIED_KEYS" "$key")
+      continue
+    fi
+    show=$TASK_SHOW_OUTPUT
+    state=$(show_field "$show" state)
+    held=$(show_field "$show" held)
+    kind=$(show_field "$show" kind)
+    hold_kind=$(show_field "$show" hold_kind)
+    body=$(show_field "$show" body)
+    if [ "$state" = queued ] && [ "$held" = yes ] && [ "$kind" = captain ] \
+      && [ "$hold_kind" = captain ]; then
+      queued_hold_body_valid "$body" "$origin" "$key" \
+        || fail "captain decision $id has malformed or mismatched active provenance"
+      reject_archived_generation_collision "$id"
+      if resolution_record_valid "$body" "$origin" "$key"; then
+        persist_parsed_legacy_resolution "$id" "$origin" "$key"
+      fi
+    elif [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
+      && body_has_resolution_record "$body" "$origin" "$key"; then
+      reject_archived_generation_collision "$id"
+      persist_parsed_legacy_resolution "$id" "$origin" "$key"
+    else
+      fail "captain decision $id is not a source-verifiable active or retained Done generation"
+    fi
+    LEGACY_SOURCE_CURRENT_KEYS=$(sorted_key_union "$LEGACY_SOURCE_CURRENT_KEYS" "$key")
+  done <<EOF
+$(printf '%s\n' "$keys" | tr ',' '\n')
+EOF
+}
+
 verify_resolution_identity() {  # <hold-id> <origin-id> <decision-key> <body> <digest> <routed-csv>
   local id=$1 origin=$2 key=$3 hold_body=$4 decision_digest=$5 routed_csv=$6
   resolution_record_valid "$hold_body" "$origin" "$key" \
@@ -1534,8 +1683,8 @@ command_complete() {
   local origin=${1:-} meta previous='' previous_current='' previous_historical=''
   local supplied='' resolved='' supplied_csv='' resolved_csv='' keys='' key
   local current_keys='' historical_keys='' previous_last_current='' previous_last_historical=''
-  local previous_reviewed='' inventory_versioned=0 exact_retry=0
-  local status_file open raw_open key_seen=0 has_meta=0 none=0 positional_only=0
+  local previous_reviewed='' inventory_versioned=0 exact_retry=0 legacy_classified=0
+  local status_file open raw_open key_seen=0 has_meta=0 durable_inventory=0 none=0 positional_only=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
   authoritative_state_path
@@ -1553,6 +1702,10 @@ command_complete() {
   fi
   require_tasks_axi
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
+  if [ "$has_meta" = 0 ]; then
+    completion_inventory_lock_acquire "$origin"
+    durable_inventory=1
+  fi
   while [ "$#" -gt 0 ]; do
     if [ "$positional_only" -eq 1 ]; then
       validate_slug decision-key "$1"
@@ -1597,20 +1750,46 @@ EOF
     previous_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
     previous_reviewed=$META_DECISIONS_REVIEWED
     inventory_versioned=$META_DECISION_INVENTORY_VERSIONED
+  elif completion_inventory_load_locked "$origin"; then
+    previous=$META_DECISION_KEYS
+    previous_current=$META_DECISION_CURRENT_KEYS
+    previous_historical=$META_DECISION_HISTORICAL_KEYS
+    previous_last_current=$META_DECISION_LAST_CURRENT_KEYS
+    previous_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
+    previous_reviewed=$META_DECISIONS_REVIEWED
+    inventory_versioned=$META_DECISION_INVENTORY_VERSIONED
   fi
   if [ "$inventory_versioned" -eq 0 ] && [ -n "$previous" ]; then
+    classify_legacy_source_generations "$origin" "$previous"
+    legacy_classified=1
     while IFS= read -r key; do
       [ -n "$key" ] || continue
-      list_has_key "$supplied_csv" "$key" || list_has_key "$resolved_csv" "$key" \
-        || fail "legacy decision inventory key $key requires explicit current or --resolved provenance"
+      if list_has_key "$resolved_csv" "$key"; then
+        previous_historical=$(sorted_key_union "$previous_historical" "$key")
+      elif list_has_key "$LEGACY_SOURCE_CURRENT_KEYS" "$key"; then
+        previous_current=$(sorted_key_union "$previous_current" "$key")
+      elif list_has_key "$supplied_csv" "$key"; then
+        previous_current=$(sorted_key_union "$previous_current" "$key")
+      else
+        fail "legacy decision inventory key $key requires explicit current or --resolved provenance"
+      fi
     done <<EOF
 $(printf '%s\n' "$previous" | tr ',' '\n')
 EOF
+    previous_last_current=''
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      list_has_key "$LEGACY_SOURCE_CURRENT_KEYS" "$key" \
+        && previous_last_current=$(sorted_key_union "$previous_last_current" "$key")
+    done <<EOF
+$(printf '%s\n' "$previous_current" | tr ',' '\n')
+EOF
+    previous_last_historical=$previous_historical
   fi
   keys=$(sorted_key_union "$previous" "$supplied $resolved")
   current_keys=$previous_current
   historical_keys=$previous_historical
-  if [ "$inventory_versioned" -eq 1 ] \
+  if { [ "$inventory_versioned" -eq 1 ] || [ "$legacy_classified" -eq 1 ]; } \
     && [ "$supplied_csv" = "$previous_last_current" ] \
     && [ "$resolved_csv" = "$previous_last_historical" ]; then
     exact_retry=1
@@ -1677,9 +1856,8 @@ EOF
       || [ "$previous_historical" != "$historical_keys" ] \
       || [ "$previous_last_current" != "$supplied_csv" ] \
       || [ "$previous_last_historical" != "$resolved_csv" ]; then
-      printf 'decisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\n' \
-        "$keys" "$COMPLETION_INVENTORY_SCHEMA" "$current_keys" "$historical_keys" \
-        "$supplied_csv" "$resolved_csv" >> "$meta"
+      append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
+        "$supplied_csv" "$resolved_csv"
     fi
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0
@@ -1701,13 +1879,18 @@ EOF
     done <<EOF
 $raw_open
 EOF
+  elif [ "$durable_inventory" = 1 ]; then
+    completion_inventory_persist_locked "$origin" "$keys" "$current_keys" "$historical_keys" \
+      "$supplied_csv" "$resolved_csv"
+    fm_lock_release "$DECISION_META_LOCK"
+    DECISION_META_LOCK_HELD=0
   fi
   : "$key_seen"
   printf 'complete: %s decision inventory reviewed%s\n' "$origin" "${keys:+ ($keys)}"
 }
 
 command_verify() {
-  local origin=${1:-} meta status_file keys current_keys historical_keys key open
+  local origin=${1:-} meta status_file keys current_keys historical_keys key open legacy_migrated=0
   [ "$#" -eq 1 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
   authoritative_state_path
@@ -1728,10 +1911,16 @@ command_verify() {
     || fail "origin $origin has no completed unresolved-decision inventory"
   keys=$META_DECISION_KEYS
   if [ "$META_DECISION_INVENTORY_VERSIONED" -ne 1 ] && [ -n "$keys" ]; then
-    fail "origin $origin has a legacy decision inventory; rerun complete with every key as current or --resolved"
+    classify_legacy_source_generations "$origin" "$keys"
+    [ -z "$LEGACY_SOURCE_UNCLASSIFIED_KEYS" ] \
+      || fail "origin $origin has a legacy decision inventory with archive-only generations; rerun complete with each such key as current or --resolved"
+    current_keys=$LEGACY_SOURCE_CURRENT_KEYS
+    historical_keys=''
+    legacy_migrated=1
+  else
+    current_keys=$META_DECISION_CURRENT_KEYS
+    historical_keys=$META_DECISION_HISTORICAL_KEYS
   fi
-  current_keys=$META_DECISION_CURRENT_KEYS
-  historical_keys=$META_DECISION_HISTORICAL_KEYS
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     verify_hold_durable "$origin" "$key"
@@ -1755,6 +1944,10 @@ EOF
   done <<EOF
 $open
 EOF
+  if [ "$legacy_migrated" = 1 ]; then
+    append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
+      "$current_keys" "$historical_keys"
+  fi
   if [ "$DECISION_META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0

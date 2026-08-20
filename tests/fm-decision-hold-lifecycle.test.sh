@@ -630,6 +630,146 @@ test_legacy_completion_inventory_requires_explicit_provenance() {
   pass "completion provenance distinguishes missing current and historical generations"
 }
 
+test_source_verifiable_legacy_inventories_migrate_automatically() {
+  local home origin active retained hold decision digest body
+  home=$(make_home source-verifiable-legacy-inventory)
+  origin=sample-upgraded-review
+  active=active-choice
+  retained=retained-choice
+  tasks_in "$home" add "$origin" "Review an upgraded inventory" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create upgraded-inventory origin"
+  write_origin_meta "$home" "$origin"
+  run_decisions "$home" hold "$origin" "$active" \
+    --title "Choose the active option" --reason "captain active option pending" --repo sample >/dev/null \
+    || fail "could not create source-verifiable active hold"
+  hold=$(run_decisions "$home" hold "$origin" "$retained" \
+    --title "Choose the retained option" --reason "captain retained option pending" --repo sample) \
+    || fail "could not create source-verifiable retained hold"
+  printf 'Captain resolved the retained option.\n' > "$home/retained-answer.txt"
+  run_decisions "$home" answer "$origin" "$retained" \
+    --decision-file "$home/retained-answer.txt" >/dev/null \
+    || fail "could not resolve source-verifiable retained hold"
+  printf 'decisions_reviewed=1\ndecision_keys=%s,%s\n' "$active" "$retained" \
+    >> "$home/state/$origin.meta"
+
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "source-verifiable released-version inventory did not migrate automatically"
+  assert_grep 'decision_inventory_schema=fm-decision-completion.v1' "$home/state/$origin.meta" \
+    "automatic inventory migration did not persist its schema"
+  assert_grep "decision_current_keys=$active,$retained" "$home/state/$origin.meta" \
+    "automatic inventory migration did not classify active and retained Done records"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "repeated verification of an automatically migrated inventory failed"
+  run_decisions "$home" complete "$origin" "$active" "$retained" >/dev/null \
+    || fail "the released-version completion retry was not idempotent after retained resolution"
+
+  home=$(make_home live-legacy-historical-reclassification)
+  origin=sample-live-legacy-review
+  retained=old-choice
+  tasks_in "$home" add "$origin" "Review a live legacy inventory" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create live legacy origin"
+  write_origin_meta "$home" "$origin"
+  run_decisions "$home" hold "$origin" "$retained" \
+    --title "Choose the old option" --reason "captain old option pending" --repo sample >/dev/null \
+    || fail "could not create live legacy hold"
+  printf 'Captain resolved the old option.\n' > "$home/old-answer.txt"
+  run_decisions "$home" answer "$origin" "$retained" \
+    --decision-file "$home/old-answer.txt" >/dev/null \
+    || fail "could not resolve live legacy hold"
+  printf 'decisions_reviewed=1\ndecision_keys=%s\n' "$retained" >> "$home/state/$origin.meta"
+  run_decisions "$home" complete "$origin" --none --resolved "$retained" >/dev/null \
+    || fail "explicit historical reclassification with surviving legacy metadata failed"
+  [ "$(grep '^decision_current_keys=' "$home/state/$origin.meta" | tail -1)" = 'decision_current_keys=' ] \
+    || fail "explicit live reclassification retained a false current generation"
+  assert_grep "decision_historical_keys=$retained" "$home/state/$origin.meta" \
+    "explicit live reclassification did not persist historical provenance"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "explicitly reclassified live legacy metadata did not verify"
+
+  home=$(make_home trailing-marker-legacy-identity)
+  origin=sample-trailing-review
+  retained=route-decision-
+  tasks_in "$home" add "$origin" "Review a trailing-marker legacy identity" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create trailing-marker origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$retained" \
+    --title "Choose the trailing-marker route" \
+    --reason "captain trailing route pending" --repo sample) \
+    || fail "could not create trailing-marker hold"
+  decision='Captain resolved the trailing-marker route.'
+  printf '%s\n' "$decision" > "$home/trailing-answer.txt"
+  run_decisions "$home" answer "$origin" "$retained" \
+    --decision-file "$home/trailing-answer.txt" >/dev/null \
+    || fail "could not resolve trailing-marker hold"
+  digest=$(printf '%s' "$decision" | shasum -a 256 | awk '{print $1}')
+  body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: (none)\nResolution mode: answered\n\nCaptain decision:\n%s\n\nRouted work:\n(none)' \
+    "$digest" "$decision")
+  tasks_in "$home" update "$hold" --body "$body" >/dev/null \
+    || fail "could not preserve trailing-marker released-version resolution"
+  printf 'decisions_reviewed=1\ndecision_keys=%s\n' "$retained" >> "$home/state/$origin.meta"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "an invalid empty-key split made a unique legacy identity ambiguous"
+  pass "source-verifiable legacy inventories migrate without weakening archive generations"
+}
+
+test_metadata_free_completion_retries_remain_idempotent() {
+  local home origin key hold token inventory linked
+  home=$(make_home metadata-free-completion-retry)
+  origin=sample-post-teardown-review
+  key=later-choice
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Review metadata-free completion" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create metadata-free origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: initial review complete\n' > "$home/state/$origin.status"
+  printf '# Metadata-free completion review\n' > "$home/data/$origin/report.md"
+  run_decisions "$home" complete "$origin" --none >/dev/null \
+    || fail "initial completion before teardown failed"
+  run_teardown "$home" "$origin" >/dev/null 2> "$home/metadata-free-teardown.err" \
+    || fail "could not tear down metadata-free origin: $(cat "$home/metadata-free-teardown.err")"
+  tasks_in "$home" done "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
+    || fail "could not archive metadata-free origin"
+  assert_absent "$home/state/$origin.meta" "teardown retained metadata-free origin metadata"
+
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the later option" --reason "captain later option pending" --repo sample) \
+    || fail "could not create post-teardown decision"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "first metadata-free completion failed"
+  token=$(printf '%s' "$origin" | shasum -a 256 | awk '{print $1}')
+  inventory="$home/data/decision-completion-inventories/$token.inventory"
+  assert_present "$inventory" "metadata-free completion provenance was not persisted"
+  assert_grep "decision_current_keys=$key" "$inventory" \
+    "metadata-free completion did not preserve its current generation"
+  printf 'Captain resolved the later post-teardown option.\n' > "$home/later-post-teardown.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/later-post-teardown.txt" >/dev/null \
+    || fail "could not resolve metadata-free decision"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "exact metadata-free completion retry lost its resolved current generation"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "repeated metadata-free completion retry was not idempotent"
+  assert_contains "$(tasks_in "$home" show "$hold" --full)" "state: done" \
+    "metadata-free completion retry changed the resolved hold"
+
+  linked="$home/data/decision-completion-inventories/linked.inventory"
+  ln "$inventory" "$linked" || fail "could not create completion-inventory hardlink fixture"
+  if run_decisions "$home" complete "$origin" "$key" \
+    > "$home/hardlinked-inventory.out" 2> "$home/hardlinked-inventory.err"; then
+    fail "metadata-free completion followed a hardlinked provenance record"
+  fi
+  assert_grep "decision completion inventory is hardlinked" "$home/hardlinked-inventory.err" \
+    "hardlinked metadata-free provenance did not fail safely"
+  rm -f "$linked"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "removing the hardlink did not restore metadata-free completion"
+  pass "metadata-free completion provenance makes resolved retries idempotent"
+}
+
 test_queued_legacy_resolution_is_attested_before_teardown() {
   local home id hold decision digest body show
   home=$(make_home queued-legacy-resolution)
@@ -2392,6 +2532,8 @@ test_origin_slug_validation_precedes_path_construction
 test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_legacy_completion_inventory_requires_explicit_provenance
+test_source_verifiable_legacy_inventories_migrate_automatically
+test_metadata_free_completion_retries_remain_idempotent
 test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
 test_legacy_identity_compatibility_is_bounded_and_authorized
