@@ -151,6 +151,64 @@ fm_backend_orca_file_link_count() {
   fi
 }
 
+fm_backend_orca_file_inode() {
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
+fm_backend_orca_no_clobber_recover() {  # <target>
+  local target=$1 staging="${1}.publishing" target_links staging_links target_inode staging_inode
+  [ -e "$staging" ] || [ -L "$staging" ] || return 0
+  [ -f "$staging" ] && [ ! -L "$staging" ] || return 1
+  staging_links=$(fm_backend_orca_file_link_count "$staging") || {
+    [ ! -e "$staging" ] && [ ! -L "$staging" ] && return 0
+    return 1
+  }
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    [ "$staging_links" = 1 ] || return 1
+    if ! ln "$staging" "$target" 2>/dev/null; then
+      [ -e "$target" ] || [ -L "$target" ] || return 1
+    fi
+  fi
+  [ -f "$target" ] && [ ! -L "$target" ] || return 1
+  target_links=$(fm_backend_orca_file_link_count "$target") || return 1
+  staging_links=$(fm_backend_orca_file_link_count "$staging") || {
+    [ ! -e "$staging" ] && [ ! -L "$staging" ] && return 0
+    return 1
+  }
+  if [ "$target_links" != 2 ] || [ "$staging_links" != 2 ]; then
+    [ ! -e "$staging" ] && [ ! -L "$staging" ] && return 0
+    return 1
+  fi
+  target_inode=$(fm_backend_orca_file_inode "$target") || return 1
+  staging_inode=$(fm_backend_orca_file_inode "$staging") || {
+    [ ! -e "$staging" ] && [ ! -L "$staging" ] && return 0
+    return 1
+  }
+  [ "$target_inode" = "$staging_inode" ] || return 1
+  rm -f -- "$staging" || return 1
+  [ "$(fm_backend_orca_file_link_count "$target")" = 1 ]
+}
+
+fm_backend_orca_no_clobber_publish() {  # <source> <target>; 2 means target exists
+  local source=$1 target=$2 staging="${2}.publishing" links
+  fm_backend_orca_no_clobber_recover "$target" || return 1
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] || return 1
+    [ "$(fm_backend_orca_file_link_count "$target")" = 1 ] || return 1
+    return 2
+  fi
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  links=$(fm_backend_orca_file_link_count "$source") || return 1
+  [ "$links" = 1 ] || return 1
+  [ ! -e "$staging" ] && [ ! -L "$staging" ] || return 1
+  mv -- "$source" "$staging" || return 1
+  fm_backend_orca_no_clobber_recover "$target"
+}
+
 fm_backend_orca_terminal_close_exact() {  # <terminal-id> [--absent-ok]
   local terminal=${1:-} absent_ok=${2:-} out rc code
   [ -n "$terminal" ] || return 1
@@ -258,6 +316,7 @@ fm_backend_orca_worktree_create_durable() {  # <project-path> <name> <response-p
 
 fm_backend_orca_terminal_response_parse() {  # <response-path> <title>
   local response=$1 title=$2 out terminal links bytes
+  fm_backend_orca_no_clobber_recover "$response" || return 1
   [ -f "$response" ] && [ ! -L "$response" ] || return 1
   links=$(fm_backend_orca_file_link_count "$response") || return 1
   [ "$links" = 1 ] || return 1
@@ -285,6 +344,7 @@ fm_backend_orca_terminal_create() {  # <worktree-id> <title>
 
 fm_backend_orca_operation_scalar_read() {  # <path>
   local path=$1 links value
+  fm_backend_orca_no_clobber_recover "$path" || return 1
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
   links=$(fm_backend_orca_file_link_count "$path") || return 1
   [ "$links" = 1 ] || return 1
@@ -295,13 +355,25 @@ fm_backend_orca_operation_scalar_read() {  # <path>
 }
 
 fm_backend_orca_operation_scalar_publish() {  # <path> <value>
-  local path=$1 value=$2 tmp
+  local path=$1 value=$2 tmp rc=0 existing
   tmp=$(umask 077; mktemp "${path}.XXXXXX") || return 1
-  printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
-    && ln "$tmp" "$path" 2>/dev/null
-  local rc=$?
-  rm -f -- "$tmp"
-  return "$rc"
+  printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  fm_backend_orca_no_clobber_publish "$tmp" "$path" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2)
+      existing=$(fm_backend_orca_operation_scalar_read "$path") || {
+        rm -f -- "$tmp"
+        return 1
+      }
+      rm -f -- "$tmp"
+      [ "$existing" = "$value" ]
+      ;;
+    *) rm -f -- "$tmp"; return 1 ;;
+  esac
 }
 
 FM_BACKEND_ORCA_TERMINAL_CREATE_IN_PROGRESS=200
@@ -309,9 +381,13 @@ FM_BACKEND_ORCA_TERMINAL_CREATE_IN_PROGRESS=200
 fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-path> <operation-prefix>
   local worktree_id=$1 title=$2 response=$3 operation=$4
   local pid_file="${operation}.pid" start_file="${operation}.start" status_file="${operation}.status"
-  local creator pid status tmp rc i=0 max=${FM_ORCA_TERMINAL_POLLS:-3000} interval=${FM_ORCA_TERMINAL_INTERVAL:-0.02}
+  local candidate="${response}.candidate" creator pid status tmp rc publish_rc i=0 max=${FM_ORCA_TERMINAL_POLLS:-3000} interval=${FM_ORCA_TERMINAL_INTERVAL:-0.02}
   fm_backend_orca_tool_check || return 1
   while :; do
+    fm_backend_orca_no_clobber_recover "$response" || return 1
+    fm_backend_orca_no_clobber_recover "$pid_file" || return 1
+    fm_backend_orca_no_clobber_recover "$start_file" || return 1
+    fm_backend_orca_no_clobber_recover "$status_file" || return 1
     if [ -e "$status_file" ] || [ -L "$status_file" ]; then
       status=$(fm_backend_orca_operation_scalar_read "$status_file") || return 1
       if [ "$status" -eq 0 ]; then
@@ -333,6 +409,25 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
       elif [ -e "$response" ] || [ -L "$response" ]; then
         fm_backend_orca_terminal_response_parse "$response" "$title"
         return $?
+      elif [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        if ! fm_backend_orca_terminal_response_parse "$candidate" "$title" >/dev/null 2>&1; then
+          i=$((i + 1))
+          if [ "$i" -ge "$max" ]; then
+            echo "error: Orca terminal creation stopped with an incomplete recoverable outcome for $title" >&2
+            return 1
+          fi
+          sleep "$interval"
+          continue
+        fi
+        publish_rc=0
+        fm_backend_orca_no_clobber_publish "$candidate" "$response" || publish_rc=$?
+        case "$publish_rc" in
+          0) ;;
+          2) cmp -s "$candidate" "$response" && rm -f -- "$candidate" || return 1 ;;
+          *) return 1 ;;
+        esac
+        fm_backend_orca_terminal_response_parse "$response" "$title"
+        return $?
       elif [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; then
         rm -f -- "$pid_file" || return 1
         continue
@@ -341,30 +436,40 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
         return 1
       fi
     elif [ -e "$response" ] || [ -L "$response" ] \
+      || [ -e "$candidate" ] || [ -L "$candidate" ] \
       || [ -e "$start_file" ] || [ -L "$start_file" ]; then
       echo "error: Orca terminal creation journal is incomplete for $title" >&2
       return 1
     else
+      (umask 077; set -C; : > "$candidate") || return 1
       (
         trap '' HUP INT
         i=0
+        publish_pending=0
         while [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; do
           i=$((i + 1))
           [ "$i" -lt 1500 ] || exit 124
           sleep 0.02
         done
         fm_backend_orca_operation_scalar_read "$start_file" >/dev/null || exit 1
-        tmp=$(umask 077; mktemp "${response}.XXXXXX") || exit 1
+        tmp=$candidate
         if orca terminal create --worktree "id:$worktree_id" --title "$title" --json > "$tmp"; then
           rc=0
           chmod 600 "$tmp" || rc=1
           if [ "$rc" -eq 0 ]; then
-            ln "$tmp" "$response" 2>/dev/null || rc=1
+            publish_rc=0
+            fm_backend_orca_no_clobber_publish "$tmp" "$response" || publish_rc=$?
+            case "$publish_rc" in
+              0) ;;
+              2) cmp -s "$tmp" "$response" || rc=1 ;;
+              *) publish_pending=1 ;;
+            esac
           fi
         else
           rc=$?
         fi
         rm -f -- "$tmp"
+        [ "$publish_pending" -eq 0 ] || exit 126
         fm_backend_orca_operation_scalar_publish "$status_file" "$rc" || exit 1
         exit "$rc"
       ) &
@@ -372,11 +477,13 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
       if ! fm_backend_orca_operation_scalar_publish "$pid_file" "$creator"; then
         kill "$creator" 2>/dev/null || true
         wait "$creator" 2>/dev/null || true
+        rm -f -- "$candidate"
         return 1
       fi
       fm_backend_orca_operation_scalar_publish "$start_file" 1 || {
         kill "$creator" 2>/dev/null || true
         wait "$creator" 2>/dev/null || true
+        rm -f -- "$candidate"
         return 1
       }
     fi

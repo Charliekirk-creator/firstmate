@@ -24,6 +24,9 @@
 #   fm-work-identity.sh dispatch-retire-preflight <task-id>
 #   fm-work-identity.sh dispatch-retire <task-id>
 #   fm-work-identity.sh reserve-unlinked <task-id> --reason persistent-secondmate
+#   fm-work-identity.sh unlinked-prepare <task-id> --reason persistent-secondmate --transaction <id>
+#   fm-work-identity.sh unlinked-commit <task-id> --transaction <id>
+#   fm-work-identity.sh unlinked-abort <task-id> --transaction <id>
 #   fm-work-identity.sh home-id
 #   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]
 #   fm-work-identity.sh handoff-stage <task-id> --file <transfer.json|->
@@ -113,6 +116,7 @@ HANDOFF_SCHEMA=fm-work-identity-handoff.v1
 HANDOFF_STATE_SCHEMA=fm-work-identity-handoff-state.v1
 DISPATCH_STATE_SCHEMA=fm-work-identity-dispatch-state.v2
 UNLINKED_GUARD_SCHEMA=fm-work-identity-unlinked-guard.v1
+UNLINKED_RESERVATION_SCHEMA=fm-work-identity-unlinked-reservation.v1
 MAX_BYTES=65536
 HANDOFF_MAX_BYTES=$((MAX_BYTES + 8192))
 MAX_ARRAY=20
@@ -309,6 +313,7 @@ recover_no_clobber_publications() {
   recover_no_clobber_target "$SIDECAR" "work identity record"
   recover_no_clobber_target "$BRIEF_DEFAULT" "generated instructions"
   recover_no_clobber_target "$UNLINKED_GUARD" "work identity unlinked guard"
+  recover_no_clobber_target "$UNLINKED_RESERVATION" "work identity unlinked reservation"
 }
 
 publish_no_clobber() {  # <source> <target> <label>; 2 means target already exists
@@ -411,6 +416,7 @@ locate_task_dir() {  # <task-id>, read-only
   DISPATCH_STATE="$TASK_DIR/work-identity-dispatch.json"
   DISPATCH_PRIOR="$TASK_DIR/work-identity-dispatch-prior.md"
   UNLINKED_GUARD="$TASK_DIR/work-identity-unlinked-guard.json"
+  UNLINKED_RESERVATION="$TASK_DIR/work-identity-unlinked-reservation.json"
 }
 
 ensure_task_dir() {  # <task-id>
@@ -1018,6 +1024,7 @@ dispatch_instructions_path_valid() {
 
 read_unlinked_guard() {  # <task-id>
   local task=$1 wrapper
+  ensure_home_identity
   safe_regular_file "$UNLINKED_GUARD" "work identity unlinked guard" "$HANDOFF_MAX_BYTES"
   wrapper=$(jq -e -S -c -s \
     --arg schema "$UNLINKED_GUARD_SCHEMA" --arg home "$FM_HOME_REAL" \
@@ -1062,6 +1069,62 @@ write_unlinked_guard() {  # <task-id> <reason>
       || die "cannot publish work identity unlinked guard"
   fi
   read_unlinked_guard "$task"
+}
+
+read_unlinked_reservation() {  # <task-id>
+  local task=$1 wrapper
+  ensure_home_identity
+  safe_regular_file "$UNLINKED_RESERVATION" "work identity unlinked reservation" "$HANDOFF_MAX_BYTES"
+  wrapper=$(jq -e -S -c -s \
+    --arg schema "$UNLINKED_RESERVATION_SCHEMA" --arg home "$FM_HOME_REAL" \
+    --arg home_id "$FM_HOME_ID" --arg task "$task" '
+      def exact_keys($ks): (keys | sort) == ($ks | sort);
+      select(length == 1) | .[0] | select(
+        type == "object" and exact_keys(["schema","state","transaction_id","binding","reason"])
+        and .schema == $schema and .state == "prepared"
+        and (.transaction_id | type) == "string"
+        and .binding == {home:$home,home_id:$home_id,task_id:$task}
+        and .reason == "persistent-secondmate")
+    ' "$UNLINKED_RESERVATION" 2>/dev/null) \
+    || die "work identity unlinked reservation is malformed or mismatched: $UNLINKED_RESERVATION"
+  printf '%s\n' "$wrapper" | cmp -s "$UNLINKED_RESERVATION" - \
+    || die "work identity unlinked reservation is not canonical: $UNLINKED_RESERVATION"
+  UNLINKED_RESERVATION_TRANSACTION=$(printf '%s' "$wrapper" | jq -r '.transaction_id')
+  dispatch_transaction_valid "$UNLINKED_RESERVATION_TRANSACTION" \
+    || die "work identity unlinked reservation transaction is malformed"
+  [ ! -e "$SIDECAR" ] && [ ! -L "$SIDECAR" ] \
+    || die "unlinked work identity reservation conflicts with a linked record for task $task"
+}
+
+validate_unlinked_reservation() {  # <task-id>
+  if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    ensure_home_identity
+    read_unlinked_reservation "$1"
+  fi
+}
+
+write_unlinked_reservation() {  # <task-id> <reason> <transaction>
+  local task=$1 reason=$2 transaction=$3 payload
+  ensure_home_identity
+  payload=$(jq -n -S -c --arg schema "$UNLINKED_RESERVATION_SCHEMA" \
+    --arg home "$FM_HOME_REAL" --arg home_id "$FM_HOME_ID" --arg task "$task" \
+    --arg reason "$reason" --arg transaction "$transaction" \
+    '{schema:$schema,state:"prepared",transaction_id:$transaction,
+      binding:{home:$home,home_id:$home_id,task_id:$task},reason:$reason}') \
+    || die "cannot build work identity unlinked reservation"
+  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-unlinked-reservation.XXXXXX") \
+    || die "cannot create work identity unlinked reservation"
+  printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity unlinked reservation"
+  chmod 600 "$TMP" || die "cannot protect work identity unlinked reservation"
+  if ! publish_no_clobber "$TMP" "$UNLINKED_RESERVATION" "work identity unlinked reservation"; then
+    [ -z "$TMP" ] || rm -f -- "$TMP"
+    TMP=
+    [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ] \
+      || die "cannot publish work identity unlinked reservation"
+  fi
+  read_unlinked_reservation "$task"
+  [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
+    || die "task $task prepared a different unlinked reservation"
 }
 
 read_dispatch_state() {  # <task-id>
@@ -1194,6 +1257,7 @@ validate_completed_dispatch() {  # <task-id> [meta]
 reject_handoff_guard() {  # <task-id>
   local task=$1
   validate_unlinked_guard "$task"
+  validate_unlinked_reservation "$task"
   if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
     read_handoff_state "$SOURCE_HANDOFF" source "$task"
     die "work identity ownership was handed off for task $task"
@@ -1212,6 +1276,11 @@ reject_handoff_guard() {  # <task-id>
 record_ownership_guard() {  # <task-id> [meta]
   local task=$1
   RECORD_HANDOFF_TRANSITION=0
+  if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    ensure_home_identity
+    read_unlinked_reservation "$task"
+    die "task $task has an in-progress persistent secondmate reservation"
+  fi
   if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
     ensure_home_identity
     read_unlinked_guard "$task"
@@ -1308,6 +1377,11 @@ reject_ownership_guard() {  # <task-id> [meta]
 
 reject_dispatch_for_handoff() {  # <task-id>
   local task=$1 meta="$STATE_REAL/$1.meta"
+  if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    ensure_home_identity
+    read_unlinked_reservation "$task"
+    die "persistent secondmate control task $task has an in-progress reservation"
+  fi
   if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
     ensure_home_identity
     read_unlinked_guard "$task"
@@ -1705,6 +1779,9 @@ render_identity_projection_locked() {  # <task-id> [brief] [meta] [meta-brief-pa
   if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
     validate_unlinked_guard "$task"
     reason=explicitly-unlinked
+  elif [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    validate_unlinked_reservation "$task"
+    reason=explicitly-unlinked
   elif [ "$META_PROVENANCE" = metadata ] || [ "$BRIEF_PROVENANCE" = generated-instructions ]; then
     reason=explicitly-unlinked
   else
@@ -1762,10 +1839,8 @@ project_identity() {  # <task-id> [brief] [meta]
   printf '%s\n' "$IDENTITY_PROJECTION"
 }
 
-reserve_unlinked() {  # <task-id> <reason>
-  local task=$1 reason=$2 meta="$STATE_REAL/$1.meta" projection
-  [ "$reason" = persistent-secondmate ] || die "unsupported unlinked reservation reason"
-  identity_mutation_lock_acquire "$task"
+validate_unlinked_applicability_locked() {  # <task-id>
+  local task=$1 meta="$STATE_REAL/$1.meta"
   reject_handoff_guard "$task"
   if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
     read_dispatch_state "$task"
@@ -1782,11 +1857,10 @@ reserve_unlinked() {  # <task-id> <reason>
     validate_sidecar "$SIDECAR" "$task"
     die "persistent secondmate control task $task cannot carry a linked work identity"
   fi
-  if [ ! -e "$UNLINKED_GUARD" ] && [ ! -L "$UNLINKED_GUARD" ]; then
-    write_unlinked_guard "$task" "$reason"
-  else
-    read_unlinked_guard "$task"
-  fi
+}
+
+emit_unlinked_projection_locked() {  # <task-id>
+  local task=$1 meta="$STATE_REAL/$1.meta" projection
   if [ -e "$meta" ] || [ -L "$meta" ]; then
     capture_identity_projection_locked "$task" "" "$meta"
   else
@@ -1796,6 +1870,100 @@ reserve_unlinked() {  # <task-id> <reason>
   [ "$(printf '%s' "$projection" | jq -r '.status')" = unlinked ] \
     || die "persistent secondmate control task $task cannot carry a linked work identity"
   printf '%s\n' "$projection"
+}
+
+reserve_unlinked() {  # <task-id> <reason>
+  local task=$1 reason=$2
+  [ "$reason" = persistent-secondmate ] || die "unsupported unlinked reservation reason"
+  identity_mutation_lock_acquire "$task"
+  if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    read_unlinked_reservation "$task"
+    die "task $task has an in-progress persistent secondmate reservation"
+  fi
+  validate_unlinked_applicability_locked "$task"
+  if [ ! -e "$UNLINKED_GUARD" ] && [ ! -L "$UNLINKED_GUARD" ]; then
+    write_unlinked_guard "$task" "$reason"
+  else
+    read_unlinked_guard "$task"
+  fi
+  emit_unlinked_projection_locked "$task"
+}
+
+unlinked_prepare() {  # <task-id> <reason> <transaction>
+  local task=$1 reason=$2 transaction=$3
+  [ "$reason" = persistent-secondmate ] || die "unsupported unlinked reservation reason"
+  dispatch_transaction_valid "$transaction" || die "unlinked reservation transaction is malformed"
+  identity_mutation_lock_acquire "$task"
+  validate_unlinked_applicability_locked "$task"
+  if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
+    read_unlinked_guard "$task"
+    if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+      read_unlinked_reservation "$task"
+      [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
+        || die "task $task prepared a different unlinked reservation"
+      rm -f -- "$UNLINKED_RESERVATION" \
+        || die "cannot reconcile committed unlinked reservation for task $task"
+    fi
+    emit_unlinked_projection_locked "$task"
+    return 0
+  fi
+  if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    read_unlinked_reservation "$task"
+    [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
+      || die "task $task prepared a different unlinked reservation"
+  else
+    write_unlinked_reservation "$task" "$reason" "$transaction"
+  fi
+  emit_unlinked_projection_locked "$task"
+}
+
+unlinked_commit() {  # <task-id> <transaction>
+  local task=$1 transaction=$2
+  dispatch_transaction_valid "$transaction" || die "unlinked reservation transaction is malformed"
+  identity_mutation_lock_acquire "$task"
+  validate_unlinked_applicability_locked "$task"
+  if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    read_unlinked_reservation "$task"
+    [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
+      || die "task $task prepared a different unlinked reservation"
+  elif [ ! -e "$UNLINKED_GUARD" ] && [ ! -L "$UNLINKED_GUARD" ]; then
+    die "task $task has no prepared unlinked reservation"
+  fi
+  if [ ! -e "$UNLINKED_GUARD" ] && [ ! -L "$UNLINKED_GUARD" ]; then
+    write_unlinked_guard "$task" persistent-secondmate
+  else
+    read_unlinked_guard "$task"
+  fi
+  if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+    rm -f -- "$UNLINKED_RESERVATION" \
+      || die "cannot retire committed unlinked reservation for task $task"
+  fi
+  emit_unlinked_projection_locked "$task"
+}
+
+unlinked_abort() {  # <task-id> <transaction>; 4 means committed
+  local task=$1 transaction=$2
+  dispatch_transaction_valid "$transaction" || die "unlinked reservation transaction is malformed"
+  identity_mutation_lock_acquire "$task"
+  if [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ]; then
+    read_unlinked_guard "$task"
+    if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+      read_unlinked_reservation "$task"
+      [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
+        || die "task $task prepared a different unlinked reservation"
+      rm -f -- "$UNLINKED_RESERVATION" \
+        || die "cannot reconcile committed unlinked reservation for task $task"
+    fi
+    return 4
+  fi
+  if [ ! -e "$UNLINKED_RESERVATION" ] && [ ! -L "$UNLINKED_RESERVATION" ]; then
+    return 0
+  fi
+  read_unlinked_reservation "$task"
+  [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
+    || die "task $task prepared a different unlinked reservation"
+  rm -f -- "$UNLINKED_RESERVATION" \
+    || die "cannot abort unlinked reservation for task $task"
 }
 
 brief_publish() {  # <task-id> <draft>
@@ -2203,7 +2371,8 @@ publication_preflight_locked() {
       "$task_dir/work-identity-handoff-source.json" \
       "$task_dir/work-identity-handoff-target.json" \
       "$task_dir/work-identity-dispatch.json" \
-      "$task_dir/work-identity-unlinked-guard.json"
+      "$task_dir/work-identity-unlinked-guard.json" \
+      "$task_dir/work-identity-unlinked-reservation.json"
     do
       if [ -e "$guarded_path" ] || [ -L "$guarded_path" ]; then guarded=1; fi
     done
@@ -2213,6 +2382,10 @@ publication_preflight_locked() {
     locate_task_dir "$task"
     identity_lock_acquire "$task"
     validate_unlinked_guard "$task"
+    validate_unlinked_reservation "$task"
+    if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
+      die "task $task has an incomplete persistent secondmate reservation"
+    fi
     if [ -e "$SOURCE_HANDOFF" ] || [ -L "$SOURCE_HANDOFF" ]; then
       read_handoff_state "$SOURCE_HANDOFF" source "$task"
       [ "$HANDOFF_STATE" = completed ] \
@@ -2259,7 +2432,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections|publication-run) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|reserve-unlinked|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|reserve-unlinked|unlinked-prepare|unlinked-commit|unlinked-abort|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -2458,6 +2631,19 @@ case "$COMMAND" in
     [ "$#" -eq 2 ] && [ "$1" = --reason ] \
       || die "reserve-unlinked usage: fm-work-identity.sh reserve-unlinked <task-id> --reason persistent-secondmate"
     reserve_unlinked "$TASK" "$2"
+    ;;
+  unlinked-prepare)
+    [ "$#" -eq 4 ] && [ "$1" = --reason ] && [ "$3" = --transaction ] \
+      || die "unlinked-prepare usage: fm-work-identity.sh unlinked-prepare <task-id> --reason persistent-secondmate --transaction <id>"
+    unlinked_prepare "$TASK" "$2" "$4"
+    ;;
+  unlinked-commit|unlinked-abort)
+    [ "$#" -eq 2 ] && [ "$1" = --transaction ] \
+      || die "$COMMAND usage: fm-work-identity.sh $COMMAND <task-id> --transaction <id>"
+    case "$COMMAND" in
+      unlinked-commit) unlinked_commit "$TASK" "$2" ;;
+      unlinked-abort) unlinked_abort "$TASK" "$2" ;;
+    esac
     ;;
   handoff-prepare)
     [ "$#" -eq 4 ] || [ "$#" -eq 5 ] \

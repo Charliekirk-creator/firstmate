@@ -560,6 +560,11 @@ spawn_remote_secondmate() {
       return 1
     fi
   fi
+  if ! prepare_secondmate_work_identity; then
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    return 1
+  fi
   # Gate the host before anything is published or transferred, so a host that
   # cannot hold a durable Herdr endpoint refuses here rather than half-way
   # through a launch. This is also the readiness gate every liveness relaunch
@@ -586,12 +591,6 @@ spawn_remote_secondmate() {
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     echo "error: remote secondmate $id inheritance transaction could not be locked" >&2
-    return 1
-  fi
-  if ! reserve_secondmate_work_identity; then
-    fm_lock_release "$remote_lock" || true
-    fm_lock_release "$registry_lock" || true
-    fm_lock_release "$SPAWN_TASK_LOCK" || true
     return 1
   fi
   remote_generation=$(fm_remote_inherit_generation_next "$STATE" "$id" 2>/dev/null || true)
@@ -641,10 +640,12 @@ spawn_remote_secondmate() {
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     [ -z "$out" ] || printf '%s\n' "$out" >&2
     if [ "$rc" -eq 255 ]; then
+      SECONDMATE_RESERVATION_PRESERVE=1
       echo "error: remote secondmate $id is unavailable or launch completion is unknown; preserved route $host:$home" >&2
     fi
     return "$rc"
   fi
+  SECONDMATE_RESERVATION_PRESERVE=1
   remote_backend=$(printf '%s\n' "$out" | sed -n 's/^backend=//p' | tail -1)
   remote_target=$(printf '%s\n' "$out" | sed -n 's/^target=//p' | tail -1)
   remote_harness=$(printf '%s\n' "$out" | sed -n 's/^harness=//p' | tail -1)
@@ -668,6 +669,13 @@ spawn_remote_secondmate() {
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     echo "error: remote launch returned Herdr session '${remote_herdr_session:-missing}', expected 'fm-remote'; preserving the remote route for reconciliation" >&2
+    return 1
+  fi
+  if ! commit_secondmate_work_identity; then
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id launched, but its unlinked identity could not be committed; preserving the remote route for reconciliation" >&2
     return 1
   fi
   # Record what the remote endpoint ACTUALLY carries, read back from its own
@@ -761,6 +769,9 @@ SPAWN_META_PUBLISH_STARTED=0
 SPAWN_FRESH_COMMIT_PENDING=0
 SPAWN_TASK_SET_LOCK=
 SPAWN_TASK_SET_LOCK_HELD=0
+SECONDMATE_RESERVATION_TRANSACTION=
+SECONDMATE_RESERVATION_PENDING=0
+SECONDMATE_RESERVATION_PRESERVE=0
 RELAUNCH_REPLACEMENT_PENDING=0
 RELAUNCH_REPLACEMENT_BUSY_GEN=
 RELAUNCH_REPLACEMENT_HARNESS=
@@ -851,6 +862,9 @@ spawn_endpoint_receipt_publish() {  # <endpoint-creating|endpoint-created|worktr
   printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
     && mv -f -- "$tmp" "$SPAWN_ENDPOINT_RECEIPT" || { rm -f -- "$tmp"; return 1; }
   SPAWN_ENDPOINT_PHASE=$phase
+  if [ "$KIND" = secondmate ] && [ "$SECONDMATE_RESERVATION_PENDING" -eq 1 ]; then
+    SECONDMATE_RESERVATION_PRESERVE=1
+  fi
 }
 
 spawn_endpoint_receipt_load() {
@@ -905,6 +919,9 @@ spawn_endpoint_receipt_load() {
     return 1
   }
   SPAWN_ENDPOINT_PHASE=$(printf '%s' "$canonical" | jq -r '.phase') || return 1
+  if [ "$KIND" = secondmate ] && [ "$SECONDMATE_RESERVATION_PENDING" -eq 1 ]; then
+    SECONDMATE_RESERVATION_PRESERVE=1
+  fi
   if [ "$SPAWN_ENDPOINT_PHASE" = endpoint-creating ]; then
     SPAWN_ENDPOINT_CREATING_RECOVERY=1
     return 0
@@ -994,27 +1011,42 @@ spawn_orca_operation_prepare() {
 }
 
 spawn_orca_operation_publish() {  # <result|failure> <payload>
-  local kind=$1 payload=$2 tmp target
+  local kind=$1 payload=$2 tmp target rc=0
   case "$kind" in
     result) target="$SPAWN_ORCA_OPERATION/result.json" ;;
     failure) target="$SPAWN_ORCA_OPERATION/failure.json" ;;
     *) return 1 ;;
   esac
   tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.${kind}.XXXXXX") || return 1
-  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
-    && mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
+  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  fm_backend_orca_no_clobber_publish "$tmp" "$target" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2)
+      cmp -s "$tmp" "$target"
+      rc=$?
+      rm -f -- "$tmp"
+      return "$rc"
+      ;;
+    *) rm -f -- "$tmp"; return 1 ;;
+  esac
 }
 
 spawn_orca_operation_helper() {
-  local claim_tmp create_response terminal_response raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation
+  local claim_tmp claim_rc create_response terminal_response raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation
   set +e
   claim_tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.claim.XXXXXX") || exit 1
   printf '%s\n' "${BASHPID:-$$}" > "$claim_tmp" || { rm -f -- "$claim_tmp"; exit 1; }
-  if ! ln "$claim_tmp" "$SPAWN_ORCA_OPERATION/claim" 2>/dev/null; then
-    rm -f -- "$claim_tmp"
-    exit 0
-  fi
-  rm -f -- "$claim_tmp"
+  claim_rc=0
+  fm_backend_orca_no_clobber_publish "$claim_tmp" "$SPAWN_ORCA_OPERATION/claim" || claim_rc=$?
+  case "$claim_rc" in
+    0) ;;
+    2) rm -f -- "$claim_tmp"; exit 0 ;;
+    *) rm -f -- "$claim_tmp"; exit 1 ;;
+  esac
 
   create_response="$SPAWN_ORCA_OPERATION/create-response.json"
   if [ -e "$create_response" ] || [ -L "$create_response" ]; then
@@ -1070,8 +1102,6 @@ spawn_orca_operation_helper() {
     if [ "$rc" -eq 0 ] && spawn_orca_operation_publish result "$payload"; then
       exit 0
     fi
-    [ -z "$terminal" ] || fm_backend_kill orca "$terminal" >/dev/null 2>&1 || true
-    [ -z "$wt_id" ] || fm_backend_remove_worktree orca "$wt_id" >/dev/null 2>&1 || true
     exit 1
   fi
 
@@ -1105,6 +1135,17 @@ spawn_orca_operation_start() {
 
 spawn_orca_operation_load() {  # 0=result, 2=in progress, 3=unclaimed, 4=creator exited, 6=recoverable response
   local file canonical links pid failure_reason create_response_complete=0
+  for file in \
+    "$SPAWN_ORCA_OPERATION/result.json" \
+    "$SPAWN_ORCA_OPERATION/failure.json" \
+    "$SPAWN_ORCA_OPERATION/claim" \
+    "$SPAWN_ORCA_OPERATION/terminal-response.json" \
+    "$SPAWN_ORCA_OPERATION/terminal-create.pid" \
+    "$SPAWN_ORCA_OPERATION/terminal-create.start" \
+    "$SPAWN_ORCA_OPERATION/terminal-create.status"
+  do
+    fm_backend_orca_no_clobber_recover "$file" || return 1
+  done
   file="$SPAWN_ORCA_OPERATION/result.json"
   if [ -e "$file" ] || [ -L "$file" ]; then
     [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -1396,6 +1437,22 @@ spawn_abort_cleanup() {
       esac
     fi
   fi
+  if [ "$SECONDMATE_RESERVATION_PENDING" -eq 1 ] \
+     && [ "$SECONDMATE_RESERVATION_PRESERVE" -eq 0 ]; then
+    local reservation_abort_rc=0
+    SECONDMATE_RESERVATION_PENDING=0
+    FM_HOME="$FM_HOME" \
+      FM_DATA_OVERRIDE="$DATA" \
+      FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" unlinked-abort "$ID" \
+        --transaction "$SECONDMATE_RESERVATION_TRANSACTION" >/dev/null 2>&1 \
+      || reservation_abort_rc=$?
+    case "$reservation_abort_rc" in
+      0|4) ;;
+      *) echo "warning: persistent secondmate identity reservation for $ID requires reconciliation" >&2 ;;
+    esac
+  fi
   if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_LOCK" || true
@@ -1599,14 +1656,17 @@ if [ "$RELAUNCH" -eq 0 ]; then
 fi
 SECONDMATE_WORK_IDENTITY_SCHEMA=
 SECONDMATE_WORK_IDENTITY_STATUS=
-reserve_secondmate_work_identity() {
+SECONDMATE_RESERVATION_TRANSACTION="secondmate-spawn:$ID"
+prepare_secondmate_work_identity() {
+  SECONDMATE_RESERVATION_PENDING=1
   SECONDMATE_WORK_IDENTITY_JSON=$(
     FM_HOME="$FM_HOME" \
       FM_DATA_OVERRIDE="$DATA" \
       FM_STATE_OVERRIDE="$STATE" \
       FM_ROOT_OVERRIDE="$FM_ROOT" \
-      "$SCRIPT_DIR/fm-work-identity.sh" reserve-unlinked "$ID" \
-        --reason persistent-secondmate
+      "$SCRIPT_DIR/fm-work-identity.sh" unlinked-prepare "$ID" \
+        --reason persistent-secondmate \
+        --transaction "$SECONDMATE_RESERVATION_TRANSACTION"
   ) || return 1
   SECONDMATE_WORK_IDENTITY_SCHEMA=$(printf '%s' "$SECONDMATE_WORK_IDENTITY_JSON" | jq -er '.schema') \
     || { echo "error: persistent secondmate work identity projection is malformed for $ID" >&2; return 1; }
@@ -1616,6 +1676,24 @@ reserve_secondmate_work_identity() {
     echo "error: persistent secondmate control task $ID cannot carry a linked work identity; route exact work units to tasks in the secondmate home" >&2
     return 1
   }
+}
+
+commit_secondmate_work_identity() {
+  SECONDMATE_WORK_IDENTITY_JSON=$(
+    FM_HOME="$FM_HOME" \
+      FM_DATA_OVERRIDE="$DATA" \
+      FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" unlinked-commit "$ID" \
+        --transaction "$SECONDMATE_RESERVATION_TRANSACTION"
+  ) || return 1
+  SECONDMATE_WORK_IDENTITY_SCHEMA=$(printf '%s' "$SECONDMATE_WORK_IDENTITY_JSON" | jq -er '.schema') \
+    || return 1
+  SECONDMATE_WORK_IDENTITY_STATUS=$(printf '%s' "$SECONDMATE_WORK_IDENTITY_JSON" | jq -er '.status') \
+    || return 1
+  [ "$SECONDMATE_WORK_IDENTITY_STATUS" = unlinked ] || return 1
+  SECONDMATE_RESERVATION_PENDING=0
+  SECONDMATE_RESERVATION_PRESERVE=0
 }
 if [ "$KIND" = secondmate ]; then
   if spawn_remote_secondmate "$ID"; then
@@ -2343,6 +2421,7 @@ if [ "$KIND" = secondmate ]; then
     BRIEF="$DATA/$ID/brief.md"
   fi
   [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+  prepare_secondmate_work_identity || exit 1
   mkdir -p "$PROJ_ABS/state" || {
     echo "error: could not create secondmate state directory for $PROJ_ABS" >&2
     exit 1
@@ -2358,7 +2437,6 @@ if [ "$KIND" = secondmate ]; then
     fi
     CONFIG_INHERIT_LOCK_HELD=1
   fi
-  reserve_secondmate_work_identity || exit 1
   WT="$PROJ_ABS"
   # Local-HEAD sync: before launch, fast-forward this secondmate's worktree to the
   # PRIMARY checkout's current default-branch commit, so a freshly spawned or
@@ -2489,6 +2567,7 @@ if [ "$RELAUNCH" -eq 0 ] \
   spawn_endpoint_receipt_load || endpoint_receipt_rc=$?
   if [ "$endpoint_receipt_rc" -eq 2 ]; then
     rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || exit 1
+    SECONDMATE_RESERVATION_PRESERVE=0
     echo "error: retired the missing endpoint receipt for $ID; rerun spawn to create a replacement" >&2
     exit 1
   fi
@@ -3133,6 +3212,12 @@ if [ "$RELAUNCH" -eq 0 ] && { [ "$KIND" = secondmate ] || [ "$BACKEND" = orca ];
     exit 1
   }
 fi
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ]; then
+  commit_secondmate_work_identity || {
+    echo "error: secondmate endpoint is ready, but its unlinked identity could not be committed" >&2
+    exit 1
+  }
+fi
 if [ "$KIND" = secondmate ]; then
   FM_INHERITABLE_CONFIG=trace-context \
     propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config" \
@@ -3275,16 +3360,15 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || exit 1
     WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
     if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
-      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] \
-        && rmdir "$WORKTREE_REQUEST_MARKER" || {
-          echo "error: could not retire the exact worktree request marker for $ID" >&2
-          exit 1
-        }
+      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
+        echo "error: exact worktree request marker is unsafe for $ID" >&2
+        exit 1
+      }
     fi
   else
     WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || exit 1
     WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
-    WORKTREE_REQUEST_COMMAND="mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { treehouse get; rc=\$?; rmdir $(shell_quote "$WORKTREE_REQUEST_MARKER") 2>/dev/null || true; [ \"\$rc\" -eq 0 ]; }"
+    WORKTREE_REQUEST_COMMAND="mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { treehouse get; rc=\$?; if [ \"\$rc\" -ne 0 ]; then rmdir $(shell_quote "$WORKTREE_REQUEST_MARKER") 2>/dev/null || true; fi; [ \"\$rc\" -eq 0 ]; }"
     worktree_request_recovery=0
     case "$SPAWN_ENDPOINT_PHASE" in
       endpoint-created)
@@ -3350,7 +3434,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
             worktree_request_idle=1
           fi
           ;;
-        zellij|cmux) ;;
+        zellij|cmux) worktree_request_idle=1 ;;
       esac
       [ "$worktree_request_idle" -eq 1 ] || break
       if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
@@ -3384,11 +3468,10 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       exit 1
     }
     if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
-      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] \
-        && rmdir "$WORKTREE_REQUEST_MARKER" || {
-          echo "error: could not retire the exact worktree request marker for $ID" >&2
-          exit 1
-        }
+      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
+        echo "error: worktree request marker is unsafe: $WORKTREE_REQUEST_MARKER" >&2
+        exit 1
+      }
     fi
   fi
 fi
@@ -3987,7 +4070,16 @@ if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   HERDR_PROJECTION_ABORT_CLEANUP=0
   spawn_herdr_presentation_order_lock_release
 fi
+if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  SECONDMATE_RESERVATION_PRESERVE=1
+fi
 spawn_send_key "$T" Enter
+if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  commit_secondmate_work_identity || {
+    echo "error: secondmate relaunch was submitted, but its unlinked identity could not be committed" >&2
+    exit 1
+  }
+fi
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
     kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"

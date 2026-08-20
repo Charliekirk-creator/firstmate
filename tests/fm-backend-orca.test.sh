@@ -557,6 +557,88 @@ test_terminal_child_exit_124_remains_a_failure() {
   pass "fm_backend_orca_terminal_create_durable: child exit 124 stays a failure"
 }
 
+test_orca_journal_publication_recovers_interrupted_links() {
+  local dir scalar response out links
+  dir="$TMP_ROOT/journal-publication-recovery"
+  mkdir -p "$dir"
+  scalar="$dir/status"
+  printf '0\n' > "$scalar"
+  ln "$scalar" "$scalar.publishing" \
+    || fail "could not create interrupted Orca scalar publication"
+  out=$(bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_operation_scalar_read "$1"' \
+    "$ROOT" "$scalar") \
+    || fail "Orca scalar reader did not reconcile interrupted publication"
+  [ "$out" = 0 ] || fail "reconciled Orca scalar changed value"
+  assert_absent "$scalar.publishing" \
+    "Orca scalar reconciliation retained its staging link"
+  if [ "$(uname)" = Darwin ]; then
+    links=$(stat -f '%l' "$scalar")
+  else
+    links=$(stat -c '%h' "$scalar")
+  fi
+  [ "$links" = 1 ] || fail "Orca scalar reconciliation did not restore one link"
+
+  response="$dir/terminal-response.json"
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-recovered"}}}\n' \
+    > "$response.publishing"
+  out=$(bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_terminal_response_parse "$1" fm-task' \
+    "$ROOT" "$response") \
+    || fail "Orca terminal response did not recover its staged publication"
+  [ "$out" = term-recovered ] || fail "recovered Orca terminal response changed identity"
+  assert_present "$response" "Orca terminal response recovery did not publish its target"
+  assert_absent "$response.publishing" \
+    "Orca terminal response recovery retained its staging name"
+  pass "Orca journals reconcile interrupted no-clobber publications"
+}
+
+test_spawn_preserves_resources_across_result_publication_retry() {
+  local proj wt data state config id out creates
+  id="orcaresultretryz2"
+  proj="$TMP_ROOT/result-retry-project"
+  wt="$TMP_ROOT/result-retry-wt"
+  data="$TMP_ROOT/result-retry-data"
+  state="$TMP_ROOT/result-retry-state"
+  config="$TMP_ROOT/result-retry-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case result-publication-retry
+  cat > "$FB/ln" <<'SH'
+#!/usr/bin/env bash
+if [ "${2:-}" = "${FM_TEST_RESULT_TARGET:-}" ] \
+   && [ ! -e "${FM_TEST_RESULT_FAILURE:-}" ]; then
+  : > "$FM_TEST_RESULT_FAILURE"
+  exit 1
+fi
+exec "${REAL_LN_FOR_TEST:?}" "$@"
+SH
+  chmod +x "$FB/ln"
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-result-retry"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-result-retry","path":"%s"},"terminal":{"handle":"term-result-retry"}}}\n' "$wt" > "$RESP/3.out"
+  out=$(PATH="$FB:$PATH" REAL_LN_FOR_TEST="$(command -v ln)" \
+    FM_TEST_RESULT_TARGET="$state/$id.spawn-orca-operation/result.json" \
+    FM_TEST_RESULT_FAILURE="$CASE_DIR/result-publication-failed" \
+    FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1) \
+    || fail "Orca spawn did not recover transient result publication: $out"
+  assert_present "$CASE_DIR/result-publication-failed" \
+    "Orca result publication failure fixture did not execute"
+  creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
+  [ "$creates" -eq 1 ] || fail "result publication retry created $creates Orca worktrees"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1fterminal\x1fclose' \
+    "result publication retry closed the exact terminal"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1fworktree\x1frm' \
+    "result publication retry removed the exact worktree"
+  assert_grep 'orca_worktree_id=wt-result-retry' "$state/$id.meta" \
+    "result publication retry lost the exact Orca worktree"
+  rm -rf "/tmp/fm-$id"
+  pass "Orca result publication retries preserve exact resources"
+}
+
 test_spawn_retries_after_compensated_pathless_worktree() {
   local proj wt data state config id out status creates
   id="orcacompensatedz7"
@@ -1772,6 +1854,8 @@ test_worktree_create_removes_worktree_when_path_missing
 test_worktree_create_preserves_terminal_when_close_is_unconfirmed
 test_terminal_create_timeout_remains_resumable
 test_terminal_child_exit_124_remains_a_failure
+test_orca_journal_publication_recovers_interrupted_links
+test_spawn_preserves_resources_across_result_publication_retry
 test_spawn_retries_after_compensated_pathless_worktree
 test_spawn_recovers_compensated_pathless_response_after_creator_crash
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails

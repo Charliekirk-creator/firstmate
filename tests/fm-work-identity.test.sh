@@ -428,6 +428,48 @@ test_concurrent_idempotence_and_explicit_unlinked() {
   pass "concurrent identical records converge and intentional unlinked intake stays explicit"
 }
 
+test_secondmate_unlinked_reservation_is_transactional() {
+  local home task committed manifest out rc=0
+  home=$(make_home secondmate-reservation)
+  task=secondmate-reservation-abort
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" unlinked-prepare "$task" \
+    --reason persistent-secondmate --transaction secondmate-spawn:test) \
+    || fail "could not prepare transactional secondmate reservation"
+  printf '%s' "$out" | jq -e '.status == "unlinked" and .reason == "explicitly-unlinked"' >/dev/null \
+    || fail "prepared secondmate reservation did not project explicitly unlinked"
+  assert_present "$home/data/$task/work-identity-unlinked-reservation.json" \
+    "prepared secondmate reservation was not durable"
+  assert_absent "$home/data/$task/work-identity-unlinked-guard.json" \
+    "pre-launch secondmate reservation was committed early"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "linked intake bypassed a prepared secondmate reservation"
+  assert_contains "$out" "in-progress persistent secondmate reservation" \
+    "prepared secondmate reservation refusal was not explicit"
+  FM_HOME="$home" "$WORK_IDENTITY" unlinked-abort "$task" \
+    --transaction secondmate-spawn:test >/dev/null \
+    || fail "could not abort unapplied secondmate reservation"
+  assert_absent "$home/data/$task/work-identity-unlinked-reservation.json" \
+    "aborted secondmate reservation remained durable"
+  FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null \
+    || fail "aborted secondmate reservation still blocked exact linked intake"
+
+  committed=secondmate-reservation-commit
+  FM_HOME="$home" "$WORK_IDENTITY" unlinked-prepare "$committed" \
+    --reason persistent-secondmate --transaction secondmate-spawn:commit >/dev/null \
+    || fail "could not prepare committed secondmate reservation"
+  FM_HOME="$home" "$WORK_IDENTITY" unlinked-commit "$committed" \
+    --transaction secondmate-spawn:commit >/dev/null \
+    || fail "could not commit successful secondmate reservation"
+  assert_absent "$home/data/$committed/work-identity-unlinked-reservation.json" \
+    "committed secondmate reservation retained its prepared state"
+  assert_present "$home/data/$committed/work-identity-unlinked-guard.json" \
+    "successful secondmate reservation did not publish its explicit guard"
+  pass "secondmate unlinked reservations prepare, abort, and commit transactionally"
+}
+
 test_no_clobber_publications_recover_after_interruption() {
   local home task manifest sidecar brief guard out links
   home=$(make_home publication-recovery)
@@ -776,6 +818,116 @@ test_spawn_does_not_resend_inflight_worktree_request() {
   sends=$(wc -l < "$home/treehouse-sends" | tr -d ' ')
   [ "$sends" = 1 ] || fail "retry sent $sends worktree requests while the first acquisition was still active: $out"
   pass "spawn retries do not duplicate in-flight worktree acquisition"
+}
+
+test_zellij_resumes_unsent_worktree_request_once() {
+  local home task project wt fakebin manifest out rc=0 sends
+  home=$(make_home zellij-worktree-request)
+  task=zellij-worktree-request
+  project="$home/project"
+  wt="$home/worker-copy"
+  manifest="$home/manifest.json"
+  make_manifest "$home" "$task" "$manifest"
+  record_and_brief "$home" "$task" "$manifest"
+  fm_git_worktree "$project" "$wt" zellij-worktree-copy
+  fakebin=$(make_fakebin "$home/zellij-worktree-fakes")
+  cat > "$fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  --version) printf 'zellij 0.44.0\n'; exit 0 ;;
+  list-sessions) printf 'firstmate\n'; exit 0 ;;
+esac
+case "$*" in
+  *' action list-tabs --json'*)
+    if [ -f "$FM_TEST_ZELLIJ_TITLE" ]; then
+      printf '[{"tab_id":3,"name":"%s","active":true}]\n' "$(cat "$FM_TEST_ZELLIJ_TITLE")"
+    else
+      printf '[]\n'
+    fi
+    exit 0
+    ;;
+  *' action list-panes --json'*)
+    if [ -f "$FM_TEST_ZELLIJ_TITLE" ]; then
+      printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n'
+    else
+      printf '[]\n'
+    fi
+    exit 0
+    ;;
+  *' action new-tab '*)
+    previous=
+    for arg in "$@"; do
+      if [ "$previous" = --name ]; then printf '%s' "$arg" > "$FM_TEST_ZELLIJ_TITLE"; fi
+      previous=$arg
+    done
+    printf '3\n'
+    exit 0
+    ;;
+  *' action paste '*)
+    text=${!#}
+    if printf '%s' "$text" | grep -Fq 'treehouse get' \
+       && [ ! -e "$FM_TEST_ZELLIJ_FAILED" ]; then
+      : > "$FM_TEST_ZELLIJ_FAILED"
+      exit 1
+    fi
+    printf '%s' "$text" > "$FM_TEST_ZELLIJ_INPUT"
+    exit 0
+    ;;
+  *' action send-keys '*)
+    if [ "${!#}" = Enter ] && [ -f "$FM_TEST_ZELLIJ_INPUT" ]; then
+      text=$(cat "$FM_TEST_ZELLIJ_INPUT")
+      if printf '%s' "$text" | grep -Fq 'treehouse get'; then
+        PATH="$FM_TEST_ZELLIJ_FAKEBIN:$PATH" bash -c "$text" || exit 1
+        printf 'sent\n' >> "$FM_TEST_ZELLIJ_SENDS"
+        : > "$FM_TEST_ZELLIJ_WORKTREE"
+      fi
+    fi
+    exit 0
+    ;;
+  *' action dump-screen '*)
+    path=$FM_TEST_ZELLIJ_PROJECT
+    [ ! -e "$FM_TEST_ZELLIJ_WORKTREE" ] || path=$FM_TEST_ZELLIJ_WT
+    printf '__FM_ZELLIJ_CWD_BEGIN__\n%s\n__FM_ZELLIJ_CWD_END__\n' "$path"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/zellij"
+
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
+    FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
+    FM_TEST_ZELLIJ_FAILED="$home/zellij-send-failed" \
+    FM_TEST_ZELLIJ_INPUT="$home/zellij-input" \
+    FM_TEST_ZELLIJ_SENDS="$home/zellij-sends" \
+    FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
+    FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
+    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" PATH="$fakebin:$PATH" \
+    "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
+      --harness codex --backend zellij 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "zellij unsent-request fixture unexpectedly completed"
+  jq -e '.phase == "worktree-requesting" and .worktree == null' \
+    "$home/state/$task.spawn-endpoint.json" >/dev/null \
+    || fail "zellij failed send did not preserve worktree request intent: $out"
+
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
+    FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
+    FM_TEST_ZELLIJ_FAILED="$home/zellij-send-failed" \
+    FM_TEST_ZELLIJ_INPUT="$home/zellij-input" \
+    FM_TEST_ZELLIJ_SENDS="$home/zellij-sends" \
+    FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
+    FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
+    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" FM_SPAWN_WORKTREE_POLLS=2 \
+    FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
+    "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
+      --harness codex --backend zellij 2>&1) \
+    || fail "zellij did not resume its definitely unsent worktree request: $out"
+  sends=$(wc -l < "$home/zellij-sends" | tr -d ' ')
+  [ "$sends" = 1 ] || fail "zellij recovery executed $sends worktree requests"
+  assert_contains "$out" "spawned $task" \
+    "zellij worktree request recovery did not complete spawn"
+  pass "zellij resumes unsent worktree requests without duplicate acquisition"
 }
 
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
@@ -2061,6 +2213,7 @@ test_spawn_delivers_validated_brief_snapshot
 test_sidecar_validation_hashes_captured_bytes
 test_manifest_capture_rejects_same_size_rewrite
 test_concurrent_idempotence_and_explicit_unlinked
+test_secondmate_unlinked_reservation_is_transactional
 test_no_clobber_publications_recover_after_interruption
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
@@ -2069,6 +2222,7 @@ test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect
 test_spawn_resumes_unsent_worktree_request
 test_spawn_does_not_resend_inflight_worktree_request
+test_zellij_resumes_unsent_worktree_request_once
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt
 test_dispatch_publish_refuses_unstable_metadata_without_publication
 test_replacement_dispatch_recovers_prior_retirement
