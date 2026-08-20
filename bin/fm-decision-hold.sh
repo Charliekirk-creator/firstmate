@@ -157,12 +157,18 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 DECISION_META_LOCK=
 DECISION_META_LOCK_HELD=0
+DECISION_INVENTORY_LOCK=
+DECISION_INVENTORY_LOCK_HELD=0
 DECISION_ATTESTATION_LOCK=
 DECISION_ATTESTATION_LOCK_HELD=0
 decision_hold_cleanup() {
   if [ "$DECISION_ATTESTATION_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_ATTESTATION_LOCK" || true
     DECISION_ATTESTATION_LOCK_HELD=0
+  fi
+  if [ "$DECISION_INVENTORY_LOCK_HELD" = 1 ]; then
+    fm_lock_release "$DECISION_INVENTORY_LOCK" || true
+    DECISION_INVENTORY_LOCK_HELD=0
   fi
   if [ "$DECISION_META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK" || true
@@ -994,9 +1000,9 @@ completion_inventory_lock_acquire() {  # <origin-id>
   completion_inventory_dir 1
   token=$(sha256_text "$1")
   COMPLETION_INVENTORY_PATH=$(completion_inventory_path "$COMPLETION_INVENTORY_DIR" "$1")
-  DECISION_META_LOCK="$COMPLETION_INVENTORY_DIR/.completion-$token.lock"
-  fm_lock_acquire_wait "$DECISION_META_LOCK"
-  DECISION_META_LOCK_HELD=1
+  DECISION_INVENTORY_LOCK="$COMPLETION_INVENTORY_DIR/.completion-$token.lock"
+  fm_lock_acquire_wait "$DECISION_INVENTORY_LOCK"
+  DECISION_INVENTORY_LOCK_HELD=1
 }
 
 completion_inventory_load_locked() {  # <origin-id>
@@ -1694,6 +1700,8 @@ command_complete() {
   local supplied='' resolved='' supplied_csv='' resolved_csv='' keys='' key
   local current_keys='' historical_keys='' previous_last_current='' previous_last_historical=''
   local previous_reviewed='' previous_last_known=0 inventory_versioned=0 exact_retry=0 legacy_classified=0
+  local durable_keys='' durable_current='' durable_historical=''
+  local durable_last_current='' durable_last_historical='' durable_last_known=0 metadata_needs_sync=0
   local status_file open raw_open key_seen=0 has_meta=0 durable_inventory=0 none=0 positional_only=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
@@ -1712,10 +1720,8 @@ command_complete() {
   fi
   require_tasks_axi
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
-  if [ "$has_meta" = 0 ]; then
-    completion_inventory_lock_acquire "$origin"
-    durable_inventory=1
-  fi
+  completion_inventory_lock_acquire "$origin"
+  durable_inventory=1
   while [ "$#" -gt 0 ]; do
     if [ "$positional_only" -eq 1 ]; then
       validate_slug decision-key "$1"
@@ -1761,15 +1767,9 @@ EOF
     previous_last_known=$META_DECISION_LAST_INVENTORY_KNOWN
     previous_reviewed=$META_DECISIONS_REVIEWED
     inventory_versioned=$META_DECISION_INVENTORY_VERSIONED
-  elif completion_inventory_load_locked "$origin"; then
-    previous=$META_DECISION_KEYS
-    previous_current=$META_DECISION_CURRENT_KEYS
-    previous_historical=$META_DECISION_HISTORICAL_KEYS
-    previous_last_current=$META_DECISION_LAST_CURRENT_KEYS
-    previous_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
-    previous_last_known=$META_DECISION_LAST_INVENTORY_KNOWN
-    previous_reviewed=$META_DECISIONS_REVIEWED
-    inventory_versioned=$META_DECISION_INVENTORY_VERSIONED
+    if [ "$previous_reviewed" != 1 ] || [ "$inventory_versioned" -ne 1 ]; then
+      metadata_needs_sync=1
+    fi
   fi
   if [ "$inventory_versioned" -eq 0 ] && [ -n "$previous" ]; then
     classify_legacy_source_generations "$origin" "$previous"
@@ -1791,6 +1791,45 @@ EOF
     previous_last_current=''
     previous_last_historical=''
     previous_last_known=0
+  fi
+  if completion_inventory_load_locked "$origin"; then
+    durable_keys=$META_DECISION_KEYS
+    durable_current=$META_DECISION_CURRENT_KEYS
+    durable_historical=$META_DECISION_HISTORICAL_KEYS
+    durable_last_current=$META_DECISION_LAST_CURRENT_KEYS
+    durable_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
+    durable_last_known=$META_DECISION_LAST_INVENTORY_KNOWN
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      list_has_key "$previous_historical" "$key" \
+        && fail "decision completion provenance conflicts for current key $key"
+      if [ "$has_meta" = 1 ] && ! list_has_key "$previous_current" "$key"; then
+        metadata_needs_sync=1
+      fi
+      previous_current=$(sorted_key_union "$previous_current" "$key")
+    done <<EOF
+$(printf '%s\n' "$durable_current" | tr ',' '\n')
+EOF
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      list_has_key "$previous_current" "$key" \
+        && fail "decision completion provenance conflicts for historical key $key"
+      if [ "$has_meta" = 1 ] && ! list_has_key "$previous_historical" "$key"; then
+        metadata_needs_sync=1
+      fi
+      previous_historical=$(sorted_key_union "$previous_historical" "$key")
+    done <<EOF
+$(printf '%s\n' "$durable_historical" | tr ',' '\n')
+EOF
+    previous=$(sorted_key_union "$previous" "$(printf '%s' "$durable_keys" | tr ',' ' ')")
+    if [ "$previous_last_known" -ne 1 ] && [ "$durable_last_known" -eq 1 ]; then
+      previous_last_current=$durable_last_current
+      previous_last_historical=$durable_last_historical
+      previous_last_known=1
+      [ "$has_meta" != 1 ] || metadata_needs_sync=1
+    fi
+    previous_reviewed=1
+    inventory_versioned=1
   fi
   keys=$(sorted_key_union "$previous" "$supplied $resolved")
   current_keys=$previous_current
@@ -1859,8 +1898,9 @@ $open
 EOF
 
   if [ "$has_meta" = 1 ]; then
-    if [ "$previous_reviewed" != 1 ] || [ "$previous" != "$keys" ] \
-      || [ "$inventory_versioned" -ne 1 ] || [ "$previous_current" != "$current_keys" ] \
+    if [ "$metadata_needs_sync" -eq 1 ] || [ "$previous_reviewed" != 1 ] \
+      || [ "$previous" != "$keys" ] || [ "$inventory_versioned" -ne 1 ] \
+      || [ "$previous_current" != "$current_keys" ] \
       || [ "$previous_historical" != "$historical_keys" ] \
       || [ "$previous_last_current" != "$supplied_csv" ] \
       || [ "$previous_last_historical" != "$resolved_csv" ] \
@@ -1868,9 +1908,20 @@ EOF
       append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
         "$supplied_csv" "$resolved_csv" 1
     fi
+  fi
+  if [ "$durable_inventory" = 1 ]; then
+    completion_inventory_persist_locked "$origin" "$keys" "$current_keys" "$historical_keys" \
+      "$supplied_csv" "$resolved_csv" 1
+  fi
+  if [ "$has_meta" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0
-
+  fi
+  if [ "$durable_inventory" = 1 ]; then
+    fm_lock_release "$DECISION_INVENTORY_LOCK"
+    DECISION_INVENTORY_LOCK_HELD=0
+  fi
+  if [ "$has_meta" = 1 ]; then
     # Transfer any still-open status decision to its durable backlog owner so the
     # live status fold does not duplicate the same Captain's Call item.
     # The transfer line is this home's own bookkeeping close, written by the
@@ -1888,11 +1939,6 @@ EOF
     done <<EOF
 $raw_open
 EOF
-  elif [ "$durable_inventory" = 1 ]; then
-    completion_inventory_persist_locked "$origin" "$keys" "$current_keys" "$historical_keys" \
-      "$supplied_csv" "$resolved_csv" 1
-    fm_lock_release "$DECISION_META_LOCK"
-    DECISION_META_LOCK_HELD=0
   fi
   : "$key_seen"
   printf 'complete: %s decision inventory reviewed%s\n' "$origin" "${keys:+ ($keys)}"

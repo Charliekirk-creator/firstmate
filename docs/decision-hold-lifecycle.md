@@ -71,6 +71,7 @@ An unanswered decision still blocks completion and teardown, and neither `declin
 
 A retained-history regression resolves two synthetic decisions, proves retained released-version metadata first, moves both records into a non-default configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
 It repeats the exact completion command after that later decision resolves, and a companion existing-metadata case proves an unclassified pre-upgrade inventory cannot mistake an older archive row for a missing current generation until the caller explicitly migrates its provenance.
+A live-completion case proves that provenance survives normal metadata teardown, preserves an exact resolved retry, and keeps a missing previously inventoried hold from being forgotten by a later review.
 The same explicit unresolved inventory is required to have an active hold even when no matching status event exists, so status text cannot select historical fallback.
 After normal teardown removes origin metadata and its generated attestation is removed to reproduce a pre-upgrade home, repeated completion still recognizes the uniquely decomposable legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
@@ -101,6 +102,7 @@ ok - pruned resolved history permits later decisions without retention oscillati
 ok - completion provenance distinguishes missing current and historical generations
 ok - source-verifiable legacy inventories migrate without weakening archive generations
 ok - metadata-free completion provenance makes resolved retries idempotent
+ok - live completion provenance survives teardown and enforces ownership
 ok - queued legacy resolution identity survives teardown and retry
 ok - legacy migration rejects missing, conflicting, and foreign ownership
 ok - legacy compatibility stays bounded and ambiguous migration requires independent authorization

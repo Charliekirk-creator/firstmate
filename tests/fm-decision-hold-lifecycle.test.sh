@@ -810,6 +810,77 @@ test_metadata_free_completion_retries_remain_idempotent() {
   pass "metadata-free completion provenance makes resolved retries idempotent"
 }
 
+test_live_completion_provenance_survives_teardown() {
+  local home origin key hold token inventory later later_hold
+  home=$(make_home live-completion-retry)
+  origin=sample-live-completion-review
+  key=first-choice
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Review live completion provenance" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create live-completion origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: live completion review complete\n' > "$home/state/$origin.status"
+  printf '# Live completion provenance review\n' > "$home/data/$origin/report.md"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the first option" --reason "captain first option pending" --repo sample) \
+    || fail "could not create live-completion hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "live completion failed"
+  token=$(printf '%s' "$origin" | shasum -a 256 | awk '{print $1}')
+  inventory="$home/data/decision-completion-inventories/$token.inventory"
+  assert_present "$inventory" "live completion did not persist durable provenance"
+  assert_grep "decision_current_keys=$key" "$inventory" \
+    "live completion provenance omitted its current generation"
+  run_teardown "$home" "$origin" >/dev/null 2> "$home/live-teardown.err" \
+    || fail "live completion teardown failed: $(cat "$home/live-teardown.err")"
+  tasks_in "$home" done "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
+    || fail "could not archive live-completion origin"
+  assert_absent "$home/state/$origin.meta" "teardown retained live-completion metadata"
+  printf 'Captain resolved the first option.\n' > "$home/first-choice.txt"
+  run_decisions "$home" answer "$origin" "$key" --decision-file "$home/first-choice.txt" >/dev/null \
+    || fail "could not resolve the post-teardown live decision"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "live completion retry lost durable provenance after teardown"
+  assert_contains "$(tasks_in "$home" show "$hold" --full)" "state: done" \
+    "post-teardown live completion retry changed the resolved hold"
+
+  home=$(make_home live-completion-missing-owner)
+  origin=sample-live-missing-review
+  key=missing-choice
+  later=later-choice
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Review missing live ownership" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create missing-owner origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: missing-owner review complete\n' > "$home/state/$origin.status"
+  printf '# Missing live ownership review\n' > "$home/data/$origin/report.md"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the missing option" --reason "captain missing option pending" --repo sample) \
+    || fail "could not create missing-owner hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not persist missing-owner completion provenance"
+  run_teardown "$home" "$origin" >/dev/null 2> "$home/missing-owner-teardown.err" \
+    || fail "missing-owner teardown failed: $(cat "$home/missing-owner-teardown.err")"
+  tasks_in "$home" done "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
+    || fail "could not archive missing-owner origin"
+  tasks_in "$home" rm "$hold" >/dev/null \
+    || fail "could not reproduce loss of the inventoried active hold"
+  later_hold=$(run_decisions "$home" hold "$origin" "$later" \
+    --title "Choose the later option" --reason "captain later option pending" --repo sample) \
+    || fail "could not create the later post-teardown hold"
+  if run_decisions "$home" complete "$origin" "$later" \
+    > "$home/missing-owner.out" 2> "$home/missing-owner.err"; then
+    fail "later completion forgot a live decision whose metadata was removed"
+  fi
+  assert_grep "captain decision $hold is absent" "$home/missing-owner.err" \
+    "later completion did not enforce durable ownership of the missing hold"
+  assert_contains "$(tasks_in "$home" show "$later_hold" --full)" "held: yes" \
+    "refused later completion changed its active hold"
+  pass "live completion provenance survives teardown and enforces ownership"
+}
+
 test_queued_legacy_resolution_is_attested_before_teardown() {
   local home id hold decision digest body show
   home=$(make_home queued-legacy-resolution)
@@ -2574,6 +2645,7 @@ test_pruned_resolved_history_does_not_block_later_review
 test_legacy_completion_inventory_requires_explicit_provenance
 test_source_verifiable_legacy_inventories_migrate_automatically
 test_metadata_free_completion_retries_remain_idempotent
+test_live_completion_provenance_survives_teardown
 test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
 test_legacy_identity_compatibility_is_bounded_and_authorized
