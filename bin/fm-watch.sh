@@ -240,12 +240,32 @@ afk_present() { [ -e "$STATE/.afk" ]; }
 # above Pi's ready/working state line. Other timestamps, harnesses, and every
 # other pane byte remain significant to stale detection.
 normalize_pane_for_stale_hash() {  # <harness>, pane bytes on stdin
-  case "$1" in
-    pi|pi-signed)
-      perl -0pe 's{(^|\n)([^\n]*ctx:(?:\?|[0-9]+%)[^\n]*\([0-9]+(?:\.[0-9]+)?[kM]? context\)[^\n]*  )([0-9][0-9]:[0-9][0-9])(?=[^\n]*\n[[:space:]]*▶▶ agent (?:ready|working)(?:[[:space:]][^\n]*)?\z)}{$1$2<clock>}g'
-      ;;
-    *) cat ;;
+  local harness=$1 pane='' before_state state_line context_line prefix normalized_context
+  local state_re='^[[:space:]]*▶▶ agent (ready|working)([[:space:]].*)?$'
+  local context_re='^(.*ctx:(\?|[0-9]+%).*\([0-9]+(\.[0-9]+)?[kM]? context\).*  )([0-9][0-9]:[0-9][0-9])(.*)$'
+  IFS= read -r -d '' pane || true
+  case "$harness" in
+    pi|pi-signed) ;;
+    *) printf '%s' "$pane"; return ;;
   esac
+  case "$pane" in
+    *$'\n'*) ;;
+    *) printf '%s' "$pane"; return ;;
+  esac
+  state_line=${pane##*$'\n'}
+  before_state=${pane%$'\n'*}
+  context_line=${before_state##*$'\n'}
+  if [[ "$state_line" =~ $state_re ]] && [[ "$context_line" =~ $context_re ]]; then
+    normalized_context="${BASH_REMATCH[1]}<clock>${BASH_REMATCH[5]}"
+    if [ "$before_state" = "$context_line" ]; then
+      prefix=''
+    else
+      prefix="${before_state%$'\n'*}"$'\n'
+    fi
+    printf '%s%s\n%s' "$prefix" "$normalized_context" "$state_line"
+  else
+    printf '%s' "$pane"
+  fi
 }
 
 hash_pane() {

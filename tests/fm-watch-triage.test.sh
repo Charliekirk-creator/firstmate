@@ -775,11 +775,12 @@ test_terminal_stale_surfaced() {
 # launch identities, while preserving real pane progress and keeping identical
 # timestamp-shaped content significant for every other harness.
 test_pi_idle_footer_clock_does_not_repeat_stale() {
-  local harness dir state fakebin out drain_out capture_file window sig pid
+  local harness dir state fakebin out capture_file window sig pid key pre_clock_count post_clock_count
   for harness in pi pi-signed; do
     dir=$(make_case "${harness}-idle-footer-clock"); state="$dir/state"; fakebin="$dir/fakebin"
-    out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"
     window="test:fm-${harness}-clock"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
     cat > "$capture_file" <<'EOF'
 quoted older Pi pane:
 main  ctx:0%  0  Sol 5.6 (272k context)  09:10  · compact in 94%
@@ -802,29 +803,58 @@ EOF
     pid=$!
     wait_for_exit "$pid" 40 || fail "$harness initial idle pane did not surface once"
     grep -Fx "stale: $window" "$out" >/dev/null || fail "$harness initial idle pane did not print stale"
-    FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "$harness initial stale drain failed"
+    pre_clock_count=$(cat "$state/.count-$key" 2>/dev/null || true)
+    case "$pre_clock_count" in
+      ''|*[!0-9]*) fail "$harness initial stale counter was not numeric" ;;
+    esac
+    ack_stopped_cycle "$state" || fail "$harness initial stale cycle could not be acknowledged"
 
     # This is the operator-visible flood trigger: every byte remains unchanged
     # except the clock tick in the proven Pi footer immediately above its ready
     # state line. A re-armed watcher must remain quiet across many poll cycles.
-    perl -0pi -e 's/10:03/10:04/' "$capture_file"
+    cat > "$capture_file" <<'EOF'
+quoted older Pi pane:
+main  ctx:0%  0  Sol 5.6 (272k context)  09:10  · compact in 94%
+▶▶ agent ready · high thinking
+continued transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:04  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_FAKE_CREW_STATE='state: unknown · source: none · idle Pi fixture' \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
     pid=$!
-    if ! wait_live "$pid" 15; then
+    if ! wait_poll_cycle "$state" "$pid" 100; then
       reap "$pid"
       fail "$harness clock-only idle footer tick emitted another notification: $(cat "$out")"
     fi
+    post_clock_count=$(cat "$state/.count-$key" 2>/dev/null || true)
+    case "$post_clock_count" in
+      ''|*[!0-9]*) reap "$pid"; fail "$harness clock-only stale counter was not numeric" ;;
+    esac
+    [ "$post_clock_count" -gt "$pre_clock_count" ] \
+      || { reap "$pid"; fail "$harness clock-only path completed no stale scan"; }
     [ ! -s "$out" ] || { reap "$pid"; fail "$harness clock-only tick printed a wake reason"; }
     [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "$harness clock-only tick queued another wake"; }
     reap "$pid"
+    ack_stopped_cycle "$state" || fail "$harness quiet clock cycle could not be acknowledged"
 
     # A real transcript change remains significant even when it looks exactly
     # like a copied Pi footer, so only the bottom-anchored live footer is masked.
-    perl -0pi -e 's/09:10/09:11/' "$capture_file"
+    cat > "$capture_file" <<'EOF'
+quoted older Pi pane:
+main  ctx:0%  0  Sol 5.6 (272k context)  09:11  · compact in 94%
+▶▶ agent ready · high thinking
+continued transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:04  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_FAKE_CREW_STATE='state: unknown · source: none · idle Pi fixture' \
@@ -848,8 +878,8 @@ EOF
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "initial Claude clock-shaped content did not surface"
-  rm -f "$state/.wake-queue"
-  perl -0pi -e 's/10:04/10:05/' "$capture_file"
+  ack_stopped_cycle "$state" || fail "initial Claude clock-shaped cycle could not be acknowledged"
+  printf 'quoted Pi footer clock 10:05\n' > "$capture_file"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_FAKE_CREW_STATE='state: unknown · source: none · idle Claude fixture' \
