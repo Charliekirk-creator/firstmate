@@ -532,6 +532,8 @@ test_pruned_resolved_history_does_not_block_later_review() {
   printf 'Captain resolved the later choice.\n' > "$home/later.txt"
   run_decisions "$home" answer "$id" later-choice --decision-file "$home/later.txt" >/dev/null \
     || fail "could not resolve the later decision"
+  run_decisions "$home" complete "$id" later-choice >/dev/null \
+    || fail "exact completion retry lost its previously verified current generation"
   run_decisions "$home" complete "$id" --none >/dev/null \
     || fail "completed later decision did not coexist with pruned history"
   run_decisions "$home" verify "$id" >/dev/null \
@@ -539,6 +541,10 @@ test_pruned_resolved_history_does_not_block_later_review() {
 
   assert_grep 'decision_keys=later-choice,old-a,old-b' "$home/state/$id.meta" \
     "existing metadata inventory was not preserved compatibly"
+  assert_grep 'decision_inventory_schema=fm-decision-completion.v1' "$home/state/$id.meta" \
+    "completion metadata did not retain generation provenance"
+  assert_grep 'decision_current_keys=later-choice,old-a,old-b' "$home/state/$id.meta" \
+    "current decision generations were not persisted deterministically"
   run_teardown "$home" "$id" >/dev/null 2> "$home/legacy-teardown.err" \
     || fail "legacy history did not survive normal teardown: $(cat "$home/legacy-teardown.err")"
   assert_absent "$home/state/$id.meta" "normal teardown retained ephemeral origin metadata"
@@ -559,6 +565,69 @@ test_pruned_resolved_history_does_not_block_later_review() {
   [ "$before" = "$after" ] \
     || fail "post-teardown compatibility changed the backlog or configured archive"
   pass "pruned resolved history permits later decisions without retention oscillation"
+}
+
+test_legacy_completion_inventory_requires_explicit_provenance() {
+  local home origin key hold body n
+  home=$(make_home legacy-completion-provenance)
+  origin=sample-generation-review
+  key=reused-answer
+  tasks_in "$home" add "$origin" "Review a legacy completion generation" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create legacy-generation origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the generation answer" \
+    --reason "captain generation answer pending" --repo sample) \
+    || fail "could not create the historical generation"
+  printf 'Captain resolved the historical generation.\n' > "$home/generation-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/generation-answer.txt" >/dev/null \
+    || fail "could not resolve the historical generation"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "generation-filler-$n" "Generation filler $n" \
+      --kind ship --repo sample >/dev/null \
+      || fail "could not create generation filler $n"
+    tasks_in "$home" "done" "generation-filler-$n" >/dev/null \
+      || fail "could not complete generation filler $n"
+  done
+  assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
+    "historical generation was not pruned through normal retention"
+
+  body=$(printf 'Origin: %s\nDecision key: %s\nState: awaiting captain decision.' "$origin" "$key")
+  tasks_in "$home" add "$hold" "Choose the replacement generation" \
+    --kind captain --repo sample --body "$body" >/dev/null \
+    || fail "could not reproduce a pre-upgrade replacement generation"
+  tasks_in "$home" hold "$hold" --reason "captain replacement pending" --kind captain >/dev/null \
+    || fail "could not activate the pre-upgrade replacement generation"
+  printf 'decisions_reviewed=1\ndecision_keys=%s\n' "$key" >> "$home/state/$origin.meta"
+  tasks_in "$home" rm "$hold" >/dev/null \
+    || fail "could not reproduce loss of the inventoried replacement generation"
+
+  if run_decisions "$home" verify "$origin" \
+    > "$home/legacy-verify.out" 2> "$home/legacy-verify.err"; then
+    fail "legacy metadata inferred a missing current generation from older history"
+  fi
+  assert_grep "legacy decision inventory" "$home/legacy-verify.err" \
+    "ambiguous legacy inventory did not require explicit provenance migration"
+  if run_decisions "$home" complete "$origin" "$key" \
+    > "$home/missing-current.out" 2> "$home/missing-current.err"; then
+    fail "explicit current migration accepted an older archived generation"
+  fi
+  assert_grep "captain hold $hold is absent" "$home/missing-current.err" \
+    "current migration did not require the missing active owner"
+
+  run_decisions "$home" complete "$origin" --none --resolved "$key" >/dev/null \
+    || fail "explicit historical migration did not preserve existing metadata"
+  assert_grep 'decision_inventory_schema=fm-decision-completion.v1' "$home/state/$origin.meta" \
+    "legacy inventory migration did not persist its schema"
+  [ "$(grep '^decision_current_keys=' "$home/state/$origin.meta" | tail -1)" = 'decision_current_keys=' ] \
+    || fail "historical migration falsely classified the key as current"
+  assert_grep "decision_historical_keys=$key" "$home/state/$origin.meta" \
+    "historical migration did not persist exact provenance"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "explicitly migrated historical inventory did not verify"
+  pass "completion provenance distinguishes missing current and historical generations"
 }
 
 test_queued_legacy_resolution_is_attested_before_teardown() {
@@ -2322,6 +2391,7 @@ test_structured_holds_survive_teardown_and_route_resolution
 test_origin_slug_validation_precedes_path_construction
 test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
+test_legacy_completion_inventory_requires_explicit_provenance
 test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
 test_legacy_identity_compatibility_is_bounded_and_authorized

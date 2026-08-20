@@ -70,6 +70,7 @@ An unanswered decision still blocks completion and teardown, and neither `declin
 `repair` also refuses a closed captain-kind task that was never held for the captain.
 
 A retained-history regression resolves two synthetic decisions, proves retained released-version metadata first, moves both records into a non-default configured archive by completing newer ordinary work, and then completes and verifies a later decision repeatedly through the public executable.
+It repeats the exact completion command after that later decision resolves, and a companion existing-metadata case proves an unclassified pre-upgrade inventory cannot mistake an older archive row for a missing current generation until the caller explicitly migrates its provenance.
 The same explicit unresolved inventory is required to have an active hold even when no matching status event exists, so status text cannot select historical fallback.
 After normal teardown removes origin metadata and its generated attestation is removed to reproduce a pre-upgrade home, repeated completion still recognizes the uniquely decomposable legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
@@ -97,6 +98,7 @@ ok - captain holds are idempotent, distinct, teardown-safe, Bearings-visible, an
 ok - completion and verification validate origins before constructing paths
 ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
+ok - completion provenance distinguishes missing current and historical generations
 ok - queued legacy resolution identity survives teardown and retry
 ok - legacy migration rejects missing, conflicting, and foreign ownership
 ok - legacy compatibility stays bounded and ambiguous migration requires independent authorization

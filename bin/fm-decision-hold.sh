@@ -37,17 +37,22 @@
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # Positional keys are the unresolved decisions in the just-reviewed surface and
-# must have active holds; `--none` explicitly attests that there are none.
+# must have active holds on first completion; `--none` explicitly attests that
+# there are none. An exact positional retry after resolution is accepted only when
+# live metadata already records that this completion verified the key as current.
 # `--resolved` identifies an older key that must have exact durable resolution
 # proof, which lets post-teardown reviews carry historical provenance without
 # consulting status text. Later review passes may add keys; a live task's metadata
-# inventory is unioned idempotently. A resolved historical key may be proven by
-# its structured record in tasks-axi's configured archive after normal bounded
-# Done retention prunes it; the gate never restores archived rows. A missing key
-# with no valid archived resolution still fails. A post-teardown visual review can
-# complete against the surviving report and holds without recreating task state.
-# `verify` is called by scout teardown so teardown cannot erase a source before
-# this gate has succeeded.
+# inventory is unioned idempotently with current-versus-historical provenance.
+# A nonempty released-version inventory without that provenance must be migrated
+# explicitly by supplying every prior key as positional or `--resolved`; `verify`
+# never guesses from the records that happen to remain. A resolved historical key
+# may be proven by its structured record in tasks-axi's configured archive after
+# normal bounded Done retention prunes it; the gate never restores archived rows.
+# A missing key with no valid archived resolution still fails. A post-teardown
+# visual review can complete against the surviving report and holds without
+# recreating task state. `verify` is called by scout teardown so teardown cannot
+# erase a source before this gate has succeeded.
 #
 # `resolve`, `answer`, and `decline` close active holds; `repair` attests a hold
 # already closed outside this script. All four paths require a non-empty captain
@@ -534,24 +539,103 @@ require_safe_origin_report_file() {
   [ "$links" = 1 ] || fail "origin report is hardlinked: $path"
 }
 
+COMPLETION_INVENTORY_SCHEMA=fm-decision-completion.v1
 META_DECISION_KEYS=''
-reviewed_decision_inventory() {  # <meta-path>
-  local path=$1 keys key canonical
-  META_DECISION_KEYS=''
-  require_safe_origin_metadata_file "$path" || return 1
-  [ "$(meta_value "$path" decisions_reviewed)" = 1 ] || return 1
-  keys=$(meta_value "$path" decision_keys)
-  case "$keys" in ,*|*,|*,,*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
+META_DECISION_CURRENT_KEYS=''
+META_DECISION_HISTORICAL_KEYS=''
+META_DECISION_LAST_CURRENT_KEYS=''
+META_DECISION_LAST_HISTORICAL_KEYS=''
+META_DECISION_INVENTORY_VERSIONED=0
+META_DECISIONS_REVIEWED=''
+
+validate_metadata_decision_keys() {  # <meta-path> <field> <comma-list>
+  local path=$1 field=$2 keys=$3 key canonical
+  case "$keys" in ,*|*,|*,,*) fail "decision owner metadata has malformed $field: $path" ;; esac
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    case "$key" in *[!A-Za-z0-9._-]*) fail "decision owner metadata has malformed decision keys: $path" ;; esac
+    case "$key" in *[!A-Za-z0-9._-]*) fail "decision owner metadata has malformed $field: $path" ;; esac
   done <<EOF
 $(printf '%s\n' "$keys" | tr ',' '\n')
 EOF
   canonical=$(printf '%s\n' "$keys" | tr ',' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)
   [ "$keys" = "$canonical" ] \
-    || fail "decision owner metadata has noncanonical decision keys: $path"
-  META_DECISION_KEYS=$keys
+    || fail "decision owner metadata has noncanonical $field: $path"
+}
+
+completion_metadata_inventory() {  # <meta-path>
+  local path=$1 schema current historical last_current last_historical key union
+  META_DECISION_KEYS=''
+  META_DECISION_CURRENT_KEYS=''
+  META_DECISION_HISTORICAL_KEYS=''
+  META_DECISION_LAST_CURRENT_KEYS=''
+  META_DECISION_LAST_HISTORICAL_KEYS=''
+  META_DECISION_INVENTORY_VERSIONED=0
+  META_DECISIONS_REVIEWED=''
+  require_safe_origin_metadata_file "$path" || return 1
+  META_DECISIONS_REVIEWED=$(meta_value "$path" decisions_reviewed)
+  case "$META_DECISIONS_REVIEWED" in ''|1) : ;; *) fail "decision owner metadata has malformed review state: $path" ;; esac
+  META_DECISION_KEYS=$(meta_value "$path" decision_keys)
+  validate_metadata_decision_keys "$path" decision_keys "$META_DECISION_KEYS"
+  schema=$(meta_value "$path" decision_inventory_schema)
+  if [ -z "$schema" ]; then
+    if grep -qE '^decision_((current|historical)_keys|last_(current|historical)_keys)=' "$path"; then
+      fail "decision owner metadata has provenance fields without an inventory schema: $path"
+    fi
+    return 0
+  fi
+  [ "$schema" = "$COMPLETION_INVENTORY_SCHEMA" ] \
+    || fail "decision owner metadata has an unsupported inventory schema: $path"
+  [ "$META_DECISIONS_REVIEWED" = 1 ] \
+    || fail "decision owner metadata has provenance without a completed review: $path"
+  grep -q '^decision_current_keys=' "$path" \
+    && grep -q '^decision_historical_keys=' "$path" \
+    && grep -q '^decision_last_current_keys=' "$path" \
+    && grep -q '^decision_last_historical_keys=' "$path" \
+    || fail "decision owner metadata lacks its completion provenance: $path"
+  current=$(meta_value "$path" decision_current_keys)
+  historical=$(meta_value "$path" decision_historical_keys)
+  last_current=$(meta_value "$path" decision_last_current_keys)
+  last_historical=$(meta_value "$path" decision_last_historical_keys)
+  validate_metadata_decision_keys "$path" decision_current_keys "$current"
+  validate_metadata_decision_keys "$path" decision_historical_keys "$historical"
+  validate_metadata_decision_keys "$path" decision_last_current_keys "$last_current"
+  validate_metadata_decision_keys "$path" decision_last_historical_keys "$last_historical"
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    list_has_key "$current" "$key" \
+      && fail "decision owner metadata classifies $key as both current and historical: $path"
+  done <<EOF
+$(printf '%s\n' "$historical" | tr ',' '\n')
+EOF
+  union=$(sorted_key_union "$current" "$(printf '%s' "$historical" | tr ',' ' ')")
+  [ "$union" = "$META_DECISION_KEYS" ] \
+    || fail "decision owner metadata provenance does not match its decision keys: $path"
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    list_has_key "$current" "$key" \
+      || fail "decision owner metadata last completion has a noncurrent key $key: $path"
+  done <<EOF
+$(printf '%s\n' "$last_current" | tr ',' '\n')
+EOF
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    list_has_key "$META_DECISION_KEYS" "$key" \
+      || fail "decision owner metadata last completion has an unknown historical key $key: $path"
+    list_has_key "$last_current" "$key" \
+      && fail "decision owner metadata last completion duplicates key $key: $path"
+  done <<EOF
+$(printf '%s\n' "$last_historical" | tr ',' '\n')
+EOF
+  META_DECISION_CURRENT_KEYS=$current
+  META_DECISION_HISTORICAL_KEYS=$historical
+  META_DECISION_LAST_CURRENT_KEYS=$last_current
+  META_DECISION_LAST_HISTORICAL_KEYS=$last_historical
+  META_DECISION_INVENTORY_VERSIONED=1
+}
+
+reviewed_decision_inventory() {  # <meta-path>
+  completion_metadata_inventory "$1"
+  [ "$META_DECISIONS_REVIEWED" = 1 ]
 }
 
 file_link_count() {  # <path>
@@ -1447,8 +1531,11 @@ command_hold() {
 }
 
 command_complete() {
-  local origin=${1:-} meta previous='' supplied='' resolved='' supplied_csv='' resolved_csv=''
-  local keys='' key status_file open raw_open key_seen=0 has_meta=0 none=0 positional_only=0
+  local origin=${1:-} meta previous='' previous_current='' previous_historical=''
+  local supplied='' resolved='' supplied_csv='' resolved_csv='' keys='' key
+  local current_keys='' historical_keys='' previous_last_current='' previous_last_historical=''
+  local previous_reviewed='' inventory_versioned=0 exact_retry=0
+  local status_file open raw_open key_seen=0 has_meta=0 none=0 positional_only=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
   authoritative_state_path
@@ -1502,19 +1589,56 @@ command_complete() {
 $(printf '%s\n' "$resolved_csv" | tr ',' '\n')
 EOF
   if [ "$has_meta" = 1 ]; then
-    previous=$(meta_value "$meta" decision_keys)
+    completion_metadata_inventory "$meta"
+    previous=$META_DECISION_KEYS
+    previous_current=$META_DECISION_CURRENT_KEYS
+    previous_historical=$META_DECISION_HISTORICAL_KEYS
+    previous_last_current=$META_DECISION_LAST_CURRENT_KEYS
+    previous_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
+    previous_reviewed=$META_DECISIONS_REVIEWED
+    inventory_versioned=$META_DECISION_INVENTORY_VERSIONED
+  fi
+  if [ "$inventory_versioned" -eq 0 ] && [ -n "$previous" ]; then
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      list_has_key "$supplied_csv" "$key" || list_has_key "$resolved_csv" "$key" \
+        || fail "legacy decision inventory key $key requires explicit current or --resolved provenance"
+    done <<EOF
+$(printf '%s\n' "$previous" | tr ',' '\n')
+EOF
   fi
   keys=$(sorted_key_union "$previous" "$supplied $resolved")
+  current_keys=$previous_current
+  historical_keys=$previous_historical
+  if [ "$inventory_versioned" -eq 1 ] \
+    && [ "$supplied_csv" = "$previous_last_current" ] \
+    && [ "$resolved_csv" = "$previous_last_historical" ]; then
+    exact_retry=1
+  fi
   raw_open=$(status_open_decisions "$status_file")
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
+    if list_has_key "$previous_current" "$key"; then
+      if [ "$exact_retry" -eq 1 ]; then
+        verify_hold_durable "$origin" "$key"
+      else
+        verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
+      fi
+    else
+      list_has_key "$previous_historical" "$key" \
+        && fail "historical decision key $key cannot be reused as a current decision"
+      verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
+      current_keys=$(sorted_key_union "$current_keys" "$key")
+    fi
   done <<EOF
 $(printf '%s\n' "$supplied_csv" | tr ',' '\n')
 EOF
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     verify_hold_historical "$origin" "$key"
+    if ! list_has_key "$previous_current" "$key"; then
+      historical_keys=$(sorted_key_union "$historical_keys" "$key")
+    fi
   done <<EOF
 $(printf '%s\n' "$resolved_csv" | tr ',' '\n')
 EOF
@@ -1524,7 +1648,15 @@ EOF
     list_has_key "$resolved_csv" "$key" && continue
     verify_hold_durable "$origin" "$key"
   done <<EOF
-$(printf '%s\n' "$keys" | tr ',' '\n')
+$(printf '%s\n' "$previous_current" | tr ',' '\n')
+EOF
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    list_has_key "$supplied_csv" "$key" && continue
+    list_has_key "$resolved_csv" "$key" && continue
+    verify_hold_historical "$origin" "$key"
+  done <<EOF
+$(printf '%s\n' "$previous_historical" | tr ',' '\n')
 EOF
 
   open=$(origin_open_decisions "$origin")
@@ -1532,14 +1664,22 @@ EOF
     [ -n "$key" ] || continue
     list_has_key "$keys" "$key" \
       || fail "open structured decision $origin/$key has no captain-held inventory entry"
+    list_has_key "$current_keys" "$key" \
+      || fail "open structured decision $origin/$key is not classified as current"
     verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
   done <<EOF
 $open
 EOF
 
   if [ "$has_meta" = 1 ]; then
-    if [ "$(meta_value "$meta" decisions_reviewed)" != 1 ] || [ "$previous" != "$keys" ]; then
-      printf 'decisions_reviewed=1\ndecision_keys=%s\n' "$keys" >> "$meta"
+    if [ "$previous_reviewed" != 1 ] || [ "$previous" != "$keys" ] \
+      || [ "$inventory_versioned" -ne 1 ] || [ "$previous_current" != "$current_keys" ] \
+      || [ "$previous_historical" != "$historical_keys" ] \
+      || [ "$previous_last_current" != "$supplied_csv" ] \
+      || [ "$previous_last_historical" != "$resolved_csv" ]; then
+      printf 'decisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\n' \
+        "$keys" "$COMPLETION_INVENTORY_SCHEMA" "$current_keys" "$historical_keys" \
+        "$supplied_csv" "$resolved_csv" >> "$meta"
     fi
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0
@@ -1567,7 +1707,7 @@ EOF
 }
 
 command_verify() {
-  local origin=${1:-} meta status_file reviewed keys key open
+  local origin=${1:-} meta status_file keys current_keys historical_keys key open
   [ "$#" -eq 1 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
   authoritative_state_path
@@ -1583,22 +1723,34 @@ command_verify() {
   require_safe_origin_metadata_file "$meta" \
     || fail "origin metadata disappeared while verifying completion"
   require_tasks_axi
-  reviewed=$(meta_value "$meta" decisions_reviewed)
-  [ "$reviewed" = 1 ] || fail "origin $origin has no completed unresolved-decision inventory"
-  keys=$(meta_value "$meta" decision_keys)
-  if [ -n "$keys" ]; then
-    while IFS= read -r key; do
-      [ -n "$key" ] || continue
-      verify_hold_durable "$origin" "$key"
-    done <<EOF
-$(printf '%s\n' "$keys" | tr ',' '\n')
-EOF
+  completion_metadata_inventory "$meta"
+  [ "$META_DECISIONS_REVIEWED" = 1 ] \
+    || fail "origin $origin has no completed unresolved-decision inventory"
+  keys=$META_DECISION_KEYS
+  if [ "$META_DECISION_INVENTORY_VERSIONED" -ne 1 ] && [ -n "$keys" ]; then
+    fail "origin $origin has a legacy decision inventory; rerun complete with every key as current or --resolved"
   fi
+  current_keys=$META_DECISION_CURRENT_KEYS
+  historical_keys=$META_DECISION_HISTORICAL_KEYS
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    verify_hold_durable "$origin" "$key"
+  done <<EOF
+$(printf '%s\n' "$current_keys" | tr ',' '\n')
+EOF
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    verify_hold_historical "$origin" "$key"
+  done <<EOF
+$(printf '%s\n' "$historical_keys" | tr ',' '\n')
+EOF
   open=$(origin_open_decisions "$origin")
   while IFS=$'\t' read -r key _verb _summary; do
     [ -n "$key" ] || continue
     list_has_key "$keys" "$key" \
       || fail "open structured decision $origin/$key is outside the reviewed inventory"
+    list_has_key "$current_keys" "$key" \
+      || fail "open structured decision $origin/$key is not classified as current"
     verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
   done <<EOF
 $open
