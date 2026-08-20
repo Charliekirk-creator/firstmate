@@ -99,6 +99,8 @@ ok - completion and verification validate origins before constructing paths
 ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
 ok - completion provenance distinguishes missing current and historical generations
+ok - source-verifiable legacy inventories migrate without weakening archive generations
+ok - metadata-free completion provenance makes resolved retries idempotent
 ok - queued legacy resolution identity survives teardown and retry
 ok - legacy migration rejects missing, conflicting, and foreign ownership
 ok - legacy compatibility stays bounded and ambiguous migration requires independent authorization

@@ -631,7 +631,7 @@ test_legacy_completion_inventory_requires_explicit_provenance() {
 }
 
 test_source_verifiable_legacy_inventories_migrate_automatically() {
-  local home origin active retained hold decision digest body
+  local home origin active retained first second hold decision digest body
   home=$(make_home source-verifiable-legacy-inventory)
   origin=sample-upgraded-review
   active=active-choice
@@ -663,6 +663,46 @@ test_source_verifiable_legacy_inventories_migrate_automatically() {
     || fail "repeated verification of an automatically migrated inventory failed"
   run_decisions "$home" complete "$origin" "$active" "$retained" >/dev/null \
     || fail "the released-version completion retry was not idempotent after retained resolution"
+
+  home=$(make_home multipass-legacy-inventory)
+  origin=sample-multipass-review
+  first=first-choice
+  second=second-choice
+  tasks_in "$home" add "$origin" "Review a multipass legacy inventory" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create multipass legacy origin"
+  write_origin_meta "$home" "$origin"
+  run_decisions "$home" hold "$origin" "$first" \
+    --title "Choose the first option" --reason "captain first option pending" --repo sample >/dev/null \
+    || fail "could not create first multipass hold"
+  printf 'Captain resolved the first multipass option.\n' > "$home/first-answer.txt"
+  run_decisions "$home" answer "$origin" "$first" \
+    --decision-file "$home/first-answer.txt" >/dev/null \
+    || fail "could not resolve first multipass hold"
+  run_decisions "$home" hold "$origin" "$second" \
+    --title "Choose the second option" --reason "captain second option pending" --repo sample >/dev/null \
+    || fail "could not create second multipass hold"
+  printf 'Captain resolved the second multipass option.\n' > "$home/second-answer.txt"
+  run_decisions "$home" answer "$origin" "$second" \
+    --decision-file "$home/second-answer.txt" >/dev/null \
+    || fail "could not resolve second multipass hold"
+  printf 'decisions_reviewed=1\ndecision_keys=%s,%s\n' "$first" "$second" \
+    >> "$home/state/$origin.meta"
+
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "multipass released-version inventory did not migrate automatically"
+  assert_grep 'decision_last_inventory_known=0' "$home/state/$origin.meta" \
+    "legacy union migration invented an exact last completion"
+  [ "$(grep '^decision_last_current_keys=' "$home/state/$origin.meta" | tail -1)" = 'decision_last_current_keys=' ] \
+    || fail "legacy union migration grouped all retained keys into the last completion"
+  run_decisions "$home" complete "$origin" "$second" >/dev/null \
+    || fail "actual last released-version completion could not establish its retry inventory"
+  assert_grep 'decision_last_inventory_known=1' "$home/state/$origin.meta" \
+    "successful post-upgrade completion did not establish its exact inventory"
+  assert_grep "decision_last_current_keys=$second" "$home/state/$origin.meta" \
+    "post-upgrade completion did not preserve the actual last key list"
+  run_decisions "$home" complete "$origin" "$second" >/dev/null \
+    || fail "actual last released-version completion was not idempotent"
 
   home=$(make_home live-legacy-historical-reclassification)
   origin=sample-live-legacy-review

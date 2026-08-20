@@ -561,6 +561,7 @@ META_DECISION_CURRENT_KEYS=''
 META_DECISION_HISTORICAL_KEYS=''
 META_DECISION_LAST_CURRENT_KEYS=''
 META_DECISION_LAST_HISTORICAL_KEYS=''
+META_DECISION_LAST_INVENTORY_KNOWN=0
 META_DECISION_INVENTORY_VERSIONED=0
 META_DECISIONS_REVIEWED=''
 
@@ -579,12 +580,13 @@ EOF
 }
 
 completion_metadata_inventory() {  # <meta-path>
-  local path=$1 schema current historical last_current last_historical key union
+  local path=$1 schema current historical last_current last_historical last_known key union
   META_DECISION_KEYS=''
   META_DECISION_CURRENT_KEYS=''
   META_DECISION_HISTORICAL_KEYS=''
   META_DECISION_LAST_CURRENT_KEYS=''
   META_DECISION_LAST_HISTORICAL_KEYS=''
+  META_DECISION_LAST_INVENTORY_KNOWN=0
   META_DECISION_INVENTORY_VERSIONED=0
   META_DECISIONS_REVIEWED=''
   require_safe_origin_metadata_file "$path" || return 1
@@ -594,7 +596,7 @@ completion_metadata_inventory() {  # <meta-path>
   validate_metadata_decision_keys "$path" decision_keys "$META_DECISION_KEYS"
   schema=$(meta_value "$path" decision_inventory_schema)
   if [ -z "$schema" ]; then
-    if grep -qE '^decision_((current|historical)_keys|last_(current|historical)_keys)=' "$path"; then
+    if grep -qE '^decision_((current|historical)_keys|last_(current|historical)_keys|last_inventory_known)=' "$path"; then
       fail "decision owner metadata has provenance fields without an inventory schema: $path"
     fi
     return 0
@@ -607,11 +609,17 @@ completion_metadata_inventory() {  # <meta-path>
     && grep -q '^decision_historical_keys=' "$path" \
     && grep -q '^decision_last_current_keys=' "$path" \
     && grep -q '^decision_last_historical_keys=' "$path" \
+    && grep -q '^decision_last_inventory_known=' "$path" \
     || fail "decision owner metadata lacks its completion provenance: $path"
   current=$(meta_value "$path" decision_current_keys)
   historical=$(meta_value "$path" decision_historical_keys)
   last_current=$(meta_value "$path" decision_last_current_keys)
   last_historical=$(meta_value "$path" decision_last_historical_keys)
+  last_known=$(meta_value "$path" decision_last_inventory_known)
+  case "$last_known" in 0|1) : ;; *) fail "decision owner metadata has malformed last-inventory provenance: $path" ;; esac
+  if [ "$last_known" = 0 ] && { [ -n "$last_current" ] || [ -n "$last_historical" ]; }; then
+    fail "decision owner metadata invents a last inventory for legacy provenance: $path"
+  fi
   validate_metadata_decision_keys "$path" decision_current_keys "$current"
   validate_metadata_decision_keys "$path" decision_historical_keys "$historical"
   validate_metadata_decision_keys "$path" decision_last_current_keys "$last_current"
@@ -646,6 +654,7 @@ EOF
   META_DECISION_HISTORICAL_KEYS=$historical
   META_DECISION_LAST_CURRENT_KEYS=$last_current
   META_DECISION_LAST_HISTORICAL_KEYS=$last_historical
+  META_DECISION_LAST_INVENTORY_KNOWN=$last_known
   META_DECISION_INVENTORY_VERSIONED=1
 }
 
@@ -654,9 +663,9 @@ reviewed_decision_inventory() {  # <meta-path>
   [ "$META_DECISIONS_REVIEWED" = 1 ]
 }
 
-append_completion_inventory() {  # <path> <keys> <current> <historical> <last-current> <last-historical>
-  printf 'decisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\n' \
-    "$2" "$COMPLETION_INVENTORY_SCHEMA" "$3" "$4" "$5" "$6" >> "$1"
+append_completion_inventory() {  # <path> <keys> <current> <historical> <last-current> <last-historical> <last-known>
+  printf 'decisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\ndecision_last_inventory_known=%s\n' \
+    "$2" "$COMPLETION_INVENTORY_SCHEMA" "$3" "$4" "$5" "$6" "$7" >> "$1"
 }
 
 file_link_count() {  # <path>
@@ -975,9 +984,9 @@ completion_inventory_path() {  # <directory> <origin-id>
   printf '%s/%s.inventory\n' "$1" "$token"
 }
 
-completion_inventory_content() {  # <origin-id> <keys> <current> <historical> <last-current> <last-historical>
-  printf 'origin=%s\ndecisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\n' \
-    "$1" "$2" "$COMPLETION_INVENTORY_SCHEMA" "$3" "$4" "$5" "$6"
+completion_inventory_content() {  # <origin-id> <keys> <current> <historical> <last-current> <last-historical> <last-known>
+  printf 'origin=%s\ndecisions_reviewed=1\ndecision_keys=%s\ndecision_inventory_schema=%s\ndecision_current_keys=%s\ndecision_historical_keys=%s\ndecision_last_current_keys=%s\ndecision_last_historical_keys=%s\ndecision_last_inventory_known=%s\n' \
+    "$1" "$2" "$COMPLETION_INVENTORY_SCHEMA" "$3" "$4" "$5" "$6" "$7"
 }
 
 completion_inventory_lock_acquire() {  # <origin-id>
@@ -1005,12 +1014,13 @@ completion_inventory_load_locked() {  # <origin-id>
     || fail "decision completion inventory has mismatched origin ownership: $path"
   expected=$(completion_inventory_content "$origin" "$META_DECISION_KEYS" \
     "$META_DECISION_CURRENT_KEYS" "$META_DECISION_HISTORICAL_KEYS" \
-    "$META_DECISION_LAST_CURRENT_KEYS" "$META_DECISION_LAST_HISTORICAL_KEYS")
+    "$META_DECISION_LAST_CURRENT_KEYS" "$META_DECISION_LAST_HISTORICAL_KEYS" \
+    "$META_DECISION_LAST_INVENTORY_KNOWN")
   actual=$(cat "$path") || fail "could not read decision completion inventory: $path"
   [ "$actual" = "$expected" ] || fail "decision completion inventory is malformed: $path"
 }
 
-completion_inventory_persist_locked() {  # <origin-id> <keys> <current> <historical> <last-current> <last-historical>
+completion_inventory_persist_locked() {  # <origin-id> <keys> <current> <historical> <last-current> <last-historical> <last-known>
   local origin=$1 path=$COMPLETION_INVENTORY_PATH tmp links
   if [ -e "$path" ] || [ -L "$path" ]; then
     [ -f "$path" ] && [ ! -L "$path" ] \
@@ -1021,7 +1031,7 @@ completion_inventory_persist_locked() {  # <origin-id> <keys> <current> <histori
   fi
   tmp=$(umask 077; mktemp "$COMPLETION_INVENTORY_DIR/.completion.XXXXXX") \
     || fail "could not stage decision completion inventory for $origin"
-  if ! completion_inventory_content "$origin" "$2" "$3" "$4" "$5" "$6" > "$tmp" \
+  if ! completion_inventory_content "$origin" "$2" "$3" "$4" "$5" "$6" "$7" > "$tmp" \
     || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$path"; then
     rm -f -- "$tmp"
     fail "could not persist decision completion inventory for $origin"
@@ -1683,7 +1693,7 @@ command_complete() {
   local origin=${1:-} meta previous='' previous_current='' previous_historical=''
   local supplied='' resolved='' supplied_csv='' resolved_csv='' keys='' key
   local current_keys='' historical_keys='' previous_last_current='' previous_last_historical=''
-  local previous_reviewed='' inventory_versioned=0 exact_retry=0 legacy_classified=0
+  local previous_reviewed='' previous_last_known=0 inventory_versioned=0 exact_retry=0 legacy_classified=0
   local status_file open raw_open key_seen=0 has_meta=0 durable_inventory=0 none=0 positional_only=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
@@ -1748,6 +1758,7 @@ EOF
     previous_historical=$META_DECISION_HISTORICAL_KEYS
     previous_last_current=$META_DECISION_LAST_CURRENT_KEYS
     previous_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
+    previous_last_known=$META_DECISION_LAST_INVENTORY_KNOWN
     previous_reviewed=$META_DECISIONS_REVIEWED
     inventory_versioned=$META_DECISION_INVENTORY_VERSIONED
   elif completion_inventory_load_locked "$origin"; then
@@ -1756,6 +1767,7 @@ EOF
     previous_historical=$META_DECISION_HISTORICAL_KEYS
     previous_last_current=$META_DECISION_LAST_CURRENT_KEYS
     previous_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
+    previous_last_known=$META_DECISION_LAST_INVENTORY_KNOWN
     previous_reviewed=$META_DECISIONS_REVIEWED
     inventory_versioned=$META_DECISION_INVENTORY_VERSIONED
   fi
@@ -1777,19 +1789,13 @@ EOF
 $(printf '%s\n' "$previous" | tr ',' '\n')
 EOF
     previous_last_current=''
-    while IFS= read -r key; do
-      [ -n "$key" ] || continue
-      list_has_key "$LEGACY_SOURCE_CURRENT_KEYS" "$key" \
-        && previous_last_current=$(sorted_key_union "$previous_last_current" "$key")
-    done <<EOF
-$(printf '%s\n' "$previous_current" | tr ',' '\n')
-EOF
-    previous_last_historical=$previous_historical
+    previous_last_historical=''
+    previous_last_known=0
   fi
   keys=$(sorted_key_union "$previous" "$supplied $resolved")
   current_keys=$previous_current
   historical_keys=$previous_historical
-  if { [ "$inventory_versioned" -eq 1 ] || [ "$legacy_classified" -eq 1 ]; } \
+  if [ "$inventory_versioned" -eq 1 ] && [ "$previous_last_known" -eq 1 ] \
     && [ "$supplied_csv" = "$previous_last_current" ] \
     && [ "$resolved_csv" = "$previous_last_historical" ]; then
     exact_retry=1
@@ -1798,7 +1804,9 @@ EOF
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     if list_has_key "$previous_current" "$key"; then
-      if [ "$exact_retry" -eq 1 ]; then
+      if [ "$exact_retry" -eq 1 ] \
+        || { [ "$inventory_versioned" -eq 1 ] && [ "$previous_last_known" -eq 0 ]; } \
+        || { [ "$legacy_classified" -eq 1 ] && list_has_key "$LEGACY_SOURCE_CURRENT_KEYS" "$key"; }; then
         verify_hold_durable "$origin" "$key"
       else
         verify_hold_active "$(hold_id "$origin" "$key")" "$origin" "$key"
@@ -1855,9 +1863,10 @@ EOF
       || [ "$inventory_versioned" -ne 1 ] || [ "$previous_current" != "$current_keys" ] \
       || [ "$previous_historical" != "$historical_keys" ] \
       || [ "$previous_last_current" != "$supplied_csv" ] \
-      || [ "$previous_last_historical" != "$resolved_csv" ]; then
+      || [ "$previous_last_historical" != "$resolved_csv" ] \
+      || [ "$previous_last_known" -ne 1 ]; then
       append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
-        "$supplied_csv" "$resolved_csv"
+        "$supplied_csv" "$resolved_csv" 1
     fi
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0
@@ -1881,7 +1890,7 @@ $raw_open
 EOF
   elif [ "$durable_inventory" = 1 ]; then
     completion_inventory_persist_locked "$origin" "$keys" "$current_keys" "$historical_keys" \
-      "$supplied_csv" "$resolved_csv"
+      "$supplied_csv" "$resolved_csv" 1
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0
   fi
@@ -1946,7 +1955,7 @@ $open
 EOF
   if [ "$legacy_migrated" = 1 ]; then
     append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
-      "$current_keys" "$historical_keys"
+      '' '' 0
   fi
   if [ "$DECISION_META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK"
