@@ -1897,6 +1897,10 @@ EOF
 $open
 EOF
 
+  if [ "$durable_inventory" = 1 ]; then
+    completion_inventory_persist_locked "$origin" "$keys" "$current_keys" "$historical_keys" \
+      "$supplied_csv" "$resolved_csv" 1
+  fi
   if [ "$has_meta" = 1 ]; then
     if [ "$metadata_needs_sync" -eq 1 ] || [ "$previous_reviewed" != 1 ] \
       || [ "$previous" != "$keys" ] || [ "$inventory_versioned" -ne 1 ] \
@@ -1908,10 +1912,6 @@ EOF
       append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
         "$supplied_csv" "$resolved_csv" 1
     fi
-  fi
-  if [ "$durable_inventory" = 1 ]; then
-    completion_inventory_persist_locked "$origin" "$keys" "$current_keys" "$historical_keys" \
-      "$supplied_csv" "$resolved_csv" 1
   fi
   if [ "$has_meta" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK"
@@ -1945,7 +1945,13 @@ EOF
 }
 
 command_verify() {
-  local origin=${1:-} meta status_file keys current_keys historical_keys key open legacy_migrated=0
+  local origin=${1:-} meta status_file keys current_keys historical_keys key open
+  local metadata_keys metadata_current metadata_historical metadata_last_current
+  local metadata_last_historical metadata_last_known metadata_versioned
+  local durable_keys='' durable_current='' durable_historical=''
+  local durable_last_current='' durable_last_historical='' durable_last_known=0
+  local last_current='' last_historical='' last_known=0 durable_loaded=0
+  local metadata_needs_sync=0 durable_needs_sync=0
   [ "$#" -eq 1 ] || { usage >&2; exit 2; }
   validate_slug origin-id "$origin"
   authoritative_state_path
@@ -1964,18 +1970,77 @@ command_verify() {
   completion_metadata_inventory "$meta"
   [ "$META_DECISIONS_REVIEWED" = 1 ] \
     || fail "origin $origin has no completed unresolved-decision inventory"
-  keys=$META_DECISION_KEYS
-  if [ "$META_DECISION_INVENTORY_VERSIONED" -ne 1 ] && [ -n "$keys" ]; then
+  metadata_keys=$META_DECISION_KEYS
+  metadata_current=$META_DECISION_CURRENT_KEYS
+  metadata_historical=$META_DECISION_HISTORICAL_KEYS
+  metadata_last_current=$META_DECISION_LAST_CURRENT_KEYS
+  metadata_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
+  metadata_last_known=$META_DECISION_LAST_INVENTORY_KNOWN
+  metadata_versioned=$META_DECISION_INVENTORY_VERSIONED
+  keys=$metadata_keys
+  if [ "$metadata_versioned" -ne 1 ] && [ -n "$keys" ]; then
     classify_legacy_source_generations "$origin" "$keys"
     [ -z "$LEGACY_SOURCE_UNCLASSIFIED_KEYS" ] \
       || fail "origin $origin has a legacy decision inventory with archive-only generations; rerun complete with each such key as current or --resolved"
     current_keys=$LEGACY_SOURCE_CURRENT_KEYS
     historical_keys=''
-    legacy_migrated=1
+    metadata_needs_sync=1
   else
-    current_keys=$META_DECISION_CURRENT_KEYS
-    historical_keys=$META_DECISION_HISTORICAL_KEYS
+    current_keys=$metadata_current
+    historical_keys=$metadata_historical
+    last_current=$metadata_last_current
+    last_historical=$metadata_last_historical
+    last_known=$metadata_last_known
   fi
+
+  completion_inventory_lock_acquire "$origin"
+  if completion_inventory_load_locked "$origin"; then
+    durable_loaded=1
+    durable_keys=$META_DECISION_KEYS
+    durable_current=$META_DECISION_CURRENT_KEYS
+    durable_historical=$META_DECISION_HISTORICAL_KEYS
+    durable_last_current=$META_DECISION_LAST_CURRENT_KEYS
+    durable_last_historical=$META_DECISION_LAST_HISTORICAL_KEYS
+    durable_last_known=$META_DECISION_LAST_INVENTORY_KNOWN
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      list_has_key "$historical_keys" "$key" \
+        && fail "decision completion provenance conflicts for current key $key"
+      current_keys=$(sorted_key_union "$current_keys" "$key")
+    done <<EOF
+$(printf '%s\n' "$durable_current" | tr ',' '\n')
+EOF
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      list_has_key "$current_keys" "$key" \
+        && fail "decision completion provenance conflicts for historical key $key"
+      historical_keys=$(sorted_key_union "$historical_keys" "$key")
+    done <<EOF
+$(printf '%s\n' "$durable_historical" | tr ',' '\n')
+EOF
+    keys=$(sorted_key_union "$keys" "$(printf '%s' "$durable_keys" | tr ',' ' ')")
+    last_current=$durable_last_current
+    last_historical=$durable_last_historical
+    last_known=$durable_last_known
+  else
+    durable_needs_sync=1
+  fi
+  if [ "$durable_loaded" -eq 1 ] \
+    && { [ "$durable_keys" != "$keys" ] \
+      || [ "$durable_current" != "$current_keys" ] \
+      || [ "$durable_historical" != "$historical_keys" ]; }; then
+    durable_needs_sync=1
+  fi
+  if [ "$metadata_versioned" -ne 1 ] \
+    || [ "$metadata_keys" != "$keys" ] \
+    || [ "$metadata_current" != "$current_keys" ] \
+    || [ "$metadata_historical" != "$historical_keys" ] \
+    || [ "$metadata_last_current" != "$last_current" ] \
+    || [ "$metadata_last_historical" != "$last_historical" ] \
+    || [ "$metadata_last_known" != "$last_known" ]; then
+    metadata_needs_sync=1
+  fi
+
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     verify_hold_durable "$origin" "$key"
@@ -1999,10 +2064,16 @@ EOF
   done <<EOF
 $open
 EOF
-  if [ "$legacy_migrated" = 1 ]; then
-    append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
-      '' '' 0
+  if [ "$durable_needs_sync" = 1 ]; then
+    completion_inventory_persist_locked "$origin" "$keys" "$current_keys" "$historical_keys" \
+      "$last_current" "$last_historical" "$last_known"
   fi
+  if [ "$metadata_needs_sync" = 1 ]; then
+    append_completion_inventory "$meta" "$keys" "$current_keys" "$historical_keys" \
+      "$last_current" "$last_historical" "$last_known"
+  fi
+  fm_lock_release "$DECISION_INVENTORY_LOCK"
+  DECISION_INVENTORY_LOCK_HELD=0
   if [ "$DECISION_META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0

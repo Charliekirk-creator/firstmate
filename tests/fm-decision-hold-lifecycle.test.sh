@@ -631,7 +631,7 @@ test_legacy_completion_inventory_requires_explicit_provenance() {
 }
 
 test_source_verifiable_legacy_inventories_migrate_automatically() {
-  local home origin active retained first second hold decision digest body
+  local home origin active retained first second hold decision digest body token inventory later later_hold
   home=$(make_home source-verifiable-legacy-inventory)
   origin=sample-upgraded-review
   active=active-choice
@@ -728,6 +728,44 @@ test_source_verifiable_legacy_inventories_migrate_automatically() {
   run_decisions "$home" verify "$origin" >/dev/null \
     || fail "explicitly reclassified live legacy metadata did not verify"
 
+  home=$(make_home legacy-verify-durable-inventory)
+  origin=sample-legacy-verify-review
+  active=missing-choice
+  later=later-choice
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Review legacy verification provenance" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create legacy-verification origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: legacy verification complete\n' > "$home/state/$origin.status"
+  printf '# Legacy verification provenance\n' > "$home/data/$origin/report.md"
+  hold=$(run_decisions "$home" hold "$origin" "$active" \
+    --title "Choose the legacy option" --reason "captain legacy option pending" --repo sample) \
+    || fail "could not create legacy-verification hold"
+  printf 'decisions_reviewed=1\ndecision_keys=%s\n' "$active" >> "$home/state/$origin.meta"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "legacy verification did not classify its active generation"
+  token=$(printf '%s' "$origin" | shasum -a 256 | awk '{print $1}')
+  inventory="$home/data/decision-completion-inventories/$token.inventory"
+  assert_present "$inventory" "legacy verification did not persist durable provenance"
+  assert_grep "decision_current_keys=$active" "$inventory" \
+    "legacy verification omitted its active generation from durable provenance"
+  run_teardown "$home" "$origin" >/dev/null 2> "$home/legacy-verify-teardown.err" \
+    || fail "legacy-verification teardown failed: $(cat "$home/legacy-verify-teardown.err")"
+  tasks_in "$home" rm "$hold" >/dev/null \
+    || fail "could not reproduce loss of the legacy-verified hold"
+  later_hold=$(run_decisions "$home" hold "$origin" "$later" \
+    --title "Choose the later option" --reason "captain later option pending" --repo sample) \
+    || fail "could not create later hold after legacy verification"
+  if run_decisions "$home" complete "$origin" "$later" \
+    > "$home/legacy-verify-missing.out" 2> "$home/legacy-verify-missing.err"; then
+    fail "later completion forgot a legacy-verified active decision"
+  fi
+  assert_grep "captain decision $hold is absent" "$home/legacy-verify-missing.err" \
+    "durable legacy verification did not enforce the missing active owner"
+  assert_contains "$(tasks_in "$home" show "$later_hold" --full)" "held: yes" \
+    "refused later completion changed the later active hold"
+
   home=$(make_home trailing-marker-legacy-identity)
   origin=sample-trailing-review
   retained=route-decision-
@@ -811,7 +849,7 @@ test_metadata_free_completion_retries_remain_idempotent() {
 }
 
 test_live_completion_provenance_survives_teardown() {
-  local home origin key hold token inventory later later_hold
+  local home origin key hold token inventory later later_hold before after
   home=$(make_home live-completion-retry)
   origin=sample-live-completion-review
   key=first-choice
@@ -878,6 +916,40 @@ test_live_completion_provenance_survives_teardown() {
     "later completion did not enforce durable ownership of the missing hold"
   assert_contains "$(tasks_in "$home" show "$later_hold" --full)" "held: yes" \
     "refused later completion changed its active hold"
+
+  home=$(make_home completion-persist-failure)
+  origin=sample-persist-failure-review
+  key=durable-choice
+  tasks_in "$home" add "$origin" "Review completion persistence" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create persistence-failure origin"
+  write_origin_meta "$home" "$origin"
+  run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the durable option" --reason "captain durable option pending" --repo sample >/dev/null \
+    || fail "could not create persistence-failure hold"
+  before=$(shasum -a 256 "$home/state/$origin.meta" | awk '{print $1}')
+  cat > "$home/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+last=''
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  */decision-completion-inventories/*.inventory) exit 1 ;;
+  *) exec /bin/mv "$@" ;;
+esac
+SH
+  chmod +x "$home/fakebin/mv"
+  if run_decisions "$home" complete "$origin" "$key" \
+    > "$home/persist-failure.out" 2> "$home/persist-failure.err"; then
+    fail "completion succeeded without durable provenance persistence"
+  fi
+  assert_grep "could not persist decision completion inventory" "$home/persist-failure.err" \
+    "durable provenance persistence failure was not explicit"
+  after=$(shasum -a 256 "$home/state/$origin.meta" | awk '{print $1}')
+  [ "$before" = "$after" ] \
+    || fail "failed durable persistence published ephemeral completion metadata"
+  rm -f "$home/fakebin/mv"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "completion did not recover after durable persistence was restored"
   pass "live completion provenance survives teardown and enforces ownership"
 }
 
