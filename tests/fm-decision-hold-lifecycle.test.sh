@@ -1299,7 +1299,7 @@ SH
 }
 
 test_nonarchive_rows_cannot_prove_pruned_history() {
-  local home origin key hold n archive decision
+  local home origin key hold n archive decision note_alias
   home=$(make_home nonarchive-history-row)
   origin=sample-nonarchive-review
   key=old-answer
@@ -1386,11 +1386,16 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     || fail "could not remove the superseded live decision record"
   assert_grep "- [x] $hold -" "$home/data/note-archive.md" \
     "tasks-axi did not preserve the superseded Done snapshot in its note archive"
+  note_alias="$home/data/NOTE-ARCHIVE.md"
+  if [ ! -e "$note_alias" ]; then
+    ln "$home/data/note-archive.md" "$note_alias" \
+      || fail "could not create a physical note-archive alias"
+  fi
   awk '
-    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/note-archive.md\""; next }
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/NOTE-ARCHIVE.md\""; next }
     { print }
   ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
-    || fail "could not reproduce a note archive configured as Done retention"
+    || fail "could not reproduce a physical note archive alias configured as Done retention"
   if run_decisions "$home" complete "$origin" --none --resolved "$key" \
     > "$home/note-archive.out" 2> "$home/note-archive.err"; then
     fail "a superseded note snapshot proved normal Done retention"

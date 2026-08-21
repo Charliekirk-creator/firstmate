@@ -161,6 +161,9 @@ DECISION_INVENTORY_LOCK=
 DECISION_INVENTORY_LOCK_HELD=0
 DECISION_ATTESTATION_LOCK=
 DECISION_ATTESTATION_LOCK_HELD=0
+DECISION_ARCHIVE_CACHE_ENABLED=0
+DECISION_ARCHIVE_CACHE_DIR=''
+DECISION_ARCHIVE_CACHE_PATH=''
 decision_hold_cleanup() {
   if [ "$DECISION_ATTESTATION_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_ATTESTATION_LOCK" || true
@@ -173,6 +176,10 @@ decision_hold_cleanup() {
   if [ "$DECISION_META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK" || true
     DECISION_META_LOCK_HELD=0
+  fi
+  if [ -n "$DECISION_ARCHIVE_CACHE_DIR" ] && [ -d "$DECISION_ARCHIVE_CACHE_DIR" ] \
+    && [ ! -L "$DECISION_ARCHIVE_CACHE_DIR" ]; then
+    rm -rf -- "$DECISION_ARCHIVE_CACHE_DIR"
   fi
 }
 trap decision_hold_cleanup EXIT
@@ -886,6 +893,10 @@ contained_archive_parent_safe() {  # <physical-home> <archive-parent>
 
 DECISION_ARCHIVE=''
 DECISION_DATA=''
+paths_physically_alias() {
+  [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ]
+}
+
 authoritative_archive_path() {
   local physical_home expected_data physical_data project_config home_config
   local archive_value='' backlog_value='' configured_backlog configured_archive archive_dir archive_name
@@ -954,11 +965,15 @@ authoritative_archive_path() {
   [ -n "$archive_name" ] && contained_archive_parent_safe "$physical_home" "$archive_dir" \
     || fail "configured decision archive directory is unsafe: $archive_dir"
   DECISION_ARCHIVE="$archive_dir/$archive_name"
-  [ "$DECISION_ARCHIVE" != "$physical_data/backlog.md" ] \
-    || fail "configured decision archive is the active backlog: $DECISION_ARCHIVE"
+  if [ "$DECISION_ARCHIVE" = "$physical_data/backlog.md" ] \
+    || paths_physically_alias "$DECISION_ARCHIVE" "$physical_data/backlog.md"; then
+    fail "configured decision archive aliases the active backlog: $DECISION_ARCHIVE"
+  fi
   note_archive="$physical_backlog_dir/note-archive.md"
-  [ "$DECISION_ARCHIVE" != "$note_archive" ] \
-    || fail "configured decision archive aliases the tasks-axi note archive: $DECISION_ARCHIVE"
+  if [ "$DECISION_ARCHIVE" = "$note_archive" ] \
+    || paths_physically_alias "$DECISION_ARCHIVE" "$note_archive"; then
+    fail "configured decision archive aliases the tasks-axi note archive: $DECISION_ARCHIVE"
+  fi
 }
 
 COMPLETION_INVENTORY_DIR=''
@@ -1276,8 +1291,123 @@ archived_header_has_captain_provenance() {  # <header> <hold-id>
 # durable history owner. Only an exact, single, ordinary captain-hold record with
 # this owner's resolution body can prove a historical decision.
 ARCHIVED_HOLD_BODY=''
+
+prepare_decision_archive_cache() {
+  local archive=$1 id=$2 dir rc
+  if [ -n "$DECISION_ARCHIVE_CACHE_DIR" ] \
+    && [ "$DECISION_ARCHIVE_CACHE_PATH" = "$archive" ]; then
+    return 0
+  fi
+  if [ -n "$DECISION_ARCHIVE_CACHE_DIR" ] && [ -d "$DECISION_ARCHIVE_CACHE_DIR" ] \
+    && [ ! -L "$DECISION_ARCHIVE_CACHE_DIR" ]; then
+    rm -rf -- "$DECISION_ARCHIVE_CACHE_DIR"
+  fi
+  DECISION_ARCHIVE_CACHE_DIR=''
+  DECISION_ARCHIVE_CACHE_PATH=''
+  dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-decision-archive.XXXXXX") \
+    || fail "could not stage decision archive index"
+  DECISION_ARCHIVE_CACHE_DIR=$dir
+  if node - "$archive" "$dir" <<'NODE'
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+const archive = process.argv[2];
+const directory = process.argv[3];
+let text;
+try {
+  text = fs.readFileSync(archive, "utf8");
+} catch (_) {
+  process.exit(4);
+}
+const lines = text.split("\n");
+if (text.endsWith("\n")) lines.pop();
+let archived = false;
+let entry = false;
+let current = null;
+let bad = false;
+
+function finish() {
+  if (!current) return;
+  while (current.body.length && current.body[current.body.length - 1] === "") {
+    current.body.pop();
+  }
+  const match = /^- \[x\] ([^ ]+) - /.exec(current.header);
+  if (match && match[1].includes("-decision-")) {
+    const token = crypto.createHash("sha256").update(match[1]).digest("hex");
+    const record = path.join(directory, `${token}.record`);
+    const duplicate = path.join(directory, `${token}.duplicate`);
+    if (fs.existsSync(record)) {
+      fs.writeFileSync(duplicate, "", { mode: 0o600 });
+    } else {
+      fs.writeFileSync(record, `${current.header}\n${current.body.join("\n")}`, {
+        flag: "wx",
+        mode: 0o600,
+      });
+    }
+  }
+  current = null;
+}
+
+try {
+  for (const line of lines) {
+    if (/^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(line)) {
+      finish();
+      entry = false;
+      archived = true;
+      continue;
+    }
+    if (/^## /.test(line)) {
+      finish();
+      entry = false;
+      archived = false;
+      continue;
+    }
+    if (/^- \[[ x]\] /.test(line)) {
+      finish();
+      entry = archived;
+      if (archived) current = { header: line, body: [] };
+      continue;
+    }
+    if (current) {
+      if (line === "") {
+        current.body.push("");
+        continue;
+      }
+      if (line.startsWith("  ")) {
+        current.body.push(line.slice(2));
+        continue;
+      }
+      bad = true;
+      break;
+    }
+    if (archived && entry && line.startsWith("  ")) continue;
+    if (archived && line !== "") {
+      bad = true;
+      break;
+    }
+  }
+  finish();
+} catch (_) {
+  process.exit(4);
+}
+if (bad) process.exit(3);
+NODE
+  then
+    DECISION_ARCHIVE_CACHE_PATH=$archive
+    return 0
+  else
+    rc=$?
+    rm -rf -- "$DECISION_ARCHIVE_CACHE_DIR"
+    DECISION_ARCHIVE_CACHE_DIR=''
+    DECISION_ARCHIVE_CACHE_PATH=''
+    [ "$rc" -ne 3 ] || fail "captain decision $id has a malformed archived record"
+    fail "could not index decision archive: $archive"
+  fi
+}
+
 archived_hold_body() {  # <hold-id>
-  local id=$1 archive links record rc header='' body='' line body_started=0
+  local id=$1 archive links record rc header='' body='' line body_started=0 token duplicate
   ARCHIVED_HOLD_BODY=''
   authoritative_archive_path
   archive=$DECISION_ARCHIVE
@@ -1288,7 +1418,25 @@ archived_hold_body() {  # <hold-id>
     || fail "could not inspect decision archive link count: $archive"
   [ "$links" = 1 ] || fail "decision archive is hardlinked: $archive"
 
-  if record=$(LC_ALL=C awk -v id="$id" '
+  if [ "$DECISION_ARCHIVE_CACHE_ENABLED" = 1 ]; then
+    prepare_decision_archive_cache "$archive" "$id"
+    token=$(sha256_text "$id")
+    record="$DECISION_ARCHIVE_CACHE_DIR/$token.record"
+    duplicate="$DECISION_ARCHIVE_CACHE_DIR/$token.duplicate"
+    [ ! -e "$duplicate" ] \
+      || fail "captain decision $id has duplicate archived records"
+    [ -e "$record" ] || return 1
+    [ -f "$record" ] && [ ! -L "$record" ] \
+      || fail "captain decision $id has an unsafe archived index record"
+    links=$(file_link_count "$record") \
+      || fail "could not inspect captain decision $id archived index record"
+    [ "$links" = 1 ] \
+      || fail "captain decision $id has a hardlinked archived index record"
+    IFS= read -r header < "$record" \
+      || fail "captain decision $id has a malformed archived record"
+    body=$(tail -n +2 "$record") \
+      || fail "captain decision $id has a malformed archived record"
+  elif record=$(LC_ALL=C awk -v id="$id" '
     BEGIN { prefix = "- [x] " id " - "; found = 0; capture = 0; entry = 0; archived = 0; bad = 0 }
     /^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/ {
       capture = 0
@@ -1326,7 +1474,19 @@ archived_hold_body() {  # <hold-id>
       if (found == 0) exit 1
     }
   ' "$archive"); then
-    :
+    while IFS= read -r line; do
+      case "$line" in
+        H*) header=${line#H} ;;
+        B*)
+          [ "$body_started" -eq 0 ] || body="${body}"$'\n'
+          body="${body}${line#B}"
+          body_started=1
+          ;;
+        *) fail "captain decision $id has a malformed archived record" ;;
+      esac
+    done <<EOF
+$record
+EOF
   else
     rc=$?
     case "$rc" in
@@ -1335,20 +1495,6 @@ archived_hold_body() {  # <hold-id>
       *) fail "captain decision $id has a malformed archived record" ;;
     esac
   fi
-
-  while IFS= read -r line; do
-    case "$line" in
-      H*) header=${line#H} ;;
-      B*)
-        [ "$body_started" -eq 0 ] || body="${body}"$'\n'
-        body="${body}${line#B}"
-        body_started=1
-        ;;
-      *) fail "captain decision $id has a malformed archived record" ;;
-    esac
-  done <<EOF
-$record
-EOF
   while [ "${body%$'\n'}" != "$body" ]; do body=${body%$'\n'}; done
   archived_header_has_captain_provenance "$header" "$id" \
     || fail "captain decision $id has mismatched archived captain-hold provenance"
@@ -1719,6 +1865,7 @@ command_complete() {
       || fail "task metadata disappeared while recording completion"
   fi
   require_tasks_axi
+  DECISION_ARCHIVE_CACHE_ENABLED=1
   origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
   completion_inventory_lock_acquire "$origin"
   durable_inventory=1
@@ -1967,6 +2114,7 @@ command_verify() {
   require_safe_origin_metadata_file "$meta" \
     || fail "origin metadata disappeared while verifying completion"
   require_tasks_axi
+  DECISION_ARCHIVE_CACHE_ENABLED=1
   completion_metadata_inventory "$meta"
   [ "$META_DECISIONS_REVIEWED" = 1 ] \
     || fail "origin $origin has no completed unresolved-decision inventory"
