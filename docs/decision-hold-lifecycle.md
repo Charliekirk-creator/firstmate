@@ -75,6 +75,7 @@ A live-completion case proves that provenance survives normal metadata teardown,
 The same explicit unresolved inventory is required to have an active hold even when no matching status event exists, so status text cannot select historical fallback.
 After normal teardown removes origin metadata and its generated attestation is removed to reproduce a pre-upgrade home, repeated completion still recognizes the uniquely decomposable legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
+The archive-boundary cases also configure a contained root-level backlog and its derived retention owners, and prove that copying a tasks-axi note snapshot into a canonical-looking configured history file does not establish Done retention.
 Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, refuse automatic or claimant-derived migration of that collision, spoof captain metadata in an ordinary captain-kind title, exceed the captain decision size bound, mismatch resolution modes, digests, and routed-work lists, and point archive, state, metadata, or report ownership evidence across unsafe boundaries; none can masquerade as historical resolution.
 An ambiguous released-version record remains fail-closed when only claimant metadata and the recorded answer survive, while an independently authorized exact mapping migrates its original identity compatibly from durable post-teardown evidence. A queued repair-only resolution is separately rejected and a uniquely decomposable queued released-version resolution remains retryable after teardown. Another case proves overlong released task identities use bounded attestation filenames, authenticated interrupted publication recovers, and unrelated hardlinks remain untouched and rejected.
 The public completion gate also accepts option-shaped decision keys and verifies active and resolved records while `jq` is unavailable, relying only on the universal toolchain.
@@ -106,7 +107,7 @@ ok - live completion provenance survives teardown and enforces ownership
 ok - queued legacy resolution identity survives teardown and retry
 ok - legacy migration rejects missing, conflicting, and foreign ownership
 ok - legacy compatibility stays bounded and ambiguous migration requires independent authorization
-ok - only canonical retention sections prove archived decisions
+ok - only canonical retention sections and owned archives prove historical decisions
 ok - queued holds reject the repair-only resolution mode
 ok - retained resolutions enforce the captain decision size bound
 ok - pruned-history fallback rejects missing, malformed, and mismatched decisions
@@ -114,6 +115,7 @@ ok - historical resolution proof is exact, structured, and home-bound
 ok - retained history requires safe state records
 ok - origin ownership rejects linked metadata and report evidence
 ok - contained operational overrides remain supported
+ok - effective contained backlog paths own their derived retention archives
 ok - resolved findings and decision-like prose do not create false holds
 ok - terminal single-owner stale status decisions do not block empty inventory
 ok - main-home and secondmate-home captain holds remain correctly routed

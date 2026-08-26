@@ -1299,7 +1299,7 @@ SH
 }
 
 test_nonarchive_rows_cannot_prove_pruned_history() {
-  local home origin key hold n archive decision note_alias
+  local home origin key hold n archive decision note_alias note_alias_created=0
   home=$(make_home nonarchive-history-row)
   origin=sample-nonarchive-review
   key=old-answer
@@ -1390,6 +1390,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   if [ ! -e "$note_alias" ]; then
     ln "$home/data/note-archive.md" "$note_alias" \
       || fail "could not create a physical note-archive alias"
+    note_alias_created=1
   fi
   awk '
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/NOTE-ARCHIVE.md\""; next }
@@ -1402,7 +1403,22 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   fi
   assert_grep "aliases the tasks-axi note archive" "$home/note-archive.err" \
     "the configured note archive alias did not fail its retention boundary"
-  pass "only canonical retention sections prove archived decisions"
+  [ "$note_alias_created" -eq 0 ] || rm -f "$note_alias"
+
+  cp "$home/data/note-archive.md" "$home/data/copied-history.md" \
+    || fail "could not copy the note snapshot into a configured history artifact"
+  awk '
+    $0 == "archive = \"data/NOTE-ARCHIVE.md\"" { print "archive = \"data/copied-history.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure the copied note snapshot as Done history"
+  if run_decisions "$home" complete "$origin" --none --resolved "$key" \
+    > "$home/copied-note.out" 2> "$home/copied-note.err"; then
+    fail "a copied note snapshot substituted for configured Done retention"
+  fi
+  assert_grep "also exists in the tasks-axi note archive" "$home/copied-note.err" \
+    "copied note history did not retain its artifact provenance"
+  pass "only canonical retention sections and owned archives prove historical decisions"
 }
 
 test_queued_repaired_resolution_is_rejected() {
@@ -1973,6 +1989,53 @@ test_contained_operational_overrides_remain_supported() {
   assert_absent "$home/data/backlog.md" \
     "captain hold leaked into the default data directory"
   pass "contained operational overrides remain supported"
+}
+
+test_effective_root_backlog_retention_remains_supported() {
+  local home origin key hold n
+  home=$(make_home effective-root-backlog)
+  mv "$home/data/backlog.md" "$home/backlog.md"
+  awk '
+    $0 == "path = \"data/backlog.md\"" { print "path = \"backlog.md\""; next }
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"done-archive.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure the effective root backlog"
+  origin=sample-root-backlog-review
+  key=old-choice
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Review root backlog retention" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create the root-backlog origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: root backlog review complete\n' > "$home/state/$origin.status"
+  printf '# Root backlog review\n' > "$home/data/$origin/report.md"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the root backlog option" \
+    --reason "captain root backlog option pending" --repo sample) \
+    || fail "effective root backlog could not create a decision hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "effective root backlog could not complete its inventory"
+  printf 'Captain resolved the root backlog option.\n' > "$home/root-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/root-answer.txt" >/dev/null \
+    || fail "effective root backlog could not resolve its decision"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "root-filler-$n" "Root filler $n" --kind ship --repo sample >/dev/null \
+      || fail "could not create root-backlog filler $n"
+    tasks_in "$home" done "root-filler-$n" >/dev/null \
+      || fail "could not complete root-backlog filler $n"
+  done
+  assert_no_grep "- [x] $hold -" "$home/backlog.md" \
+    "effective root backlog retained the pruned decision"
+  assert_grep "- [x] $hold -" "$home/done-archive.md" \
+    "effective root backlog did not use its configured retention owner"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "effective root backlog could not verify normally pruned history"
+  assert_absent "$home/data/done-archive.md" \
+    "root-backlog retention leaked into FM_DATA_OVERRIDE"
+  pass "effective contained backlog paths own their derived retention archives"
 }
 
 test_none_inventory_and_resolved_prose_do_not_create_holds() {
@@ -2734,6 +2797,7 @@ test_historical_resolution_proof_is_exact_and_home_bound
 test_retained_history_rejects_unsafe_state_and_status
 test_origin_ownership_rejects_linked_evidence
 test_contained_operational_overrides_remain_supported
+test_effective_root_backlog_retention_remains_supported
 test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home
