@@ -325,7 +325,7 @@ publish_no_clobber() {  # <source> <target> <label>; 2 means target already exis
   mv -- "$source" "$staging" || die "cannot stage $label publication: $target"
   [ "${TMP:-}" != "$source" ] || TMP=
   PUBLICATION_STAGING=$staging
-  if ln "$staging" "$target" 2>/dev/null; then
+  if command link "$staging" "$target" 2>/dev/null; then
     rm -f -- "$staging" || die "cannot complete $label publication: $target"
     PUBLICATION_STAGING=
     return 0

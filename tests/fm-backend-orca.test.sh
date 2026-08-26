@@ -591,8 +591,41 @@ test_orca_journal_publication_recovers_interrupted_links() {
   pass "Orca journals reconcile interrupted no-clobber publications"
 }
 
+test_orca_journal_publication_does_not_follow_raced_target() {
+  local source target sink real_link real_ln out rc=0
+  orca_case journal-target-race
+  source="$CASE_DIR/source"
+  target="$CASE_DIR/target"
+  sink="$CASE_DIR/sink"
+  real_link=$(command -v link)
+  real_ln=$(command -v ln)
+  mkdir -p "$sink"
+  printf 'journal\n' > "$source"
+  cat > "$FB/link" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ "${2:-}" = "$FM_TEST_PUBLICATION_TARGET" ] \
+   && [ ! -e "$FM_TEST_PUBLICATION_RACED" ]; then
+  "$FM_TEST_REAL_LN" -s "$FM_TEST_PUBLICATION_SINK" "$FM_TEST_PUBLICATION_TARGET"
+  : > "$FM_TEST_PUBLICATION_RACED"
+fi
+exec "$FM_TEST_REAL_LINK" "$@"
+SH
+  chmod +x "$FB/link"
+  out=$(PATH="$FB:$PATH" FM_TEST_PUBLICATION_TARGET="$target" \
+    FM_TEST_PUBLICATION_SINK="$sink" FM_TEST_PUBLICATION_RACED="$CASE_DIR/raced" \
+    FM_TEST_REAL_LINK="$real_link" FM_TEST_REAL_LN="$real_ln" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_no_clobber_publish "$1" "$2"' \
+      "$ROOT" "$source" "$target" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "Orca journal publication followed a raced target"
+  [ -L "$target" ] || fail "Orca journal race fixture did not replace the exact target"
+  [ -z "$(find "$sink" -mindepth 1 -print -quit)" ] \
+    || fail "Orca journal publication partially wrote through a raced target"
+  pass "Orca journal publication never follows a raced target"
+}
+
 test_spawn_preserves_resources_across_result_publication_retry() {
-  local proj wt data state config id out creates
+  local proj wt data state config id real_link out creates
   id="orcaresultretryz2"
   proj="$TMP_ROOT/result-retry-project"
   wt="$TMP_ROOT/result-retry-wt"
@@ -604,20 +637,21 @@ test_spawn_preserves_resources_across_result_publication_retry() {
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case result-publication-retry
-  cat > "$FB/ln" <<'SH'
+  real_link=$(command -v link)
+  cat > "$FB/link" <<'SH'
 #!/usr/bin/env bash
 if [ "${2:-}" = "${FM_TEST_RESULT_TARGET:-}" ] \
    && [ ! -e "${FM_TEST_RESULT_FAILURE:-}" ]; then
   : > "$FM_TEST_RESULT_FAILURE"
   exit 1
 fi
-exec "${REAL_LN_FOR_TEST:?}" "$@"
+exec "${REAL_LINK_FOR_TEST:?}" "$@"
 SH
-  chmod +x "$FB/ln"
+  chmod +x "$FB/link"
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-result-retry"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-result-retry","path":"%s"},"terminal":{"handle":"term-result-retry"}}}\n' "$wt" > "$RESP/3.out"
-  out=$(PATH="$FB:$PATH" REAL_LN_FOR_TEST="$(command -v ln)" \
+  out=$(PATH="$FB:$PATH" REAL_LINK_FOR_TEST="$real_link" \
     FM_TEST_RESULT_TARGET="$state/$id.spawn-orca-operation/result.json" \
     FM_TEST_RESULT_FAILURE="$CASE_DIR/result-publication-failed" \
     FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
@@ -1855,6 +1889,7 @@ test_worktree_create_preserves_terminal_when_close_is_unconfirmed
 test_terminal_create_timeout_remains_resumable
 test_terminal_child_exit_124_remains_a_failure
 test_orca_journal_publication_recovers_interrupted_links
+test_orca_journal_publication_does_not_follow_raced_target
 test_spawn_preserves_resources_across_result_publication_retry
 test_spawn_retries_after_compensated_pathless_worktree
 test_spawn_recovers_compensated_pathless_response_after_creator_crash

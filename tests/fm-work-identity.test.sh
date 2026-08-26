@@ -146,8 +146,18 @@ exit 0
 SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
-case "$*" in
-  *--lease*) printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_TEST_ZELLIJ_WT:-}}" ;;
+case "${1:-}" in
+  status) printf '%s\n' "${FM_TEST_TREEHOUSE_STATUS_JSON:-[]}"; exit 0 ;;
+  get)
+    if [ -n "${FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER:-}" ] \
+       && [ ! -e "$FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER" ]; then
+      : > "$FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER"
+      exit 17
+    fi
+    case "$*" in
+      *--lease*) printf '%s\n' "${FM_FAKE_WORKTREE:-${FM_TEST_ZELLIJ_WT:-}}" ;;
+    esac
+    ;;
 esac
 exit 0
 SH
@@ -517,6 +527,42 @@ test_no_clobber_publications_recover_after_interruption() {
   pass "no-clobber identity publications recover interrupted staging links"
 }
 
+test_no_clobber_publication_does_not_follow_raced_target() {
+  local home task manifest target sink fakebin real_link real_ln out rc=0
+  home=$(make_home publication-target-race)
+  task=publication-target-race
+  manifest="$home/manifest.json"
+  target="$home/data/$task/work-identity.json"
+  sink="$home/publication-sink"
+  fakebin=$(fm_fakebin "$home/publication-link-fakes")
+  real_link=$(command -v link)
+  real_ln=$(command -v ln)
+  make_manifest "$home" "$task" "$manifest"
+  mkdir -p "$sink"
+  cat > "$fakebin/link" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ "${2:-}" = "$FM_TEST_PUBLICATION_TARGET" ] \
+   && [ ! -e "$FM_TEST_PUBLICATION_RACED" ]; then
+  "$FM_TEST_REAL_LN" -s "$FM_TEST_PUBLICATION_SINK" "$FM_TEST_PUBLICATION_TARGET"
+  : > "$FM_TEST_PUBLICATION_RACED"
+fi
+exec "$FM_TEST_REAL_LINK" "$@"
+SH
+  chmod +x "$fakebin/link"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_PUBLICATION_TARGET="$target" \
+    FM_TEST_PUBLICATION_SINK="$sink" FM_TEST_PUBLICATION_RACED="$home/raced" \
+    FM_TEST_REAL_LINK="$real_link" FM_TEST_REAL_LN="$real_ln" \
+    FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "identity publication followed a raced target"
+  [ -L "$target" ] || fail "publication race fixture did not replace the exact target"
+  [ -z "$(find "$sink" -mindepth 1 -print -quit)" ] \
+    || fail "identity publication partially wrote through a raced target"
+  assert_contains "$out" "symlinked" \
+    "identity publication did not reject the raced target"
+  pass "identity publication never follows a raced target"
+}
+
 test_projection_serializes_identity_ownership() {
   local home task lock lock_key entered release holder projection wait_count
   home=$(make_home projection-lock)
@@ -824,7 +870,7 @@ test_spawn_does_not_resend_inflight_worktree_request() {
 }
 
 test_zellij_resumes_unsent_worktree_request_once() {
-  local home task project wt fakebin manifest out rc=0 sends
+  local home task project wt fakebin manifest out rc=0 sends transaction digest ack
   home=$(make_home zellij-worktree-request)
   task=zellij-worktree-request
   project="$home/project"
@@ -869,7 +915,7 @@ case "$*" in
     ;;
   *' action paste '*)
     text=${!#}
-    if printf '%s' "$text" | grep -Fq 'treehouse get' \
+    if printf '%s' "$text" | grep -Eq 'treehouse get|fm-treehouse-worktree-request[.]sh' \
        && [ ! -e "$FM_TEST_ZELLIJ_FAILED" ]; then
       : > "$FM_TEST_ZELLIJ_FAILED"
       exit 1
@@ -880,7 +926,7 @@ case "$*" in
   *' action send-keys '*)
     if [ "${!#}" = Enter ] && [ -f "$FM_TEST_ZELLIJ_INPUT" ]; then
       text=$(cat "$FM_TEST_ZELLIJ_INPUT")
-      if printf '%s' "$text" | grep -Fq 'treehouse get'; then
+      if printf '%s' "$text" | grep -Eq 'treehouse get|fm-treehouse-worktree-request[.]sh'; then
         printf 'sent\n' >> "$FM_TEST_ZELLIJ_SENDS"
         if [ "${FM_TEST_ZELLIJ_DELAY_WORKTREE:-0}" != 1 ]; then
           PATH="$FM_TEST_ZELLIJ_FAKEBIN:$PATH" bash -c "$text" || exit 1
@@ -919,6 +965,14 @@ SH
   jq -S -c '.phase = "worktree-requesting"' "$home/state/$task.spawn-endpoint.json" \
     > "$home/state/$task.spawn-endpoint.next"
   mv "$home/state/$task.spawn-endpoint.next" "$home/state/$task.spawn-endpoint.json"
+  transaction=$(jq -r '.transaction_id' "$home/state/$task.spawn-endpoint.json")
+  if command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$transaction" | shasum -a 256 | awk '{print $1}')
+  else
+    digest=$(printf '%s' "$transaction" | sha256sum | awk '{print $1}')
+  fi
+  ack="$home/state/.$task.worktree-request.$digest.send"
+  mkdir -m 700 "$ack"
   export FM_TEST_ZELLIJ_PROBES="$home/zellij-probes"
 
   rc=0
@@ -956,9 +1010,13 @@ SH
   assert_absent "$home/zellij-probes" \
     "zellij recovery injected a cwd probe into an accepted worktree request"
 
-  PATH="$fakebin:$PATH" FM_TEST_ZELLIJ_WT="$wt" bash -c "$(cat "$home/zellij-input")" \
-    || fail "could not complete the command-published zellij worktree result"
-  : > "$home/zellij-worktree"
+  PATH="$fakebin:$PATH" FM_TEST_ZELLIJ_WT="$wt" \
+    FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER="$home/treehouse-no-resource" \
+    bash -c "$(cat "$home/zellij-input")" \
+    || fail "could not publish the proven no-resource zellij result"
+  jq -e '.status == "retryable" and .leases == []' \
+    "$home/state/.$task.worktree-request.$digest/result" >/dev/null \
+    || fail "failed treehouse request did not publish no-resource evidence"
   out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
     FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
     FM_TEST_ZELLIJ_FAILED="$home/zellij-send-failed" \
@@ -966,17 +1024,51 @@ SH
     FM_TEST_ZELLIJ_SENDS="$home/zellij-sends" \
     FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
     FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
-    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" FM_SPAWN_WORKTREE_POLLS=2 \
-    FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
+    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" \
+    FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER="$home/treehouse-no-resource" \
+    FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
     "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
       --harness codex --backend zellij 2>&1) \
-    || fail "zellij did not reconcile its completed worktree request: $out"
+    || fail "zellij did not retry its proven no-resource worktree request: $out"
   sends=$(wc -l < "$home/zellij-sends" | tr -d ' ')
-  [ "$sends" = 1 ] || fail "zellij recovery executed $sends worktree requests"
+  [ "$sends" = 2 ] || fail "zellij recovery executed $sends worktree requests"
   assert_contains "$out" "spawned $task" \
     "zellij worktree request recovery did not complete spawn"
   unset FM_TEST_ZELLIJ_PROBES
   pass "zellij distinguishes unsent and accepted worktree requests"
+}
+
+test_treehouse_request_reconciles_exact_failed_lease() {
+  local home wt marker holder fakebin out status_json
+  home=$(make_home treehouse-lease-reconcile)
+  wt="$home/exact-lease"
+  marker="$home/state/.treehouse-request"
+  holder=firstmate-exact-lease
+  fakebin=$(fm_fakebin "$home/treehouse-lease-fakes")
+  mkdir -p "$wt"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  get) exit 23 ;;
+  status) printf '%s\n' "$FM_TEST_TREEHOUSE_STATUS_JSON" ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/treehouse"
+  status_json=$(jq -n -c --arg path "$wt" --arg holder "$holder" \
+    '[{leased:true,path:$path,lease_holder:$holder,lease_id:"lease-exact-1"}]')
+  out=$(cd "$home" && PATH="$fakebin:$PATH" \
+    FM_TEST_TREEHOUSE_STATUS_JSON="$status_json" \
+    bash -c '. "$1" "$2" "$3"; pwd -P' _ \
+      "$ROOT/bin/fm-treehouse-worktree-request.sh" "$marker" "$holder") \
+    || fail "failed treehouse command did not reconcile its exact lease"
+  [ "$out" = "$wt" ] || fail "reconciled treehouse command did not enter its exact lease: $out"
+  jq -e --arg path "$wt" --arg holder "$holder" '
+    .status == "ok" and .path == $path and .lease_holder == $holder
+      and .leases == [{path:$path,lease_id:"lease-exact-1"}]
+  ' "$marker/result" >/dev/null \
+    || fail "reconciled treehouse command lost its exact lease evidence"
+  pass "failed treehouse commands reconcile one exact durable lease"
 }
 
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt() {
@@ -2264,6 +2356,7 @@ test_manifest_capture_rejects_same_size_rewrite
 test_concurrent_idempotence_and_explicit_unlinked
 test_secondmate_unlinked_reservation_is_transactional
 test_no_clobber_publications_recover_after_interruption
+test_no_clobber_publication_does_not_follow_raced_target
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
@@ -2272,6 +2365,7 @@ test_spawn_recovers_creation_intent_after_endpoint_side_effect
 test_spawn_resumes_unsent_worktree_request
 test_spawn_does_not_resend_inflight_worktree_request
 test_zellij_resumes_unsent_worktree_request_once
+test_treehouse_request_reconciles_exact_failed_lease
 test_pre_metadata_dispatch_reuses_exact_prepared_receipt
 test_dispatch_publish_refuses_unstable_metadata_without_publication
 test_replacement_dispatch_recovers_prior_retirement

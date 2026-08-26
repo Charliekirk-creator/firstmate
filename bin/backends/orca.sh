@@ -169,7 +169,7 @@ fm_backend_orca_no_clobber_recover() {  # <target>
   }
   if [ ! -e "$target" ] && [ ! -L "$target" ]; then
     [ "$staging_links" = 1 ] || return 1
-    if ! ln "$staging" "$target" 2>/dev/null; then
+    if ! command link "$staging" "$target" 2>/dev/null; then
       [ -e "$target" ] || [ -L "$target" ] || return 1
     fi
   fi
