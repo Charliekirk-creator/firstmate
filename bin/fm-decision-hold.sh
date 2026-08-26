@@ -34,6 +34,9 @@
 #   fm-decision-hold.sh repair <origin-id> <decision-key> --decision-file <path>
 #   fm-decision-hold.sh migrate-legacy <origin-id> <decision-key> \
 #     --decision-file <path> [--identity-file <path>]
+#   fm-decision-hold.sh task-done <task-id> [tasks-axi done flags]
+#   fm-decision-hold.sh retention-prune
+#   fm-decision-hold.sh tasks-axi <retention-affecting tasks-axi arguments>
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # Positional keys are the unresolved decisions in the just-reviewed surface and
@@ -48,8 +51,9 @@
 # Done records; archive-only generations require explicit current or `--resolved`
 # classification. A resolved historical key
 # may be proven by its structured record in the effective backlog's configured
-# archive after normal bounded Done retention prunes it and only while that record
-# remains bound to the same retention owner; the gate never restores archived rows.
+# archive after normal bounded Done retention prunes it through `task-done` or
+# `retention-prune`, which bind the exact archived bytes to that transition; the
+# gate never restores archived rows.
 # A missing key with no valid archived resolution still fails. A post-teardown
 # visual review can complete against the surviving report and holds without
 # recreating task state. `verify` is called by scout teardown so teardown cannot
@@ -164,10 +168,16 @@ DECISION_ATTESTATION_LOCK=
 DECISION_ATTESTATION_LOCK_HELD=0
 DECISION_RETENTION_LOCK=
 DECISION_RETENTION_LOCK_HELD=0
+DECISION_RETENTION_HOOK=''
+DECISION_RETENTION_HOOK_DIR=''
 DECISION_ARCHIVE_CACHE_ENABLED=1
 DECISION_ARCHIVE_CACHE_DIR=''
 DECISION_ARCHIVE_CACHE_PATH=''
 decision_hold_cleanup() {
+  if [ -n "$DECISION_RETENTION_HOOK_DIR" ] && [ -d "$DECISION_RETENTION_HOOK_DIR" ] \
+    && [ ! -L "$DECISION_RETENTION_HOOK_DIR" ]; then
+    rm -rf -- "$DECISION_RETENTION_HOOK_DIR"
+  fi
   if [ "$DECISION_RETENTION_LOCK_HELD" = 1 ]; then
     fm_lock_release "$DECISION_RETENTION_LOCK" || true
     DECISION_RETENTION_LOCK_HELD=0
@@ -998,10 +1008,11 @@ authoritative_archive_path() {
   fi
 }
 
-RETENTION_OWNER_SCHEMA=fm-decision-retention-owner.v1
-RETENTION_BINDING_SCHEMA=fm-decision-retention-binding.v1
+RETENTION_OWNER_SCHEMA=fm-decision-retention-owner.v2
+RETENTION_RECORD_SCHEMA=fm-decision-retention-record.v1
 RETENTION_PROVENANCE_DIR=''
-RETENTION_OWNER_MARKER=''
+RETENTION_OWNER_TOKEN=''
+RETENTION_OWNER_SECRET=''
 
 retention_provenance_dir() {
   local create=$1 dir physical_dir
@@ -1024,25 +1035,14 @@ retention_provenance_dir() {
 }
 
 retention_owner_content() {
-  printf 'schema=%s\nbacklog=%s\narchive=%s\nmarker=%s\n' \
-    "$RETENTION_OWNER_SCHEMA" "$DECISION_BACKLOG" "$DECISION_ARCHIVE" "$1"
-}
-
-retention_binding_content() {
-  printf 'schema=%s\nhold_id=%s\norigin=%s\ndecision_key=%s\nbacklog=%s\narchive=%s\nmarker=%s\n' \
-    "$RETENTION_BINDING_SCHEMA" "$1" "$2" "$3" "$DECISION_BACKLOG" "$DECISION_ARCHIVE" "$4"
+  printf 'schema=%s\nbacklog=%s\narchive=%s\nowner=%s\nsecret=%s\n' \
+    "$RETENTION_OWNER_SCHEMA" "$DECISION_BACKLOG" "$DECISION_ARCHIVE" "$1" "$2"
 }
 
 retention_owner_path() {
   local token
   token=$(sha256_text "${DECISION_BACKLOG}"$'\n'"${DECISION_ARCHIVE}")
   printf '%s/%s.owner\n' "$1" "$token"
-}
-
-retention_binding_path() {
-  local token
-  token=$(sha256_text "$2")
-  printf '%s/%s.binding\n' "$1" "$token"
 }
 
 require_safe_retention_file() {
@@ -1063,54 +1063,37 @@ require_safe_decision_archive() {
   [ "$links" = 1 ] || fail "decision archive is hardlinked: $path"
 }
 
-ensure_archive_parent_exists() {
-  local physical_home archive_dir physical_dir
-  physical_home=$(cd "$FM_HOME" && pwd -P) \
-    || fail "could not resolve active home: $FM_HOME"
-  archive_dir=${DECISION_ARCHIVE%/*}
-  contained_archive_parent_safe "$physical_home" "$archive_dir" \
-    || fail "configured decision archive directory is unsafe: $archive_dir"
-  if [ ! -d "$archive_dir" ]; then
-    (umask 077; mkdir -p "$archive_dir") \
-      || fail "could not create configured decision archive directory: $archive_dir"
-  fi
-  contained_archive_parent_safe "$physical_home" "$archive_dir" \
-    || fail "configured decision archive directory is unsafe: $archive_dir"
-  physical_dir=$(cd "$archive_dir" && pwd -P) \
-    || fail "could not resolve configured decision archive directory: $archive_dir"
-  [ "$physical_dir" = "$archive_dir" ] \
-    || fail "configured decision archive directory escapes the active home: $archive_dir"
-}
-
 retention_owner_load() {
-  local dir=$1 owner marker actual expected marker_count
-  RETENTION_OWNER_MARKER=''
+  local dir=$1 owner token secret actual expected
+  RETENTION_OWNER_TOKEN=''
+  RETENTION_OWNER_SECRET=''
   owner=$(retention_owner_path "$dir")
   [ -e "$owner" ] || [ -L "$owner" ] || return 1
   require_safe_retention_file "decision retention owner" "$owner"
-  marker=$(meta_value "$owner" marker)
-  [ "${#marker}" -eq 64 ] || fail "decision retention owner is malformed: $owner"
-  case "$marker" in *[!0-9a-f]*) fail "decision retention owner is malformed: $owner" ;; esac
-  expected=$(retention_owner_content "$marker")
+  token=$(meta_value "$owner" owner)
+  secret=$(meta_value "$owner" secret)
+  [ "${#token}" -eq 64 ] && [ "${#secret}" -eq 64 ] \
+    || fail "decision retention owner is malformed: $owner"
+  case "$token$secret" in *[!0-9a-f]*) fail "decision retention owner is malformed: $owner" ;; esac
+  [ "$token" = "$(sha256_text "$RETENTION_RECORD_SCHEMA"$'\n'"$DECISION_BACKLOG"$'\n'"$DECISION_ARCHIVE")" ] \
+    || fail "decision retention owner is malformed: $owner"
+  expected=$(retention_owner_content "$token" "$secret")
   actual=$(cat "$owner") || fail "could not read decision retention owner: $owner"
   [ "$actual" = "$expected" ] || fail "decision retention owner is malformed: $owner"
-  require_safe_decision_archive "$DECISION_ARCHIVE"
-  marker_count=$(grep -Fxc -- "## Firstmate retention $marker" "$DECISION_ARCHIVE" || true)
-  [ "$marker_count" = 1 ] \
-    || fail "configured decision archive does not match its retention owner: $DECISION_ARCHIVE"
-  RETENTION_OWNER_MARKER=$marker
+  RETENTION_OWNER_TOKEN=$token
+  RETENTION_OWNER_SECRET=$secret
 }
 
 ensure_retention_owner() {
-  local dir owner lock token tmp actual expected
+  local dir owner lock path_token owner_token secret tmp
   retention_provenance_dir 1
   dir=$RETENTION_PROVENANCE_DIR
   if retention_owner_load "$dir"; then
     return 0
   fi
   owner=$(retention_owner_path "$dir")
-  token=$(sha256_text "${DECISION_BACKLOG}"$'\n'"${DECISION_ARCHIVE}")
-  lock="$dir/.owner-$token.lock"
+  path_token=$(sha256_text "${DECISION_BACKLOG}"$'\n'"${DECISION_ARCHIVE}")
+  lock="$dir/.owner-$path_token.lock"
   DECISION_RETENTION_LOCK=$lock
   fm_lock_acquire_wait "$DECISION_RETENTION_LOCK"
   DECISION_RETENTION_LOCK_HELD=1
@@ -1119,19 +1102,12 @@ ensure_retention_owner() {
     DECISION_RETENTION_LOCK_HELD=0
     return 0
   fi
-  ensure_archive_parent_exists
-  if [ ! -e "$DECISION_ARCHIVE" ] && [ ! -L "$DECISION_ARCHIVE" ]; then
-    if ! (umask 077; set -C; : > "$DECISION_ARCHIVE") 2>/dev/null \
-      && [ ! -f "$DECISION_ARCHIVE" ]; then
-      fail "could not create configured decision archive: $DECISION_ARCHIVE"
-    fi
-  fi
-  require_safe_decision_archive "$DECISION_ARCHIVE"
+  owner_token=$(sha256_text "$RETENTION_RECORD_SCHEMA"$'\n'"$DECISION_BACKLOG"$'\n'"$DECISION_ARCHIVE")
+  secret=$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))') \
+    || fail "could not generate decision retention owner secret"
   tmp=$(umask 077; mktemp "$dir/.retention-owner.XXXXXX") \
     || fail "could not stage decision retention owner"
-  token=$(sha256_text "${DECISION_BACKLOG}|${DECISION_ARCHIVE}|$$|$RANDOM|${tmp##*/}")
-  if ! printf '\n## Firstmate retention %s\n' "$token" >> "$DECISION_ARCHIVE" \
-    || ! retention_owner_content "$token" > "$tmp" \
+  if ! retention_owner_content "$owner_token" "$secret" > "$tmp" \
     || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$owner"; then
     rm -f -- "$tmp"
     fail "could not persist decision retention owner"
@@ -1140,54 +1116,128 @@ ensure_retention_owner() {
   DECISION_RETENTION_LOCK_HELD=0
   retention_owner_load "$dir" \
     || fail "could not validate decision retention owner"
-  expected=$(retention_owner_content "$RETENTION_OWNER_MARKER")
-  actual=$(cat "$owner") || fail "could not read decision retention owner: $owner"
-  [ "$actual" = "$expected" ] || fail "decision retention owner is malformed: $owner"
 }
 
-retention_binding_valid() {
-  local id=$1 origin=$2 key=$3 dir binding actual expected
-  retention_provenance_dir 0 || return 1
-  dir=$RETENTION_PROVENANCE_DIR
-  retention_owner_load "$dir" || return 1
-  binding=$(retention_binding_path "$dir" "$id")
-  [ -e "$binding" ] || [ -L "$binding" ] || return 1
-  require_safe_retention_file "decision retention binding" "$binding"
-  expected=$(retention_binding_content "$id" "$origin" "$key" "$RETENTION_OWNER_MARKER")
-  actual=$(cat "$binding") || fail "could not read decision retention binding: $binding"
-  [ "$actual" = "$expected" ] \
-    || fail "decision retention binding does not match $origin/$key in the configured retention owner"
-}
-
-persist_retention_binding() {
-  local id=$1 origin=$2 key=$3 dir binding token tmp
-  retention_binding_valid "$id" "$origin" "$key" && return 0
+tasks_axi_with_retention_provenance() {
+  local hook hook_dir rc=0 prior_node_options=${NODE_OPTIONS:-}
   ensure_retention_owner
-  dir=$RETENTION_PROVENANCE_DIR
-  binding=$(retention_binding_path "$dir" "$id")
-  token=$(sha256_text "$id")
-  DECISION_RETENTION_LOCK="$dir/.binding-$token.lock"
-  fm_lock_acquire_wait "$DECISION_RETENTION_LOCK"
-  DECISION_RETENTION_LOCK_HELD=1
-  if retention_binding_valid "$id" "$origin" "$key"; then
-    fm_lock_release "$DECISION_RETENTION_LOCK"
-    DECISION_RETENTION_LOCK_HELD=0
-    return 0
+  hook_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-decision-retention.XXXXXX") \
+    || fail "could not stage decision retention hook"
+  hook="$hook_dir/hook.cjs"
+  DECISION_RETENTION_HOOK_DIR=$hook_dir
+  DECISION_RETENTION_HOOK=$hook
+  if [ -e "$DECISION_ARCHIVE" ] || [ -L "$DECISION_ARCHIVE" ]; then
+    require_safe_decision_archive "$DECISION_ARCHIVE"
   fi
-  if [ -e "$binding" ] || [ -L "$binding" ]; then
-    fail "decision retention binding does not match $origin/$key in the configured retention owner"
+  cat > "$hook" <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const moduleApi = require("node:module");
+const path = require("node:path");
+
+const originalAppendFileSync = fs.appendFileSync;
+const archive = path.resolve(process.env.FM_DECISION_RETENTION_ARCHIVE);
+const backlog = path.resolve(process.env.FM_DECISION_RETENTION_BACKLOG);
+const owner = process.env.FM_DECISION_RETENTION_OWNER;
+const secret = process.env.FM_DECISION_RETENTION_SECRET;
+const schema = process.env.FM_DECISION_RETENTION_SCHEMA;
+
+function archivedRecords(text) {
+  const lines = String(text).split("\n");
+  if (String(text).endsWith("\n")) lines.pop();
+  const records = [];
+  let archived = false;
+  let current = null;
+  function finish() {
+    if (!current) return;
+    while (current.body.length && current.body[current.body.length - 1] === "") current.body.pop();
+    const match = /^- \[x\] ([^ ]+) - /.exec(current.header);
+    if (match && match[1].includes("-decision-")) {
+      records.push({ id: match[1], text: `${current.header}\n${current.body.join("\n")}` });
+    }
+    current = null;
+  }
+  for (const line of lines) {
+    if (/^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(line)) {
+      finish();
+      archived = true;
+      continue;
+    }
+    if (/^- \[[ x]\] /.test(line)) {
+      finish();
+      if (!archived) throw new Error("retention append lacks its archive section");
+      current = { header: line, body: [] };
+      continue;
+    }
+    if (current) {
+      if (line === "") current.body.push("");
+      else if (line.startsWith("  ")) current.body.push(line.slice(2));
+      else throw new Error("retention append contains malformed task bytes");
+      continue;
+    }
+    if (line !== "") throw new Error("retention append contains unexpected bytes");
+  }
+  finish();
+  return records;
+}
+
+function marker(record) {
+  const digest = crypto.createHash("sha256").update(record.text).digest("hex");
+  const payload = `${schema}\n${owner}\n${backlog}\n${archive}\n${record.id}\n${digest}`;
+  const mac = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return `<!-- fm-decision-retention:v1 owner=${owner} id=${record.id} record=${digest} mac=${mac} -->`;
+}
+
+fs.appendFileSync = function retentionAppend(target, data, ...rest) {
+  if (path.resolve(String(target)) !== archive) return originalAppendFileSync.call(fs, target, data, ...rest);
+  let restorePoint = { existed: false, size: 0 };
+  try {
+    const archiveStat = fs.lstatSync(target);
+    if (!archiveStat.isFile() || archiveStat.isSymbolicLink() || archiveStat.nlink !== 1) {
+      throw new Error("decision archive is not an ordinary single-linked file");
+    }
+    restorePoint = { existed: true, size: archiveStat.size };
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  const records = archivedRecords(data);
+  if (records.length === 0) return originalAppendFileSync.call(fs, target, data, ...rest);
+  const lock = `${backlog}.lock`;
+  const lockStat = fs.lstatSync(lock);
+  if (!lockStat.isFile() || lockStat.isSymbolicLink() || lockStat.nlink !== 1) throw new Error("decision retention append lacks the effective backlog lock");
+  const suffix = `${records.map(marker).join("\n")}\n`;
+  try {
+    return originalAppendFileSync.call(fs, target, `${String(data)}${suffix}`, ...rest);
+  } catch (error) {
+    try {
+      if (restorePoint.existed) fs.truncateSync(target, restorePoint.size);
+      else fs.unlinkSync(target);
+    } catch (_) {}
+    throw error;
+  }
+};
+moduleApi.syncBuiltinESMExports();
+NODE
+  if (
+    export FM_DECISION_RETENTION_ARCHIVE=$DECISION_ARCHIVE
+    export FM_DECISION_RETENTION_BACKLOG=$DECISION_BACKLOG
+    export FM_DECISION_RETENTION_OWNER=$RETENTION_OWNER_TOKEN
+    export FM_DECISION_RETENTION_SECRET=$RETENTION_OWNER_SECRET
+    export FM_DECISION_RETENTION_SCHEMA=$RETENTION_RECORD_SCHEMA
+    export NODE_OPTIONS="--require=$hook${prior_node_options:+ $prior_node_options}"
+    tasks_axi "$@"
+  ); then
+    rc=0
+  else
+    rc=$?
   fi
-  tmp=$(umask 077; mktemp "$dir/.retention-binding.XXXXXX") \
-    || fail "could not stage decision retention binding for $origin/$key"
-  if ! retention_binding_content "$id" "$origin" "$key" "$RETENTION_OWNER_MARKER" > "$tmp" \
-    || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$binding"; then
-    rm -f -- "$tmp"
-    fail "could not persist decision retention binding for $origin/$key"
+  if [ "$rc" -eq 0 ] && { [ -e "$DECISION_ARCHIVE" ] || [ -L "$DECISION_ARCHIVE" ]; }; then
+    require_safe_decision_archive "$DECISION_ARCHIVE"
   fi
-  fm_lock_release "$DECISION_RETENTION_LOCK"
-  DECISION_RETENTION_LOCK_HELD=0
-  retention_binding_valid "$id" "$origin" "$key" \
-    || fail "could not validate decision retention binding for $origin/$key"
+  rm -rf -- "$hook_dir"
+  DECISION_RETENTION_HOOK=''
+  DECISION_RETENTION_HOOK_DIR=''
+  return "$rc"
 }
 
 COMPLETION_INVENTORY_DIR=''
@@ -1507,7 +1557,7 @@ archived_header_has_captain_provenance() {  # <header> <hold-id>
 ARCHIVED_HOLD_BODY=''
 
 prepare_decision_archive_cache() {
-  local archive=$1 id=$2 dir rc note=$DECISION_NOTE_ARCHIVE links
+  local archive=$1 id=$2 dir rc owner='' secret=''
   if [ -n "$DECISION_ARCHIVE_CACHE_DIR" ] \
     && [ "$DECISION_ARCHIVE_CACHE_PATH" = "$archive" ]; then
     return 0
@@ -1518,26 +1568,26 @@ prepare_decision_archive_cache() {
   fi
   DECISION_ARCHIVE_CACHE_DIR=''
   DECISION_ARCHIVE_CACHE_PATH=''
-  if [ -e "$note" ] || [ -L "$note" ]; then
-    [ -f "$note" ] && [ ! -L "$note" ] && [ -r "$note" ] \
-      || fail "tasks-axi note archive is not an ordinary readable file: $note"
-    links=$(file_link_count "$note") \
-      || fail "could not inspect tasks-axi note archive link count: $note"
-    [ "$links" = 1 ] || fail "tasks-axi note archive is hardlinked: $note"
-  else
-    note=''
+  if retention_provenance_dir 0 && retention_owner_load "$RETENTION_PROVENANCE_DIR"; then
+    owner=$RETENTION_OWNER_TOKEN
+    secret=$RETENTION_OWNER_SECRET
   fi
   dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-decision-archive.XXXXXX") \
     || fail "could not stage decision archive index"
   DECISION_ARCHIVE_CACHE_DIR=$dir
-  if node - "$archive" "$note" "$dir" <<'NODE'
+  if node - "$archive" "$dir" "$owner" "$secret" "$DECISION_BACKLOG" \
+    "$DECISION_ARCHIVE" "$RETENTION_RECORD_SCHEMA" <<'NODE'
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
 const archive = process.argv[2];
-const noteArchive = process.argv[3];
-const directory = process.argv[4];
+const directory = process.argv[3];
+const owner = process.argv[4];
+const secret = process.argv[5];
+const backlog = process.argv[6];
+const configuredArchive = process.argv[7];
+const schema = process.argv[8];
 
 function read(source) {
   try {
@@ -1551,20 +1601,21 @@ function parse(text) {
   const lines = text.split("\n");
   if (text.endsWith("\n")) lines.pop();
   const records = [];
+  const markers = [];
   let archived = false;
   let entry = false;
   let current = null;
 
   function finish() {
     if (!current) return;
-    while (current.body.length && current.body[current.body.length - 1] === "") {
-      current.body.pop();
-    }
+    while (current.body.length && current.body[current.body.length - 1] === "") current.body.pop();
     const match = /^- \[x\] ([^ ]+) - /.exec(current.header);
     if (match && match[1].includes("-decision-")) {
+      const text = `${current.header}\n${current.body.join("\n")}`;
       records.push({
         id: match[1],
-        text: `${current.header}\n${current.body.join("\n")}`,
+        text,
+        digest: crypto.createHash("sha256").update(text).digest("hex"),
       });
     }
     current = null;
@@ -1589,6 +1640,14 @@ function parse(text) {
       if (archived) current = { header: line, body: [] };
       continue;
     }
+    if (line.startsWith("<!-- fm-decision-retention:")) {
+      finish();
+      const match = /^<!-- fm-decision-retention:v1 owner=([0-9a-f]{64}) id=([A-Za-z0-9._-]+) record=([0-9a-f]{64}) mac=([0-9a-f]{64}) -->$/.exec(line);
+      if (!archived || !match) throw new Error("malformed retention marker");
+      markers.push({ owner: match[1], id: match[2], digest: match[3], mac: match[4] });
+      entry = false;
+      continue;
+    }
     if (current) {
       if (line === "") {
         current.body.push("");
@@ -1604,31 +1663,41 @@ function parse(text) {
     if (archived && line !== "") throw new Error("malformed archive");
   }
   finish();
-  return records;
+  return { records, markers };
 }
 
-let records;
-let notes;
+let parsed;
 try {
-  records = parse(read(archive));
-  notes = noteArchive === "" ? [] : parse(read(noteArchive));
+  parsed = parse(read(archive));
 } catch (_) {
   process.exit(3);
 }
-const noteRecords = new Set(notes.map((record) => record.text));
-for (const current of records) {
+const byRecord = new Map();
+for (const current of parsed.records) byRecord.set(`${current.id}\0${current.digest}`, current);
+const proven = new Map();
+for (const marker of parsed.markers) {
+  if (marker.owner !== owner) continue;
+  const current = byRecord.get(`${marker.id}\0${marker.digest}`);
+  if (!current || secret === "") process.exit(3);
+  const payload = `${schema}\n${owner}\n${backlog}\n${configuredArchive}\n${marker.id}\n${marker.digest}`;
+  const expected = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  if (marker.mac !== expected) process.exit(3);
+  const key = `${marker.id}\0${marker.digest}`;
+  proven.set(key, (proven.get(key) ?? 0) + 1);
+}
+for (const current of parsed.records) {
   const token = crypto.createHash("sha256").update(current.id).digest("hex");
   const record = path.join(directory, `${token}.record`);
   const duplicate = path.join(directory, `${token}.duplicate`);
-  const artifact = path.join(directory, `${token}.artifact`);
+  const provenance = path.join(directory, `${token}.provenance`);
   if (fs.existsSync(record)) {
     fs.writeFileSync(duplicate, "", { mode: 0o600 });
   } else {
     fs.writeFileSync(record, current.text, { flag: "wx", mode: 0o600 });
   }
-  if (noteRecords.has(current.text)) {
-    fs.writeFileSync(artifact, "", { mode: 0o600 });
-  }
+  const count = proven.get(`${current.id}\0${current.digest}`) ?? 0;
+  if (count > 1) process.exit(3);
+  if (count === 1) fs.writeFileSync(provenance, current.digest, { flag: "wx", mode: 0o600 });
 }
 NODE
   then
@@ -1645,93 +1714,37 @@ NODE
 }
 
 archived_hold_body() {  # <hold-id>
-  local id=$1 archive links record rc header='' body='' line body_started=0 token duplicate artifact
+  local id=$1 archive links record provenance header='' body='' token duplicate
   ARCHIVED_HOLD_BODY=''
   authoritative_archive_path
   archive=$DECISION_ARCHIVE
   [ -e "$archive" ] || [ -L "$archive" ] || return 1
   require_safe_decision_archive "$archive"
-
-  if [ "$DECISION_ARCHIVE_CACHE_ENABLED" = 1 ]; then
-    prepare_decision_archive_cache "$archive" "$id"
-    token=$(sha256_text "$id")
-    record="$DECISION_ARCHIVE_CACHE_DIR/$token.record"
-    duplicate="$DECISION_ARCHIVE_CACHE_DIR/$token.duplicate"
-    artifact="$DECISION_ARCHIVE_CACHE_DIR/$token.artifact"
-    [ ! -e "$duplicate" ] \
-      || fail "captain decision $id has duplicate archived records"
-    [ -e "$record" ] || return 1
-    [ ! -e "$artifact" ] \
-      || fail "captain decision $id also exists in the tasks-axi note archive and does not prove Done retention"
-    [ -f "$record" ] && [ ! -L "$record" ] \
-      || fail "captain decision $id has an unsafe archived index record"
-    links=$(file_link_count "$record") \
-      || fail "could not inspect captain decision $id archived index record"
-    [ "$links" = 1 ] \
-      || fail "captain decision $id has a hardlinked archived index record"
-    IFS= read -r header < "$record" \
-      || fail "captain decision $id has a malformed archived record"
-    body=$(tail -n +2 "$record") \
-      || fail "captain decision $id has a malformed archived record"
-  elif record=$(LC_ALL=C awk -v id="$id" '
-    BEGIN { prefix = "- [x] " id " - "; found = 0; capture = 0; entry = 0; archived = 0; bad = 0 }
-    /^## Archived [0-9]{4}-[0-9]{2}-[0-9]{2}$/ {
-      capture = 0
-      entry = 0
-      archived = 1
-      next
-    }
-    /^## / {
-      capture = 0
-      entry = 0
-      archived = 0
-      next
-    }
-    /^- \[[ x]\] / {
-      capture = 0
-      entry = archived
-      if (archived && index($0, prefix) == 1) {
-        found++
-        if (found > 1) exit 2
-        print "H" $0
-        capture = 1
-      }
-      next
-    }
-    capture {
-      if ($0 == "") { print "B"; next }
-      if (substr($0, 1, 2) != "  ") { bad = 1; exit }
-      print "B" substr($0, 3)
-      next
-    }
-    archived && entry && substr($0, 1, 2) == "  " { next }
-    archived && $0 != "" { bad = 1; exit }
-    END {
-      if (bad) exit 3
-      if (found == 0) exit 1
-    }
-  ' "$archive"); then
-    while IFS= read -r line; do
-      case "$line" in
-        H*) header=${line#H} ;;
-        B*)
-          [ "$body_started" -eq 0 ] || body="${body}"$'\n'
-          body="${body}${line#B}"
-          body_started=1
-          ;;
-        *) fail "captain decision $id has a malformed archived record" ;;
-      esac
-    done <<EOF
-$record
-EOF
-  else
-    rc=$?
-    case "$rc" in
-      1) return 1 ;;
-      2) fail "captain decision $id has duplicate archived records" ;;
-      *) fail "captain decision $id has a malformed archived record" ;;
-    esac
-  fi
+  [ "$DECISION_ARCHIVE_CACHE_ENABLED" = 1 ] \
+    || fail "decision archive provenance index is disabled"
+  prepare_decision_archive_cache "$archive" "$id"
+  token=$(sha256_text "$id")
+  record="$DECISION_ARCHIVE_CACHE_DIR/$token.record"
+  duplicate="$DECISION_ARCHIVE_CACHE_DIR/$token.duplicate"
+  provenance="$DECISION_ARCHIVE_CACHE_DIR/$token.provenance"
+  [ ! -e "$duplicate" ] \
+    || fail "captain decision $id has duplicate archived records"
+  [ -e "$record" ] || return 1
+  [ -f "$provenance" ] && [ ! -L "$provenance" ] \
+    || fail "captain decision $id lacks provenance from its configured Done retention transition"
+  links=$(file_link_count "$provenance") \
+    || fail "could not inspect captain decision $id archived provenance"
+  [ "$links" = 1 ] || fail "captain decision $id has hardlinked archived provenance"
+  [ -f "$record" ] && [ ! -L "$record" ] \
+    || fail "captain decision $id has an unsafe archived index record"
+  links=$(file_link_count "$record") \
+    || fail "could not inspect captain decision $id archived index record"
+  [ "$links" = 1 ] \
+    || fail "captain decision $id has a hardlinked archived index record"
+  IFS= read -r header < "$record" \
+    || fail "captain decision $id has a malformed archived record"
+  body=$(tail -n +2 "$record") \
+    || fail "captain decision $id has a malformed archived record"
   while [ "${body%$'\n'}" != "$body" ]; do body=${body%$'\n'}; done
   archived_header_has_captain_provenance "$header" "$id" \
     || fail "captain decision $id has mismatched archived captain-hold provenance"
@@ -1743,14 +1756,6 @@ archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   archived_hold_body "$id" || return 1
   resolution_record_valid "$ARCHIVED_HOLD_BODY" "$origin" "$key" \
     || fail "captain decision $id has a malformed or mismatched archived resolution"
-  if retention_binding_valid "$id" "$origin" "$key"; then
-    return 0
-  fi
-  if [ -z "$RESOLUTION_ORIGIN" ] && [ -z "$RESOLUTION_KEY" ]; then
-    persist_retention_binding "$id" "$origin" "$key"
-    return 0
-  fi
-  fail "captain decision $id lacks provenance from its configured Done retention owner"
 }
 
 reject_archived_generation_collision() {  # <hold-id>
@@ -1828,7 +1833,7 @@ verify_hold_active() {  # <hold-id> <origin-id> <decision-key>
   queued_hold_body_valid "$body" "$origin" "$key" \
     || fail "captain hold $id has malformed or mismatched active provenance"
   reject_archived_generation_collision "$id"
-  persist_retention_binding "$id" "$origin" "$key"
+  ensure_retention_owner
 }
 
 verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
@@ -1843,7 +1848,7 @@ verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   [ "$hold_kind" = captain ] || return 1
   body_has_resolution_record "$body" "$origin" "$key" || return 1
   reject_archived_generation_collision "$id"
-  persist_retention_binding "$id" "$origin" "$key"
+  ensure_retention_owner
 }
 
 verify_hold_historical() {  # <origin-id> <decision-key>
@@ -1858,7 +1863,7 @@ verify_hold_historical() {  # <origin-id> <decision-key>
     if [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
       && body_has_resolution_record "$body" "$origin" "$key"; then
       reject_archived_generation_collision "$id"
-      persist_retention_binding "$id" "$origin" "$key"
+      ensure_retention_owner
       persist_parsed_legacy_resolution "$id" "$origin" "$key"
       return 0
     fi
@@ -1892,7 +1897,7 @@ verify_hold_durable() {  # <origin-id> <decision-key>
     queued_hold_body_valid "$body" "$origin" "$key" \
       || fail "captain decision $id has malformed or mismatched active provenance"
     reject_archived_generation_collision "$id"
-    persist_retention_binding "$id" "$origin" "$key"
+    ensure_retention_owner
     if resolution_record_valid "$body" "$origin" "$key"; then
       persist_parsed_legacy_resolution "$id" "$origin" "$key"
     fi
@@ -1901,7 +1906,7 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   if [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
     && body_has_resolution_record "$body" "$origin" "$key"; then
     reject_archived_generation_collision "$id"
-    persist_retention_binding "$id" "$origin" "$key"
+    ensure_retention_owner
     persist_parsed_legacy_resolution "$id" "$origin" "$key"
     return 0
   fi
@@ -1933,14 +1938,14 @@ classify_legacy_source_generations() {  # <origin-id> <comma-keys>
       queued_hold_body_valid "$body" "$origin" "$key" \
         || fail "captain decision $id has malformed or mismatched active provenance"
       reject_archived_generation_collision "$id"
-      persist_retention_binding "$id" "$origin" "$key"
+      ensure_retention_owner
       if resolution_record_valid "$body" "$origin" "$key"; then
         persist_parsed_legacy_resolution "$id" "$origin" "$key"
       fi
     elif [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
       && body_has_resolution_record "$body" "$origin" "$key"; then
       reject_archived_generation_collision "$id"
-      persist_retention_binding "$id" "$origin" "$key"
+      ensure_retention_owner
       persist_parsed_legacy_resolution "$id" "$origin" "$key"
     else
       fail "captain decision $id is not a source-verifiable active or retained Done generation"
@@ -2027,7 +2032,7 @@ command_migrate_legacy() {
     fail "captain decision $id has ambiguous legacy ownership and requires an independent --identity-file authorization"
   fi
   persist_legacy_resolution_attestation "$id" "$origin" "$key" "$RESOLUTION_RECORD_DIGEST"
-  persist_retention_binding "$id" "$origin" "$key"
+  ensure_retention_owner
   if [ "$has_meta" = 1 ]; then
     fm_lock_release "$DECISION_META_LOCK"
     DECISION_META_LOCK_HELD=0
@@ -2544,7 +2549,8 @@ command_resolve() {
         || fail "could not route the recorded decision to $dep"
     fi
   done
-  tasks_axi "done" "$id" >/dev/null || fail "could not close resolved captain hold $id"
+  tasks_axi_with_retention_provenance "done" "$id" >/dev/null \
+    || fail "could not close resolved captain hold $id"
   verify_hold_resolved "$id" "$origin" "$key" || fail "captain hold $id did not retain its durable resolution record"
   printf 'resolved: %s -> %s\n' "$id" "$routed"
 }
@@ -2599,7 +2605,8 @@ close_unrouted_hold() {  # <mode> <outcome-word> <origin-id> <decision-key> <fla
   body=$(resolution_body "$origin" "$key" "$mode" "$ROUTED_NONE")
   tasks_axi update "$id" --body "$body" >/dev/null \
     || fail "could not record the captain decision on $id"
-  tasks_axi "done" "$id" >/dev/null || fail "could not close $mode captain hold $id"
+  tasks_axi_with_retention_provenance "done" "$id" >/dev/null \
+    || fail "could not close $mode captain hold $id"
   verify_hold_resolved "$id" "$origin" "$key" || fail "captain hold $id did not retain its durable resolution record"
   printf '%s: %s\n' "$outcome" "$id"
 }
@@ -2734,6 +2741,28 @@ command_decline() {
   close_unrouted_hold declined declined "$@"
 }
 
+command_retention_tasks_axi() {
+  local arg
+  [ "$#" -ge 1 ] || { usage >&2; exit 2; }
+  for arg in "$@"; do
+    case "$arg" in
+      --file|--file=*|--backend|--backend=*) fail "retention commands use the active home's configured tasks-axi backlog" ;;
+    esac
+  done
+  require_tasks_axi
+  tasks_axi_with_retention_provenance "$@"
+}
+
+command_task_done() {
+  [ "$#" -ge 1 ] || { usage >&2; exit 2; }
+  command_retention_tasks_axi "done" "$@"
+}
+
+command_retention_prune() {
+  [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+  command_retention_tasks_axi prune --state done
+}
+
 command_repair() {
   local origin=${1:-} key=${2:-} decision_file id body show state kind hold_kind hold_body
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
@@ -2788,6 +2817,9 @@ case "${1:-}" in
   decline) shift; command_decline "$@" ;;
   repair) shift; command_repair "$@" ;;
   migrate-legacy) shift; command_migrate_legacy "$@" ;;
+  task-done) shift; command_task_done "$@" ;;
+  retention-prune) shift; command_retention_prune "$@" ;;
+  tasks-axi) shift; command_retention_tasks_axi "$@" ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

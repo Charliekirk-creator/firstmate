@@ -441,8 +441,13 @@ test_pruned_resolved_history_does_not_block_later_review() {
   for n in $(seq 1 12); do
     tasks_in "$home" add "sample-filler-$n" "Sample filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create retention filler $n"
-    tasks_in "$home" "done" "sample-filler-$n" >/dev/null \
-      || fail "could not complete retention filler $n"
+    if [ "$n" -eq 12 ]; then
+      run_decisions "$home" task-done "sample-filler-$n" >/dev/null \
+        || fail "could not complete retention filler $n through the public retention boundary"
+    else
+      tasks_in "$home" "done" "sample-filler-$n" --no-prune >/dev/null \
+        || fail "could not retain filler $n before the retention transition"
+    fi
   done
   assert_no_grep "- [x] $old_a -" "$home/data/backlog.md" \
     "old-a unexpectedly remained in the retained Done window"
@@ -588,9 +593,11 @@ test_legacy_completion_inventory_requires_explicit_provenance() {
     tasks_in "$home" add "generation-filler-$n" "Generation filler $n" \
       --kind ship --repo sample >/dev/null \
       || fail "could not create generation filler $n"
-    tasks_in "$home" "done" "generation-filler-$n" >/dev/null \
-      || fail "could not complete generation filler $n"
+    tasks_in "$home" "done" "generation-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain generation filler $n before pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune the historical generation through the public retention boundary"
   assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
     "historical generation was not pruned through normal retention"
 
@@ -1019,9 +1026,11 @@ test_legacy_migration_rejects_missing_conflicting_or_foreign_owners() {
   for n in $(seq 1 10); do
     tasks_in "$home" add "ambiguous-filler-$n" "Ambiguous filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create ambiguous filler $n"
-    tasks_in "$home" "done" "ambiguous-filler-$n" >/dev/null \
-      || fail "could not complete ambiguous filler $n"
+    tasks_in "$home" "done" "ambiguous-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain ambiguous filler $n before pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune ambiguous history through the public retention boundary"
   assert_grep "- [x] $collision -" "$home/data/done-archive.md" \
     "ambiguous legacy record was not pruned normally"
   if run_decisions "$home" complete "$victim" --none --resolved later \
@@ -1210,9 +1219,11 @@ test_legacy_identity_compatibility_is_bounded_and_authorized() {
     tasks_in "$home" add "authorized-legacy-filler-$n" "Authorized legacy filler $n" \
       --kind ship --repo sample >/dev/null \
       || fail "could not create authorized legacy filler $n"
-    tasks_in "$home" "done" "authorized-legacy-filler-$n" >/dev/null \
-      || fail "could not complete authorized legacy filler $n"
+    tasks_in "$home" "done" "authorized-legacy-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain authorized legacy filler $n before pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune authorized legacy history through the public retention boundary"
   assert_absent "$home/state/$origin.meta" \
     "post-teardown legacy migration unexpectedly retained origin metadata"
   assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
@@ -1319,9 +1330,11 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     tasks_in "$home" add "nonarchive-filler-$n" "Nonarchive filler $n" \
       --kind ship --repo sample >/dev/null \
       || fail "could not create nonarchive filler $n"
-    tasks_in "$home" "done" "nonarchive-filler-$n" >/dev/null \
-      || fail "could not complete nonarchive filler $n"
+    tasks_in "$home" "done" "nonarchive-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain nonarchive filler $n before pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune the canonical fixture through the public retention boundary"
   archive="$home/data/done-archive.md"
   assert_no_grep "- [x] $hold -" "$home/data/backlog.md" \
     "nonarchive fixture did not leave the bounded Done window"
@@ -1341,8 +1354,8 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     > "$home/nonarchive.out" 2> "$home/nonarchive.err"; then
     fail "a resolution-shaped row outside a canonical archive section proved history"
   fi
-  assert_grep "not durably resolved in its archive" "$home/nonarchive.err" \
-    "nonarchive row did not fail as absent retained history"
+  assert_grep "malformed archived record" "$home/nonarchive.err" \
+    "nonarchive row and its transition marker did not fail outside canonical retention"
 
   cp "$archive.canonical" "$archive" \
     || fail "could not restore the canonical retention archive"
@@ -1366,6 +1379,11 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   home=$(make_home note-archive-history-row)
   origin=sample-note-archive-review
   key=old-answer
+  awk '
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/copied-history.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure the copied-history retention owner"
   tasks_in "$home" add "$origin" "Review note archive history" \
     --kind scout --repo sample --start >/dev/null \
     || fail "could not create note-archive origin"
@@ -1393,7 +1411,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     note_alias_created=1
   fi
   awk '
-    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/NOTE-ARCHIVE.md\""; next }
+    $0 == "archive = \"data/copied-history.md\"" { print "archive = \"data/NOTE-ARCHIVE.md\""; next }
     { print }
   ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
     || fail "could not reproduce a physical note archive alias configured as Done retention"
@@ -1405,19 +1423,25 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     "the configured note archive alias did not fail its retention boundary"
   [ "$note_alias_created" -eq 0 ] || rm -f "$note_alias"
 
-  cp "$home/data/note-archive.md" "$home/data/copied-history.md" \
-    || fail "could not copy the note snapshot into a configured history artifact"
   awk '
     $0 == "archive = \"data/NOTE-ARCHIVE.md\"" { print "archive = \"data/copied-history.md\""; next }
     { print }
   ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
-    || fail "could not configure the copied note snapshot as Done history"
+    || fail "could not restore the copied-history retention owner"
+  cp "$home/data/note-archive.md" "$home/data/copied-history.md" \
+    || fail "could not copy the note snapshot into a configured history artifact"
+  awk -v id="$hold" '
+    index($0, "- [x] " id " - ") == 1 { sub(" - ", " - Edited copied title ") }
+    { print }
+  ' "$home/data/copied-history.md" > "$home/data/copied-history.md.tmp" \
+    && mv "$home/data/copied-history.md.tmp" "$home/data/copied-history.md" \
+    || fail "could not edit the copied history title counterfactual"
   if run_decisions "$home" complete "$origin" --none --resolved "$key" \
     > "$home/copied-note.out" 2> "$home/copied-note.err"; then
-    fail "a copied note snapshot substituted for configured Done retention"
+    fail "an edited copied note snapshot substituted for configured Done retention"
   fi
-  assert_grep "also exists in the tasks-axi note archive" "$home/copied-note.err" \
-    "copied note history did not retain its artifact provenance"
+  assert_grep "lacks provenance from its configured Done retention transition" "$home/copied-note.err" \
+    "copied note history was not rejected at the retention transition boundary"
   pass "only canonical retention sections and owned archives prove historical decisions"
 }
 
@@ -1538,9 +1562,11 @@ test_pruned_history_fallback_rejects_unproven_decisions() {
   for n in $(seq 1 10); do
     tasks_in "$home" add "malformed-filler-$n" "Malformed filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create malformed filler $n"
-    tasks_in "$home" "done" "malformed-filler-$n" >/dev/null \
-      || fail "could not complete malformed filler $n"
+    tasks_in "$home" "done" "malformed-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain malformed filler $n before pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune malformed history through the public retention boundary"
   assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
     "malformed record was not pruned into the archive"
   if run_decisions "$home" verify "$id" > "$home/malformed.out" 2> "$home/malformed.err"; then
@@ -1711,9 +1737,11 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   for n in $(seq 1 12); do
     tasks_in "$home" add "exact-proof-filler-$n" "Exact proof filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create exact-proof filler $n"
-    tasks_in "$home" "done" "exact-proof-filler-$n" >/dev/null \
-      || fail "could not complete exact-proof filler $n"
+    tasks_in "$home" "done" "exact-proof-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain exact-proof filler $n before pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune exact history through the public retention boundary"
   assert_grep "- [x] $collision -" "$home/data/done-archive.md" \
     "collision record was not pruned into historical proof"
   assert_grep "- [x] $spoof -" "$home/data/done-archive.md" \
@@ -1739,8 +1767,8 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
     > "$home/empty-hold-spoof.out" 2> "$home/empty-hold-spoof.err"; then
     fail "an empty hold token forged archived captain-hold provenance"
   fi
-  assert_grep "mismatched archived captain-hold provenance" "$home/empty-hold-spoof.err" \
-    "empty archived hold provenance did not fail as malformed"
+  assert_grep "malformed archived record" "$home/empty-hold-spoof.err" \
+    "post-retention title edits did not invalidate transition provenance"
 
   foreign=$(make_home foreign-history-proof)
   write_origin_meta "$foreign" "$source"
@@ -1789,9 +1817,11 @@ test_retained_history_rejects_unsafe_state_and_status() {
     tasks_in "$home" add "state-safety-filler-$n" "State safety filler $n" \
       --kind ship --repo sample >/dev/null \
       || fail "could not create state-safety filler $n"
-    tasks_in "$home" "done" "state-safety-filler-$n" >/dev/null \
-      || fail "could not complete state-safety filler $n"
+    tasks_in "$home" "done" "state-safety-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain state-safety filler $n before pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune state-safety history through the public retention boundary"
   assert_no_grep "- [x] $hold -" "$home/data/backlog.md" \
     "state-safety decision remained in the retained Done window"
   assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
@@ -2021,18 +2051,30 @@ test_effective_root_backlog_retention_remains_supported() {
   run_decisions "$home" answer "$origin" "$key" \
     --decision-file "$home/root-answer.txt" >/dev/null \
     || fail "effective root backlog could not resolve its decision"
+  awk '
+    $0 == "archive = \"done-archive.md\"" { print "archive = \"history/root-done.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not migrate the effective root retention archive"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "retained Done proof could not migrate to a new contained retention owner"
   for n in $(seq 1 10); do
     tasks_in "$home" add "root-filler-$n" "Root filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create root-backlog filler $n"
-    tasks_in "$home" done "root-filler-$n" >/dev/null \
-      || fail "could not complete root-backlog filler $n"
+    tasks_in "$home" done "root-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain root-backlog filler $n before explicit pruning"
   done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune through the provenance-bound public retention interface"
   assert_no_grep "- [x] $hold -" "$home/backlog.md" \
     "effective root backlog retained the pruned decision"
-  assert_grep "- [x] $hold -" "$home/done-archive.md" \
-    "effective root backlog did not use its configured retention owner"
+  assert_grep "- [x] $hold -" "$home/history/root-done.md" \
+    "effective root backlog did not use its migrated configured retention owner"
   run_decisions "$home" verify "$origin" >/dev/null \
     || fail "effective root backlog could not verify normally pruned history"
+  assert_absent "$home/done-archive.md" \
+    "path migration wrote decision history to the prior retention owner"
   assert_absent "$home/data/done-archive.md" \
     "root-backlog retention leaked into FM_DATA_OVERRIDE"
   pass "effective contained backlog paths own their derived retention archives"
