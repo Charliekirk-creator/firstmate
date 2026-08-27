@@ -149,6 +149,7 @@ SH
 case "${1:-}" in
   status) printf '%s\n' "${FM_TEST_TREEHOUSE_STATUS_JSON:-[]}"; exit 0 ;;
   get)
+    [ -z "${FM_TEST_TREEHOUSE_GET_LOG:-}" ] || printf 'get\n' >> "$FM_TEST_TREEHOUSE_GET_LOG"
     if [ -n "${FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER:-}" ] \
        && [ ! -e "$FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER" ]; then
       : > "$FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER"
@@ -870,7 +871,7 @@ test_spawn_does_not_resend_inflight_worktree_request() {
 }
 
 test_zellij_resumes_unsent_worktree_request_once() {
-  local home task project wt fakebin manifest out rc=0 sends transaction digest ack
+  local home task project wt fakebin manifest out rc=0 sends gets
   home=$(make_home zellij-worktree-request)
   task=zellij-worktree-request
   project="$home/project"
@@ -898,7 +899,9 @@ case "$*" in
     ;;
   *' action list-panes --json'*)
     if [ -f "$FM_TEST_ZELLIJ_TITLE" ]; then
-      printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n'
+      path=$FM_TEST_ZELLIJ_PROJECT
+      [ ! -e "$FM_TEST_ZELLIJ_WORKTREE" ] || path=$FM_TEST_ZELLIJ_WT
+      printf '[{"id":7,"tab_id":3,"is_plugin":false,"pane_cwd":"%s"}]\n' "$path"
     else
       printf '[]\n'
     fi
@@ -915,24 +918,18 @@ case "$*" in
     ;;
   *' action paste '*)
     text=${!#}
-    if printf '%s' "$text" | grep -Eq 'treehouse get|fm-treehouse-worktree-request[.]sh' \
-       && [ ! -e "$FM_TEST_ZELLIJ_FAILED" ]; then
-      : > "$FM_TEST_ZELLIJ_FAILED"
-      exit 1
-    fi
     printf '%s' "$text" > "$FM_TEST_ZELLIJ_INPUT"
     exit 0
     ;;
   *' action send-keys '*)
     if [ "${!#}" = Enter ] && [ -f "$FM_TEST_ZELLIJ_INPUT" ]; then
       text=$(cat "$FM_TEST_ZELLIJ_INPUT")
-      if printf '%s' "$text" | grep -Eq 'treehouse get|fm-treehouse-worktree-request[.]sh'; then
-        printf 'sent\n' >> "$FM_TEST_ZELLIJ_SENDS"
-        if [ "${FM_TEST_ZELLIJ_DELAY_WORKTREE:-0}" != 1 ]; then
-          PATH="$FM_TEST_ZELLIJ_FAKEBIN:$PATH" bash -c "$text" || exit 1
-          : > "$FM_TEST_ZELLIJ_WORKTREE"
-        fi
-      fi
+      case "$text" in
+        "cd -- "*)
+          printf 'sent\n' >> "$FM_TEST_ZELLIJ_SENDS"
+          [ "${FM_TEST_ZELLIJ_DELAY_WORKTREE:-0}" = 1 ] || : > "$FM_TEST_ZELLIJ_WORKTREE"
+          ;;
+      esac
     fi
     exit 0
     ;;
@@ -946,96 +943,68 @@ case "$*" in
 esac
 exit 0
 SH
-  chmod +x "$fakebin/zellij"
-
-  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
-    FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
-    FM_TEST_ZELLIJ_FAILED="$home/zellij-send-failed" \
-    FM_TEST_ZELLIJ_INPUT="$home/zellij-input" \
-    FM_TEST_ZELLIJ_SENDS="$home/zellij-sends" \
-    FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
-    FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
-    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" PATH="$fakebin:$PATH" \
-    "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
-      --harness codex --backend zellij 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "zellij unsent-request fixture unexpectedly completed"
-  jq -e '.phase == "worktree-unsent" and .worktree == null' \
-    "$home/state/$task.spawn-endpoint.json" >/dev/null \
-    || fail "zellij failed send did not preserve a definitely-unsent request: $out"
-  jq -S -c '.phase = "worktree-requesting"' "$home/state/$task.spawn-endpoint.json" \
-    > "$home/state/$task.spawn-endpoint.next"
-  mv "$home/state/$task.spawn-endpoint.next" "$home/state/$task.spawn-endpoint.json"
-  transaction=$(jq -r '.transaction_id' "$home/state/$task.spawn-endpoint.json")
-  if command -v shasum >/dev/null 2>&1; then
-    digest=$(printf '%s' "$transaction" | shasum -a 256 | awk '{print $1}')
-  else
-    digest=$(printf '%s' "$transaction" | sha256sum | awk '{print $1}')
-  fi
-  ack="$home/state/.$task.worktree-request.$digest.send"
-  mkdir -m 700 "$ack"
+  cat > "$fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  */result)
+    if [ ! -e "$FM_TEST_RESULT_PUBLISH_KILLED" ]; then
+      : > "$FM_TEST_RESULT_PUBLISH_KILLED"
+      kill -KILL "$PPID"
+      sleep 1
+      exit 99
+    fi
+    ;;
+esac
+exec "$REAL_MV_FOR_TEST" "$@"
+SH
+  chmod +x "$fakebin/zellij" "$fakebin/mv"
   export FM_TEST_ZELLIJ_PROBES="$home/zellij-probes"
 
-  rc=0
-  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
+  out=$(REAL_MV_FOR_TEST="$(command -v mv)" \
+    FM_TEST_RESULT_PUBLISH_KILLED="$home/result-publish-killed" \
+    FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
     FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
-    FM_TEST_ZELLIJ_FAILED="$home/zellij-send-failed" \
     FM_TEST_ZELLIJ_INPUT="$home/zellij-input" \
     FM_TEST_ZELLIJ_SENDS="$home/zellij-sends" \
     FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
     FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
-    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" FM_TEST_ZELLIJ_DELAY_WORKTREE=1 \
+    FM_TEST_ZELLIJ_DELAY_WORKTREE=1 FM_TEST_TREEHOUSE_GET_LOG="$home/treehouse-gets" \
     FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
     "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
       --harness codex --backend zellij 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "delayed zellij request unexpectedly completed"
-  jq -e '.phase == "worktree-requested" and .worktree == null' \
+  [ "$rc" -ne 0 ] || fail "delayed zellij worktree transition unexpectedly completed"
+  assert_present "$home/result-publish-killed" \
+    "treehouse result publication interruption was not exercised"
+  jq -e --arg path "$wt" '.phase == "worktree-acquired" and .worktree == $path' \
     "$home/state/$task.spawn-endpoint.json" >/dev/null \
-    || fail "accepted zellij request was not recorded as in flight: $out"
+    || fail "zellij did not preserve its exact locally acquired worktree: $out"
+  assert_absent "$home/zellij-probes" \
+    "zellij worktree recovery injected an active cwd probe"
 
   rc=0
-  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
+  out=$(REAL_MV_FOR_TEST="$(command -v mv)" \
+    FM_TEST_RESULT_PUBLISH_KILLED="$home/result-publish-killed" \
+    FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
     FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
-    FM_TEST_ZELLIJ_FAILED="$home/zellij-send-failed" \
     FM_TEST_ZELLIJ_INPUT="$home/zellij-input" \
     FM_TEST_ZELLIJ_SENDS="$home/zellij-sends" \
     FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
     FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
-    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" FM_TEST_ZELLIJ_DELAY_WORKTREE=1 \
+    FM_TEST_TREEHOUSE_GET_LOG="$home/treehouse-gets" \
     FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
     "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
       --harness codex --backend zellij 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "in-flight zellij retry unexpectedly completed"
+  [ "$rc" -eq 0 ] || fail "zellij did not resume its exact acquired worktree: $out"
   sends=$(wc -l < "$home/zellij-sends" | tr -d ' ')
-  [ "$sends" = 1 ] || fail "zellij resent an accepted worktree request: $out"
-  assert_absent "$home/zellij-probes" \
-    "zellij recovery injected a cwd probe into an accepted worktree request"
-
-  PATH="$fakebin:$PATH" FM_TEST_ZELLIJ_WT="$wt" \
-    FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER="$home/treehouse-no-resource" \
-    bash -c "$(cat "$home/zellij-input")" \
-    || fail "could not publish the proven no-resource zellij result"
-  jq -e '.status == "retryable" and .leases == []' \
-    "$home/state/.$task.worktree-request.$digest/result" >/dev/null \
-    || fail "failed treehouse request did not publish no-resource evidence"
-  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_SPAWN_NO_GUARD=1 \
-    FM_TEST_ZELLIJ_TITLE="$home/zellij-title" \
-    FM_TEST_ZELLIJ_FAILED="$home/zellij-send-failed" \
-    FM_TEST_ZELLIJ_INPUT="$home/zellij-input" \
-    FM_TEST_ZELLIJ_SENDS="$home/zellij-sends" \
-    FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
-    FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
-    FM_TEST_ZELLIJ_FAKEBIN="$fakebin" \
-    FM_TEST_TREEHOUSE_NO_RESOURCE_MARKER="$home/treehouse-no-resource" \
-    FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
-    "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
-      --harness codex --backend zellij 2>&1) \
-    || fail "zellij did not retry its proven no-resource worktree request: $out"
-  sends=$(wc -l < "$home/zellij-sends" | tr -d ' ')
-  [ "$sends" = 2 ] || fail "zellij recovery executed $sends worktree requests"
+  gets=$(wc -l < "$home/treehouse-gets" | tr -d ' ')
+  [ "$sends" = 2 ] || fail "zellij worktree transition was not idempotently retried: $out"
+  [ "$gets" = 1 ] || fail "zellij recovery allocated $gets worktrees instead of one: $out"
   assert_contains "$out" "spawned $task" \
-    "zellij worktree request recovery did not complete spawn"
+    "zellij exact worktree recovery did not complete spawn"
   unset FM_TEST_ZELLIJ_PROBES
-  pass "zellij distinguishes unsent and accepted worktree requests"
+  pass "zellij recovers exact local worktree acquisition without duplicate allocation"
 }
 
 test_treehouse_request_reconciles_exact_failed_lease() {

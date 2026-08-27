@@ -760,6 +760,7 @@ SPAWN_ENDPOINT_RECEIPT=
 SPAWN_ENDPOINT_RECOVERED=0
 SPAWN_ENDPOINT_CREATING_RECOVERY=0
 SPAWN_ENDPOINT_PHASE=
+SPAWN_LAUNCH_SUBMITTED_RECOVERY=0
 SPAWN_IDENTITY_HOME=
 SPAWN_IDENTITY_HOME_ID=
 SPAWN_ORCA_OPERATION=
@@ -815,9 +816,9 @@ spawn_file_link_count() {
   fi
 }
 
-spawn_endpoint_receipt_publish() {  # <endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-retryable|worktree-ready> [worktree]
+spawn_endpoint_receipt_publish() {  # <phase> [worktree]
   local phase=$1 worktree=${2:-} details payload tmp
-  case "$phase" in endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-retryable|worktree-ready) ;; *) return 1 ;; esac
+  case "$phase" in endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-retryable|worktree-acquired|worktree-ready|launch-submitted) ;; *) return 1 ;; esac
   case "$BACKEND" in
     tmux)
       details=$(jq -n -S -c --arg session "${SES:-}" --arg window_id "${WT_TARGET:-}" \
@@ -891,7 +892,8 @@ spawn_endpoint_receipt_load() {
         and (.phase == "endpoint-creating" or .phase == "endpoint-created"
           or .phase == "worktree-unsent" or .phase == "worktree-requesting"
           or .phase == "worktree-requested" or .phase == "worktree-retryable"
-          or .phase == "worktree-ready")
+          or .phase == "worktree-acquired" or .phase == "worktree-ready"
+          or .phase == "launch-submitted")
         and .binding == {home:$home,home_id:$home_id,task_id:$task}
         and .transaction_id == $transaction and .instructions_sha256 == $instructions_sha256
         and .backend == $backend and .kind == $kind and .project == $project
@@ -907,11 +909,13 @@ spawn_endpoint_receipt_load() {
                elif $backend == "orca" then (.details | exact(["worktree_id","terminal"]))
                else false end))
         and (.worktree == null or (.worktree | type) == "string")
-        and (if .phase == "worktree-ready" then (.worktree | type) == "string" and (.worktree | length) > 0
+        and (if .phase == "worktree-ready" or .phase == "worktree-acquired" or .phase == "launch-submitted"
+             then (.worktree | type) == "string" and (.worktree | length) > 0
              elif .phase == "endpoint-creating" or .phase == "worktree-retryable" then .worktree == null
              else true end)
-        and (if .phase == "worktree-retryable" then
+        and (if .phase == "worktree-retryable" or .phase == "worktree-acquired" then
                ($backend == "zellij" or $backend == "cmux")
+             elif .phase == "launch-submitted" then $kind == "secondmate"
              else true end)
       ) | $r
     ' "$receipt" 2>/dev/null) || {
@@ -945,6 +949,11 @@ spawn_endpoint_receipt_load() {
   if [ "$BACKEND" = tmux ] || [ "$BACKEND" = herdr ]; then
     endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
     case "$SPAWN_ENDPOINT_PHASE:$endpoint_state" in
+      launch-submitted:*) SPAWN_LAUNCH_SUBMITTED_RECOVERY=1 ;;
+      worktree-ready:alive)
+        [ "$KIND" = secondmate ] || return 1
+        SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
+        ;;
       worktree-requesting:dead|worktree-requesting:ambiguous|worktree-requested:dead|worktree-requested:ambiguous) ;;
       *:dead) ;;
       *)
@@ -952,6 +961,8 @@ spawn_endpoint_receipt_load() {
         return 1
         ;;
     esac
+  elif [ "$SPAWN_ENDPOINT_PHASE" = launch-submitted ]; then
+    SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
   fi
   T=$target
   WT=$worktree
@@ -2577,6 +2588,20 @@ if [ "$RELAUNCH" -eq 0 ] \
   fi
   [ "$endpoint_receipt_rc" -eq 0 ] || exit "$endpoint_receipt_rc"
 fi
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ] \
+   && [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -eq 1 ]; then
+  commit_secondmate_work_identity || {
+    echo "error: submitted secondmate launch identity requires reconciliation for $ID" >&2
+    exit 1
+  }
+  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+    echo "error: submitted secondmate launch receipt could not be retired for $ID" >&2
+    exit 1
+  }
+  SPAWN_DISPATCH_PENDING=0
+  echo "spawned $ID harness=$HARNESS kind=secondmate mode=secondmate yolo=off window=$T worktree=$WT"
+  exit 0
+fi
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
@@ -3216,12 +3241,6 @@ if [ "$RELAUNCH" -eq 0 ] && { [ "$KIND" = secondmate ] || [ "$BACKEND" = orca ];
     exit 1
   }
 fi
-if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ]; then
-  commit_secondmate_work_identity || {
-    echo "error: secondmate endpoint is ready, but its unlinked identity could not be committed" >&2
-    exit 1
-  }
-fi
 if [ "$KIND" = secondmate ]; then
   FM_INHERITABLE_CONFIG=trace-context \
     propagate_inheritable_config "$CONFIG" "$PROJ_ABS/config" \
@@ -3250,29 +3269,24 @@ spawn_current_path() {  # <target>
     cmux) fm_backend_cmux_current_path "$1" "$W" ;;
   esac
 }
-spawn_worktree_request_send() {  # <target> <text>
+spawn_passive_current_path() {  # <target>
   case "$BACKEND" in
-    zellij) fm_backend_zellij_worktree_request_send "$1" "$2" "$WORKTREE_REQUEST_ACK" "$W" ;;
-    cmux) fm_backend_cmux_worktree_request_send "$1" "$2" "$WORKTREE_REQUEST_ACK" "$W" ;;
-    *) spawn_send_text_line "$1" "$2" ;;
+    zellij) fm_backend_zellij_passive_current_path "$1" "$W" ;;
+    cmux) fm_backend_cmux_passive_current_path "$1" "$W" ;;
+    *) spawn_current_path "$1" ;;
   esac
 }
-spawn_worktree_request_ack_state() {
-  fm_backend_worktree_request_ack_state "$WORKTREE_REQUEST_ACK"
+spawn_worktree_request_send() {  # <target> <text>
+  spawn_send_text_line "$1" "$2"
 }
-spawn_worktree_request_result_load() {
-  local result="$WORKTREE_REQUEST_MARKER/result" links bytes canonical status value
-  [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
-    if [ ! -e "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ]; then return 1; fi
-    return 3
-  }
-  if [ ! -e "$result" ] && [ ! -L "$result" ]; then return 1; fi
-  [ -f "$result" ] && [ ! -L "$result" ] || return 3
-  links=$(spawn_file_link_count "$result") || return 3
-  [ "$links" = 1 ] || return 3
+spawn_worktree_request_result_file_validate() {
+  local result=$1 links bytes canonical
+  [ -f "$result" ] && [ ! -L "$result" ] || return 1
+  links=$(spawn_file_link_count "$result") || return 1
+  [ "$links" = 1 ] || return 1
   bytes=$(LC_ALL=C wc -c < "$result" | tr -d ' ')
-  case "$bytes" in ''|*[!0-9]*) return 3 ;; esac
-  [ "$bytes" -le 16384 ] || return 3
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 16384 ] || return 1
   canonical=$(jq -e -S -c --arg holder "$lease_holder" '
     def exact($keys): (keys | sort) == ($keys | sort);
     select(type == "object"
@@ -3291,8 +3305,40 @@ spawn_worktree_request_result_load() {
            elif .status == "retryable" then .path == null and (.leases | length) == 0
            else .path == null end))
     | .
-  ' "$result" 2>/dev/null) || return 3
-  printf '%s\n' "$canonical" | cmp -s "$result" - || return 3
+  ' "$result" 2>/dev/null) || return 1
+  printf '%s\n' "$canonical" | cmp -s "$result" -
+}
+spawn_worktree_request_result_recover() {
+  local result="$WORKTREE_REQUEST_MARKER/result" candidate="$WORKTREE_REQUEST_MARKER/.result.tmp" links bytes
+  if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then return 0; fi
+  if ! spawn_worktree_request_result_file_validate "$candidate"; then
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    links=$(spawn_file_link_count "$candidate") || return 1
+    [ "$links" = 1 ] || return 1
+    bytes=$(LC_ALL=C wc -c < "$candidate" | tr -d ' ')
+    case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$bytes" -le 16384 ] || return 1
+    rm -f -- "$candidate" || return 1
+    return 0
+  fi
+  if [ ! -e "$result" ] && [ ! -L "$result" ]; then
+    mv -- "$candidate" "$result" || return 1
+    return 0
+  fi
+  spawn_worktree_request_result_file_validate "$result" || return 1
+  cmp -s "$candidate" "$result" || return 1
+  rm -f -- "$candidate"
+}
+spawn_worktree_request_result_load() {
+  local result="$WORKTREE_REQUEST_MARKER/result" canonical status value
+  [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
+    if [ ! -e "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ]; then return 1; fi
+    return 3
+  }
+  spawn_worktree_request_result_recover || return 3
+  if [ ! -e "$result" ] && [ ! -L "$result" ]; then return 1; fi
+  spawn_worktree_request_result_file_validate "$result" || return 3
+  canonical=$(cat "$result") || return 3
   status=$(printf '%s' "$canonical" | jq -r '.status') || return 3
   case "$status" in
     ok)
@@ -3304,14 +3350,66 @@ spawn_worktree_request_result_load() {
     *) return 3 ;;
   esac
 }
+spawn_worktree_request_owner_state() {
+  local owner="$WORKTREE_REQUEST_MARKER/owner" links bytes pid
+  if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then printf 'absent'; return 0; fi
+  [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
+  links=$(spawn_file_link_count "$owner") || return 1
+  [ "$links" = 1 ] || return 1
+  bytes=$(LC_ALL=C wc -c < "$owner" | tr -d ' ')
+  case "$bytes" in ''|*[!0-9]*|0) return 1 ;; esac
+  [ "$bytes" -le 32 ] || return 1
+  pid=$(tr -d '[:space:]' < "$owner")
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if kill -0 "$pid" 2>/dev/null; then printf 'live'; else printf 'dead'; fi
+}
+spawn_worktree_request_result_publish() {
+  local payload=$1 tmp="$WORKTREE_REQUEST_MARKER/.result.tmp"
+  [ ! -e "$WORKTREE_REQUEST_MARKER/result" ] && [ ! -L "$WORKTREE_REQUEST_MARKER/result" ] || return 1
+  [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
+  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
+    && mv -- "$tmp" "$WORKTREE_REQUEST_MARKER/result"
+}
+spawn_worktree_request_reconcile() {
+  local raw leases count path payload
+  raw=$(treehouse status --json 2>/dev/null) || return 3
+  leases=$(printf '%s' "$raw" | jq -e -S -c --arg holder "$lease_holder" '
+    if type != "array" then error("status is not an array") else
+      [.[] | select(.leased == true and .lease_holder == $holder
+        and (.path | type == "string" and startswith("/") and length <= 4096)
+        and (.lease_id | type == "string" and length > 0 and length <= 256))
+        | {path:.path,lease_id:.lease_id}]
+      | unique_by([.path,.lease_id])
+    end
+  ' 2>/dev/null) || return 3
+  count=$(printf '%s' "$leases" | jq -r 'length') || return 3
+  case "$count" in
+    0) return 2 ;;
+    1)
+      path=$(printf '%s' "$leases" | jq -er '.[0].path') || return 3
+      payload=$(jq -n -S -c --arg schema fm-spawn-worktree-result.v1 \
+        --arg path "$path" --arg lease_holder "$lease_holder" --argjson leases "$leases" \
+        '{schema:$schema,status:"ok",exit_status:0,path:$path,lease_holder:$lease_holder,leases:$leases}') \
+        || return 3
+      spawn_worktree_request_result_publish "$payload" || return 3
+      printf '%s' "$path"
+      ;;
+    *)
+      payload=$(jq -n -S -c --arg schema fm-spawn-worktree-result.v1 \
+        --arg lease_holder "$lease_holder" --argjson leases "$leases" \
+        '{schema:$schema,status:"ambiguous",exit_status:1,path:null,lease_holder:$lease_holder,leases:$leases}') \
+        || return 3
+      spawn_worktree_request_result_publish "$payload" || return 3
+      return 4
+      ;;
+  esac
+}
 spawn_worktree_request_cleanup() {
-  local entry links ack_state
-  ack_state=$(spawn_worktree_request_ack_state) || return 1
-  case "$ack_state" in absent|prepared|ambiguous|accepted) ;; *) return 1 ;; esac
+  local entry links
   if [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ]; then
     for entry in "$WORKTREE_REQUEST_MARKER"/* "$WORKTREE_REQUEST_MARKER"/.[!.]* "$WORKTREE_REQUEST_MARKER"/..?*; do
       [ -e "$entry" ] || [ -L "$entry" ] || continue
-      case "${entry##*/}" in result|.result.tmp) ;; *) return 1 ;; esac
+      case "${entry##*/}" in result|.result.tmp|owner|.owner.tmp) ;; *) return 1 ;; esac
       [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
       links=$(spawn_file_link_count "$entry") || return 1
       [ "$links" = 1 ] || return 1
@@ -3352,6 +3450,148 @@ spawn_send_key() {  # <target> <key>
     orca) fm_backend_orca_send_key "$1" "$2" ;;
     cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
   esac
+}
+
+spawn_session_backend_worktree_acquire() {
+  local old_request=0 owner_state result_rc reconcile_rc round=0
+  local poll_max=${FM_SPAWN_WORKTREE_POLLS:-60} poll_interval=${FM_SPAWN_WORKTREE_INTERVAL:-1}
+  local seen= cd_command
+  WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || return 1
+  WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
+  WORKTREE_REQUEST_ACK="$WORKTREE_REQUEST_MARKER.send"
+  lease_holder="firstmate-$WORKTREE_REQUEST_DIGEST"
+  case "$SPAWN_ENDPOINT_PHASE" in
+    endpoint-created)
+      if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ] \
+         || [ -e "$WORKTREE_REQUEST_ACK" ] || [ -L "$WORKTREE_REQUEST_ACK" ]; then
+        echo "error: stale worktree request evidence exists before acquisition for $ID" >&2
+        return 1
+      fi
+      spawn_endpoint_receipt_publish worktree-requesting || return 1
+      ;;
+    worktree-unsent|worktree-retryable)
+      spawn_worktree_request_cleanup || return 1
+      spawn_endpoint_receipt_publish worktree-requesting || return 1
+      ;;
+    worktree-requesting) ;;
+    worktree-requested) old_request=1 ;;
+    worktree-acquired)
+      [ -n "$WT" ] || return 1
+      ;;
+    *)
+      echo "error: endpoint receipt has no valid local worktree acquisition phase for $ID" >&2
+      return 1
+      ;;
+  esac
+  while [ -z "$WT" ] && [ "$round" -lt 2 ]; do
+    if [ ! -e "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ]; then
+      [ "$old_request" -eq 0 ] || break
+      (cd "$PROJ_ABS" && bash "$SCRIPT_DIR/fm-treehouse-worktree-request.sh" \
+        "$WORKTREE_REQUEST_MARKER" "$lease_holder") >/dev/null 2>&1 || true
+    fi
+    for _ in $(seq 1 "$poll_max"); do
+      result_rc=0
+      WT=$(spawn_worktree_request_result_load) || result_rc=$?
+      case "$result_rc" in
+        0) break ;;
+        1)
+          owner_state=$(spawn_worktree_request_owner_state) || {
+            echo "error: worktree request owner evidence is unsafe for $ID" >&2
+            return 1
+          }
+          if [ "$owner_state" = live ]; then
+            WT=
+          else
+            reconcile_rc=0
+            WT=$(spawn_worktree_request_reconcile) || reconcile_rc=$?
+            case "$reconcile_rc" in
+              0) break ;;
+              2)
+                WT=
+                if [ "$old_request" -eq 1 ]; then
+                  sleep "$poll_interval"
+                  continue
+                fi
+                spawn_worktree_request_cleanup || return 1
+                round=$((round + 1))
+                break
+                ;;
+              4)
+                echo "error: treehouse acquisition has several exact leases for $ID at $WORKTREE_REQUEST_MARKER/result" >&2
+                return 1
+                ;;
+              *)
+                echo "error: treehouse lease reconciliation is unsafe for $ID" >&2
+                return 1
+                ;;
+            esac
+          fi
+          ;;
+        2)
+          WT=
+          spawn_endpoint_receipt_publish worktree-retryable || return 1
+          spawn_worktree_request_cleanup || return 1
+          spawn_endpoint_receipt_publish worktree-requesting || return 1
+          round=$((round + 1))
+          break
+          ;;
+        4)
+          echo "error: treehouse acquisition has ambiguous exact lease evidence for $ID at $WORKTREE_REQUEST_MARKER/result" >&2
+          return 1
+          ;;
+        *)
+          echo "error: worktree request result is unsafe for $ID" >&2
+          return 1
+          ;;
+      esac
+      [ -z "$WT" ] || break
+      sleep "$poll_interval"
+    done
+    [ -z "$WT" ] || break
+    [ "$old_request" -eq 0 ] || break
+  done
+  if [ -z "$WT" ]; then
+    echo "error: treehouse acquisition remains in progress; exact lease evidence is preserved for $ID" >&2
+    return 1
+  fi
+  if [ "$SPAWN_ENDPOINT_PHASE" != worktree-acquired ]; then
+    spawn_endpoint_receipt_publish worktree-acquired "$WT" || {
+      echo "error: could not preserve the acquired worktree for $ID" >&2
+      return 1
+    }
+  fi
+  for _ in $(seq 1 10); do
+    seen=$(spawn_passive_current_path "$WT_TARGET" || true)
+    [ -z "$seen" ] || [ "$(real_path_or_raw "$seen")" != "$(real_path_or_raw "$WT")" ] || break
+    sleep 0.1
+  done
+  if [ -z "$seen" ] || [ "$(real_path_or_raw "$seen")" != "$(real_path_or_raw "$WT")" ]; then
+    spawn_send_key "$WT_TARGET" C-u || {
+      echo "error: could not clear the pending worktree transition for $ID" >&2
+      return 1
+    }
+    cd_command="cd -- $(shell_quote "$WT")"
+    spawn_send_text_line "$WT_TARGET" "$cd_command" || {
+      echo "error: could not submit the exact worktree transition for $ID" >&2
+      return 1
+    }
+    seen=
+    for _ in $(seq 1 "$poll_max"); do
+      seen=$(spawn_passive_current_path "$WT_TARGET" || true)
+      [ -z "$seen" ] || [ "$(real_path_or_raw "$seen")" != "$(real_path_or_raw "$WT")" ] || break
+      sleep "$poll_interval"
+    done
+  fi
+  if [ -z "$seen" ] || [ "$(real_path_or_raw "$seen")" != "$(real_path_or_raw "$WT")" ]; then
+    echo "error: endpoint did not enter its exact acquired worktree for $ID" >&2
+    return 1
+  fi
+  validate_spawn_worktree "treehouse get" "$T"
+  spawn_endpoint_receipt_publish worktree-ready "$WT" || return 1
+  spawn_worktree_request_cleanup || {
+    echo "error: could not retire exact worktree acquisition evidence for $ID" >&2
+    return 1
+  }
 }
 
 kimi_capture() {
@@ -3434,7 +3674,10 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     recovered_worktree=$WT
     recovered_seen=
     for _ in $(seq 1 10); do
-      recovered_seen=$(spawn_current_path "$WT_TARGET" || true)
+      case "$BACKEND" in
+        zellij|cmux) recovered_seen=$(spawn_passive_current_path "$WT_TARGET" || true) ;;
+        *) recovered_seen=$(spawn_current_path "$WT_TARGET" || true) ;;
+      esac
       [ -z "$recovered_seen" ] \
         || [ "$(real_path_or_raw "$recovered_seen")" != "$(real_path_or_raw "$recovered_worktree")" ] \
         || break
@@ -3464,25 +3707,21 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
         ;;
     esac
   else
+    case "$BACKEND" in
+      zellij|cmux)
+        spawn_session_backend_worktree_acquire || exit 1
+        ;;
+      *)
     WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || exit 1
     WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
     WORKTREE_REQUEST_ACK="$WORKTREE_REQUEST_MARKER.send"
-    case "$BACKEND" in
-      zellij|cmux)
-        lease_holder="firstmate-$WORKTREE_REQUEST_DIGEST"
-        WORKTREE_REQUEST_COMMAND=". $(shell_quote "$SCRIPT_DIR/fm-treehouse-worktree-request.sh") $(shell_quote "$WORKTREE_REQUEST_MARKER") $(shell_quote "$lease_holder")"
-        ;;
-      *)
-        WORKTREE_REQUEST_COMMAND="mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { treehouse get; rc=\$?; if [ \"\$rc\" -ne 0 ]; then rmdir $(shell_quote "$WORKTREE_REQUEST_MARKER") 2>/dev/null || true; fi; [ \"\$rc\" -eq 0 ]; }"
-        ;;
-    esac
+    WORKTREE_REQUEST_COMMAND="mkdir -m 700 -- $(shell_quote "$WORKTREE_REQUEST_MARKER") && { treehouse get; rc=\$?; if [ \"\$rc\" -ne 0 ]; then rmdir $(shell_quote "$WORKTREE_REQUEST_MARKER") 2>/dev/null || true; fi; [ \"\$rc\" -eq 0 ]; }"
     worktree_request_recovery=0
     worktree_request_send_ready=0
     worktree_request_retryable=0
     case "$SPAWN_ENDPOINT_PHASE" in
       endpoint-created)
-        if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ] \
-           || [ -e "$WORKTREE_REQUEST_ACK" ] || [ -L "$WORKTREE_REQUEST_ACK" ]; then
+        if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
           echo "error: stale worktree request acknowledgement exists before dispatch for $ID" >&2
           exit 1
         fi
@@ -3490,99 +3729,21 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
           echo "error: could not publish worktree request intent for $ID" >&2
           exit 1
         }
-        worktree_send_rc=0
-        spawn_worktree_request_send "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
-        if [ "$worktree_send_rc" -ne 0 ]; then
-          case "$BACKEND:$worktree_send_rc" in
-            zellij:3|cmux:3)
-              spawn_endpoint_receipt_publish worktree-unsent || {
-                echo "error: could not preserve the definitely unsent worktree request for $ID" >&2
-                exit 1
-              }
-              ;;
-          esac
+        spawn_worktree_request_send "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || {
           echo "error: could not send worktree acquisition for $ID; request intent preserved" >&2
           exit 1
-        fi
+        }
         spawn_endpoint_receipt_publish worktree-requested || {
           echo "error: could not confirm the sent worktree request for $ID" >&2
           exit 1
         }
         ;;
-      worktree-unsent)
-        case "$BACKEND" in
-          zellij|cmux)
-            ack_state=$(spawn_worktree_request_ack_state) || {
-              echo "error: worktree request acknowledgement is unsafe for $ID" >&2
-              exit 1
-            }
-            case "$ack_state" in
-              absent|prepared) ;;
-              *)
-                echo "error: definitely unsent worktree request has an inconsistent backend acknowledgement for $ID" >&2
-                exit 1
-                ;;
-            esac
-            worktree_request_send_ready=1
-            ;;
-        esac
+      worktree-unsent|worktree-requesting|worktree-requested)
         worktree_request_recovery=1
         ;;
-      worktree-requesting)
-        case "$BACKEND" in
-          zellij|cmux)
-            ack_state=$(spawn_worktree_request_ack_state) || {
-              echo "error: worktree request acknowledgement is unsafe for $ID" >&2
-              exit 1
-            }
-            case "$ack_state" in
-              absent|prepared)
-                worktree_request_recovery=1
-                worktree_request_send_ready=1
-                ;;
-              ambiguous|accepted) ;;
-              *) exit 1 ;;
-            esac
-            ;;
-          *) worktree_request_recovery=1 ;;
-        esac
-        ;;
-      worktree-requested)
-        case "$BACKEND" in
-          zellij|cmux)
-            ack_state=$(spawn_worktree_request_ack_state) || {
-              echo "error: worktree request acknowledgement is unsafe for $ID" >&2
-              exit 1
-            }
-            [ "$ack_state" = accepted ] || {
-              echo "error: accepted worktree request has no exact backend acknowledgement for $ID" >&2
-              exit 1
-            }
-            ;;
-          *) worktree_request_recovery=1 ;;
-        esac
-        ;;
       worktree-retryable)
-        case "$BACKEND" in
-          zellij|cmux)
-            result_rc=1
-            if [ -e "$WORKTREE_REQUEST_MARKER/result" ] \
-               || [ -L "$WORKTREE_REQUEST_MARKER/result" ]; then
-              spawn_worktree_request_result_load >/dev/null || result_rc=$?
-              [ "$result_rc" -eq 2 ] || {
-                echo "error: retryable worktree request has inconsistent lease evidence for $ID" >&2
-                exit 1
-              }
-            fi
-            worktree_request_recovery=1
-            worktree_request_send_ready=1
-            worktree_request_retryable=1
-            ;;
-          *)
-            echo "error: retryable worktree request is unsupported for backend $BACKEND" >&2
-            exit 1
-            ;;
-        esac
+        echo "error: retryable worktree request is unsupported for backend $BACKEND" >&2
+        exit 1
         ;;
       *)
         echo "error: endpoint receipt has no valid worktree acquisition phase for $ID" >&2
@@ -3597,48 +3758,21 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       candidate=""
       if [ "$worktree_request_send_ready" -eq 0 ]; then
         for _ in $(seq 1 "$worktree_poll_max"); do
-        case "$BACKEND" in
-          zellij|cmux)
-            result_rc=0
-            p=$(spawn_worktree_request_result_load) || result_rc=$?
-            case "$result_rc" in
-              0) WT=$p; break ;;
-              1) ;;
-              2)
-                spawn_endpoint_receipt_publish worktree-retryable || {
-                  echo "error: could not preserve retryable worktree lease evidence for $ID" >&2
-                  exit 1
-                }
-                worktree_request_recovery=1
-                worktree_request_send_ready=1
-                worktree_request_retryable=1
-                break
-                ;;
-              4)
-                echo "error: treehouse acquisition has ambiguous exact lease evidence for $ID at $WORKTREE_REQUEST_MARKER/result" >&2
-                exit 1
-                ;;
-              *) echo "error: worktree request result is unsafe for $ID" >&2; exit 1 ;;
-            esac
-            ;;
-          *)
-            p=$(spawn_current_path "$WT_TARGET" || true)
-            if [ -n "$p" ]; then
-              p_real=$(real_path_or_raw "$p")
-              if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
-                if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-                  WT="$p"
-                  break
-                fi
-                candidate="$p_real"
-              else
-                candidate=""
-              fi
-            else
-              candidate=""
+        p=$(spawn_current_path "$WT_TARGET" || true)
+        if [ -n "$p" ]; then
+          p_real=$(real_path_or_raw "$p")
+          if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
+            if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
+              WT="$p"
+              break
             fi
-            ;;
-        esac
+            candidate="$p_real"
+          else
+            candidate=""
+          fi
+        else
+          candidate=""
+        fi
           sleep "$worktree_poll_interval"
         done
       fi
@@ -3662,7 +3796,6 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
             worktree_request_idle=1
           fi
           ;;
-        zellij|cmux) worktree_request_idle=1 ;;
       esac
       [ "$worktree_request_idle" -eq 1 ] || break
       if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
@@ -3677,14 +3810,6 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       worktree_send_rc=0
       spawn_worktree_request_send "$WT_TARGET" "$WORKTREE_REQUEST_COMMAND" || worktree_send_rc=$?
       if [ "$worktree_send_rc" -ne 0 ]; then
-        case "$BACKEND:$worktree_send_rc" in
-          zellij:3|cmux:3)
-            spawn_endpoint_receipt_publish worktree-unsent || {
-              echo "error: could not preserve the definitely unsent worktree request for $ID" >&2
-              exit 1
-            }
-            ;;
-        esac
         echo "error: could not resume failed worktree acquisition for $ID; request intent preserved" >&2
         exit 1
       fi
@@ -3706,20 +3831,12 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       echo "error: could not bind the recovered endpoint worktree for $ID" >&2
       exit 1
     }
-    case "$BACKEND" in
-      zellij|cmux)
-        spawn_worktree_request_cleanup || {
-          echo "error: could not retire the exact worktree request acknowledgement for $ID" >&2
-          exit 1
-        }
-        ;;
-      *)
-        if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
-          [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
-            echo "error: worktree request marker is unsafe: $WORKTREE_REQUEST_MARKER" >&2
-            exit 1
-          }
-        fi
+    if [ -e "$WORKTREE_REQUEST_MARKER" ] || [ -L "$WORKTREE_REQUEST_MARKER" ]; then
+      [ -d "$WORKTREE_REQUEST_MARKER" ] && [ ! -L "$WORKTREE_REQUEST_MARKER" ] || {
+        echo "error: worktree request marker is unsafe: $WORKTREE_REQUEST_MARKER" >&2
+        exit 1
+      }
+    fi
         ;;
     esac
   fi
@@ -4196,10 +4313,12 @@ if [ "$RELAUNCH" -eq 0 ]; then
       exit 1
     }
   fi
-  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
-    echo "error: could not retire endpoint recovery receipt for $ID" >&2
-    exit 1
-  }
+  if [ "$KIND" != secondmate ]; then
+    rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+      echo "error: could not retire endpoint recovery receipt for $ID" >&2
+      exit 1
+    }
+  fi
 fi
 # A dispatch or relaunch keeps the per-task meta lock through launch delivery.
 # The backlog mutation is deliberately the final fallible commit below, so
@@ -4323,11 +4442,23 @@ if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" = secondmate ]; then
   SECONDMATE_RESERVATION_PRESERVE=1
 fi
 spawn_send_key "$T" Enter
-if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" = secondmate ]; then
+if [ "$KIND" = secondmate ]; then
+  if [ "$RELAUNCH" -eq 0 ]; then
+    spawn_endpoint_receipt_publish launch-submitted "$WT" || {
+      echo "error: secondmate launch was submitted, but its exact acceptance receipt could not be published" >&2
+      exit 1
+    }
+  fi
   commit_secondmate_work_identity || {
-    echo "error: secondmate relaunch was submitted, but its unlinked identity could not be committed" >&2
+    echo "error: secondmate launch was submitted, but its unlinked identity could not be committed" >&2
     exit 1
   }
+  if [ "$RELAUNCH" -eq 0 ]; then
+    rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+      echo "error: secondmate launch identity committed, but its acceptance receipt could not be retired" >&2
+      exit 1
+    }
+  fi
 fi
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then

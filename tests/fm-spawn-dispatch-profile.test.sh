@@ -33,6 +33,20 @@ SH
 make_spawn_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_test_make_spawn_fakebin "$dir")
+  mv "$fakebin/tmux" "$fakebin/tmux-real"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = send-keys ] && [ "${FM_TEST_FAIL_LAUNCH_LITERAL:-0}" = 1 ]; then
+  prev=
+  for arg in "$@"; do
+    [ "$prev" != -l ] || exit 91
+    prev=$arg
+  done
+fi
+exec "$(dirname "$0")/tmux-real" "$@"
+SH
+  chmod +x "$fakebin/tmux"
   cat > "$fakebin/timeout" <<'SH'
 #!/usr/bin/env bash
 shift
@@ -95,6 +109,7 @@ run_spawn() {
     FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_PI_VERSION="${FM_TEST_PI_VERSION:-0.84.0}" \
     FM_FAKE_CURSOR_MODELS="${FM_TEST_CURSOR_MODELS:-}" \
     FM_FAKE_CURSOR_LIST_STATUS="${FM_TEST_CURSOR_LIST_STATUS:-0}" \
+    FM_TEST_FAIL_LAUNCH_LITERAL="${FM_TEST_FAIL_LAUNCH_LITERAL:-0}" \
     GROK_HOME="$home/grok-home" \
     fm_test_run_spawn "$home" "$wt" "$fakebin" "$@"
 }
@@ -846,6 +861,27 @@ test_invalid_secondmate_launch_does_not_reserve_identity() {
   pass "secondmate identity reservation follows non-mutating launch validation"
 }
 
+test_failed_secondmate_launch_does_not_commit_identity() {
+  local rec id sm out status
+  id=profile-failed-secondmate-z22
+  rec=$(make_spawn_case profile-failed-secondmate codex "$id")
+  read_case_record "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+
+  out=$(FM_TEST_FAIL_LAUNCH_LITERAL=1 \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "failed secondmate launch fixture unexpectedly completed"
+  assert_absent "$HOME_DIR/data/$id/work-identity-unlinked-guard.json" \
+    "failed secondmate launch committed its permanent unlinked identity"
+  assert_present "$HOME_DIR/data/$id/work-identity-unlinked-reservation.json" \
+    "failed secondmate launch lost its recoverable identity reservation"
+  assert_present "$HOME_DIR/state/$id.spawn-endpoint.json" \
+    "failed secondmate launch lost its exact endpoint recovery receipt"
+  pass "secondmate identity commits only after launch submission"
+}
+
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
   local rec id sm out status
   id=profile-secondmate-z16
@@ -896,6 +932,7 @@ test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
 test_fresh_metadata_interruption_never_publishes_partial_record
 test_invalid_secondmate_launch_does_not_reserve_identity
+test_failed_secondmate_launch_does_not_commit_identity
 test_active_dispatch_profile_does_not_block_secondmate_launch
 
 echo "# all fm-spawn-dispatch-profile tests passed"

@@ -119,9 +119,6 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-backend-hometag-lib.sh
 . "$FM_BACKEND_ZELLIJ_ROOT/bin/fm-backend-hometag-lib.sh"
 
-# shellcheck source=bin/fm-backend-worktree-request-lib.sh
-. "$FM_BACKEND_ZELLIJ_ROOT/bin/fm-backend-worktree-request-lib.sh"
-
 # Shared composer classification (the fleet-wide shape catalogue and verdict
 # owner; this adapter contributes only capture and capability facts).
 # shellcheck source=bin/fm-composer-lib.sh
@@ -498,8 +495,15 @@ fm_backend_zellij_send_text_line() {  # <target> <text> [expected-label]
   return 2
 }
 
-fm_backend_zellij_worktree_request_send() {  # <target> <text> <ack-dir> [expected-label]
-  fm_backend_worktree_request_send_owned fm_backend_zellij_send_text_line "$@"
+fm_backend_zellij_passive_current_path() {  # <target> [expected-label]
+  local target=$1 expected_label=${2:-} path
+  fm_backend_zellij_target_ready "$target" "$expected_label" || return 1
+  path=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null \
+    | jq -er --argjson p "$FM_BACKEND_ZELLIJ_PANE" \
+      '[.[]? | select(.id == $p and .is_plugin == false)]
+       | select(length == 1) | .[0].pane_cwd
+       | select(type == "string" and startswith("/"))' 2>/dev/null) || return 1
+  printf '%s' "$path"
 }
 
 # fm_backend_zellij_capture: bounded plain-text pane capture. Mirrors

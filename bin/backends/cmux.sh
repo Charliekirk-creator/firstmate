@@ -114,9 +114,6 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-backend-hometag-lib.sh
 . "$FM_BACKEND_CMUX_ROOT/bin/fm-backend-hometag-lib.sh"
 
-# shellcheck source=bin/fm-backend-worktree-request-lib.sh
-. "$FM_BACKEND_CMUX_ROOT/bin/fm-backend-worktree-request-lib.sh"
-
 # Shared composer-content classifier (empty|pending|unknown, and the fleet-wide
 # dead-shell-vs-agent-composer rule). Owned by bin/fm-composer-lib.sh, reused by
 # every backend so the decision cannot drift.
@@ -541,8 +538,15 @@ fm_backend_cmux_send_text_line() {  # <target> <text> [expected-label]
   return 2
 }
 
-fm_backend_cmux_worktree_request_send() {  # <target> <text> <ack-dir> [expected-label]
-  fm_backend_worktree_request_send_owned fm_backend_cmux_send_text_line "$@"
+fm_backend_cmux_passive_current_path() {  # <target> [expected-label]
+  local target=$1 expected_label=${2:-} path
+  fm_backend_cmux_target_ready "$target" "$expected_label" || return 1
+  path=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null \
+    | jq -er --arg id "$FM_BACKEND_CMUX_WORKSPACE" \
+      '[.workspaces[]? | select(.id == $id)]
+       | select(length == 1) | .[0].current_directory
+       | select(type == "string" and startswith("/"))' 2>/dev/null) || return 1
+  printf '%s' "$path"
 }
 
 # fm_backend_cmux_capture: bounded plain-text surface capture. No herdr-style

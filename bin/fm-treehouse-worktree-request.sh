@@ -7,6 +7,8 @@ case "$fm_treehouse_request_holder" in ''|*[!A-Za-z0-9._:-]*) return 1 2>/dev/nu
 
 fm_treehouse_request_result="$fm_treehouse_request_marker/result"
 fm_treehouse_request_result_tmp="$fm_treehouse_request_marker/.result.tmp"
+fm_treehouse_request_owner="$fm_treehouse_request_marker/owner"
+fm_treehouse_request_owner_tmp="$fm_treehouse_request_marker/.owner.tmp"
 fm_treehouse_request_get_out=
 fm_treehouse_request_get_rc=0
 fm_treehouse_request_path=
@@ -61,6 +63,13 @@ fm_treehouse_request_adopt_or_compensate() {
 
 umask 077
 if ! mkdir -m 700 -- "$fm_treehouse_request_marker"; then
+  unset -f fm_treehouse_request_publish fm_treehouse_request_retryable \
+    fm_treehouse_request_ambiguous fm_treehouse_request_adopt_or_compensate 2>/dev/null || true
+  return 1 2>/dev/null || exit 1
+fi
+if ! printf '%s\n' "$$" > "$fm_treehouse_request_owner_tmp" \
+  || ! chmod 600 "$fm_treehouse_request_owner_tmp" \
+  || ! mv -- "$fm_treehouse_request_owner_tmp" "$fm_treehouse_request_owner"; then
   unset -f fm_treehouse_request_publish fm_treehouse_request_retryable \
     fm_treehouse_request_ambiguous fm_treehouse_request_adopt_or_compensate 2>/dev/null || true
   return 1 2>/dev/null || exit 1
