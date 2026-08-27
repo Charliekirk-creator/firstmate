@@ -89,12 +89,17 @@ RECEIVER_WAKE_MESSAGE='New routed work is in your backlog. Run bin/fm-session-st
 
 ACTIVE_HANDOFF_LOCK=
 ACTIVE_BACKLOG_LOCK=
+ACTIVE_TARGET_BACKLOG_LOCK=
 ACTIVE_REGISTRY_LOCK=
 HANDOFF_PLAN_DIR=
 release_remote_locks() {
   if [ -n "$HANDOFF_PLAN_DIR" ]; then
     rm -rf -- "$HANDOFF_PLAN_DIR" 2>/dev/null || true
     HANDOFF_PLAN_DIR=
+  fi
+  if [ -n "$ACTIVE_TARGET_BACKLOG_LOCK" ]; then
+    fm_lock_release "$ACTIVE_TARGET_BACKLOG_LOCK"
+    ACTIVE_TARGET_BACKLOG_LOCK=
   fi
   if [ -n "$ACTIVE_BACKLOG_LOCK" ]; then
     fm_lock_release "$ACTIVE_BACKLOG_LOCK"
@@ -1372,6 +1377,9 @@ RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
 SUB_HOME=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
 SUB_BACKLOG="$SUB_HOME/data/backlog.md"
+ACTIVE_TARGET_BACKLOG_LOCK="$SUB_HOME/state/.backlog-mutation.lock"
+mkdir -p "$SUB_HOME/state" || { echo "error: could not create destination mutation-lock directory" >&2; exit 1; }
+fm_lock_acquire_wait "$ACTIVE_TARGET_BACKLOG_LOCK"
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
 

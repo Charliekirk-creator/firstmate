@@ -904,10 +904,10 @@ spawn_launch_request_helper() {  # <command>
   tmp="$SPAWN_LAUNCH_REQUEST/.owner.tmp"
   printf '%s\n' "${BASHPID:-$$}" > "$tmp" && chmod 600 "$tmp" \
     && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/owner" || exit 1
+  spawn_send_launch_line "$T" "$command" || rc=$?
   tmp="$SPAWN_LAUNCH_REQUEST/.attempted.tmp"
   printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" && chmod 600 "$tmp" \
     && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/attempted" || exit 1
-  spawn_send_launch_line "$T" "$command" || rc=$?
   if [ "$rc" -eq 0 ]; then
     tmp="$SPAWN_LAUNCH_REQUEST/.accepted.tmp"
     printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" && chmod 600 "$tmp" \
@@ -2745,9 +2745,17 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ] \
       SPAWN_LAUNCH_PREPARED_RECOVERY=1
       SPAWN_METADATA_RECOVERY=1
       ;;
-    failed|attempted-dead)
-      echo "error: secondmate launch submission is ambiguous; exact request evidence is preserved for $ID" >&2
+    failed)
+      echo "error: secondmate launch submission failed; exact request evidence is preserved for $ID" >&2
       exit 1
+      ;;
+    attempted-dead)
+      spawn_launch_request_cleanup || {
+        echo "error: interrupted secondmate launch evidence could not be retired for $ID" >&2
+        exit 1
+      }
+      SPAWN_LAUNCH_PREPARED_RECOVERY=1
+      SPAWN_METADATA_RECOVERY=1
       ;;
     *)
       echo "error: secondmate launch acceptance is ambiguous; exact request evidence is preserved for $ID" >&2
@@ -3891,7 +3899,10 @@ kimi_deliver_launch_brief() {
   if [ "$submission_state" = submitting ]; then
     composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || composer_state=unknown
     case "$composer_state" in
-      empty) submission_state=absent ;;
+      empty)
+        kimi_spawn_fail "kimi launch brief submission remains ambiguous"
+        return 1
+        ;;
       pending|pending-unproven) submission_state=pending ;;
       *)
         kimi_spawn_fail "kimi launch brief submission remains ambiguous"
@@ -4751,7 +4762,7 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
     LAUNCH_COMMAND="$LAUNCH_COMMAND && export TRACEPARENT=$(shell_quote "$SPAWN_TRACEPARENT")"
   fi
   LAUNCH_GUARD="$STATE/.$ID.launch-execution.$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream)"
-  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $(shell_quote "$LAUNCH_GUARD") 2>/dev/null; then ( $LAUNCH ); launch_rc=\$?; rmdir $(shell_quote "$LAUNCH_GUARD") 2>/dev/null || true; (exit \$launch_rc); fi"
+  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $(shell_quote "$LAUNCH_GUARD") 2>/dev/null; then ( $LAUNCH ); launch_rc=\$?; (exit \$launch_rc); fi"
   spawn_endpoint_receipt_publish launch-prepared "$WT" || {
     echo "error: secondmate launch preparation could not be journaled" >&2
     exit 1
