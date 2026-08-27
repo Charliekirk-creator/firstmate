@@ -1,0 +1,46 @@
+$ fm-decision-hold.sh hold review-live old-choice ...
+review-live-decision-old-choice
+$ fm-decision-hold.sh complete review-live old-choice
+complete: review-live decision inventory reviewed (old-choice)
+$ fm-decision-hold.sh answer review-live old-choice --decision-file old-answer.txt
+answered: review-live-decision-old-choice
+
+After normal configured retention (done_keep remains 10):
+  live old row count: 0
+  archived old row count: 1
+  retained Done row count: 10
+
+$ fm-decision-hold.sh complete review-live missing-current  # smallest counterfactual
+fm-decision-hold: captain hold review-live-decision-missing-current is absent from /var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/no-mistakes-evidence/01M097074X95P818TR2BSD79ZQ/.retained-history-fixture/data/backlog.md
+exit=1
+
+$ fm-decision-hold.sh hold review-live later-choice ...
+review-live-decision-later-choice
+$ fm-decision-hold.sh complete review-live later-choice  # twice
+complete: review-live decision inventory reviewed (later-choice,old-choice)
+complete: review-live decision inventory reviewed (later-choice,old-choice)
+$ fm-decision-hold.sh verify review-live  # twice
+verified: review-live unresolved-decision inventory
+verified: review-live unresolved-decision inventory
+  repeated complete/verify: success
+  backlog+archive hashes unchanged: yes
+  retained Done row count: 10
+  later hold state:
+  state: queued
+  held: yes
+  completion metadata:
+decision_keys=old-choice
+decision_inventory_schema=fm-decision-completion.v1
+decision_current_keys=old-choice
+decision_historical_keys=
+decision_keys=later-choice,old-choice
+decision_inventory_schema=fm-decision-completion.v1
+decision_current_keys=later-choice,old-choice
+decision_historical_keys=
+
+Base-commit reproduction of the retained-history defect:
+$ [base 64d61ae] fm-decision-hold.sh complete review-live later-choice
+  old live row count: 0
+  old archive row count: 1
+fm-decision-hold: captain decision review-live-decision-old-choice is absent from /var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/no-mistakes-evidence/01M097074X95P818TR2BSD79ZQ/.base-repro/home/data/backlog.md
+exit=1
