@@ -563,6 +563,61 @@ SH
   pass "identity publication never follows raced staging paths"
 }
 
+test_owned_replace_refuses_changed_unsafe_destination() {
+  local home parent inode source target sink expected out rc=0
+  home=$(make_home replace-destination-race)
+  parent="$home/state"
+  source="$home/replacement"
+  target="$parent/authoritative"
+  sink="$home/sink"
+  printf 'replacement\n' > "$source"
+  printf 'original\n' > "$target"
+  printf 'unchanged\n' > "$sink"
+  inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$parent")
+  expected=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe "$parent" "$inode" authoritative) \
+    || fail "could not capture owned destination state"
+  rm -f "$target"
+  ln -s "$sink" "$target"
+  out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" replace \
+    "$parent" "$inode" authoritative "$source" "$expected" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "changed symlink destination was replaced"
+  [ "$(cat "$sink")" = unchanged ] || fail "replace wrote through a changed destination symlink"
+  [ "$(cat "$source")" = replacement ] || fail "refused replace changed its publication source"
+  assert_contains "$out" "destination entry is unsafe" \
+    "replace refusal did not identify the changed unsafe destination"
+  pass "owned replacement refuses a changed unsafe destination without publication"
+}
+
+test_identity_lock_refuses_replaced_storage_parent() {
+  local home sink fakebin real_python out rc=0
+  home=$(make_home identity-lock-parent-race)
+  sink="$home/outside"
+  mkdir -p "$sink"
+  fakebin=$(fm_fakebin "$home/fakebin")
+  real_python=$(command -v python3)
+  cat > "$fakebin/python3" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ "${2:-}" = lock-try ] && [ ! -e "$FM_TEST_LOCK_RACED" ]; then
+  mv "$3" "$3.original"
+  ln -s "$FM_TEST_LOCK_SINK" "$3"
+  : > "$FM_TEST_LOCK_RACED"
+fi
+exec "$FM_TEST_REAL_PYTHON" "$@"
+SH
+  chmod +x "$fakebin/python3"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
+    FM_TEST_LOCK_RACED="$home/raced" FM_TEST_LOCK_SINK="$sink" \
+    FM_HOME="$home" "$WORK_IDENTITY" verify lock-parent-race 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "identity lock followed a replaced storage parent"
+  [ -e "$home/raced" ] || fail "identity lock race fixture did not replace the storage parent"
+  [ -z "$(find "$sink" -mindepth 1 -print -quit)" ] \
+    || fail "identity lock created an artifact through the replacement parent"
+  assert_contains "$out" "lock path is unsafe or was replaced" \
+    "identity lock refusal did not identify its replaced parent"
+  pass "identity locks refuse replaced storage parents without publication"
+}
+
 test_projection_serializes_identity_ownership() {
   local home task lock lock_key entered release holder projection wait_count
   home=$(make_home projection-lock)
@@ -2383,6 +2438,8 @@ test_concurrent_idempotence_and_explicit_unlinked
 test_secondmate_unlinked_reservation_is_transactional
 test_no_clobber_publications_recover_after_interruption
 test_no_clobber_publication_does_not_follow_raced_target
+test_owned_replace_refuses_changed_unsafe_destination
+test_identity_lock_refuses_replaced_storage_parent
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff

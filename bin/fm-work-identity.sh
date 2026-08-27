@@ -130,8 +130,14 @@ LOCATED_TASK=
 TASK_DIR=
 TASK_DIR_ID=
 ACTIVE_IDENTITY_LOCK=
+ACTIVE_IDENTITY_LOCK_PARENT=
+ACTIVE_IDENTITY_LOCK_PARENT_ID=
+ACTIVE_IDENTITY_LOCK_TOKEN=
 ACTIVE_IDENTITY_LOCK_HELD=0
 ACTIVE_PUBLICATION_LOCK=
+ACTIVE_PUBLICATION_LOCK_PARENT=
+ACTIVE_PUBLICATION_LOCK_PARENT_ID=
+ACTIVE_PUBLICATION_LOCK_TOKEN=
 ACTIVE_PUBLICATION_LOCK_HELD=0
 RECORD_HANDOFF_TRANSITION=0
 RECORD_HANDOFF_TRANSFER=
@@ -173,11 +179,15 @@ work_identity_cleanup() {
   fi
   if [ "${ACTIVE_IDENTITY_LOCK_HELD:-0}" -eq 1 ]; then
     ACTIVE_IDENTITY_LOCK_HELD=0
-    fm_lock_release "$ACTIVE_IDENTITY_LOCK" 2>/dev/null || true
+    python3 "$FS_OWNER" lock-release "$ACTIVE_IDENTITY_LOCK_PARENT" \
+      "$ACTIVE_IDENTITY_LOCK_PARENT_ID" "$ACTIVE_IDENTITY_LOCK" \
+      "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN" >/dev/null 2>&1 || true
   fi
   if [ "${ACTIVE_PUBLICATION_LOCK_HELD:-0}" -eq 1 ]; then
     ACTIVE_PUBLICATION_LOCK_HELD=0
-    fm_lock_release "$ACTIVE_PUBLICATION_LOCK" 2>/dev/null || true
+    python3 "$FS_OWNER" lock-release "$ACTIVE_PUBLICATION_LOCK_PARENT" \
+      "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" "$ACTIVE_PUBLICATION_LOCK" \
+      "${BASHPID:-$$}" "$ACTIVE_PUBLICATION_LOCK_TOKEN" >/dev/null 2>&1 || true
   fi
   return "$status"
 }
@@ -387,11 +397,13 @@ owned_parent_details() {  # <target>
 }
 
 owned_atomic_replace() {  # <source> <target> <label>
-  local source=$1 target=$2 label=$3 parent expected base
+  local source=$1 target=$2 label=$3 parent expected base destination_state
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
-  python3 "$FS_OWNER" replace "$parent" "$expected" "$base" "$source" \
+  destination_state=$(python3 "$FS_OWNER" describe "$parent" "$expected" "$base") \
+    || die "$label destination is unsafe: $target"
+  python3 "$FS_OWNER" replace "$parent" "$expected" "$base" "$source" "$destination_state" \
     || die "cannot publish $label: $target"
   rm -f -- "$source" || die "cannot retire $label publication source"
   [ "${TMP:-}" != "$source" ] || TMP=
@@ -978,36 +990,47 @@ validate_projection_set() {  # <path> <expected-home> <expected-home-id>
   rm -f -- "$tmp"
 }
 
-ensure_lock_lib() {
-  ensure_state_dir
-  if ! type fm_lock_acquire_wait >/dev/null 2>&1; then
-    STATE=$STATE_REAL
-    # shellcheck source=bin/fm-wake-lib.sh
-    # shellcheck disable=SC1091
-    . "$SCRIPT_DIR/fm-wake-lib.sh"
-  fi
+owned_lock_acquire() {  # <directory> <inode> <name> <token> <label>
+  local directory=$1 inode=$2 name=$3 token=$4 label=$5 rc stale=${FM_LOCK_STALE_AFTER:-2}
+  while :; do
+    rc=0
+    python3 "$FS_OWNER" lock-try "$directory" "$inode" "$name" \
+      "${BASHPID:-$$}" "$token" "$stale" >/dev/null || rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      2) sleep 0.1 ;;
+      *) die "$label lock path is unsafe or was replaced: $directory/$name" ;;
+    esac
+  done
 }
 
 publication_lock_acquire() {
   [ "$ACTIVE_PUBLICATION_LOCK_HELD" -eq 0 ] || return 0
   ensure_data_dir
-  ensure_lock_lib
   lock_parent_preflight "$DATA_REAL" "work identity publication"
-  ACTIVE_PUBLICATION_LOCK="$DATA_REAL/.work-identity-publication.lock"
-  fm_lock_acquire_wait "$ACTIVE_PUBLICATION_LOCK"
+  ACTIVE_PUBLICATION_LOCK=.work-identity-publication.lock
+  ACTIVE_PUBLICATION_LOCK_PARENT=$DATA_REAL
+  ACTIVE_PUBLICATION_LOCK_PARENT_ID=$DATA_DIR_ID
+  ACTIVE_PUBLICATION_LOCK_TOKEN="publication-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
+  owned_lock_acquire "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
+    "$ACTIVE_PUBLICATION_LOCK" "$ACTIVE_PUBLICATION_LOCK_TOKEN" "work identity publication"
   ACTIVE_PUBLICATION_LOCK_HELD=1
 }
 
 identity_lock_acquire() {  # <task-id>
   local task=$1 lock_key
-  ensure_lock_lib
+  ensure_state_dir
   lock_parent_preflight "$STATE_REAL" "work identity task"
   lock_key=$(printf '%s' "$task" | sha256_stream) \
     || die "SHA-256 is unavailable for work identity task lock"
   case "$lock_key" in ''|*[!A-Fa-f0-9]*) die "work identity task lock digest is invalid" ;; esac
   [ "${#lock_key}" -eq 64 ] || die "work identity task lock digest has the wrong length"
-  ACTIVE_IDENTITY_LOCK="$STATE_REAL/.work-identity-task-${lock_key}.lock"
-  fm_lock_acquire_wait "$ACTIVE_IDENTITY_LOCK"
+  ACTIVE_IDENTITY_LOCK=".work-identity-task-${lock_key}.lock"
+  ACTIVE_IDENTITY_LOCK_PARENT=$STATE_REAL
+  ACTIVE_IDENTITY_LOCK_PARENT_ID=$STATE_DIR_ID
+  ACTIVE_IDENTITY_LOCK_TOKEN="task-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
+  owned_lock_acquire "$ACTIVE_IDENTITY_LOCK_PARENT" "$ACTIVE_IDENTITY_LOCK_PARENT_ID" \
+    "$ACTIVE_IDENTITY_LOCK" "$ACTIVE_IDENTITY_LOCK_TOKEN" "work identity task"
   ACTIVE_IDENTITY_LOCK_HELD=1
   locate_task_dir "$task"
   [ ! -d "$TASK_DIR" ] || recover_no_clobber_publications
@@ -1015,9 +1038,15 @@ identity_lock_acquire() {  # <task-id>
 
 identity_lock_release() {
   [ "$ACTIVE_IDENTITY_LOCK_HELD" -eq 1 ] || return 0
+  python3 "$FS_OWNER" lock-release "$ACTIVE_IDENTITY_LOCK_PARENT" \
+    "$ACTIVE_IDENTITY_LOCK_PARENT_ID" "$ACTIVE_IDENTITY_LOCK" \
+    "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN" \
+    || die "cannot release work identity task lock"
   ACTIVE_IDENTITY_LOCK_HELD=0
-  fm_lock_release "$ACTIVE_IDENTITY_LOCK"
   ACTIVE_IDENTITY_LOCK=
+  ACTIVE_IDENTITY_LOCK_PARENT=
+  ACTIVE_IDENTITY_LOCK_PARENT_ID=
+  ACTIVE_IDENTITY_LOCK_TOKEN=
 }
 
 identity_mutation_lock_acquire() {  # <task-id>

@@ -29,6 +29,7 @@ TOOLS="$TMP_ROOT/tools"
 mkdir -p "$TOOLS"
 ln -sf "$(command -v git)" "$TOOLS/git"
 ln -sf "$(command -v jq)" "$TOOLS/jq"
+ln -sf "$(command -v python3)" "$TOOLS/python3"
 BASE_PATH="$TOOLS:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # new_case <Darwin|Linux> [with-herdr] [gui]
@@ -275,6 +276,14 @@ assert_contains "$DOCTOR_OUT" 'check herdr=human:' "--fix stopped reporting the 
 assert_not_contains "$DOCTOR_OUT" 'fix herdr=applied' "--fix claimed to have installed herdr"
 assert_no_dangerous_calls "the doctor reached for auto-login, FileVault, or the keychain"
 pass "a missing herdr CLI is a human gap that --fix never claims to close"
+
+new_case Darwin with-herdr gui
+rm -f "$TOOLS/python3"
+doctor
+expect_code 1 "$DOCTOR_RC" "a remote host without python3 was reported ready"
+assert_contains "$DOCTOR_OUT" 'required python3=MISSING' "missing python3 was omitted from remote readiness"
+ln -sf "$(command -v python3)" "$TOOLS/python3"
+pass "remote doctor requires python3 for exact identity storage"
 
 # --- an absent launch agent is a fixable gap that --fix installs -------------
 
