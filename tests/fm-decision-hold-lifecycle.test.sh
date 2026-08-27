@@ -800,6 +800,12 @@ test_current_generation_rejects_an_older_archive_owner() {
   fi
   assert_grep "different retention generation" "$home/owner-verify.err" \
     "missing current generation did not report its archive-owner mismatch"
+  if run_decisions "$home" complete "$origin" --none --resolved "$key" \
+    > "$home/owner-resolved.out" 2> "$home/owner-resolved.err"; then
+    fail "--resolved let an older archive owner replace the missing current generation"
+  fi
+  assert_grep "different retention generation" "$home/owner-resolved.err" \
+    "--resolved did not enforce the current generation archive owner"
   pass "current generations cannot fall back to older archive owners"
 }
 

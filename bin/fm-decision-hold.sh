@@ -2656,8 +2656,10 @@ $(printf '%s\n' "$supplied_csv" | tr ',' '\n')
 EOF
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    verify_hold_historical "$origin" "$key"
-    if ! list_has_key "$previous_current" "$key"; then
+    if list_has_key "$previous_current" "$key"; then
+      verify_hold_durable "$origin" "$key"
+    else
+      verify_hold_historical "$origin" "$key"
       historical_keys=$(sorted_key_union "$historical_keys" "$key")
     fi
   done <<EOF
