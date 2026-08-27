@@ -77,7 +77,7 @@ case "${1:-}" in
       case "$literal" in
         *' --auto')
           printf '%s\n' "$literal" >> "$FM_FAKE_LAUNCH_LOG"
-          if [ -n "${FM_FAKE_LAUNCH_BRIEF:-}" ]; then
+          if [ "${FM_FAKE_MUTATE_BRIEF:-yes}" = yes ] && [ -n "${FM_FAKE_LAUNCH_BRIEF:-}" ]; then
             printf 'mutated delayed kimi brief\n' > "$FM_FAKE_LAUNCH_BRIEF.replacement"
             mv -f "$FM_FAKE_LAUNCH_BRIEF.replacement" "$FM_FAKE_LAUNCH_BRIEF"
           fi
@@ -142,7 +142,7 @@ SH
   cat > "$fakebin/kimi" <<'SH'
 #!/usr/bin/env bash
 printf 'ready\n' > "$FM_FAKE_KIMI_STATE"
-sleep 5
+exec sleep 5
 SH
   chmod +x "$fakebin/kimi"
   ln -s "$JQ_BIN" "$fakebin/jq"
@@ -184,6 +184,7 @@ run_spawn() {
     FM_FAKE_TMUX_CALL_LOG="$case_dir/tmux-calls.log" \
     FM_FAKE_BRIEF_REAL="$(cd "$home/data/$id" && pwd -P)/brief.md" \
     FM_FAKE_LAUNCH_BRIEF="$home/state/$id.launch-brief.md" \
+    FM_FAKE_MUTATE_BRIEF="${FM_FAKE_MUTATE_BRIEF:-yes}" \
     FM_KIMI_READY_POLLS=2 FM_KIMI_DELIVERY_POLLS=2 FM_KIMI_POLL_INTERVAL=0 \
     PATH="$fakebin:$BASE_PATH" \
     "$SPAWN" "$id" "$proj" --harness kimi --mode no-mistakes --yolo off "$@" 2>&1
@@ -476,16 +477,17 @@ test_kimi_teardown_removes_pointer_and_registry_token() {
   id=kimi-teardown-z8
   rec=$(make_spawn_case teardown "$id")
   read_spawn_record "$rec"
-  out=$(run_spawn "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id")
+  out=$(FM_FAKE_MUTATE_BRIEF=no run_spawn \
+    "$CASE_DIR" "$HOME_DIR" "$PROJ_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id")
   rc=$?
   expect_code 0 "$rc" "Kimi spawn should succeed before teardown"
   token=$(sed -n 's/^token=//p' "$WT_DIR/.fm-kimi-turnend")
 
-  HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
+  out=$(HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 PATH="$FAKEBIN_DIR:$BASE_PATH" \
-    "$TEARDOWN" "$id" --force >/dev/null 2>&1 || fail "Kimi teardown failed"
+    "$TEARDOWN" "$id" --force 2>&1) || fail "Kimi teardown failed: $out"
   assert_absent "$WT_DIR/.fm-kimi-turnend" "Kimi token pointer survived teardown"
   assert_absent "$HOME_DIR/.kimi-code/fm-turn-end.d/$token" "Kimi registry token survived teardown"
   assert_absent "$HOME_DIR/state/$id.kimi-turnend-token" "Kimi token state survived teardown"

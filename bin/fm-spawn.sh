@@ -833,7 +833,7 @@ spawn_launch_request_paths() {
 }
 
 spawn_launch_guard_state() {
-  local owner child value pid token
+  local owner child value pid token comm
   if [ ! -e "$SPAWN_LAUNCH_GUARD" ] && [ ! -L "$SPAWN_LAUNCH_GUARD" ]; then
     printf 'absent'
     return 0
@@ -860,7 +860,12 @@ spawn_launch_guard_state() {
     token=${value#*:}
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
-    if kill -0 "$pid" 2>/dev/null; then printf 'running'; else printf 'exited'; fi
+    if kill -0 "$pid" 2>/dev/null; then
+      comm=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{print $1}')
+      case "${comm##*/}" in sh|bash|dash|zsh|ksh|env|'') printf 'starting' ;; *) printf 'running' ;; esac
+    else
+      printf 'exited'
+    fi
   elif kill -0 "$pid" 2>/dev/null; then
     printf 'starting'
   else
@@ -902,17 +907,15 @@ spawn_launch_request_state() {
     return 0
   fi
   [ -d "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ] || return 1
-  if [ -e "$SPAWN_LAUNCH_EXECUTED" ] || [ -L "$SPAWN_LAUNCH_EXECUTED" ]; then
-    spawn_launch_request_file_matches "$SPAWN_LAUNCH_EXECUTED" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-    if [ ! -e "$SPAWN_LAUNCH_OUTCOME" ] && [ ! -L "$SPAWN_LAUNCH_OUTCOME" ]; then
-      printf 'accepted'
-      return 0
-    fi
+  guard_state=$(spawn_launch_guard_state) || return 1
+  if [ -e "$SPAWN_LAUNCH_OUTCOME" ] || [ -L "$SPAWN_LAUNCH_OUTCOME" ]; then
     [ -f "$SPAWN_LAUNCH_OUTCOME" ] && [ ! -L "$SPAWN_LAUNCH_OUTCOME" ] || return 1
     [ "$(spawn_file_link_count "$SPAWN_LAUNCH_OUTCOME")" = 1 ] || return 1
     outcome=$(tr -d '\n' < "$SPAWN_LAUNCH_OUTCOME") || return 1
     case "$outcome" in
-      "running:$SPAWN_LAUNCH_REQUEST_TOKEN") printf 'executed' ;;
+      "running:$SPAWN_LAUNCH_REQUEST_TOKEN")
+        case "$guard_state" in running) printf 'executed' ;; exited|abandoned) printf 'launch-exited' ;; *) printf 'accepted' ;; esac
+        ;;
       "exited:"*":$SPAWN_LAUNCH_REQUEST_TOKEN")
         outcome=${outcome#exited:}
         outcome=${outcome%:"$SPAWN_LAUNCH_REQUEST_TOKEN"}
@@ -923,13 +926,25 @@ spawn_launch_request_state() {
     esac
     return 0
   fi
-  guard_state=$(spawn_launch_guard_state) || return 1
+  if [ -e "$SPAWN_LAUNCH_EXECUTED" ] || [ -L "$SPAWN_LAUNCH_EXECUTED" ]; then
+    spawn_launch_request_file_matches "$SPAWN_LAUNCH_EXECUTED" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+    case "$guard_state" in
+      running) printf 'executed' ;;
+      exited|abandoned) printf 'launch-exited' ;;
+      *) printf 'accepted' ;;
+    esac
+    return 0
+  fi
   case "$guard_state" in
-    running|starting)
+    running)
+      printf 'executed'
+      return 0
+      ;;
+    starting)
       printf 'accepted'
       return 0
       ;;
-    exited)
+    exited|abandoned)
       printf 'launch-exited'
       return 0
       ;;
@@ -968,7 +983,7 @@ spawn_launch_request_cleanup() {
   [ -d "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ] || return 1
   for entry in "$SPAWN_LAUNCH_REQUEST"/* "$SPAWN_LAUNCH_REQUEST"/.[!.]* "$SPAWN_LAUNCH_REQUEST"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
-    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
+    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-attempted|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-attempted.tmp|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
     [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
     [ "$(spawn_file_link_count "$entry")" = 1 ] || return 1
     rm -f -- "$entry" || return 1
@@ -2700,6 +2715,8 @@ fi
 [ -f "$BRIEF" ] || { echo "error: task $ID has no brief at inaccessible data path $BRIEF" >&2; exit 1; }
 BRIEF_SOURCE=$BRIEF
 mkdir -p "$STATE" || { echo "error: could not create state directory for launch brief" >&2; exit 1; }
+STATE=$(cd -P "$STATE" && pwd -P) \
+  || { echo "error: could not anchor state directory for launch brief" >&2; exit 1; }
 BRIEF_SNAPSHOT="$STATE/$ID.launch-brief.md"
 SPAWN_ENDPOINT_RECEIPT="$STATE/$ID.spawn-endpoint.json"
 [ "$BACKEND" != orca ] || SPAWN_ORCA_OPERATION="$STATE/$ID.spawn-orca-operation"
@@ -2830,7 +2847,11 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ] \
       echo "error: secondmate launch submission failed; exact request evidence is preserved for $ID" >&2
       exit 1
       ;;
-    attempted-dead)
+    attempted-dead|launch-exited)
+      spawn_launch_guard_cleanup_retryable || {
+        echo "error: interrupted secondmate execution guard could not be retired for $ID" >&2
+        exit 1
+      }
       spawn_launch_request_cleanup || {
         echo "error: interrupted secondmate launch evidence could not be retired for $ID" >&2
         exit 1
@@ -3949,8 +3970,9 @@ kimi_spawn_fail() {  # <detail>
 }
 
 kimi_submission_state() {
-  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner result value links pid token verdict
+  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner attempted result value links pid token verdict
   owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner"
+  attempted="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted"
   result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'absent'; return 0; fi
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
@@ -3963,10 +3985,14 @@ kimi_submission_state() {
       && [ "$(spawn_file_link_count "$result")" = 1 ] || return 1
     IFS=$'\t' read -r token verdict < "$result" || return 1
     [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
-    case "$verdict" in accepted|pending|send-failed) printf '%s' "$verdict" ;; *) return 1 ;; esac
+    case "$verdict" in accepted|pending|send-failed|ambiguous) printf '%s' "$verdict" ;; *) return 1 ;; esac
     return 0
   fi
-  if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then printf 'prepared'; return 0; fi
+  if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then
+    if [ -e "$attempted" ] || [ -L "$attempted" ]; then return 1; fi
+    printf 'prepared'
+    return 0
+  fi
   [ -f "$owner" ] && [ ! -L "$owner" ] \
     && [ "$(spawn_file_link_count "$owner")" = 1 ] || return 1
   value=$(tr -d '\n' < "$owner") || return 1
@@ -3974,7 +4000,14 @@ kimi_submission_state() {
   token=${value#*:}
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
-  if kill -0 "$pid" 2>/dev/null; then printf 'submitting'; else printf 'ambiguous'; fi
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'submitting'
+  elif [ ! -e "$attempted" ] && [ ! -L "$attempted" ]; then
+    printf 'prepared'
+  else
+    spawn_launch_request_file_matches "$attempted" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+    printf 'ambiguous'
+  fi
 }
 
 kimi_submission_publish() {  # <prepared|pending|accepted>
@@ -3985,25 +4018,38 @@ kimi_submission_publish() {  # <prepared|pending|accepted>
 }
 
 kimi_submission_helper() {
-  local owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
-  local tmp verdict
+  local owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" attempted="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted"
+  local result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result" tmp verdict
   set +e
   umask 077
   tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-owner.tmp"
   printf '%s:%s\n' "${BASHPID:-$$}" "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" \
     && chmod 600 "$tmp" && mv -- "$tmp" "$owner" || exit 1
+  tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-attempted.tmp"
+  printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" \
+    && chmod 600 "$tmp" && mv -- "$tmp" "$attempted" || exit 1
   verdict=$(fm_backend_send_text_submit \
     "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
     "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || verdict=send-failed
-  case "$verdict" in accepted|pending|send-failed) ;; *) verdict=send-failed ;; esac
+  case "$verdict" in
+    empty|accepted) verdict=accepted ;;
+    pending|pending-unproven) verdict=pending ;;
+    send-failed) ;;
+    *) verdict=ambiguous ;;
+  esac
   tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-result.tmp"
   printf '%s\t%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" "$verdict" > "$tmp" \
     && chmod 600 "$tmp" && mv -- "$tmp" "$result"
 }
 
 kimi_submission_start() {
-  local owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
-  local helper_pid i=0
+  local owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" attempted="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted"
+  local result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result" helper_pid i=0 state
+  state=$(kimi_submission_state) || return 1
+  if [ "$state" = prepared ] && { [ -e "$owner" ] || [ -L "$owner" ]; }; then
+    [ ! -e "$attempted" ] && [ ! -L "$attempted" ] || return 1
+    rm -f -- "$owner" || return 1
+  fi
   [ ! -e "$owner" ] && [ ! -L "$owner" ] \
     && [ ! -e "$result" ] && [ ! -L "$result" ] || return 0
   (trap - EXIT; trap '' HUP INT TERM; kimi_submission_helper) \
@@ -4919,12 +4965,13 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
     LAUNCH_COMMAND="$LAUNCH_COMMAND && export TRACEPARENT=$(shell_quote "$SPAWN_TRACEPARENT")"
   fi
   LAUNCH_GUARD=$SPAWN_LAUNCH_GUARD
-  sq_launch_executed=$(shell_quote "$SPAWN_LAUNCH_EXECUTED")
   sq_launch_outcome=$(shell_quote "$SPAWN_LAUNCH_OUTCOME")
   sq_launch_token=$(shell_quote "$SPAWN_LAUNCH_REQUEST_TOKEN")
   sq_launch_request=$(shell_quote "$SPAWN_LAUNCH_REQUEST")
   sq_launch_guard=$(shell_quote "$LAUNCH_GUARD")
-  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; ( $LAUNCH ) & launch_pid=\$!; printf '%s:%s\\n' \"\$launch_pid\" $sq_launch_token > $sq_launch_guard/.child.tmp && chmod 600 $sq_launch_guard/.child.tmp && mv $sq_launch_guard/.child.tmp $sq_launch_guard/child || exit 1; if kill -0 \"\$launch_pid\" 2>/dev/null; then printf '%s\\n' $sq_launch_token > $sq_launch_request/.executed.tmp && chmod 600 $sq_launch_request/.executed.tmp && mv $sq_launch_request/.executed.tmp $sq_launch_executed && printf 'running:%s\\n' $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome || exit 1; fi; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"
+  LAUNCH_CHILD_COMMAND="printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.child.tmp && chmod 600 $sq_launch_guard/.child.tmp && mv $sq_launch_guard/.child.tmp $sq_launch_guard/child || exit 1; exec env $LAUNCH"
+  sq_launch_child=$(shell_quote "$LAUNCH_CHILD_COMMAND")
+  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; sh -c $sq_launch_child & launch_pid=\$!; launch_wait=0; launch_exec=0; while kill -0 \"\$launch_pid\" 2>/dev/null && [ \"\$launch_wait\" -lt 100 ]; do if [ -f $sq_launch_guard/child ] && printf '%s:%s\\n' \"\$launch_pid\" $sq_launch_token | cmp -s $sq_launch_guard/child -; then launch_comm=\$(ps -p \"\$launch_pid\" -o comm= 2>/dev/null | awk '{print \$1}'); case \"\${launch_comm##*/}\" in sh|dash|env|'') ;; *) sleep 0.1; if kill -0 \"\$launch_pid\" 2>/dev/null; then launch_exec=1; break; fi ;; esac; fi; sleep 0.01; launch_wait=\$((launch_wait + 1)); done; if [ \"\$launch_exec\" -eq 1 ]; then printf 'running:%s\\n' $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome || exit 1; fi; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"
   spawn_endpoint_receipt_publish launch-prepared "$WT" || {
     echo "error: secondmate launch preparation could not be journaled" >&2
     exit 1

@@ -1338,6 +1338,43 @@ EOF
   pass "same-id destination rows require an exact transferred-content receipt"
 }
 
+test_scaffold_parent_swap_refuses_without_external_write() {
+  local home="$TMP_ROOT/scaffold-race-main" sub="$TMP_ROOT/scaffold-race-sub"
+  local outside="$TMP_ROOT/scaffold-race-outside" fakebin="$TMP_ROOT/scaffold-race-bin"
+  local real_cat sub_abs out rc=0
+  setup_homes "$home" "$sub"
+  sub_abs=$(cd "$sub" && pwd -P)
+  mkdir -p "$outside" "$fakebin"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] scaffold-race-item - must remain at source (repo: alpha)
+
+## Done
+EOF
+  real_cat=$(command -v cat)
+  cat > "$fakebin/cat" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "$sub_abs/.fm-secondmate-home" ]; then
+  "$real_cat" "\$1"
+  mv "$sub/data" "$sub/data.original"
+  ln -s "$outside" "$sub/data"
+  exit 0
+fi
+exec "$real_cat" "\$@"
+EOF
+  chmod +x "$fakebin/cat"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design scaffold-race-item 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "handoff followed a destination data-directory swap"
+  assert_contains "$out" "could not anchor destination data directory" \
+    "destination data-directory swap did not fail at the anchored owner boundary"
+  assert_absent "$outside/backlog.md" \
+    "destination data-directory swap published a scaffold outside the validated home"
+  assert_grep 'scaffold-race-item' "$home/data/backlog.md" \
+    "destination data-directory swap changed the source backlog"
+  pass "handoff scaffold stays anchored across a destination parent swap"
+}
+
 test_registry_home_missing_field_fails_cleanly() {
   local home="$TMP_ROOT/reg-nohome-main"
   local sub="$TMP_ROOT/reg-nohome-sub"
@@ -1368,6 +1405,12 @@ EOF
   pass "registry entry without (home: ...) fails cleanly with has no home"
 }
 
+if [ "${FM_TEST_ONLY:-}" = scaffold-parent-swap ]; then
+  test_scaffold_parent_swap_refuses_without_external_write
+  echo "ALL TESTS PASSED"
+  exit 0
+fi
+
 test_handoff_wakes_live_local_receiver
 test_failed_wake_retries_when_the_item_is_already_present
 test_known_receiver_failure_remains_retryable_after_grace
@@ -1390,6 +1433,7 @@ test_noncanonical_indented_continuations_refuse_without_changes
 test_indented_heading_is_not_section_boundary
 test_registry_home_with_pre_home_parentheses
 test_registry_home_missing_field_fails_cleanly
+test_scaffold_parent_swap_refuses_without_external_write
 test_same_id_destination_requires_exact_handoff_receipt
 test_handoff_warns_when_a_moved_item_still_owes_a_public_reply
 test_handoff_is_silent_about_public_commitments_without_the_relay

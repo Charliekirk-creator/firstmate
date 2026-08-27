@@ -241,7 +241,15 @@ validate_secondmate_home() {
     echo "error: $home is not a firstmate home (missing bin/)" >&2
     return 1
   fi
-  printf '%s\n' "$abs_home"
+  (
+    cd -P "$abs_home" || exit 1
+    [ "$(pwd -P)" = "$abs_home" ] || exit 1
+    [ ! -L .fm-secondmate-home ] && [ -f .fm-secondmate-home ] \
+      && [ "$(cat .fm-secondmate-home 2>/dev/null || true)" = "$id" ] \
+      && [ ! -L AGENTS.md ] && [ -f AGENTS.md ] \
+      && [ ! -L bin ] && [ -d bin ] || exit 1
+    printf '%s\t%s\n' "$abs_home" "$(backlog_file_inode .)"
+  )
 }
 
 backlog_file_link_count() {
@@ -327,56 +335,82 @@ backlog_key_noncanonical_body_lines() {
   ' "$file"
 }
 
-seed_backlog_scaffold() { # <path>
-  local target=$1 dir staging tmp target_links staging_links target_inode staging_inode rc=0
+safe_child_dir() { # <anchor-dir> <anchor-inode> <child-name>
+  local anchor=$1 anchor_inode=$2 child=$3 expected
+  case "$child" in ''|.|..|*/*) return 1 ;; esac
+  expected="$anchor/$child"
+  (
+    cd -P "$anchor" || exit 1
+    [ "$(backlog_file_inode .)" = "$anchor_inode" ] || exit 1
+    [ ! -L "$child" ] || exit 1
+    if [ ! -e "$child" ]; then
+      mkdir -m 700 -- "$child" || exit 1
+    fi
+    [ -d "$child" ] && [ ! -L "$child" ] || exit 1
+    cd -P -- "$child" || exit 1
+    [ "$(pwd -P)" = "$expected" ] || exit 1
+    [ "$(backlog_file_inode ..)" = "$anchor_inode" ] || exit 1
+    printf '%s\t%s\n' "$expected" "$(backlog_file_inode .)"
+  )
+}
+
+seed_backlog_scaffold() { # <path> <parent-inode>
+  local target=$1 expected_dir_inode=$2 dir base
   dir=$(dirname "$target")
-  staging="${target}.scaffold-publishing"
-  mkdir -p "$dir" || return 1
-  if [ -e "$staging" ] || [ -L "$staging" ]; then
-    [ -f "$staging" ] && [ ! -L "$staging" ] || return 1
-    printf '## In flight\n\n## Queued\n\n## Done\n' | cmp -s "$staging" - || return 1
-  else
-    tmp=$(umask 077; mktemp "$dir/.backlog-scaffold.XXXXXX") || return 1
-    if ! printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
-      || ! chmod 600 "$tmp" || ! command link "$tmp" "$staging" 2>/dev/null; then
-      rm -f -- "$tmp"
-      return 1
-    fi
-    rm -f -- "$tmp" || return 1
-  fi
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    if [ ! -f "$target" ] || [ -L "$target" ]; then
-      rm -f -- "$staging" || return 1
-      return 1
-    fi
-    target_links=$(backlog_file_link_count "$target") || return 1
-    staging_links=$(backlog_file_link_count "$staging") || return 1
-    target_inode=$(backlog_file_inode "$target") || return 1
-    staging_inode=$(backlog_file_inode "$staging") || return 1
-    if [ "$target_inode" = "$staging_inode" ] \
-      && [ "$target_links" = 2 ] && [ "$staging_links" = 2 ]; then
-      rm -f -- "$staging" || return 1
-      return 0
-    fi
-    rm -f -- "$staging" || return 1
-    [ "$target_links" = 1 ] || return 1
-    return 0
-  fi
-  command link "$staging" "$target" 2>/dev/null || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      if [ -L "$target" ]; then
-        rm -f -- "$staging" || return 1
-        return 1
+  base=$(basename "$target")
+  case "$base" in ''|.|..|*/*) return 1 ;; esac
+  (
+    local staging tmp target_links staging_links target_inode staging_inode rc=0
+    cd -P "$dir" || exit 1
+    [ "$(backlog_file_inode .)" = "$expected_dir_inode" ] || exit 1
+    target=$base
+    staging="${target}.scaffold-publishing"
+    if [ -e "$staging" ] || [ -L "$staging" ]; then
+      [ -f "$staging" ] && [ ! -L "$staging" ] || exit 1
+      printf '## In flight\n\n## Queued\n\n## Done\n' | cmp -s "$staging" - || exit 1
+    else
+      tmp=$(umask 077; mktemp './.backlog-scaffold.XXXXXX') || exit 1
+      if ! printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
+        || ! chmod 600 "$tmp" || ! command link "$tmp" "$staging" 2>/dev/null; then
+        rm -f -- "$tmp"
+        exit 1
       fi
-      rm -f -- "$staging" || return 1
-      validate_backlog_file "backlog scaffold target" "$target"
-      return $?
+      rm -f -- "$tmp" || exit 1
     fi
-    return "$rc"
-  fi
-  rm -f -- "$staging" || return 1
-  validate_backlog_file "backlog scaffold target" "$target"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      if [ ! -f "$target" ] || [ -L "$target" ]; then
+        rm -f -- "$staging" || exit 1
+        exit 1
+      fi
+      target_links=$(backlog_file_link_count "$target") || exit 1
+      staging_links=$(backlog_file_link_count "$staging") || exit 1
+      target_inode=$(backlog_file_inode "$target") || exit 1
+      staging_inode=$(backlog_file_inode "$staging") || exit 1
+      if [ "$target_inode" = "$staging_inode" ] \
+        && [ "$target_links" = 2 ] && [ "$staging_links" = 2 ]; then
+        rm -f -- "$staging" || exit 1
+        exit 0
+      fi
+      rm -f -- "$staging" || exit 1
+      [ "$target_links" = 1 ] || exit 1
+      exit 0
+    fi
+    command link "$staging" "$target" 2>/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ -L "$target" ]; then
+          rm -f -- "$staging" || exit 1
+          exit 1
+        fi
+        rm -f -- "$staging" || exit 1
+        validate_backlog_file "backlog scaffold target" "$target"
+        exit $?
+      fi
+      exit "$rc"
+    fi
+    rm -f -- "$staging" || exit 1
+    validate_backlog_file "backlog scaffold target" "$target"
+  )
 }
 
 # A public commitment made through the relay binds its work by home AND id, so an
@@ -728,7 +762,7 @@ resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
     cp -p -- "$target" "$HANDOFF_PLAN_DIR/target.md" || return 1
     MOVE_PLAN_TARGET_PRESENT=1
   else
-    seed_backlog_scaffold "$HANDOFF_PLAN_DIR/target.md"
+    seed_backlog_scaffold "$HANDOFF_PLAN_DIR/target.md" "$(backlog_file_inode "$HANDOFF_PLAN_DIR")" || return 1
   fi
   MOVE_PLAN_SOURCE_HASH=$(sha256_file "$HANDOFF_PLAN_DIR/source.md") || return 1
   MOVE_PLAN_TARGET_HASH=$(sha256_file "$HANDOFF_PLAN_DIR/target.md") || return 1
@@ -1232,6 +1266,8 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
 
 remote_handoff() { # <secondmate-id> <keys...>
   local id=$1 outbox section main_section out_section key mv_out target_home persisted
+  local home_real data_parent data_parent_real data_base data_expected
+  local data_info data_real data_inode handoff_info handoff_dir handoff_inode
   local -a requested unique_requested to_move already missing in_flight done_items not_queued delivery_keys
   shift
   requested=("$@")
@@ -1240,7 +1276,34 @@ remote_handoff() { # <secondmate-id> <keys...>
     task_array_contains "$key" "${unique_requested[@]}" || unique_requested+=("$key")
   done
   requested=("${unique_requested[@]}")
-  outbox="$DATA/handoff/$id.outbox.md"
+  [ -d "$DATA" ] && [ ! -L "$DATA" ] || {
+    echo "error: active data directory is unsafe: $DATA" >&2
+    return 1
+  }
+  home_real=$(cd -P "$FM_HOME" && pwd -P) || return 1
+  data_parent=$(dirname "$DATA")
+  data_base=$(basename "$DATA")
+  case "$data_base" in ''|.|..|*/*) return 1 ;; esac
+  data_parent_real=$(cd -P "$data_parent" && pwd -P) || return 1
+  data_expected="$data_parent_real/$data_base"
+  data_info=$(cd -P "$DATA" && printf '%s\t%s\n' "$(pwd -P)" "$(backlog_file_inode .)") || return 1
+  data_real=${data_info%%$'\t'*}
+  data_inode=${data_info#*$'\t'}
+  [ "$data_real" = "$data_expected" ] || {
+    echo "error: active data directory changed while it was being anchored: $DATA" >&2
+    return 1
+  }
+  case "$data_real" in "$home_real"/*) ;; *)
+    echo "error: active data directory resolves outside its firstmate home: $DATA" >&2
+    return 1 ;;
+  esac
+  handoff_info=$(safe_child_dir "$data_real" "$data_inode" handoff) || {
+    echo "error: remote handoff directory could not be anchored safely" >&2
+    return 1
+  }
+  handoff_dir=${handoff_info%%$'\t'*}
+  handoff_inode=${handoff_info#*$'\t'}
+  outbox="$handoff_dir/$id.outbox.md"
   validate_backlog_file "main backlog" "$MAIN_BACKLOG" || return 1
   validate_backlog_file "remote handoff outbox" "$outbox" || return 1
   if [ ! -e "$outbox" ] && [ ! -L "$outbox" ]; then
@@ -1357,7 +1420,7 @@ remote_handoff() { # <secondmate-id> <keys...>
     echo "error: backlog revisions changed after identity preparation; nothing new was handed off" >&2
     return 1
   fi
-  if ! seed_backlog_scaffold "$outbox"; then
+  if ! seed_backlog_scaffold "$outbox" "$handoff_inode"; then
     abort_remote_handoff_identities "$id" || true
     echo "error: remote handoff outbox scaffold could not be published safely; nothing new was handed off" >&2
     return 1
@@ -1500,10 +1563,18 @@ fm_lock_acquire_wait "$ACTIVE_BACKLOG_LOCK"
 
 RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
-SUB_HOME=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
-SUB_BACKLOG="$SUB_HOME/data/backlog.md"
-ACTIVE_TARGET_BACKLOG_LOCK="$SUB_HOME/state/.backlog-mutation.lock"
-mkdir -p "$SUB_HOME/state" || { echo "error: could not create destination mutation-lock directory" >&2; exit 1; }
+SUB_HOME_INFO=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
+SUB_HOME=${SUB_HOME_INFO%%$'\t'*}
+SUB_HOME_INODE=${SUB_HOME_INFO#*$'\t'}
+SUB_DATA_INFO=$(safe_child_dir "$SUB_HOME" "$SUB_HOME_INODE" data) \
+  || { echo "error: could not anchor destination data directory" >&2; exit 1; }
+SUB_DATA_DIR=${SUB_DATA_INFO%%$'\t'*}
+SUB_DATA_INODE=${SUB_DATA_INFO#*$'\t'}
+SUB_STATE_INFO=$(safe_child_dir "$SUB_HOME" "$SUB_HOME_INODE" state) \
+  || { echo "error: could not anchor destination mutation-lock directory" >&2; exit 1; }
+SUB_STATE_DIR=${SUB_STATE_INFO%%$'\t'*}
+SUB_BACKLOG="$SUB_DATA_DIR/backlog.md"
+ACTIVE_TARGET_BACKLOG_LOCK="$SUB_STATE_DIR/.backlog-mutation.lock"
 fm_lock_acquire_wait "$ACTIVE_TARGET_BACKLOG_LOCK"
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
@@ -1662,12 +1733,11 @@ receiver_wake_mark_prepared "$ID" "$REQUESTED_BATCH" || {
 # does not exist yet, so the moved item lands under the right section. (Left to
 # create the file itself, tasks-axi mv writes its own `# Backlog` title format,
 # which is not firstmate's home-backlog convention.)
-mkdir -p "$SUB_HOME/data"
 SUB_CREATED=0
 if [ ! -e "$SUB_BACKLOG" ] && [ ! -L "$SUB_BACKLOG" ]; then
   SUB_CREATED=1
 fi
-if ! seed_backlog_scaffold "$SUB_BACKLOG"; then
+if ! seed_backlog_scaffold "$SUB_BACKLOG" "$SUB_DATA_INODE"; then
   abort_local_handoff_identities "$SUB_HOME" || true
   echo "error: destination backlog scaffold could not be published safely; nothing was moved." >&2
   exit 1
