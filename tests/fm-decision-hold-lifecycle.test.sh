@@ -2869,6 +2869,36 @@ SH
   pass "a bound channel's captured answers close their captain holds at answer time"
 }
 
+test_pruned_answer_retry_uses_proven_retention_history() {
+  local home id hold show
+  home=$(make_home pruned-answer-retry)
+  id=sample-pruned-answer-review
+  sed 's/done_keep = 10/done_keep = 0/' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure immediate Done retention"
+  tasks_in "$home" add "$id" "Review pruned answer retry" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create the pruned-answer origin"
+  write_origin_meta "$home" "$id"
+  hold=$(run_decisions "$home" hold "$id" final-choice \
+    --title "Choose the final option" --reason "captain final choice pending" --repo sample) \
+    || fail "could not create the immediately pruned hold"
+  printf 'Captain chose the final option.\n' > "$home/final-choice.txt"
+  run_decisions "$home" answer "$id" final-choice --decision-file "$home/final-choice.txt" >/dev/null \
+    || fail "answer reported failure after its resolution was immediately pruned"
+  if tasks_in "$home" show "$hold" --full > "$home/pruned-show.out" 2>&1; then
+    fail "done_keep=0 retained the answered hold in the active backlog"
+  fi
+  assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
+    "the answered hold did not cross normal configured retention"
+  run_decisions "$home" answer "$id" final-choice --decision-file "$home/final-choice.txt" >/dev/null \
+    || fail "an exact answer retry did not accept proven retained history"
+  run_decisions "$home" verify "$id" >/dev/null \
+    || fail "proven retained history did not satisfy verification after answer retry"
+  show=$(tasks_in "$home" list --state done)
+  assert_not_contains "$show" "$hold" "answer retry restored pruned history into the Done window"
+  pass "immediately pruned answers and exact retries use proven retention history"
+}
+
 # Answer-time closure is opt-in per source. A channel with no binding must behave
 # exactly as it always did: capture, announce, close nothing.
 test_unbound_source_closes_no_hold() {
@@ -3081,6 +3111,7 @@ test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home
 test_resolve_matches_quoted_blocked_by_edges
 test_bound_channel_answers_close_their_holds_at_answer_time
+test_pruned_answer_retry_uses_proven_retention_history
 test_unbound_source_closes_no_hold
 test_answer_preserves_every_unrouted_close_guard
 test_chat_channel_feeds_the_same_keyed_answer_intake

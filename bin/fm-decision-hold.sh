@@ -2085,19 +2085,28 @@ verify_hold_active() {  # <hold-id> <origin-id> <decision-key>
   ensure_retention_owner
 }
 
+RESOLVED_HOLD_BODY=''
 verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   local id=$1 origin=$2 key=$3 show state kind hold_kind body
-  show=$(task_show "$id") || return 1
-  state=$(show_field "$show" state)
-  kind=$(show_field "$show" kind)
-  hold_kind=$(show_field "$show" hold_kind)
-  body=$(show_field "$show" body)
-  [ "$state" = "done" ] || return 1
-  [ "$kind" = captain ] || return 1
-  [ "$hold_kind" = captain ] || return 1
-  body_has_resolution_record "$body" "$origin" "$key" || return 1
-  reject_archived_generation_collision "$id"
-  ensure_retention_owner
+  RESOLVED_HOLD_BODY=''
+  if task_show_optional "$id"; then
+    show=$TASK_SHOW_OUTPUT
+    state=$(show_field "$show" state)
+    kind=$(show_field "$show" kind)
+    hold_kind=$(show_field "$show" hold_kind)
+    body=$(show_field "$show" body)
+    [ "$state" = "done" ] || return 1
+    [ "$kind" = captain ] || return 1
+    [ "$hold_kind" = captain ] || return 1
+    body_has_resolution_record "$body" "$origin" "$key" || return 1
+    reject_archived_generation_collision "$id"
+    ensure_retention_owner
+    RESOLVED_HOLD_BODY=$body
+    return 0
+  fi
+  reset_decision_archive_cache
+  archived_hold_resolved "$id" "$origin" "$key" || return 1
+  RESOLVED_HOLD_BODY=$ARCHIVED_HOLD_BODY
 }
 
 verify_hold_historical() {  # <origin-id> <decision-key>
@@ -2798,8 +2807,7 @@ command_resolve() {
   require_tasks_axi
   id=$(hold_id "$origin" "$key")
   if verify_hold_resolved "$id" "$origin" "$key"; then
-    hold_show=$(task_show "$id")
-    hold_body=$(show_field "$hold_show" body)
+    hold_body=$RESOLVED_HOLD_BODY
     verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$routed_csv"
     printf 'resolved: %s\n' "$id"
     return 0
@@ -2872,8 +2880,7 @@ close_unrouted_hold() {  # <mode> <outcome-word> <origin-id> <decision-key> <fla
   require_tasks_axi
   id=$(hold_id "$origin" "$key")
   if verify_hold_resolved "$id" "$origin" "$key"; then
-    hold_show=$(task_show "$id")
-    hold_body=$(show_field "$hold_show" body)
+    hold_body=$RESOLVED_HOLD_BODY
     verify_resolution_identity "$id" "$origin" "$key" "$hold_body" "$DECISION_DIGEST" "$ROUTED_NONE"
     printf '%s: %s\n' "$outcome" "$id"
     return 0

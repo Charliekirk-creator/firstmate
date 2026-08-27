@@ -125,6 +125,7 @@ ok - terminal single-owner stale status decisions do not block empty inventory
 ok - main-home and secondmate-home captain holds remain correctly routed
 ok - resolve matches first/middle/last in quoted blocked_by and rejects a genuinely absent id
 ok - a bound channel's captured answers close their captain holds at answer time
+ok - immediately pruned answers and exact retries use proven retention history
 ok - a channel source with no decision binding closes nothing
 ok - the answer path keeps every guard the unrouted close path already had
 ok - the chat channel feeds the same keyed-answer intake a captured review does
