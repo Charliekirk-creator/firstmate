@@ -1408,7 +1408,7 @@ detect_local_tools() {
   if command -v quota-axi >/dev/null 2>&1 && ! fm_quota_axi_compatible; then
     echo "MISSING: quota-axi (install: $(install_cmd quota-axi))"
   fi
-  if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible; then
+  if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_handoff_compatible; then
     echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
   fi
 }

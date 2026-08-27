@@ -123,6 +123,8 @@ if [ "\${1:-}" = update ] && [ "\${2:-}" = --help ]; then
 fi
 if [ "\${1:-}" = mv ] && [ "\${2:-}" = --help ]; then
   printf '%s\n' '$mv_usage'
+  printf '%s\n' '  --if-source-sha256 <digest>'
+  printf '%s\n' '  --if-target-sha256 <digest>'
   exit 0
 fi
 exit 0

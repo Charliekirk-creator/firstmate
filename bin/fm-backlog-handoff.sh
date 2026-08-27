@@ -658,9 +658,7 @@ resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
     seed_backlog_scaffold "$HANDOFF_PLAN_DIR/target.md"
   fi
   MOVE_PLAN_SOURCE_HASH=$(sha256_file "$HANDOFF_PLAN_DIR/source.md") || return 1
-  if [ "$MOVE_PLAN_TARGET_PRESENT" -eq 1 ]; then
-    MOVE_PLAN_TARGET_HASH=$(sha256_file "$HANDOFF_PLAN_DIR/target.md") || return 1
-  fi
+  MOVE_PLAN_TARGET_HASH=$(sha256_file "$HANDOFF_PLAN_DIR/target.md") || return 1
   if ! result=$(tasks-axi mv "$@" --file "$HANDOFF_PLAN_DIR/source.md" \
     --to "$HANDOFF_PLAN_DIR/target.md" --json 2>&1); then
     [ -z "$result" ] || printf '%s\n' "$result" >&2
@@ -1130,8 +1128,8 @@ remote_handoff() { # <secondmate-id> <keys...>
       return 1
     }
   fi
-  fm_tasks_axi_compatible || {
-    echo "error: a compatible tasks-axi with atomic multi-ID mv support is required to stage remote handoffs; run bin/fm-bootstrap.sh for the required version" >&2
+  fm_tasks_axi_handoff_compatible || {
+    echo "error: a compatible tasks-axi with revision-checked atomic multi-ID mv support is required to stage remote handoffs; run bin/fm-bootstrap.sh for the required version" >&2
     return 1
   }
   to_move=()
@@ -1240,7 +1238,9 @@ remote_handoff() { # <secondmate-id> <keys...>
   fi
   seed_backlog_scaffold "$outbox"
   if [ "${#to_move[@]}" -gt 0 ]; then
-    if ! mv_out=$(tasks-axi mv "${RESOLVED_MOVE_KEYS[@]}" --file "$MAIN_BACKLOG" --to "$outbox" --json 2>&1); then
+    if ! mv_out=$(tasks-axi mv "${RESOLVED_MOVE_KEYS[@]}" --file "$MAIN_BACKLOG" --to "$outbox" \
+      --if-source-sha256 "$MOVE_PLAN_SOURCE_HASH" --if-target-sha256 "$MOVE_PLAN_TARGET_HASH" \
+      --json 2>&1); then
       [ -z "$mv_out" ] || printf '%s\n' "$mv_out" >&2
       persisted=0
       for key in "${RESOLVED_MOVE_KEYS[@]}"; do
@@ -1446,8 +1446,8 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-if [ "${#TO_MOVE[@]}" -gt 0 ] && ! fm_tasks_axi_compatible; then
-  echo "error: a compatible tasks-axi with atomic multi-ID mv support is required to move backlog items; run bin/fm-bootstrap.sh for the required version" >&2
+if [ "${#TO_MOVE[@]}" -gt 0 ] && ! fm_tasks_axi_handoff_compatible; then
+  echo "error: a compatible tasks-axi with revision-checked atomic multi-ID mv support is required to move backlog items; run bin/fm-bootstrap.sh for the required version" >&2
   exit 1
 fi
 
@@ -1549,7 +1549,9 @@ fi
 # together and, on any failure, neither backlog's content changes - the only
 # cleanup is a scaffold we just created. tasks-axi writes both its success and
 # error output to stdout, so capture it and surface it only on failure.
-if ! MV_OUT=$(tasks-axi mv "${RESOLVED_MOVE_KEYS[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" --json 2>&1); then
+if ! MV_OUT=$(tasks-axi mv "${RESOLVED_MOVE_KEYS[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" \
+  --if-source-sha256 "$MOVE_PLAN_SOURCE_HASH" --if-target-sha256 "$MOVE_PLAN_TARGET_HASH" \
+  --json 2>&1); then
   PERSISTED=0
   for key in "${RESOLVED_MOVE_KEYS[@]}"; do
     backlog_key_section "$SUB_BACKLOG" "$key" >/dev/null 2>&1 && PERSISTED=1
