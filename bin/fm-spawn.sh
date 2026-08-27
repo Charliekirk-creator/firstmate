@@ -888,7 +888,7 @@ spawn_launch_request_cleanup() {
   [ -d "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ] || return 1
   for entry in "$SPAWN_LAUNCH_REQUEST"/* "$SPAWN_LAUNCH_REQUEST"/.[!.]* "$SPAWN_LAUNCH_REQUEST"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
-    case "${entry##*/}" in owner|attempted|accepted|failed|executed|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp) ;; *) return 1 ;; esac
+    case "${entry##*/}" in owner|attempted|accepted|failed|executed|kimi-submission|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.kimi-submission.tmp) ;; *) return 1 ;; esac
     [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
     [ "$(spawn_file_link_count "$entry")" = 1 ] || return 1
     rm -f -- "$entry" || return 1
@@ -904,11 +904,11 @@ spawn_launch_request_helper() {  # <command>
   tmp="$SPAWN_LAUNCH_REQUEST/.owner.tmp"
   printf '%s\n' "${BASHPID:-$$}" > "$tmp" && chmod 600 "$tmp" \
     && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/owner" || exit 1
-  tmp="$SPAWN_LAUNCH_REQUEST/.attempted.tmp"
-  printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" && chmod 600 "$tmp" \
-    && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/attempted" || exit 1
   spawn_send_literal "$T" "$command" || rc=$?
   if [ "$rc" -eq 0 ]; then
+    tmp="$SPAWN_LAUNCH_REQUEST/.attempted.tmp"
+    printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" && chmod 600 "$tmp" \
+      && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/attempted" || exit 1
     sleep 0.3
     spawn_send_key "$T" Enter || rc=$?
   fi
@@ -3851,26 +3851,66 @@ kimi_spawn_fail() {  # <detail>
   echo "error: $1; inspect window $T" >&2
 }
 
+kimi_submission_state() {
+  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" value links
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'absent'; return 0; fi
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  links=$(spawn_file_link_count "$path") || return 1
+  [ "$links" = 1 ] || return 1
+  value=$(tr -d '\n' < "$path") || return 1
+  case "$value" in pending|accepted) printf '%s' "$value" ;; *) return 1 ;; esac
+}
+
+kimi_submission_publish() {  # <pending|accepted>
+  local value=$1 tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submission.tmp"
+  case "$value" in pending|accepted) ;; *) return 1 ;; esac
+  printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
+    && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/kimi-submission"
+}
+
 kimi_deliver_launch_brief() {
-  local recovery=${1:-fresh}
+  local recovery=${1:-fresh} submission_state journal=0
   if [ "$recovery" = recovery ] && kimi_wait_for_delivery; then return 0; fi
-  if ! kimi_wait_for_ready; then
-    kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"
-    return 1
+  if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
+    journal=1
+    submission_state=$(kimi_submission_state) || {
+      kimi_spawn_fail "kimi launch brief submission evidence is unsafe"
+      return 1
+    }
+  else
+    submission_state=absent
   fi
-  KIMI_INPUT=$SPAWN_BRIEF_INPUT
-  KIMI_SUBMIT_RETRIES=${FM_KIMI_SUBMIT_RETRIES:-3}
-  KIMI_SUBMIT_SLEEP=${FM_KIMI_SUBMIT_SLEEP:-${FM_KIMI_POLL_INTERVAL:-0.5}}
-  KIMI_SUBMIT_SETTLE=${FM_KIMI_SUBMIT_SETTLE:-0}
-  KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
-    "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
-    "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || {
-    kimi_spawn_fail "kimi launch brief could not be submitted"
-    return 1
-  }
-  if [ "$KIMI_SUBMIT_VERDICT" = send-failed ]; then
-    kimi_spawn_fail "kimi launch brief could not be submitted"
-    return 1
+  if [ "$submission_state" = absent ]; then
+    if ! kimi_wait_for_ready; then
+      kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"
+      return 1
+    fi
+    KIMI_INPUT=$SPAWN_BRIEF_INPUT
+    KIMI_SUBMIT_RETRIES=${FM_KIMI_SUBMIT_RETRIES:-3}
+    KIMI_SUBMIT_SLEEP=${FM_KIMI_SUBMIT_SLEEP:-${FM_KIMI_POLL_INTERVAL:-0.5}}
+    KIMI_SUBMIT_SETTLE=${FM_KIMI_SUBMIT_SETTLE:-0}
+    KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
+      "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
+      "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || {
+      kimi_spawn_fail "kimi launch brief could not be submitted"
+      return 1
+    }
+    if [ "$KIMI_SUBMIT_VERDICT" = send-failed ]; then
+      kimi_spawn_fail "kimi launch brief could not be submitted"
+      return 1
+    fi
+    if [ "$KIMI_SUBMIT_VERDICT" = pending ]; then submission_state=pending; else submission_state=accepted; fi
+    if [ "$journal" -eq 1 ]; then
+      kimi_submission_publish "$submission_state" || {
+        kimi_spawn_fail "kimi launch brief submission could not be journaled"
+        return 1
+      }
+    fi
+  elif [ "$submission_state" = pending ]; then
+    spawn_send_key "$T" Enter || {
+      kimi_spawn_fail "kimi pending launch brief could not be resubmitted"
+      return 1
+    }
   fi
   if ! kimi_wait_for_delivery; then
     kimi_spawn_fail "kimi launch brief delivery was not confirmed"
