@@ -126,6 +126,8 @@ DIE_STATUS=1
 case "${1:-}" in publication-run) DIE_STATUS=42 ;; esac
 FM_HOME_ID=
 LOCATED_TASK=
+TASK_DIR=
+TASK_DIR_ID=
 ACTIVE_IDENTITY_LOCK=
 ACTIVE_IDENTITY_LOCK_HELD=0
 ACTIVE_PUBLICATION_LOCK=
@@ -322,7 +324,7 @@ recover_no_clobber_target() {  # <target> <label>
   if [ ! -e "$target" ] && [ ! -L "$target" ]; then
     [ "$staging_links" = 1 ] \
       || die "$label publication staging path is unexpectedly hardlinked: $staging"
-    rm -f -- "$staging" || die "cannot retire incomplete $label publication staging path: $staging"
+    owned_remove "$staging" "$label publication staging path"
     return 0
   fi
   [ ! -L "$target" ] || die "$label is symlinked: $target"
@@ -335,7 +337,7 @@ recover_no_clobber_target() {  # <target> <label>
     || die "cannot inspect $label publication staging inode: $staging"
   [ "$target_inode" = "$staging_inode" ] \
     || die "$label publication staging path does not own the authoritative record: $staging"
-  rm -f -- "$staging" || die "cannot complete $label publication recovery: $staging"
+  owned_remove "$staging" "$label publication staging path"
   target_links=$(file_link_count "$target") || die "cannot reinspect $label link count: $target"
   [ "$target_links" = 1 ] || die "$label publication recovery did not restore one link: $target"
 }
@@ -347,27 +349,80 @@ recover_no_clobber_publications() {
   recover_no_clobber_target "$UNLINKED_RESERVATION" "work identity unlinked reservation"
 }
 
-publish_no_clobber() {  # <source> <target> <label>; 2 means target already exists
-  local source=$1 target=$2 label=$3 staging rc
-  [ ! -e "$target" ] && [ ! -L "$target" ] || return 2
-  staging="${target}.publishing"
-  [ ! -e "$staging" ] && [ ! -L "$staging" ] \
-    || die "$label publication staging path already exists: $staging"
-  mv -- "$source" "$staging" || die "cannot stage $label publication: $target"
+owned_parent_details() {  # <target>
+  local target=$1 parent
+  parent=$(dirname -- "$target") || return 1
+  if [ "$parent" = "$TASK_DIR" ] && [ -n "$TASK_DIR_ID" ]; then
+    printf '%s\t%s\n' "$TASK_DIR" "$TASK_DIR_ID"
+  elif [ "$parent" = "$STATE_REAL" ] && [ -n "$STATE_DIR_ID" ]; then
+    printf '%s\t%s\n' "$STATE_REAL" "$STATE_DIR_ID"
+  elif [ "$parent" = "$DATA_REAL" ] && [ -n "$DATA_DIR_ID" ]; then
+    printf '%s\t%s\n' "$DATA_REAL" "$DATA_DIR_ID"
+  else
+    return 1
+  fi
+}
+
+owned_atomic_replace() {  # <source> <target> <label>
+  local source=$1 target=$2 label=$3 parent expected base stage
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
+  stage=".$base.replacing.${BASHPID:-$$}.$RANDOM"
+  (
+    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
+    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
+    [ ! -e "$stage" ] && [ ! -L "$stage" ] || exit 1
+    cp -p -- "$source" "$stage" \
+      && [ "$(directory_inode_identity "$parent")" = "$expected" ] \
+      && mv -f -- "$stage" "$base"
+  ) || die "cannot publish $label: $target"
+  rm -f -- "$source" || die "cannot retire $label publication source"
   [ "${TMP:-}" != "$source" ] || TMP=
-  PUBLICATION_STAGING=$staging
-  if command link "$staging" "$target" 2>/dev/null; then
-    rm -f -- "$staging" || die "cannot complete $label publication: $target"
-    PUBLICATION_STAGING=
-    return 0
-  fi
-  rc=$?
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    rm -f -- "$staging" || die "cannot retire conflicting $label publication staging path: $staging"
-    PUBLICATION_STAGING=
-    return 2
-  fi
-  die "cannot publish $label: $target (link status $rc)"
+}
+
+owned_remove() {  # <target> <label>
+  local target=$1 label=$2 parent expected base
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
+  (
+    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
+    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
+    rm -f -- "$base"
+  ) || die "cannot remove $label: $target"
+}
+
+publish_no_clobber() {  # <source> <target> <label>; 2 means target already exists
+  local source=$1 target=$2 label=$3 parent expected base staging rc
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
+  staging="${base}.publishing"
+  rc=0
+  (
+    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
+    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
+    [ ! -e "$base" ] && [ ! -L "$base" ] || exit 2
+    [ ! -e "$staging" ] && [ ! -L "$staging" ] || exit 1
+    cp -p -- "$source" "$staging" || exit 1
+    [ "$(directory_inode_identity "$parent")" = "$expected" ] || exit 1
+    if command link "$staging" "$base" 2>/dev/null; then
+      rm -f -- "$staging" || exit 1
+      exit 0
+    fi
+    [ ! -e "$base" ] && [ ! -L "$base" ] || { rm -f -- "$staging"; exit 2; }
+    exit 1
+  ) || rc=$?
+  case "$rc" in
+    0)
+      rm -f -- "$source" || die "cannot retire $label publication source"
+      [ "${TMP:-}" != "$source" ] || TMP=
+      return 0
+      ;;
+    2) return 2 ;;
+    *) die "cannot publish $label: $target" ;;
+  esac
 }
 
 home_id_literal_valid() {  # <main|secondmate:id>
@@ -395,12 +450,26 @@ ensure_home_identity() {
   FM_HOME_ID="secondmate:$id"
 }
 
+create_owned_directory() {  # <name> <path>
+  local name=$1 path=$2 parent base expected
+  parent=$(dirname -- "$path") || die "cannot resolve $name directory parent: $path"
+  base=$(basename -- "$path") || die "cannot resolve $name directory name: $path"
+  [ "$base" != . ] && [ "$base" != .. ] || die "$name directory path is unsafe: $path"
+  expected=$(directory_inode_identity "$parent") \
+    || die "$name directory parent cannot be inspected: $parent"
+  (
+    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
+    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
+    mkdir -- "$base" 2>/dev/null
+  ) || die "cannot create $name directory: $path"
+}
+
 ensure_data_dir() {
   local resolved inode
   if [ ! -e "$DATA_INPUT" ] && [ ! -L "$DATA_INPUT" ]; then
     [ -z "$DATA_DIR_ID" ] \
       || die "data directory disappeared after validation: $DATA_INPUT"
-    mkdir -p -- "$DATA_INPUT" || die "cannot create data directory: $DATA_INPUT"
+    create_owned_directory data "$DATA_INPUT"
   fi
   IFS=$'\t' read -r resolved inode \
     < <(resolve_owned_dir data "$DATA_INPUT" "${DATA_DIR_ID:+$DATA_REAL}" "$DATA_DIR_ID")
@@ -413,7 +482,7 @@ ensure_state_dir() {
   if [ ! -e "$STATE_INPUT" ] && [ ! -L "$STATE_INPUT" ]; then
     [ -z "$STATE_DIR_ID" ] \
       || die "state directory disappeared after validation: $STATE_INPUT"
-    mkdir -p -- "$STATE_INPUT" || die "cannot create state directory: $STATE_INPUT"
+    create_owned_directory state "$STATE_INPUT"
   fi
   IFS=$'\t' read -r resolved inode \
     < <(resolve_owned_dir state "$STATE_INPUT" "${STATE_DIR_ID:+$STATE_REAL}" "$STATE_DIR_ID")
@@ -429,7 +498,7 @@ lock_parent_preflight() {  # <directory> <label>
 }
 
 locate_task_dir() {  # <task-id>, read-only
-  local id=$1 dir real
+  local id=$1 dir real inode
   LOCATED_TASK=$id
   if [ -e "$DATA_INPUT" ] || [ -L "$DATA_INPUT" ]; then
     local resolved inode
@@ -444,8 +513,14 @@ locate_task_dir() {  # <task-id>, read-only
     [ -d "$dir" ] || die "task data path is not a directory: $dir"
     real=$(resolve_existing_dir task-data "$dir")
     [ "$real" = "$DATA_REAL/$id" ] || die "task data directory escapes the configured data directory: $dir"
+    inode=$(directory_inode_identity "$real") \
+      || die "task data directory cannot be inspected: $dir"
+    [ -z "$TASK_DIR_ID" ] || [ "$inode" = "$TASK_DIR_ID" ] \
+      || die "task data directory was replaced after validation: $dir"
     TASK_DIR=$real
+    TASK_DIR_ID=$inode
   else
+    [ -z "$TASK_DIR_ID" ] || die "task data directory disappeared after validation: $dir"
     TASK_DIR=$dir
   fi
   SIDECAR="$TASK_DIR/work-identity.json"
@@ -463,7 +538,11 @@ ensure_task_dir() {  # <task-id>
   ensure_data_dir
   locate_task_dir "$id"
   if [ ! -d "$TASK_DIR" ]; then
-    if ! mkdir -- "$TASK_DIR" 2>/dev/null; then
+    if ! (
+      CDPATH='' cd -- "$DATA_REAL" 2>/dev/null || exit 1
+      [ "$(directory_inode_identity .)" = "$DATA_DIR_ID" ] || exit 1
+      mkdir -- "$id" 2>/dev/null
+    ); then
       [ -d "$TASK_DIR" ] && [ ! -L "$TASK_DIR" ] \
         || die "cannot create task data directory: $TASK_DIR"
     fi
@@ -1041,11 +1120,11 @@ write_handoff_state() {  # <path> <source|target> <prepared|completed> <transfer
   local path=$1 role=$2 state=$3 transfer=$4 payload
   payload=$(handoff_state_json "$role" "$state" "$transfer") \
     || die "cannot build work identity handoff state"
-  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-handoff.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-handoff.XXXXXX") \
     || die "cannot create work identity handoff state"
   printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity handoff state"
   chmod 600 "$TMP" || die "cannot protect work identity handoff state"
-  mv -f -- "$TMP" "$path" || die "cannot publish work identity handoff state"
+  owned_atomic_replace "$TMP" "$path" "work identity handoff state"
   TMP=
 }
 
@@ -1101,7 +1180,7 @@ write_unlinked_guard() {  # <task-id> <reason>
     --arg reason "$reason" \
     '{schema:$schema,binding:{home:$home,home_id:$home_id,task_id:$task},reason:$reason}') \
     || die "cannot build work identity unlinked guard"
-  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-unlinked-guard.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-unlinked-guard.XXXXXX") \
     || die "cannot create work identity unlinked guard"
   printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity unlinked guard"
   chmod 600 "$TMP" || die "cannot protect work identity unlinked guard"
@@ -1155,7 +1234,7 @@ write_unlinked_reservation() {  # <task-id> <reason> <transaction>
     '{schema:$schema,state:"prepared",transaction_id:$transaction,
       binding:{home:$home,home_id:$home_id,task_id:$task},reason:$reason}') \
     || die "cannot build work identity unlinked reservation"
-  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-unlinked-reservation.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-unlinked-reservation.XXXXXX") \
     || die "cannot create work identity unlinked reservation"
   printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity unlinked reservation"
   chmod 600 "$TMP" || die "cannot protect work identity unlinked reservation"
@@ -1241,11 +1320,11 @@ write_dispatch_state() {  # <prepared|completed> <task> <transaction> <path> <br
        previous_transaction_id:(if $replacement then $previous_transaction else null end),
        previous_instructions_sha256:(if $replacement then $previous_sha else null end)}') \
     || die "cannot build work identity dispatch state"
-  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-dispatch.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-dispatch-state.XXXXXX") \
     || die "cannot create work identity dispatch state"
   printf '%s\n' "$payload" > "$TMP" || die "cannot write work identity dispatch state"
   chmod 600 "$TMP" || die "cannot protect work identity dispatch state"
-  mv -f -- "$TMP" "$DISPATCH_STATE" || die "cannot publish work identity dispatch state"
+  owned_atomic_replace "$TMP" "$DISPATCH_STATE" "work identity dispatch state"
   TMP=
 }
 
@@ -1264,7 +1343,7 @@ validate_dispatch_prior_locked() {
 retire_dispatch_prior_locked() {
   validate_dispatch_prior_locked
   if [ -e "$DISPATCH_PRIOR" ] || [ -L "$DISPATCH_PRIOR" ]; then
-    rm -f -- "$DISPATCH_PRIOR" || die "cannot retire retained prior dispatch instructions"
+    owned_remove "$DISPATCH_PRIOR" "retained prior dispatch instructions"
   fi
 }
 
@@ -1645,7 +1724,7 @@ publish_handoff_sidecar() {  # <task-id>; HANDOFF_RECORD/HANDOFF_TARGET_SHA load
       || die "handoff target linked record is conflicting"
     return 0
   fi
-  TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-handoff-sidecar.XXXXXX") \
     || die "cannot create handoff work identity record"
   printf '%s\n' "$HANDOFF_RECORD" > "$TMP" || die "cannot write handoff work identity record"
   validate_sidecar "$TMP" "$task"
@@ -1761,7 +1840,7 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
     write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
     return 4
   fi
-  rm -f -- "$TARGET_HANDOFF" || die "cannot abort handoff target state"
+  owned_remove "$TARGET_HANDOFF" "handoff target state"
 }
 
 handoff_backlog_state() {  # <task-id> <transfer-path>
@@ -1842,7 +1921,7 @@ handoff_cancel() {  # <task-id> <transfer-path>; 4 means source is already compl
   read_handoff_state "$SOURCE_HANDOFF" source "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different source handoff"
   [ "$HANDOFF_STATE" != completed ] || return 4
-  rm -f -- "$SOURCE_HANDOFF" || die "cannot cancel handoff source state"
+  owned_remove "$SOURCE_HANDOFF" "handoff source state"
 }
 
 render_identity_projection_locked() {  # <task-id> [brief] [meta] [meta-brief-path]
@@ -1992,8 +2071,7 @@ unlinked_prepare() {  # <task-id> <reason> <transaction>
       read_unlinked_reservation "$task"
       [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
         || die "task $task prepared a different unlinked reservation"
-      rm -f -- "$UNLINKED_RESERVATION" \
-        || die "cannot reconcile committed unlinked reservation for task $task"
+      owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation"
     fi
     emit_unlinked_projection_locked "$task"
     return 0
@@ -2026,8 +2104,7 @@ unlinked_commit() {  # <task-id> <transaction>
     read_unlinked_guard "$task"
   fi
   if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
-    rm -f -- "$UNLINKED_RESERVATION" \
-      || die "cannot retire committed unlinked reservation for task $task"
+    owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation"
   fi
   emit_unlinked_projection_locked "$task"
 }
@@ -2042,8 +2119,7 @@ unlinked_abort() {  # <task-id> <transaction>; 4 means committed
       read_unlinked_reservation "$task"
       [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
         || die "task $task prepared a different unlinked reservation"
-      rm -f -- "$UNLINKED_RESERVATION" \
-        || die "cannot reconcile committed unlinked reservation for task $task"
+      owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation"
     fi
     return 4
   fi
@@ -2053,8 +2129,7 @@ unlinked_abort() {  # <task-id> <transaction>; 4 means committed
   read_unlinked_reservation "$task"
   [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
     || die "task $task prepared a different unlinked reservation"
-  rm -f -- "$UNLINKED_RESERVATION" \
-    || die "cannot abort unlinked reservation for task $task"
+  owned_remove "$UNLINKED_RESERVATION" "unlinked reservation"
 }
 
 brief_publish() {  # <task-id> <draft>
@@ -2073,7 +2148,7 @@ brief_publish() {  # <task-id> <draft>
   fi
   RETAIN_BRIEF_CAPTURE=0
   [ -n "$BRIEF_VALIDATED_CAPTURE" ] || die "cannot retain validated generated instructions"
-  TMP=$(umask 077; mktemp "$TASK_DIR/.brief.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-brief.XXXXXX") \
     || die "cannot create generated instructions"
   cp -- "$BRIEF_VALIDATED_CAPTURE" "$TMP" || die "cannot capture generated instructions"
   rm -f -- "$BRIEF_VALIDATED_CAPTURE"
@@ -2122,13 +2197,12 @@ publish_dispatch_instructions_locked() {  # <task-id>
     [ "$DISPATCH_REPLACEMENT" = false ] \
       || die "replacement dispatch instructions are unexpectedly absent"
   fi
-  TMP=$(umask 077; mktemp "$STATE_REAL/.$task.launch-brief-publish.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-launch-brief.XXXXXX") \
     || die "cannot create authoritative dispatch instructions"
   cp -- "$BRIEF_VALIDATED_CAPTURE" "$TMP" \
     || die "cannot capture authoritative dispatch instructions"
   chmod 400 "$TMP" || die "cannot protect authoritative dispatch instructions"
-  mv -f -- "$TMP" "$DISPATCH_INSTRUCTIONS" \
-    || die "cannot publish authoritative dispatch instructions"
+  owned_atomic_replace "$TMP" "$DISPATCH_INSTRUCTIONS" "authoritative dispatch instructions"
   TMP=
   rm -f -- "$BRIEF_VALIDATED_CAPTURE"
   BRIEF_VALIDATED_CAPTURE=
@@ -2248,11 +2322,11 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
     fi
     [ ! -e "$DISPATCH_PRIOR" ] && [ ! -L "$DISPATCH_PRIOR" ] \
       || die "replacement dispatch already has retained prior instructions"
-    DISPATCH_PRIOR_TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity-dispatch-prior.XXXXXX") \
+    DISPATCH_PRIOR_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-dispatch-prior.XXXXXX") \
       || die "cannot retain prior dispatch instructions"
     cp -- "$prior_brief" "$DISPATCH_PRIOR_TMP" || die "cannot retain prior dispatch instructions"
     chmod 400 "$DISPATCH_PRIOR_TMP" || die "cannot protect retained prior dispatch instructions"
-    mv -- "$DISPATCH_PRIOR_TMP" "$DISPATCH_PRIOR" || die "cannot publish retained prior dispatch instructions"
+    owned_atomic_replace "$DISPATCH_PRIOR_TMP" "$DISPATCH_PRIOR" "retained prior dispatch instructions"
     DISPATCH_PRIOR_TMP=
     DISPATCH_PRIOR_CLEANUP=1
   else
@@ -2346,12 +2420,12 @@ dispatch_publish() {  # <task-id> <brief> <metadata-candidate> <transaction>
   fi
   capture_metadata "$candidate"
   validate_dispatch_commit_candidate_locked "$task" "$brief" "$candidate"
-  TMP=$(umask 077; mktemp "$STATE_REAL/.$task.meta-publish.XXXXXX") \
+  TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-meta.XXXXXX") \
     || die "cannot create authoritative task metadata"
   cp -- "$META_CAPTURE_TMP" "$TMP" || die "cannot capture authoritative task metadata"
   chmod 600 "$TMP" || die "cannot protect authoritative task metadata"
   finish_metadata_capture "$candidate"
-  mv -f -- "$TMP" "$target" || die "cannot publish authoritative task metadata"
+  owned_atomic_replace "$TMP" "$target" "authoritative task metadata"
   TMP=
   read_dispatch_state "$task"
   [ "$DISPATCH_TRANSACTION" = "$transaction" ] \
@@ -2403,22 +2477,22 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
     current_hash=$(sha256_file "$DISPATCH_PRIOR") || die "SHA-256 is unavailable for retained prior instructions"
     [ "$current_hash" = "$DISPATCH_PREVIOUS_SHA" ] \
       || die "retained prior dispatch instructions are stale or mismatched"
-    TMP=$(umask 077; mktemp "$STATE_REAL/.$task.launch-brief-restore.XXXXXX") \
+    TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-launch-restore.XXXXXX") \
       || die "cannot restore prior dispatch instructions"
     cp -- "$DISPATCH_PRIOR" "$TMP" || die "cannot restore prior dispatch instructions"
     chmod 400 "$TMP" || die "cannot protect restored dispatch instructions"
-    mv -f -- "$TMP" "$DISPATCH_INSTRUCTIONS" || die "cannot publish restored dispatch instructions"
+    owned_atomic_replace "$TMP" "$DISPATCH_INSTRUCTIONS" "restored dispatch instructions"
     TMP=
-    rm -f -- "$DISPATCH_PRIOR" || die "cannot retire retained prior dispatch instructions"
+    owned_remove "$DISPATCH_PRIOR" "retained prior dispatch instructions"
   elif [ -e "$DISPATCH_INSTRUCTIONS" ] || [ -L "$DISPATCH_INSTRUCTIONS" ]; then
     safe_regular_file "$DISPATCH_INSTRUCTIONS" "prepared dispatch instructions"
     current_hash=$(sha256_file "$DISPATCH_INSTRUCTIONS") \
       || die "SHA-256 is unavailable for prepared dispatch instructions"
     [ "$current_hash" = "$DISPATCH_INSTRUCTIONS_SHA" ] \
       || die "prepared dispatch instructions changed before abort"
-    rm -f -- "$DISPATCH_INSTRUCTIONS" || die "cannot remove prepared dispatch instructions"
+    owned_remove "$DISPATCH_INSTRUCTIONS" "prepared dispatch instructions"
   fi
-  rm -f -- "$DISPATCH_STATE" || die "cannot abort work identity dispatch"
+  owned_remove "$DISPATCH_STATE" "work identity dispatch"
 }
 
 dispatch_retire_preflight() {  # <task-id>
@@ -2448,7 +2522,7 @@ dispatch_retire() {  # <task-id>
   [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
     || die "task $task dispatch instructions path is mismatched"
   retire_dispatch_prior_locked
-  rm -f -- "$DISPATCH_STATE" || die "cannot retire work identity dispatch"
+  owned_remove "$DISPATCH_STATE" "work identity dispatch"
 }
 
 publication_preflight_locked() {
@@ -2631,7 +2705,7 @@ case "$COMMAND" in
       die "work identity must be recorded before generated instructions and dispatch"
     fi
     record_handoff_transition_prepare "$TASK"
-    TMP=$(umask 077; mktemp "$TASK_DIR/.work-identity.XXXXXX") || die "cannot create work identity temporary file"
+    TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-record.XXXXXX") || die "cannot create work identity temporary file"
     printf '%s\n' "$CANONICAL" > "$TMP" || die "cannot write work identity temporary file"
     validate_sidecar "$TMP" "$TASK"
     if publish_no_clobber "$TMP" "$SIDECAR" "work identity record"; then

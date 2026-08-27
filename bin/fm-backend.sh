@@ -738,6 +738,14 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
   esac
 }
 
+fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
+  local evidence=$1 token=$2
+  shift 2
+  FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
+    FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
+    fm_backend_send_text_submit "$@"
+}
+
 # fm_backend_kill: remove the task's session endpoint (best-effort; a
 # nonexistent/already-gone target is not an error - callers already swallow
 # failures here exactly as the inline `tmux kill-window ... || true` did).

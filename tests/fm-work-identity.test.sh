@@ -543,7 +543,7 @@ test_no_clobber_publication_does_not_follow_raced_target() {
   cat > "$fakebin/link" <<'SH'
 #!/usr/bin/env bash
 set -eu
-if [ "${2:-}" = "$FM_TEST_PUBLICATION_TARGET" ] \
+if [ "$(pwd -P)/${2:-}" = "$FM_TEST_PUBLICATION_TARGET" ] \
    && [ ! -e "$FM_TEST_PUBLICATION_RACED" ]; then
   "$FM_TEST_REAL_LN" -s "$FM_TEST_PUBLICATION_SINK" "$FM_TEST_PUBLICATION_TARGET"
   : > "$FM_TEST_PUBLICATION_RACED"
@@ -1182,7 +1182,7 @@ test_replacement_dispatch_recovers_prior_retirement() {
   cat > "$fakebin/rm" <<'SH'
 #!/usr/bin/env bash
 for arg in "$@"; do
-  [ "$arg" != "$FM_TEST_PRIOR" ] || exit 1
+  [ "$(pwd -P)/$arg" != "$FM_TEST_PRIOR" ] || exit 1
 done
 exec "$FM_TEST_REAL_RM" "$@"
 SH
@@ -1191,7 +1191,7 @@ SH
     FM_TEST_REAL_RM="$real_rm" FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
     --brief "$launch" --meta "$candidate" --transaction "$transaction" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "injected retained-prior retirement failure unexpectedly completed"
-  assert_contains "$out" "cannot retire retained prior dispatch instructions" \
+  assert_contains "$out" "cannot remove retained prior dispatch instructions" \
     "retained-prior failure did not identify the recoverable transition"
   jq -e '.state == "prepared"' "$home/data/$task/work-identity-dispatch.json" >/dev/null \
     || fail "replacement was marked completed before retained prior retirement"

@@ -1026,11 +1026,19 @@ spawn_launch_request_start() {  # <command>
 }
 
 spawn_launch_request_wait() {
-  local state i=0 max=${FM_SPAWN_LAUNCH_POLLS:-100} interval=${FM_SPAWN_LAUNCH_INTERVAL:-0.1}
+  local state agent_state composer_state i=0 max=${FM_SPAWN_LAUNCH_POLLS:-100} interval=${FM_SPAWN_LAUNCH_INTERVAL:-0.1}
   while [ "$i" -lt "$max" ]; do
     state=$(spawn_launch_request_state) || return 1
     case "$state" in
-      executed) return 0 ;;
+      accepted|executed|attempted-live)
+        agent_state=$(fm_backend_agent_state "$BACKEND" "$T")
+        [ "$agent_state" != alive ] || return 0
+        if [ "$agent_state" = unverified ]; then
+          composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) \
+            || composer_state=unknown
+          case "$composer_state" in empty|pending|pending-unproven) return 0 ;; esac
+        fi
+        ;;
       failed|attempted-dead|launch-exited) return 2 ;;
     esac
     i=$((i + 1))
@@ -4024,12 +4032,10 @@ kimi_submission_helper() {
   tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-owner.tmp"
   printf '%s:%s\n' "${BASHPID:-$$}" "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" \
     && chmod 600 "$tmp" && mv -- "$tmp" "$owner" || exit 1
-  verdict=$(fm_backend_send_text_submit \
+  verdict=$(fm_backend_send_text_submit_journaled \
+    "$attempted" "$SPAWN_LAUNCH_REQUEST_TOKEN" \
     "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
     "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || verdict=ambiguous
-  tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-attempted.tmp"
-  printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" \
-    && chmod 600 "$tmp" && mv -- "$tmp" "$attempted" || exit 1
   case "$verdict" in
     empty|accepted) verdict=accepted ;;
     pending|pending-unproven) verdict=pending ;;
@@ -4988,7 +4994,7 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
   sq_launch_eval=$(shell_quote "$LAUNCH")
   LAUNCH_CHILD_COMMAND="printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.child.tmp && chmod 600 $sq_launch_guard/.child.tmp && mv $sq_launch_guard/.child.tmp $sq_launch_guard/child || exit 1; exec sh -c $sq_launch_eval"
   sq_launch_child=$(shell_quote "$LAUNCH_CHILD_COMMAND")
-  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; sh -c $sq_launch_child & launch_pid=\$!; launch_wait=0; launch_exec=0; while kill -0 \"\$launch_pid\" 2>/dev/null && [ \"\$launch_wait\" -lt 100 ]; do if [ -f $sq_launch_guard/child ] && printf '%s:%s\\n' \"\$launch_pid\" $sq_launch_token | cmp -s $sq_launch_guard/child -; then sleep 0.1; if kill -0 \"\$launch_pid\" 2>/dev/null; then launch_exec=1; break; fi; fi; sleep 0.01; launch_wait=\$((launch_wait + 1)); done; if [ \"\$launch_exec\" -eq 1 ]; then printf 'running:%s\\n' $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome || exit 1; fi; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"
+  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; sh -c $sq_launch_child & launch_pid=\$!; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"
   spawn_endpoint_receipt_publish launch-prepared "$WT" || {
     echo "error: secondmate launch preparation could not be journaled" >&2
     exit 1

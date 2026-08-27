@@ -112,6 +112,21 @@
 # plain text (stdin-only, matching fm_composer_strip_ghost). The character class
 # includes ':' so an ITU colon-form SGR (38:2::r:g:b) is stripped whole, not left
 # with a dangling tail.
+fm_backend_submit_typed_evidence() {
+  local path=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE:-}
+  local token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-} tmp
+  [ -n "$path" ] || return 0
+  [ -n "$token" ] || return 1
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    printf '%s\n' "$token" | cmp -s "$path" -
+    return
+  fi
+  tmp="${path}.tmp.${BASHPID:-$$}"
+  (umask 077; printf '%s\n' "$token" > "$tmp") \
+    && chmod 600 "$tmp" && mv -- "$tmp" "$path"
+}
+
 fm_composer_strip_ansi() {
   local esc; esc=$(printf '\033')
   LC_ALL=C sed "s/${esc}\\[[0-9;:?]*[[:alpha:]]//g"
