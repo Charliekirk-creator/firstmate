@@ -756,6 +756,53 @@ test_legacy_completion_inventory_requires_explicit_provenance() {
   pass "completion provenance distinguishes missing current and historical generations"
 }
 
+test_current_generation_rejects_an_older_archive_owner() {
+  local home origin key hold n
+  home=$(make_home archive-owner-generation)
+  origin=sample-owner-review
+  key=route-choice
+  tasks_in "$home" add "$origin" "Review archive-owner generations" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create archive-owner origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the old route" --reason "captain old route pending" --repo sample) \
+    || fail "could not create the old archive-owner generation"
+  printf 'Captain resolved the old route.\n' > "$home/old-owner-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/old-owner-answer.txt" >/dev/null \
+    || fail "could not resolve the old archive-owner generation"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "owner-filler-$n" "Owner filler $n" --kind ship --repo sample >/dev/null \
+      || fail "could not add archive-owner filler $n"
+    tasks_in "$home" done "owner-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain archive-owner filler $n"
+  done
+  run_decisions "$home" retention-prune >/dev/null \
+    || fail "could not prune the old archive-owner generation"
+  assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
+    "old archive-owner generation was not normally retained"
+
+  awk '{ if ($0 == "archive = \"data/done-archive.md\"") print "archive = \"data/other-history.md\""; else print }' \
+    "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml"
+  run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the new route" --reason "captain new route pending" --repo sample >/dev/null \
+    || fail "could not create the replacement generation under its new retention owner"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory the replacement generation"
+  tasks_in "$home" rm "$hold" >/dev/null \
+    || fail "could not reproduce loss of the replacement generation"
+  awk '{ if ($0 == "archive = \"data/other-history.md\"") print "archive = \"data/done-archive.md\""; else print }' \
+    "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml"
+
+  if run_decisions "$home" verify "$origin" > "$home/owner-verify.out" 2> "$home/owner-verify.err"; then
+    fail "an older archive owner substituted for the missing current generation"
+  fi
+  assert_grep "different retention generation" "$home/owner-verify.err" \
+    "missing current generation did not report its archive-owner mismatch"
+  pass "current generations cannot fall back to older archive owners"
+}
+
 test_source_verifiable_legacy_inventories_migrate_automatically() {
   local home origin active retained first second hold decision digest body token inventory later later_hold
   home=$(make_home source-verifiable-legacy-inventory)
@@ -3088,6 +3135,7 @@ test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
 test_pre_boundary_retention_requires_exact_migration
 test_legacy_completion_inventory_requires_explicit_provenance
+test_current_generation_rejects_an_older_archive_owner
 test_source_verifiable_legacy_inventories_migrate_automatically
 test_metadata_free_completion_retries_remain_idempotent
 test_live_completion_provenance_survives_teardown
