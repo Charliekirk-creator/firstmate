@@ -55,4 +55,4 @@ Bearings reads the resulting structured state and must never compensate by scrap
 8. Confirm Bearings no longer shows the closed hold and that any routed work remains in structured backlog state.
 
 `bin/fm-decision-hold.sh --help` owns command syntax, identity construction, completion attestation, retry behavior, and close ordering.
-`docs/decision-hold-lifecycle.md` records the mechanism and regression evidence without restating this policy.
+`docs/decision-hold-lifecycle.md` records integration context and regression evidence without restating this policy.
