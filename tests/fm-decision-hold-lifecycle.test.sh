@@ -455,6 +455,8 @@ test_pruned_resolved_history_does_not_block_later_review() {
   local home id old_a old_b later before after done_count n show archive decision digest body
   home=$(make_home pruned-resolved-history)
   archive="$home/data/history/done.md"
+  # Either failed step must invoke fail.
+  # shellcheck disable=SC2015
   awk '{ if ($0 == "archive = \"data/done-archive.md\"") print "archive = \"data/history/done.md\""; else print }' \
     "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
     || fail "could not configure the retained-history archive"
@@ -497,7 +499,7 @@ test_pruned_resolved_history_does_not_block_later_review() {
     tasks_in "$home" add "sample-filler-$n" "Sample filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create retention filler $n"
     if [ "$n" -eq 12 ]; then
-      retention_tasks_in "$home" done "sample-filler-$n" >/dev/null \
+      retention_tasks_in "$home" "done" "sample-filler-$n" >/dev/null \
         || fail "could not complete retention filler $n through the public retention boundary"
     else
       tasks_in "$home" "done" "sample-filler-$n" --no-prune >/dev/null \
@@ -657,10 +659,10 @@ test_pre_boundary_retention_requires_exact_migration() {
     tasks_in "$home" add "pre-boundary-filler-$n" "Pre-boundary filler $n" \
       --kind ship --repo sample >/dev/null \
       || fail "could not create pre-boundary filler $n"
-    tasks_in "$home" done "pre-boundary-filler-$n" --no-prune >/dev/null \
+    tasks_in "$home" "done" "pre-boundary-filler-$n" --no-prune >/dev/null \
       || fail "could not retain pre-boundary filler $n"
   done
-  (cd "$home" && "$TASKS_AXI_BIN" prune --state done >/dev/null) \
+  (cd "$home" && "$TASKS_AXI_BIN" prune --state "done" >/dev/null) \
     || fail "could not reproduce retention from before the shared transition boundary"
   assert_grep "- [x] $hold -" "$archive" \
     "pre-boundary decision was not moved into configured retention history"
@@ -781,7 +783,7 @@ test_current_generation_rejects_an_older_archive_owner() {
   for n in $(seq 1 10); do
     tasks_in "$home" add "owner-filler-$n" "Owner filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not add archive-owner filler $n"
-    tasks_in "$home" done "owner-filler-$n" --no-prune >/dev/null \
+    tasks_in "$home" "done" "owner-filler-$n" --no-prune >/dev/null \
       || fail "could not retain archive-owner filler $n"
   done
   run_decisions "$home" retention-prune >/dev/null \
@@ -835,6 +837,7 @@ test_current_generation_rejects_an_older_retained_done_owner() {
     || fail "could not resolve the old retained generation"
 
   : > "$home/data/replacement-backlog.md"
+  # shellcheck disable=SC2015
   awk '
     $0 == "path = \"data/backlog.md\"" { print "path = \"data/replacement-backlog.md\""; next }
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/replacement-archive.md\""; next }
@@ -849,6 +852,7 @@ test_current_generation_rejects_an_older_retained_done_owner() {
     || fail "could not inventory the replacement retained generation"
   tasks_in "$home" rm "$hold" >/dev/null \
     || fail "could not reproduce loss of the replacement retained generation"
+  # shellcheck disable=SC2015
   awk '
     $0 == "path = \"data/replacement-backlog.md\"" { print "path = \"data/backlog.md\""; next }
     $0 == "archive = \"data/replacement-archive.md\"" { print "archive = \"data/done-archive.md\""; next }
@@ -880,6 +884,7 @@ test_current_generation_rejects_an_older_queued_owner() {
     || fail "could not create the old queued generation"
 
   : > "$home/data/replacement-backlog.md"
+  # shellcheck disable=SC2015
   awk '
     $0 == "path = \"data/backlog.md\"" { print "path = \"data/replacement-backlog.md\""; next }
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/replacement-archive.md\""; next }
@@ -895,6 +900,7 @@ test_current_generation_rejects_an_older_queued_owner() {
     || fail "could not inventory the replacement queued generation"
   tasks_in "$home" rm "$hold" >/dev/null \
     || fail "could not reproduce loss of the replacement queued generation"
+  # shellcheck disable=SC2015
   awk '
     $0 == "path = \"data/replacement-backlog.md\"" { print "path = \"data/backlog.md\""; next }
     $0 == "archive = \"data/replacement-archive.md\"" { print "archive = \"data/done-archive.md\""; next }
@@ -922,8 +928,8 @@ test_source_verifiable_legacy_inventories_migrate_automatically() {
   local home origin active retained first second hold decision digest body token inventory later later_hold
   home=$(make_home source-verifiable-legacy-inventory)
   origin=sample-upgraded-review
-  active=active-choice
-  retained=retained-choice
+  active="active-choice"
+  retained="retained-choice"
   tasks_in "$home" add "$origin" "Review an upgraded inventory" \
     --kind scout --repo sample --start >/dev/null \
     || fail "could not create upgraded-inventory origin"
@@ -954,8 +960,8 @@ test_source_verifiable_legacy_inventories_migrate_automatically() {
 
   home=$(make_home multipass-legacy-inventory)
   origin=sample-multipass-review
-  first=first-choice
-  second=second-choice
+  first="first-choice"
+  second="second-choice"
   tasks_in "$home" add "$origin" "Review a multipass legacy inventory" \
     --kind scout --repo sample --start >/dev/null \
     || fail "could not create multipass legacy origin"
@@ -1019,7 +1025,7 @@ test_source_verifiable_legacy_inventories_migrate_automatically() {
   home=$(make_home legacy-verify-durable-inventory)
   origin=sample-legacy-verify-review
   active=missing-choice
-  later=later-choice
+  later="later-choice"
   mkdir -p "$home/data/$origin"
   tasks_in "$home" add "$origin" "Review legacy verification provenance" \
     --kind scout --repo sample --start >/dev/null \
@@ -1085,7 +1091,7 @@ test_metadata_free_completion_retries_remain_idempotent() {
   local home origin key hold token inventory linked
   home=$(make_home metadata-free-completion-retry)
   origin=sample-post-teardown-review
-  key=later-choice
+  key="later-choice"
   mkdir -p "$home/data/$origin"
   tasks_in "$home" add "$origin" "Review metadata-free completion" \
     --kind scout --repo sample --start >/dev/null \
@@ -1097,7 +1103,7 @@ test_metadata_free_completion_retries_remain_idempotent() {
     || fail "initial completion before teardown failed"
   run_teardown "$home" "$origin" >/dev/null 2> "$home/metadata-free-teardown.err" \
     || fail "could not tear down metadata-free origin: $(cat "$home/metadata-free-teardown.err")"
-  tasks_in "$home" done "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
+  tasks_in "$home" "done" "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
     || fail "could not archive metadata-free origin"
   assert_absent "$home/state/$origin.meta" "teardown retained metadata-free origin metadata"
 
@@ -1140,7 +1146,7 @@ test_live_completion_provenance_survives_teardown() {
   local home origin key hold token inventory later later_hold before after
   home=$(make_home live-completion-retry)
   origin=sample-live-completion-review
-  key=first-choice
+  key="first-choice"
   mkdir -p "$home/data/$origin"
   tasks_in "$home" add "$origin" "Review live completion provenance" \
     --kind scout --repo sample --start >/dev/null \
@@ -1160,7 +1166,7 @@ test_live_completion_provenance_survives_teardown() {
     "live completion provenance omitted its current generation"
   run_teardown "$home" "$origin" >/dev/null 2> "$home/live-teardown.err" \
     || fail "live completion teardown failed: $(cat "$home/live-teardown.err")"
-  tasks_in "$home" done "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
+  tasks_in "$home" "done" "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
     || fail "could not archive live-completion origin"
   assert_absent "$home/state/$origin.meta" "teardown retained live-completion metadata"
   printf 'Captain resolved the first option.\n' > "$home/first-choice.txt"
@@ -1174,7 +1180,7 @@ test_live_completion_provenance_survives_teardown() {
   home=$(make_home live-completion-missing-owner)
   origin=sample-live-missing-review
   key=missing-choice
-  later=later-choice
+  later="later-choice"
   mkdir -p "$home/data/$origin"
   tasks_in "$home" add "$origin" "Review missing live ownership" \
     --kind scout --repo sample --start >/dev/null \
@@ -1189,7 +1195,7 @@ test_live_completion_provenance_survives_teardown() {
     || fail "could not persist missing-owner completion provenance"
   run_teardown "$home" "$origin" >/dev/null 2> "$home/missing-owner-teardown.err" \
     || fail "missing-owner teardown failed: $(cat "$home/missing-owner-teardown.err")"
-  tasks_in "$home" done "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
+  tasks_in "$home" "done" "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
     || fail "could not archive missing-owner origin"
   tasks_in "$home" rm "$hold" >/dev/null \
     || fail "could not reproduce loss of the inventoried active hold"
@@ -1623,6 +1629,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     "nonarchive fixture was not pruned by configured retention"
   cp "$archive" "$archive.canonical" \
     || fail "could not preserve the canonical retention archive"
+  # shellcheck disable=SC2015
   awk '
     /^## Archived [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
       print "## Notes"
@@ -1640,6 +1647,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
 
   cp "$archive.canonical" "$archive" \
     || fail "could not restore the canonical retention archive"
+  # shellcheck disable=SC2015
   awk '
     /^## Archived [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ && !inserted {
       print
@@ -1660,6 +1668,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   home=$(make_home note-archive-history-row)
   origin=sample-note-archive-review
   key=old-answer
+  # shellcheck disable=SC2015
   awk '
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/copied-history.md\""; next }
     { print }
@@ -1691,6 +1700,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
       || fail "could not create a physical note-archive alias"
     note_alias_created=1
   fi
+  # shellcheck disable=SC2015
   awk '
     $0 == "archive = \"data/copied-history.md\"" { print "archive = \"data/NOTE-ARCHIVE.md\""; next }
     { print }
@@ -1704,6 +1714,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     "the configured note archive alias did not fail its retention boundary"
   [ "$note_alias_created" -eq 0 ] || rm -f "$note_alias"
 
+  # shellcheck disable=SC2015
   awk '
     $0 == "archive = \"data/NOTE-ARCHIVE.md\"" { print "archive = \"data/copied-history.md\""; next }
     { print }
@@ -1711,6 +1722,7 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
     || fail "could not restore the copied-history retention owner"
   cp "$home/data/note-archive.md" "$home/data/copied-history.md" \
     || fail "could not copy the note snapshot into a configured history artifact"
+  # shellcheck disable=SC2015
   awk -v id="$hold" '
     index($0, "- [x] " id " - ") == 1 { sub(" - ", " - Edited copied title ") }
     { print }
@@ -1749,7 +1761,7 @@ test_nested_public_retention_hook_prunes_once() {
     tasks_in "$home" add "nested-filler-$n" "Nested filler $n" \
       --kind ship --repo sample >/dev/null \
       || fail "could not create nested-retention filler $n"
-    tasks_in "$home" done "nested-filler-$n" --no-prune >/dev/null \
+    tasks_in "$home" "done" "nested-filler-$n" --no-prune >/dev/null \
       || fail "could not retain nested-retention filler $n"
   done
   if ! PATH="$home/fakebin:$ROOT/bin:$PATH" FM_HOME="$home" \
@@ -1771,6 +1783,7 @@ test_dangling_note_archive_alias_is_rejected() {
   local home origin
   home=$(make_home dangling-note-archive-alias)
   origin=sample-dangling-alias-review
+  # shellcheck disable=SC2015
   awk '
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/history.md\""; next }
     { print }
@@ -1803,6 +1816,7 @@ test_absent_case_alias_is_rejected_before_retention() {
   local home origin probe alternate case_insensitive=0 hold
   home=$(make_home absent-case-alias)
   origin=sample-case-alias-review
+  # shellcheck disable=SC2015
   awk '
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/NOTE-ARCHIVE.md\""; next }
     { print }
@@ -2119,6 +2133,7 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   tasks_in "$home" add "$spoof" "Ordinary title" --kind captain --repo sample --body "$body" >/dev/null \
     || fail "could not create title-spoof ordinary task"
   tasks_in "$home" "done" "$spoof" >/dev/null || fail "could not close title-spoof ordinary task"
+  # shellcheck disable=SC2015
   awk -v id="$spoof" '
     index($0, "- [x] " id " - Ordinary title ") == 1 {
       sub("Ordinary title", "Ordinary title (kind: captain) (hold-kind: captain)")
@@ -2148,6 +2163,7 @@ test_historical_resolution_proof_is_exact_and_home_bound() {
   fi
   assert_grep "mismatched archived captain-hold provenance" "$home/title-spoof.err" \
     "title-spoof failure did not reject canonical kind and hold provenance"
+  # shellcheck disable=SC2015
   awk -v id="$spoof" '
     index($0, "- [x] " id " - ") == 1 {
       print $0 " (hold:) (hold-kind: captain)"
@@ -2374,6 +2390,7 @@ test_contained_operational_overrides_remain_supported() {
   data="$home/fixtures/data"
   mkdir -p "$state" "$data"
   mv "$home/data/backlog.md" "$data/backlog.md"
+  # shellcheck disable=SC2015
   awk '
     $0 == "path = \"data/backlog.md\"" { print "path = \"fixtures/data/backlog.md\""; next }
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"fixtures/data/history/done.md\""; next }
@@ -2419,6 +2436,7 @@ test_effective_root_backlog_retention_remains_supported() {
   local home origin key hold n
   home=$(make_home effective-root-backlog)
   mv "$home/data/backlog.md" "$home/backlog.md"
+  # shellcheck disable=SC2015
   awk '
     $0 == "path = \"data/backlog.md\"" { print "path = \"backlog.md\""; next }
     $0 == "archive = \"data/done-archive.md\"" { print "archive = \"done-archive.md\""; next }
@@ -2445,6 +2463,7 @@ test_effective_root_backlog_retention_remains_supported() {
   run_decisions "$home" answer "$origin" "$key" \
     --decision-file "$home/root-answer.txt" >/dev/null \
     || fail "effective root backlog could not resolve its decision"
+  # shellcheck disable=SC2015
   awk '
     $0 == "archive = \"done-archive.md\"" { print "archive = \"history/root-done.md\""; next }
     { print }
@@ -2456,7 +2475,7 @@ test_effective_root_backlog_retention_remains_supported() {
   for n in $(seq 1 10); do
     tasks_in "$home" add "root-filler-$n" "Root filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create root-backlog filler $n"
-    tasks_in "$home" done "root-filler-$n" --no-prune >/dev/null \
+    tasks_in "$home" "done" "root-filler-$n" --no-prune >/dev/null \
       || fail "could not retain root-backlog filler $n before explicit pruning"
   done
   run_decisions "$home" retention-prune >/dev/null \
@@ -3035,6 +3054,7 @@ test_pruned_answer_retry_uses_proven_retention_history() {
   local home id hold show
   home=$(make_home pruned-answer-retry)
   id=sample-pruned-answer-review
+  # shellcheck disable=SC2015
   sed 's/done_keep = 10/done_keep = 0/' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
     && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
     || fail "could not configure immediate Done retention"
@@ -3058,7 +3078,7 @@ test_pruned_answer_retry_uses_proven_retention_history() {
     || fail "an exact answer retry did not accept proven retained history"
   run_decisions "$home" verify "$id" >/dev/null \
     || fail "proven retained history did not satisfy verification after answer retry"
-  show=$(tasks_in "$home" list --state done)
+  show=$(tasks_in "$home" list --state "done")
   assert_not_contains "$show" "$hold" "answer retry restored pruned history into the Done window"
   pass "immediately pruned answers and exact retries use proven retention history"
 }

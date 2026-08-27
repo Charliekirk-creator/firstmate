@@ -189,7 +189,6 @@ DECISION_ATTESTATION_LOCK=
 DECISION_ATTESTATION_LOCK_HELD=0
 DECISION_RETENTION_LOCK=
 DECISION_RETENTION_LOCK_HELD=0
-DECISION_RETENTION_HOOK=''
 DECISION_RETENTION_HOOK_DIR=''
 DECISION_ARCHIVE_CACHE_ENABLED=1
 DECISION_ARCHIVE_CACHE_DIR=''
@@ -423,7 +422,6 @@ RESOLUTION_KEY=''
 RESOLUTION_DIGEST=''
 RESOLUTION_ROUTES=''
 RESOLUTION_MODE=''
-RESOLUTION_DECISION=''
 RESOLUTION_RECORD_DIGEST=''
 
 decode_json_string() {
@@ -448,7 +446,6 @@ parse_resolution_record() {  # <hold-body>
   RESOLUTION_DIGEST=''
   RESOLUTION_ROUTES=''
   RESOLUTION_MODE=''
-  RESOLUTION_DECISION=''
   RESOLUTION_RECORD_DIGEST=''
 
   case "$encoded" in
@@ -534,7 +531,6 @@ EOF
 
   RESOLUTION_DIGEST=$digest
   RESOLUTION_ROUTES=$routes
-  RESOLUTION_DECISION=$decision
   RESOLUTION_RECORD_DIGEST=$(sha256_text "$body")
 }
 
@@ -666,12 +662,13 @@ completion_metadata_inventory() {  # <meta-path>
     || fail "decision owner metadata has an unsupported inventory schema: $path"
   [ "$META_DECISIONS_REVIEWED" = 1 ] \
     || fail "decision owner metadata has provenance without a completed review: $path"
-  grep -q '^decision_current_keys=' "$path" \
-    && grep -q '^decision_historical_keys=' "$path" \
-    && grep -q '^decision_last_current_keys=' "$path" \
-    && grep -q '^decision_last_historical_keys=' "$path" \
-    && grep -q '^decision_last_inventory_known=' "$path" \
-    || fail "decision owner metadata lacks its completion provenance: $path"
+  if ! grep -q '^decision_current_keys=' "$path" \
+    || ! grep -q '^decision_historical_keys=' "$path" \
+    || ! grep -q '^decision_last_current_keys=' "$path" \
+    || ! grep -q '^decision_last_historical_keys=' "$path" \
+    || ! grep -q '^decision_last_inventory_known=' "$path"; then
+    fail "decision owner metadata lacks its completion provenance: $path"
+  fi
   current=$(meta_value "$path" decision_current_keys)
   historical=$(meta_value "$path" decision_historical_keys)
   last_current=$(meta_value "$path" decision_last_current_keys)
@@ -941,7 +938,6 @@ contained_archive_parent_safe() {  # <physical-home> <archive-parent>
 
 DECISION_ARCHIVE=''
 DECISION_BACKLOG=''
-DECISION_NOTE_ARCHIVE=''
 DECISION_DATA=''
 paths_physically_alias() {
   [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ]
@@ -1031,7 +1027,6 @@ authoritative_archive_path() {
   local configured_backlog_dir physical_backlog_dir note_archive links rc
   DECISION_ARCHIVE=''
   DECISION_BACKLOG=''
-  DECISION_NOTE_ARCHIVE=''
   DECISION_DATA=''
   [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
   physical_home=$(cd "$FM_HOME" && pwd -P) \
@@ -1102,7 +1097,9 @@ authoritative_archive_path() {
   fi
   archive_dir=${configured_archive%/*}
   archive_name=${configured_archive##*/}
-  [ -n "$archive_name" ] && contained_archive_parent_safe "$physical_home" "$archive_dir" \
+  [ -n "$archive_name" ] \
+    || fail "configured decision archive directory is unsafe: $archive_dir"
+  contained_archive_parent_safe "$physical_home" "$archive_dir" \
     || fail "configured decision archive directory is unsafe: $archive_dir"
   DECISION_ARCHIVE="$archive_dir/$archive_name"
   if [ "$DECISION_ARCHIVE" = "$configured_backlog" ] \
@@ -1110,7 +1107,6 @@ authoritative_archive_path() {
     fail "configured decision archive aliases the active backlog: $DECISION_ARCHIVE"
   fi
   note_archive="$physical_backlog_dir/note-archive.md"
-  DECISION_NOTE_ARCHIVE=$note_archive
   if [ "$DECISION_ARCHIVE" = "$note_archive" ] \
     || paths_destination_alias "$DECISION_ARCHIVE" "$note_archive"; then
     fail "configured decision archive aliases the tasks-axi note archive: $DECISION_ARCHIVE"
@@ -1348,7 +1344,6 @@ tasks_axi_with_retention_provenance() {
     || fail "could not stage decision retention hook"
   hook="$hook_dir/hook.cjs"
   DECISION_RETENTION_HOOK_DIR=$hook_dir
-  DECISION_RETENTION_HOOK=$hook
   if [ -e "$DECISION_ARCHIVE" ] || [ -L "$DECISION_ARCHIVE" ]; then
     require_safe_decision_archive "$DECISION_ARCHIVE"
   fi
@@ -1459,7 +1454,6 @@ NODE
     require_safe_decision_archive "$DECISION_ARCHIVE"
   fi
   rm -rf -- "$hook_dir"
-  DECISION_RETENTION_HOOK=''
   DECISION_RETENTION_HOOK_DIR=''
   return "$rc"
 }
@@ -2251,7 +2245,7 @@ verify_hold_historical() {  # <origin-id> <decision-key>
     kind=$(show_field "$show" kind)
     hold_kind=$(show_field "$show" hold_kind)
     body=$(show_field "$show" body)
-    if [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
+    if [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
       && body_has_resolution_record "$body" "$origin" "$key"; then
       reject_archived_generation_collision "$id"
       ensure_retention_owner
@@ -2334,7 +2328,7 @@ classify_legacy_source_generations() {  # <origin-id> <comma-keys>
       if resolution_record_valid "$body" "$origin" "$key"; then
         persist_parsed_legacy_resolution "$id" "$origin" "$key"
       fi
-    elif [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
+    elif [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
       && body_has_resolution_record "$body" "$origin" "$key"; then
       reject_archived_generation_collision "$id"
       persist_visible_resolved_generation_owner "$origin" "$key"
@@ -2448,7 +2442,7 @@ command_migrate_legacy() {
   else
     archived_hold_record "$id" \
       || fail "captain decision $id is absent from the backlog and configured archive"
-    state=done
+    state="done"
     body=$ARCHIVED_HOLD_BODY
   fi
   parse_resolution_record "$body" \
@@ -3195,7 +3189,7 @@ command_task_done() {
 
 command_retention_prune() {
   [ "$#" -eq 0 ] || { usage >&2; exit 2; }
-  command_retention_tasks_axi prune --state done
+  command_retention_tasks_axi prune --state "done"
 }
 
 command_repair() {

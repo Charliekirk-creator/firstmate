@@ -194,7 +194,7 @@ require_tools() {
 tx() { (cd "$FM_HOME" && tasks-axi "$@"); }
 retention_tx() {
   (
-    cd "$FM_HOME"
+    cd "$FM_HOME" || exit
     FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
       "$SCRIPT_DIR/fm-decision-hold.sh" tasks-axi "$@"
   )
