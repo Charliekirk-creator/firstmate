@@ -111,6 +111,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME_INPUT="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+FS_OWNER="$SCRIPT_DIR/fm-work-identity-fs.py"
 SCHEMA=fm-work-identity.v1
 HANDOFF_SCHEMA=fm-work-identity-handoff.v2
 HANDOFF_STATE_SCHEMA=fm-work-identity-handoff-state.v2
@@ -234,9 +235,31 @@ resolve_owned_dir() {  # <name> <path> [expected-real] [expected-inode]
   printf '%s\t%s\n' "$resolved" "$resolved_inode"
 }
 
-FM_HOME_REAL=$(resolve_existing_dir FM_HOME "$FM_HOME_INPUT")
+IFS=$'\t' read -r FM_HOME_REAL HOME_DIR_ID < <(resolve_owned_dir FM_HOME "$FM_HOME_INPUT")
 DATA_INPUT=${FM_DATA_OVERRIDE:-$FM_HOME_REAL/data}
 STATE_INPUT=${FM_STATE_OVERRIDE:-$FM_HOME_REAL/state}
+DATA_PARENT_INPUT=$(dirname -- "$DATA_INPUT")
+STATE_PARENT_INPUT=$(dirname -- "$STATE_INPUT")
+DATA_BASE=$(basename -- "$DATA_INPUT")
+STATE_BASE=$(basename -- "$STATE_INPUT")
+[ "$DATA_BASE" != . ] && [ "$DATA_BASE" != .. ] \
+  || die "data directory path is unsafe: $DATA_INPUT"
+[ "$STATE_BASE" != . ] && [ "$STATE_BASE" != .. ] \
+  || die "state directory path is unsafe: $STATE_INPUT"
+IFS=$'\t' read -r DATA_PARENT_REAL DATA_PARENT_ID \
+  < <(resolve_owned_dir data-parent "$DATA_PARENT_INPUT")
+IFS=$'\t' read -r STATE_PARENT_REAL STATE_PARENT_ID \
+  < <(resolve_owned_dir state-parent "$STATE_PARENT_INPUT")
+if [ "$DATA_PARENT_REAL" = "$FM_HOME_REAL" ]; then
+  [ "$DATA_PARENT_ID" = "$HOME_DIR_ID" ] \
+    || die "FM_HOME was replaced before data storage was anchored"
+fi
+if [ "$STATE_PARENT_REAL" = "$FM_HOME_REAL" ]; then
+  [ "$STATE_PARENT_ID" = "$HOME_DIR_ID" ] \
+    || die "FM_HOME was replaced before state storage was anchored"
+fi
+DATA_INPUT="$DATA_PARENT_REAL/$DATA_BASE"
+STATE_INPUT="$STATE_PARENT_REAL/$STATE_BASE"
 DATA_DIR_ID=
 STATE_DIR_ID=
 if [ -e "$DATA_INPUT" ] || [ -L "$DATA_INPUT" ]; then
@@ -364,19 +387,12 @@ owned_parent_details() {  # <target>
 }
 
 owned_atomic_replace() {  # <source> <target> <label>
-  local source=$1 target=$2 label=$3 parent expected base stage
+  local source=$1 target=$2 label=$3 parent expected base
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
-  stage=".$base.replacing.${BASHPID:-$$}.$RANDOM"
-  (
-    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
-    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
-    [ ! -e "$stage" ] && [ ! -L "$stage" ] || exit 1
-    cp -p -- "$source" "$stage" \
-      && [ "$(directory_inode_identity "$parent")" = "$expected" ] \
-      && mv -f -- "$stage" "$base"
-  ) || die "cannot publish $label: $target"
+  python3 "$FS_OWNER" replace "$parent" "$expected" "$base" "$source" \
+    || die "cannot publish $label: $target"
   rm -f -- "$source" || die "cannot retire $label publication source"
   [ "${TMP:-}" != "$source" ] || TMP=
 }
@@ -386,11 +402,8 @@ owned_remove() {  # <target> <label>
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
-  (
-    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
-    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
-    rm -f -- "$base"
-  ) || die "cannot remove $label: $target"
+  python3 "$FS_OWNER" remove "$parent" "$expected" "$base" \
+    || die "cannot remove $label: $target"
 }
 
 publish_no_clobber() {  # <source> <target> <label>; 2 means target already exists
@@ -400,20 +413,11 @@ publish_no_clobber() {  # <source> <target> <label>; 2 means target already exis
   base=$(basename -- "$target") || die "cannot resolve $label target name"
   staging="${base}.publishing"
   rc=0
-  (
-    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
-    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
-    [ ! -e "$base" ] && [ ! -L "$base" ] || exit 2
-    [ ! -e "$staging" ] && [ ! -L "$staging" ] || exit 1
-    cp -p -- "$source" "$staging" || exit 1
-    [ "$(directory_inode_identity "$parent")" = "$expected" ] || exit 1
-    if command link "$staging" "$base" 2>/dev/null; then
-      rm -f -- "$staging" || exit 1
-      exit 0
-    fi
-    [ ! -e "$base" ] && [ ! -L "$base" ] || { rm -f -- "$staging"; exit 2; }
-    exit 1
-  ) || rc=$?
+  if python3 "$FS_OWNER" no-clobber "$parent" "$expected" "$base" "$source" "$staging"; then
+    rc=0
+  else
+    rc=$?
+  fi
   case "$rc" in
     0)
       rm -f -- "$source" || die "cannot retire $label publication source"
@@ -451,17 +455,21 @@ ensure_home_identity() {
 }
 
 create_owned_directory() {  # <name> <path>
-  local name=$1 path=$2 parent base expected
+  local name=$1 path=$2 parent base expected created
   parent=$(dirname -- "$path") || die "cannot resolve $name directory parent: $path"
   base=$(basename -- "$path") || die "cannot resolve $name directory name: $path"
   [ "$base" != . ] && [ "$base" != .. ] || die "$name directory path is unsafe: $path"
-  expected=$(directory_inode_identity "$parent") \
-    || die "$name directory parent cannot be inspected: $parent"
-  (
-    CDPATH='' cd -- "$parent" 2>/dev/null || exit 1
-    [ "$(directory_inode_identity .)" = "$expected" ] || exit 1
-    mkdir -- "$base" 2>/dev/null
-  ) || die "cannot create $name directory: $path"
+  if [ "$parent" = "$DATA_PARENT_REAL" ]; then
+    expected=$DATA_PARENT_ID
+  elif [ "$parent" = "$STATE_PARENT_REAL" ]; then
+    expected=$STATE_PARENT_ID
+  else
+    die "$name directory parent is not owned: $parent"
+  fi
+  created=$(python3 "$FS_OWNER" mkdir "$parent" "$expected" "$base") \
+    || die "cannot create $name directory: $path"
+  case "$created" in *:* ) ;; *) die "cannot anchor created $name directory: $path" ;; esac
+  printf '%s\n' "$created"
 }
 
 ensure_data_dir() {
@@ -469,7 +477,7 @@ ensure_data_dir() {
   if [ ! -e "$DATA_INPUT" ] && [ ! -L "$DATA_INPUT" ]; then
     [ -z "$DATA_DIR_ID" ] \
       || die "data directory disappeared after validation: $DATA_INPUT"
-    create_owned_directory data "$DATA_INPUT"
+    DATA_DIR_ID=$(create_owned_directory data "$DATA_INPUT")
   fi
   IFS=$'\t' read -r resolved inode \
     < <(resolve_owned_dir data "$DATA_INPUT" "${DATA_DIR_ID:+$DATA_REAL}" "$DATA_DIR_ID")
@@ -482,7 +490,7 @@ ensure_state_dir() {
   if [ ! -e "$STATE_INPUT" ] && [ ! -L "$STATE_INPUT" ]; then
     [ -z "$STATE_DIR_ID" ] \
       || die "state directory disappeared after validation: $STATE_INPUT"
-    create_owned_directory state "$STATE_INPUT"
+    STATE_DIR_ID=$(create_owned_directory state "$STATE_INPUT")
   fi
   IFS=$'\t' read -r resolved inode \
     < <(resolve_owned_dir state "$STATE_INPUT" "${STATE_DIR_ID:+$STATE_REAL}" "$STATE_DIR_ID")
@@ -491,14 +499,23 @@ ensure_state_dir() {
 }
 
 lock_parent_preflight() {  # <directory> <label>
-  local directory=$1 label=$2 probe
-  probe=$(umask 077; mktemp -d "$directory/.work-identity-lock-check.XXXXXX" 2>/dev/null) \
+  local directory=$1 label=$2 expected
+  if [ "$directory" = "$DATA_REAL" ]; then
+    expected=$DATA_DIR_ID
+  elif [ "$directory" = "$STATE_REAL" ]; then
+    expected=$STATE_DIR_ID
+  else
+    die "$label lock directory is not owned: $directory"
+  fi
+  python3 "$FS_OWNER" probe "$directory" "$expected" work-identity-lock-check \
     || die "$label lock directory is not writable: $directory"
-  rmdir -- "$probe" 2>/dev/null || die "$label lock directory cannot remove temporary owners: $directory"
 }
 
 locate_task_dir() {  # <task-id>, read-only
   local id=$1 dir real inode
+  if [ "$LOCATED_TASK" != "$id" ]; then
+    TASK_DIR_ID=
+  fi
   LOCATED_TASK=$id
   if [ -e "$DATA_INPUT" ] || [ -L "$DATA_INPUT" ]; then
     local resolved inode
@@ -534,15 +551,13 @@ locate_task_dir() {  # <task-id>, read-only
 }
 
 ensure_task_dir() {  # <task-id>
-  local id=$1
+  local id=$1 created
   ensure_data_dir
   locate_task_dir "$id"
   if [ ! -d "$TASK_DIR" ]; then
-    if ! (
-      CDPATH='' cd -- "$DATA_REAL" 2>/dev/null || exit 1
-      [ "$(directory_inode_identity .)" = "$DATA_DIR_ID" ] || exit 1
-      mkdir -- "$id" 2>/dev/null
-    ); then
+    if created=$(python3 "$FS_OWNER" mkdir "$DATA_REAL" "$DATA_DIR_ID" "$id"); then
+      TASK_DIR_ID=$created
+    else
       [ -d "$TASK_DIR" ] && [ ! -L "$TASK_DIR" ] \
         || die "cannot create task data directory: $TASK_DIR"
     fi
@@ -2593,6 +2608,7 @@ publication_run() {
 }
 
 command -v jq >/dev/null 2>&1 || die "jq not found"
+command -v python3 >/dev/null 2>&1 || die "python3 not found"
 COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;

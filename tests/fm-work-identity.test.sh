@@ -529,39 +529,38 @@ test_no_clobber_publications_recover_after_interruption() {
 }
 
 test_no_clobber_publication_does_not_follow_raced_target() {
-  local home task manifest target sink fakebin real_link real_ln out rc=0
+  local home task manifest target staging sink fakebin real_python out rc=0
   home=$(make_home publication-target-race)
   task=publication-target-race
   manifest="$home/manifest.json"
   target="$home/data/$task/work-identity.json"
+  staging="$target.publishing"
   sink="$home/publication-sink"
-  fakebin=$(fm_fakebin "$home/publication-link-fakes")
-  real_link=$(command -v link)
-  real_ln=$(command -v ln)
+  real_python=$(command -v python3)
+  fakebin=$(fm_fakebin "$home/publication-owner-fakes")
   make_manifest "$home" "$task" "$manifest"
-  mkdir -p "$sink"
-  cat > "$fakebin/link" <<'SH'
+  printf 'must remain unchanged\n' > "$sink"
+  cat > "$fakebin/python3" <<'SH'
 #!/usr/bin/env bash
 set -eu
-if [ "$(pwd -P)/${2:-}" = "$FM_TEST_PUBLICATION_TARGET" ] \
-   && [ ! -e "$FM_TEST_PUBLICATION_RACED" ]; then
-  "$FM_TEST_REAL_LN" -s "$FM_TEST_PUBLICATION_SINK" "$FM_TEST_PUBLICATION_TARGET"
+if [ "${2:-}" = no-clobber ] && [ ! -e "$FM_TEST_PUBLICATION_RACED" ]; then
+  ln -s "$FM_TEST_PUBLICATION_SINK" "${3}/${7}"
   : > "$FM_TEST_PUBLICATION_RACED"
 fi
-exec "$FM_TEST_REAL_LINK" "$@"
+exec "$FM_TEST_REAL_PYTHON" "$@"
 SH
-  chmod +x "$fakebin/link"
-  out=$(PATH="$fakebin:$PATH" FM_TEST_PUBLICATION_TARGET="$target" \
-    FM_TEST_PUBLICATION_SINK="$sink" FM_TEST_PUBLICATION_RACED="$home/raced" \
-    FM_TEST_REAL_LINK="$real_link" FM_TEST_REAL_LN="$real_ln" \
+  chmod +x "$fakebin/python3"
+  out=$(PATH="$fakebin:$PATH" FM_TEST_PUBLICATION_SINK="$sink" \
+    FM_TEST_PUBLICATION_RACED="$home/raced" FM_TEST_REAL_PYTHON="$real_python" \
     FM_HOME="$home" "$WORK_IDENTITY" record "$task" --file "$manifest" 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "identity publication followed a raced target"
-  [ -L "$target" ] || fail "publication race fixture did not replace the exact target"
-  [ -z "$(find "$sink" -mindepth 1 -print -quit)" ] \
-    || fail "identity publication partially wrote through a raced target"
-  assert_contains "$out" "symlinked" \
-    "identity publication did not reject the raced target"
-  pass "identity publication never follows a raced target"
+  [ "$rc" -ne 0 ] || fail "identity publication followed a raced staging path"
+  [ -L "$staging" ] || fail "publication race fixture did not replace the staging path"
+  assert_absent "$target" "staging race partially published an authoritative identity"
+  [ "$(cat "$sink")" = "must remain unchanged" ] \
+    || fail "identity publication partially wrote through a raced staging symlink"
+  assert_contains "$out" "publication staging entry already exists" \
+    "identity publication did not reject the raced staging path"
+  pass "identity publication never follows raced staging paths"
 }
 
 test_projection_serializes_identity_ownership() {
@@ -1137,7 +1136,7 @@ SH
 }
 
 test_replacement_dispatch_recovers_prior_retirement() {
-  local home task launch old_transaction old_binding old_hash old_candidate draft transaction binding hash candidate fakebin real_rm out rc=0
+  local home task launch old_transaction old_binding old_hash old_candidate draft transaction binding hash candidate fakebin real_python out rc=0
   home=$(make_home replacement-prior-recovery)
   task=replacement-prior-recovery
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
@@ -1178,17 +1177,17 @@ test_replacement_dispatch_recovers_prior_retirement() {
     { print }
   ' "$home/state/$task.meta" > "$candidate"
   fakebin=$(fm_fakebin "$home/prior-retirement-fakes")
-  real_rm=$(command -v rm)
-  cat > "$fakebin/rm" <<'SH'
+  real_python=$(command -v python3)
+  cat > "$fakebin/python3" <<'SH'
 #!/usr/bin/env bash
-for arg in "$@"; do
-  [ "$(pwd -P)/$arg" != "$FM_TEST_PRIOR" ] || exit 1
-done
-exec "$FM_TEST_REAL_RM" "$@"
+if [ "${2:-}" = remove ] && [ "${3:-}/${5:-}" = "$FM_TEST_PRIOR" ]; then
+  exit 1
+fi
+exec "$FM_TEST_REAL_PYTHON" "$@"
 SH
-  chmod +x "$fakebin/rm"
+  chmod +x "$fakebin/python3"
   out=$(PATH="$fakebin:$PATH" FM_TEST_PRIOR="$home/data/$task/work-identity-dispatch-prior.md" \
-    FM_TEST_REAL_RM="$real_rm" FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
+    FM_TEST_REAL_PYTHON="$real_python" FM_HOME="$home" "$WORK_IDENTITY" dispatch-publish "$task" \
     --brief "$launch" --meta "$candidate" --transaction "$transaction" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "injected retained-prior retirement failure unexpectedly completed"
   assert_contains "$out" "cannot remove retained prior dispatch instructions" \
@@ -1356,6 +1355,15 @@ test_snapshot_preflight_and_dispatch_recovery() {
   printf '%s\n' "$transfer" | FM_HOME="$home" "$WORK_IDENTITY" \
     handoff-cancel "$task" --file - >/dev/null \
     || fail "could not cancel omitted prepared handoff fixture"
+
+  FM_HOME="$home" "$WORK_IDENTITY" reserve-unlinked publication-guard-a \
+    --reason persistent-secondmate >/dev/null
+  FM_HOME="$home" "$WORK_IDENTITY" reserve-unlinked publication-guard-b \
+    --reason persistent-secondmate >/dev/null
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" publication-run -- printf 'published\n') \
+    || fail "publication preflight rejected distinct guarded task directories"
+  [ "$out" = published ] \
+    || fail "publication preflight did not run after validating multiple guarded tasks"
 
   task=secondmate-dispatch-recovery
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \

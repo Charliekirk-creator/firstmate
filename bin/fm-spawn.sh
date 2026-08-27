@@ -4010,7 +4010,7 @@ kimi_submission_state() {
   if kill -0 "$pid" 2>/dev/null; then
     printf 'submitting'
   elif [ ! -e "$attempted" ] && [ ! -L "$attempted" ]; then
-    printf 'prepared'
+    printf 'ambiguous'
   else
     spawn_launch_request_file_matches "$attempted" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
     printf 'ambiguous'
