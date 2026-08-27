@@ -495,6 +495,12 @@ fm_backend_zellij_send_text_line() {  # <target> <text> [expected-label]
   return 2
 }
 
+fm_backend_zellij_send_launch_line() {  # <target> <text> [expected-label]
+  fm_backend_zellij_target_ready "$1" "${3:-}" || return 1
+  fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action write-chars \
+    --pane-id "$FM_BACKEND_ZELLIJ_PANE" -- "$2"$'\n' >/dev/null 2>&1
+}
+
 fm_backend_zellij_passive_current_path() {  # <target> [expected-label]
   local target=$1 expected_label=${2:-} path
   fm_backend_zellij_target_ready "$target" "$expected_label" || return 1

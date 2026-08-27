@@ -904,14 +904,10 @@ spawn_launch_request_helper() {  # <command>
   tmp="$SPAWN_LAUNCH_REQUEST/.owner.tmp"
   printf '%s\n' "${BASHPID:-$$}" > "$tmp" && chmod 600 "$tmp" \
     && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/owner" || exit 1
-  spawn_send_literal "$T" "$command" || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    tmp="$SPAWN_LAUNCH_REQUEST/.attempted.tmp"
-    printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" && chmod 600 "$tmp" \
-      && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/attempted" || exit 1
-    sleep 0.3
-    spawn_send_key "$T" Enter || rc=$?
-  fi
+  tmp="$SPAWN_LAUNCH_REQUEST/.attempted.tmp"
+  printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" && chmod 600 "$tmp" \
+    && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/attempted" || exit 1
+  spawn_send_launch_line "$T" "$command" || rc=$?
   if [ "$rc" -eq 0 ]; then
     tmp="$SPAWN_LAUNCH_REQUEST/.accepted.tmp"
     printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" && chmod 600 "$tmp" \
@@ -2741,9 +2737,9 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ] \
       }
       SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
       ;;
-    absent|unattempted-dead)
+    absent|unattempted-dead|failed|attempted-dead)
       spawn_launch_request_cleanup || {
-        echo "error: definitely unsent secondmate launch evidence could not be retired for $ID" >&2
+        echo "error: retryable secondmate launch evidence could not be retired for $ID" >&2
         exit 1
       }
       SPAWN_LAUNCH_PREPARED_RECOVERY=1
@@ -3620,6 +3616,14 @@ spawn_worktree_request_cleanup() {
     return 1
   fi
 }
+spawn_send_launch_line() {  # <target> <text>
+  case "$BACKEND" in
+    tmux) fm_backend_tmux_send_text_line "$1" "$2" ;;
+    herdr) fm_backend_herdr_send_text_line "$1" "$2" ;;
+    zellij) fm_backend_zellij_send_launch_line "$1" "$2" "$W" ;;
+    *) return 1 ;;
+  esac
+}
 spawn_send_literal() {  # <target> <text>
   case "$BACKEND" in
     tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
@@ -3858,12 +3862,12 @@ kimi_submission_state() {
   links=$(spawn_file_link_count "$path") || return 1
   [ "$links" = 1 ] || return 1
   value=$(tr -d '\n' < "$path") || return 1
-  case "$value" in pending|accepted) printf '%s' "$value" ;; *) return 1 ;; esac
+  case "$value" in submitting|pending|accepted) printf '%s' "$value" ;; *) return 1 ;; esac
 }
 
-kimi_submission_publish() {  # <pending|accepted>
+kimi_submission_publish() {  # <submitting|pending|accepted>
   local value=$1 tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submission.tmp"
-  case "$value" in pending|accepted) ;; *) return 1 ;; esac
+  case "$value" in submitting|pending|accepted) ;; *) return 1 ;; esac
   printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" \
     && mv -- "$tmp" "$SPAWN_LAUNCH_REQUEST/kimi-submission"
 }
@@ -3889,6 +3893,12 @@ kimi_deliver_launch_brief() {
     KIMI_SUBMIT_RETRIES=${FM_KIMI_SUBMIT_RETRIES:-3}
     KIMI_SUBMIT_SLEEP=${FM_KIMI_SUBMIT_SLEEP:-${FM_KIMI_POLL_INTERVAL:-0.5}}
     KIMI_SUBMIT_SETTLE=${FM_KIMI_SUBMIT_SETTLE:-0}
+    if [ "$journal" -eq 1 ]; then
+      kimi_submission_publish submitting || {
+        kimi_spawn_fail "kimi launch brief submission could not be journaled"
+        return 1
+      }
+    fi
     KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
       "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
       "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || {
@@ -3906,7 +3916,7 @@ kimi_deliver_launch_brief() {
         return 1
       }
     fi
-  elif [ "$submission_state" = pending ]; then
+  elif [ "$submission_state" = submitting ] || [ "$submission_state" = pending ]; then
     spawn_send_key "$T" Enter || {
       kimi_spawn_fail "kimi pending launch brief could not be resubmitted"
       return 1
@@ -4725,7 +4735,8 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
   if [ -n "$SPAWN_TRACEPARENT" ]; then
     LAUNCH_COMMAND="$LAUNCH_COMMAND && export TRACEPARENT=$(shell_quote "$SPAWN_TRACEPARENT")"
   fi
-  LAUNCH_COMMAND="$LAUNCH_COMMAND && $LAUNCH"
+  LAUNCH_GUARD="$STATE/.$ID.launch-execution.$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream)"
+  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $(shell_quote "$LAUNCH_GUARD") 2>/dev/null; then ( $LAUNCH ); launch_rc=\$?; rmdir $(shell_quote "$LAUNCH_GUARD") 2>/dev/null || true; (exit \$launch_rc); fi"
   spawn_endpoint_receipt_publish launch-prepared "$WT" || {
     echo "error: secondmate launch preparation could not be journaled" >&2
     exit 1

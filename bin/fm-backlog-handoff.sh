@@ -88,12 +88,17 @@ MAIN_BACKLOG="$DATA/backlog.md"
 RECEIVER_WAKE_MESSAGE='New routed work is in your backlog. Run bin/fm-session-start.sh now, then act on the routed task.'
 
 ACTIVE_HANDOFF_LOCK=
+ACTIVE_BACKLOG_LOCK=
 ACTIVE_REGISTRY_LOCK=
 HANDOFF_PLAN_DIR=
 release_remote_locks() {
   if [ -n "$HANDOFF_PLAN_DIR" ]; then
     rm -rf -- "$HANDOFF_PLAN_DIR" 2>/dev/null || true
     HANDOFF_PLAN_DIR=
+  fi
+  if [ -n "$ACTIVE_BACKLOG_LOCK" ]; then
+    fm_lock_release "$ACTIVE_BACKLOG_LOCK"
+    ACTIVE_BACKLOG_LOCK=
   fi
   if [ -n "$ACTIVE_HANDOFF_LOCK" ]; then
     fm_lock_release "$ACTIVE_HANDOFF_LOCK"
@@ -1281,6 +1286,8 @@ with_remote_route_locks() { # <secondmate-id> <function> <args...>
   fi
   ACTIVE_HANDOFF_LOCK="$STATE/.backlog-handoff-$id.lock"
   fm_lock_acquire_wait "$ACTIVE_HANDOFF_LOCK"
+  ACTIVE_BACKLOG_LOCK="$STATE/.backlog-mutation.lock"
+  fm_lock_acquire_wait "$ACTIVE_BACKLOG_LOCK"
   if "$operation" "$@"; then rc=0; else rc=$?; fi
   release_remote_locks
   return "$rc"
@@ -1355,6 +1362,9 @@ ACTIVE_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
 fm_lock_acquire_wait "$ACTIVE_HANDOFF_LOCK"
 fm_lock_release "$ACTIVE_REGISTRY_LOCK"
 ACTIVE_REGISTRY_LOCK=
+
+ACTIVE_BACKLOG_LOCK="$STATE/.backlog-mutation.lock"
+fm_lock_acquire_wait "$ACTIVE_BACKLOG_LOCK"
 
 RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
