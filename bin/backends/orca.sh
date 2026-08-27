@@ -475,6 +475,15 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
         else
           fm_backend_orca_operation_scalar_read "$start_file" >/dev/null || return 1
         fi
+      elif [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; then
+        if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+          [ -f "$candidate" ] && [ ! -L "$candidate" ] \
+            && [ "$(fm_backend_orca_file_link_count "$candidate")" = 1 ] || return 1
+          [ ! -s "$candidate" ] || return 1
+          rm -f -- "$candidate" || return 1
+        fi
+        rm -f -- "$pid_file" || return 1
+        continue
       elif [ -e "$response" ] || [ -L "$response" ]; then
         fm_backend_orca_terminal_response_parse "$response" "$title"
         return $?
@@ -497,9 +506,6 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
         esac
         fm_backend_orca_terminal_response_parse "$response" "$title"
         return $?
-      elif [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; then
-        rm -f -- "$pid_file" || return 1
-        continue
       else
         echo "error: Orca terminal creation stopped without a recoverable outcome for $title" >&2
         return 1
@@ -686,9 +692,9 @@ fm_backend_orca_send_key() {  # <terminal-id> <key>
 # duplicating text.
 fm_backend_orca_send_text_submit() {  # <terminal-id> <text> <retries> <enter-sleep> <settle>
   local terminal=$1 text=$2 retries=$3 sleep_s=$4 settle=$5
-  fm_backend_submit_entering_evidence || { printf 'send-failed'; return 0; }
   fm_backend_orca_tool_check || { printf 'send-failed'; return 0; }
   fm_backend_orca_send_literal "$terminal" "$text" || { printf 'send-failed'; return 0; }
+  fm_backend_submit_entering_evidence || { printf 'pending-unproven'; return 0; }
   fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
   sleep "$settle"
   fm_composer_submit_retry_core fm_backend_orca_send_key fm_backend_orca_composer_state \

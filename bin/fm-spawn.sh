@@ -978,7 +978,7 @@ spawn_launch_request_cleanup() {
   [ -d "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ] || return 1
   for entry in "$SPAWN_LAUNCH_REQUEST"/* "$SPAWN_LAUNCH_REQUEST"/.[!.]* "$SPAWN_LAUNCH_REQUEST"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
-    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-go|kimi-submit-entering|kimi-submit-attempted|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-go.tmp|.kimi-submit-entering.tmp|.kimi-submit-entering.tmp.*|.kimi-submit-attempted.tmp|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
+    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-go|kimi-submit-attempted|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-go.tmp|.kimi-submit-attempted.tmp|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
     [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
     [ "$(spawn_file_link_count "$entry")" = 1 ] || return 1
     rm -f -- "$entry" || return 1
@@ -3973,10 +3973,9 @@ kimi_spawn_fail() {  # <detail>
 }
 
 kimi_submission_state() {
-  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go entering attempted result value links pid token verdict
+  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted result value links pid token verdict
   owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner"
   go="$SPAWN_LAUNCH_REQUEST/kimi-submit-go"
-  entering="$SPAWN_LAUNCH_REQUEST/kimi-submit-entering"
   attempted="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted"
   result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'absent'; return 0; fi
@@ -3998,8 +3997,7 @@ kimi_submission_state() {
     return 0
   fi
   if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then
-    if [ -e "$entering" ] || [ -L "$entering" ] \
-      || [ -e "$attempted" ] || [ -L "$attempted" ]; then return 1; fi
+    if [ -e "$attempted" ] || [ -L "$attempted" ]; then return 1; fi
     printf 'prepared'
     return 0
   fi
@@ -4018,14 +4016,10 @@ kimi_submission_state() {
     if kill -0 "$pid" 2>/dev/null; then
       printf 'submitting'
     else
-      if [ -e "$entering" ] || [ -L "$entering" ]; then
-        spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-        if [ -e "$attempted" ] || [ -L "$attempted" ]; then
-          spawn_launch_request_file_matches "$attempted" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-        fi
+      if [ -e "$attempted" ] || [ -L "$attempted" ]; then
+        spawn_launch_request_file_matches "$attempted" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
         printf 'ambiguous'
       else
-        [ ! -e "$attempted" ] && [ ! -L "$attempted" ] || return 1
         printf 'prepared'
       fi
     fi

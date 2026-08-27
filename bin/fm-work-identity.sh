@@ -409,6 +409,15 @@ owned_atomic_replace() {  # <source> <target> <label>
   [ "${TMP:-}" != "$source" ] || TMP=
 }
 
+recover_owned_replacement() {  # <target> <label>
+  local target=$1 label=$2 parent expected base
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
+  python3 "$FS_OWNER" describe "$parent" "$expected" "$base" >/dev/null \
+    || die "cannot recover $label publication: $target"
+}
+
 owned_remove() {  # <target> <label>
   local target=$1 label=$2 parent expected base
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
@@ -1033,7 +1042,17 @@ identity_lock_acquire() {  # <task-id>
     "$ACTIVE_IDENTITY_LOCK" "$ACTIVE_IDENTITY_LOCK_TOKEN" "work identity task"
   ACTIVE_IDENTITY_LOCK_HELD=1
   locate_task_dir "$task"
-  [ ! -d "$TASK_DIR" ] || recover_no_clobber_publications
+  if [ -d "$TASK_DIR" ]; then
+    recover_no_clobber_publications
+    recover_owned_replacement "$SOURCE_HANDOFF" "source handoff state"
+    recover_owned_replacement "$TARGET_HANDOFF" "target handoff state"
+    recover_owned_replacement "$DISPATCH_STATE" "dispatch state"
+    recover_owned_replacement "$DISPATCH_PRIOR" "retained dispatch instructions"
+  fi
+  if [ "${#task}" -le 220 ]; then
+    recover_owned_replacement "$STATE_REAL/$task.launch-brief.md" "dispatch instructions"
+    recover_owned_replacement "$STATE_REAL/$task.meta" "task metadata"
+  fi
 }
 
 identity_lock_release() {
@@ -2570,9 +2589,25 @@ dispatch_retire() {  # <task-id>
 }
 
 publication_preflight_locked() {
-  local task_dir task guarded guarded_path
+  local task_dir task guarded guarded_path name
   ensure_data_dir
+  ensure_state_dir
   ensure_home_identity
+  for guarded_path in \
+    "$STATE_REAL"/.*.meta.replace-journal \
+    "$STATE_REAL"/.*.launch-brief.md.replace-journal
+  do
+    [ -e "$guarded_path" ] || [ -L "$guarded_path" ] || continue
+    name=$(basename -- "$guarded_path")
+    case "$name" in
+      .*.meta.replace-journal) task=${name#.}; task=${task%.meta.replace-journal} ;;
+      .*.launch-brief.md.replace-journal) task=${name#.}; task=${task%.launch-brief.md.replace-journal} ;;
+      *) die "work identity publication journal is malformed: $guarded_path" ;;
+    esac
+    fm_pr_task_id_valid "$task" || die "work identity publication journal has an invalid task id: $guarded_path"
+    identity_lock_acquire "$task"
+    identity_lock_release
+  done
   for task_dir in "$DATA_REAL"/*; do
     [ -e "$task_dir" ] || [ -L "$task_dir" ] || continue
     guarded=0
@@ -2581,7 +2616,11 @@ publication_preflight_locked() {
       "$task_dir/work-identity-handoff-target.json" \
       "$task_dir/work-identity-dispatch.json" \
       "$task_dir/work-identity-unlinked-guard.json" \
-      "$task_dir/work-identity-unlinked-reservation.json"
+      "$task_dir/work-identity-unlinked-reservation.json" \
+      "$task_dir/.work-identity-handoff-source.json.replace-journal" \
+      "$task_dir/.work-identity-handoff-target.json.replace-journal" \
+      "$task_dir/.work-identity-dispatch.json.replace-journal" \
+      "$task_dir/.work-identity-dispatch-prior.md.replace-journal"
     do
       if [ -e "$guarded_path" ] || [ -L "$guarded_path" ]; then guarded=1; fi
     done

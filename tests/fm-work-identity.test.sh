@@ -652,6 +652,29 @@ test_identity_lock_refuses_unsafe_lock_entry_without_waiting() {
   pass "unsafe identity lock entries refuse without waiting"
 }
 
+test_identity_lock_reclaims_reused_pid_owner() {
+  local home parent inode lock owner token
+  home=$(make_home identity-lock-pid-reuse)
+  parent="$home/state"
+  lock=.work-identity-reused-pid.lock
+  mkdir "$parent/$lock"
+  printf '%s\tstale-owner\told-process-start\n' "${BASHPID:-$$}" > "$parent/$lock/owner"
+  inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$parent")
+  token="replacement-${RANDOM}"
+  python3 "$ROOT/bin/fm-work-identity-fs.py" lock-try "$parent" "$inode" "$lock" \
+    "${BASHPID:-$$}" "$token" 0 \
+    || fail "reused lock PID could not be reclaimed by process-start identity"
+  owner=$(cat "$parent/$lock/owner")
+  [ "$(printf '%s' "$owner" | cut -f2)" = "$token" ] \
+    || fail "reused lock PID retained the stale owner token"
+  [ "$(printf '%s' "$owner" | awk -F '\t' '{print NF}')" -eq 3 ] \
+    || fail "replacement lock owner did not persist process-start identity"
+  python3 "$ROOT/bin/fm-work-identity-fs.py" lock-release "$parent" "$inode" "$lock" \
+    "${BASHPID:-$$}" "$token" \
+    || fail "replacement lock owner could not release its lock"
+  pass "identity locks distinguish reused PIDs by process-start identity"
+}
+
 test_projection_serializes_identity_ownership() {
   local home task lock lock_name lock_key state_inode entered release holder projection wait_count
   home=$(make_home projection-lock)
@@ -2478,6 +2501,7 @@ test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
 test_identity_lock_refuses_replaced_storage_parent
 test_identity_lock_refuses_unsafe_lock_entry_without_waiting
+test_identity_lock_reclaims_reused_pid_owner
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff

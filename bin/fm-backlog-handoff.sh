@@ -773,13 +773,19 @@ resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
     HANDOFF_PLAN_DIR=
     return 1
   fi
-  parse_tasks_axi_move_result "$result" \
-    && task_sets_match EXPECTED_MOVE_KEYS PARSED_MOVE_KEYS || {
+  parse_tasks_axi_move_result "$result" || {
     rm -rf -- "$HANDOFF_PLAN_DIR"
     HANDOFF_PLAN_DIR=
     return 1
   }
-  RESOLVED_MOVE_KEYS=("${EXPECTED_MOVE_KEYS[@]}")
+  for task in "${EXPECTED_MOVE_KEYS[@]}"; do
+    task_array_contains "$task" "${PARSED_MOVE_KEYS[@]}" || {
+      rm -rf -- "$HANDOFF_PLAN_DIR"
+      HANDOFF_PLAN_DIR=
+      return 1
+    }
+  done
+  RESOLVED_MOVE_KEYS=("${PARSED_MOVE_KEYS[@]}")
   for task in "${RESOLVED_MOVE_KEYS[@]}"; do
     RESOLVED_MOVE_HASHES+=("$(backlog_task_sha256 "$HANDOFF_PLAN_DIR/target.md" "$task")")
   done

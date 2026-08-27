@@ -5,6 +5,7 @@ import fcntl
 import os
 import secrets
 import stat
+import subprocess
 import sys
 import time
 
@@ -133,31 +134,140 @@ def atomic_rename(directory_fd, first, second, exchange):
         raise OSError(code, os.strerror(code))
 
 
-def replace_entry(directory_fd, name, source, expected_state):
-    if entry_state(directory_fd, name) != expected_state:
-        fail(f"owned destination changed before publication: {name}")
-    stage = f".{name}.replacing.{os.getpid()}.{secrets.token_hex(8)}"
+def state_matches(actual, expected):
+    return actual.rsplit(":", 1)[0] == expected.rsplit(":", 1)[0]
+
+
+def read_replace_journal(directory_fd, journal):
     try:
-        copy_to_new(source, directory_fd, stage)
-        if entry_state(directory_fd, name) != expected_state:
-            fail(f"owned destination changed during publication: {name}")
-        if expected_state == "absent":
-            try:
-                atomic_rename(directory_fd, stage, name, False)
-            except OSError as exc:
-                if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
-                    fail(f"owned destination changed during publication: {name}")
-                raise
-        else:
-            atomic_rename(directory_fd, stage, name, True)
-            displaced_state = raw_entry_state(directory_fd, stage)
-            if displaced_state.rsplit(":", 1)[0] != expected_state.rsplit(":", 1)[0]:
-                atomic_rename(directory_fd, stage, name, True)
-                fail(f"owned destination changed during publication: {name}")
-            remove(directory_fd, stage)
+        fd = os.open(
+            journal,
+            os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            fail(f"owned replacement journal is unsafe: {journal}")
+        raise
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 2048:
+        os.close(fd)
+        fail(f"owned replacement journal is unsafe: {journal}")
+    try:
+        payload = os.read(fd, 2049).decode("ascii", "strict")
+    except UnicodeError:
+        os.close(fd)
+        fail(f"owned replacement journal is malformed: {journal}")
+    lines = payload.splitlines()
+    if len(lines) not in (2, 3):
+        os.close(fd)
+        fail(f"owned replacement journal is malformed: {journal}")
+    header = lines[0].split("\t")
+    if len(header) != 3 or header[0] != "v1" or not valid_name(header[1]) or not valid_name(header[2]):
+        os.close(fd)
+        fail(f"owned replacement journal is malformed: {journal}")
+    expected = lines[1]
+    if expected != "absent" and not expected.startswith("regular:"):
+        os.close(fd)
+        fail(f"owned replacement journal is malformed: {journal}")
+    candidate_state = lines[2] if len(lines) == 3 else None
+    if candidate_state is not None and not candidate_state.startswith("regular:"):
+        os.close(fd)
+        fail(f"owned replacement journal is malformed: {journal}")
+    return fd, header[1], header[2], expected, candidate_state
+
+
+def publish_replace_journal(directory_fd, journal, stage, previous, expected_state, candidate_state):
+    temporary = f".{journal}.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+    published = False
+    try:
+        payload = f"v1\t{stage}\t{previous}\n{expected_state}\n{candidate_state}\n".encode("ascii")
+        if os.write(fd, payload) != len(payload):
+            raise OSError(errno.EIO, "short replacement journal write")
+        os.fsync(fd)
+        atomic_rename(directory_fd, temporary, journal, False)
+        published = True
         os.fsync(directory_fd)
     finally:
-        remove(directory_fd, stage)
+        os.close(fd)
+        if not published:
+            remove(directory_fd, temporary)
+
+
+def recover_replace(directory_fd, name):
+    journal = f".{name}.replace-journal"
+    stage = f".{name}.replace-candidate"
+    previous = f".{name}.replace-previous"
+    loaded = read_replace_journal(directory_fd, journal)
+    if loaded is None:
+        stage_state = raw_entry_state(directory_fd, stage)
+        if stage_state != "absent":
+            if not stage_state.startswith("regular:"):
+                fail(f"owned replacement candidate is unsafe: {stage}")
+            remove(directory_fd, stage)
+            os.fsync(directory_fd)
+        if raw_entry_state(directory_fd, previous) != "absent":
+            fail(f"owned replacement predecessor has no journal: {previous}")
+        return
+    journal_fd, stage, previous, expected_state, candidate_state = loaded
+    try:
+        target_state = raw_entry_state(directory_fd, name)
+        stage_state = raw_entry_state(directory_fd, stage)
+        previous_state = raw_entry_state(directory_fd, previous)
+        if candidate_state is None:
+            fail(f"owned replacement journal is incomplete for {name}")
+        if previous_state != "absent" and not state_matches(previous_state, expected_state):
+            if target_state == "absent":
+                atomic_rename(directory_fd, previous, name, False)
+            fail(f"owned destination changed during publication: {name}")
+        if expected_state != "absent" and previous_state == "absent":
+            if target_state != expected_state:
+                fail(f"owned destination changed during publication: {name}")
+            atomic_rename(directory_fd, name, previous, False)
+            previous_state = raw_entry_state(directory_fd, previous)
+            target_state = "absent"
+            if not state_matches(previous_state, expected_state):
+                atomic_rename(directory_fd, previous, name, False)
+                fail(f"owned destination changed during publication: {name}")
+        if target_state == "absent":
+            if not state_matches(stage_state, candidate_state):
+                fail(f"owned replacement candidate changed during publication: {stage}")
+            atomic_rename(directory_fd, stage, name, False)
+            target_state = raw_entry_state(directory_fd, name)
+            stage_state = "absent"
+        if not state_matches(target_state, candidate_state) or stage_state != "absent":
+            fail(f"owned destination changed during publication: {name}")
+        if previous_state != "absent":
+            remove(directory_fd, previous)
+        os.close(journal_fd)
+        journal_fd = None
+        remove(directory_fd, journal)
+        os.fsync(directory_fd)
+    finally:
+        if journal_fd is not None:
+            os.close(journal_fd)
+
+
+def replace_entry(directory_fd, name, source, expected_state):
+    recover_replace(directory_fd, name)
+    if entry_state(directory_fd, name) != expected_state:
+        fail(f"owned destination changed before publication: {name}")
+    stage = f".{name}.replace-candidate"
+    previous = f".{name}.replace-previous"
+    journal = f".{name}.replace-journal"
+    copy_to_new(source, directory_fd, stage)
+    candidate_state = raw_entry_state(directory_fd, stage)
+    if not candidate_state.startswith("regular:"):
+        fail(f"owned replacement candidate is unsafe: {stage}")
+    publish_replace_journal(
+        directory_fd, journal, stage, previous, expected_state, candidate_state
+    )
+    recover_replace(directory_fd, name)
 
 
 def pid_alive(pid):
@@ -168,6 +278,25 @@ def pid_alive(pid):
         return False
     except PermissionError:
         return True
+
+
+def process_start_identity(pid):
+    if sys.platform.startswith("linux"):
+        try:
+            payload = open(f"/proc/{pid}/stat", "r", encoding="ascii").read()
+            fields = payload.rsplit(")", 1)[1].split()
+            return f"linux:{fields[19]}"
+        except (OSError, IndexError, UnicodeError):
+            return None
+    try:
+        output = subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"ps:{output.replace(' ', '_')}" if output else None
 
 
 def lock_owner(directory_fd, name):
@@ -193,7 +322,7 @@ def lock_owner(directory_fd, name):
                 dir_fd=lock_fd,
             )
         except FileNotFoundError:
-            return lock_info, None, None, entries
+            return lock_info, None, None, None, entries
         try:
             owner_info = os.fstat(owner_fd)
             if not stat.S_ISREG(owner_info.st_mode) or owner_info.st_nlink != 1 or owner_info.st_size > 512:
@@ -205,11 +334,14 @@ def lock_owner(directory_fd, name):
         finally:
             os.close(owner_fd)
         fields = payload.rstrip("\n").split("\t")
-        if len(fields) != 2 or not fields[0].isdigit() or not valid_token(fields[1]):
+        if len(fields) not in (2, 3) or not fields[0].isdigit() or not valid_token(fields[1]):
             fail(f"owned lock owner is malformed: {name}/owner")
-        if entries != ["owner"]:
+        owner_start = fields[2] if len(fields) == 3 else None
+        if owner_start is not None and not valid_token(owner_start):
+            fail(f"owned lock owner is malformed: {name}/owner")
+        if sorted(entries) != ["owner"]:
             fail(f"owned lock contains unexpected entries: {name}")
-        return lock_info, int(fields[0]), fields[1], entries
+        return lock_info, int(fields[0]), fields[1], owner_start, entries
     finally:
         os.close(lock_fd)
 
@@ -231,7 +363,10 @@ def create_lock(directory_fd, name, pid, token):
             dir_fd=lock_fd,
         )
         try:
-            payload = f"{pid}\t{token}\n".encode("ascii")
+            start_identity = process_start_identity(pid)
+            if start_identity is None or not valid_token(start_identity):
+                raise OSError(errno.ESRCH, "cannot identify lock owner process")
+            payload = f"{pid}\t{token}\t{start_identity}\n".encode("ascii")
             if os.write(owner_fd, payload) != len(payload):
                 raise OSError(errno.EIO, "short lock owner write")
             os.fsync(owner_fd)
@@ -293,10 +428,14 @@ def lock_try(directory_fd, name, pid, token, stale_after):
     details = lock_owner(directory_fd, name)
     if details is None:
         raise SystemExit(2)
-    lock_info, owner_pid, owner_token, entries = details
+    lock_info, owner_pid, owner_token, owner_start, entries = details
     if owner_pid == pid and owner_token == token:
         return
-    if owner_pid is not None and pid_alive(owner_pid):
+    current_start = process_start_identity(owner_pid) if owner_pid is not None and pid_alive(owner_pid) else None
+    if owner_start is not None and current_start == owner_start:
+        raise SystemExit(2)
+    if owner_start is None and current_start is not None \
+            and time.time() - lock_info.st_mtime < stale_after:
         raise SystemExit(2)
     if owner_pid is None and entries:
         raise SystemExit(2)
@@ -318,7 +457,7 @@ def lock_release(directory_fd, name, pid, token):
     details = lock_owner(directory_fd, name)
     if details is None:
         return
-    _, owner_pid, owner_token, _ = details
+    _, owner_pid, owner_token, _, _ = details
     if owner_pid != pid or owner_token != token:
         return
     lock_fd = os.open(
@@ -360,10 +499,20 @@ def main():
             os.mkdir(probe, 0o700, dir_fd=directory_fd)
             os.rmdir(probe, dir_fd=directory_fd)
         elif command == "describe":
-            print(entry_state(directory_fd, name))
+            mutex_fd = operation_lock(directory_fd, name)
+            try:
+                recover_replace(directory_fd, name)
+                print(entry_state(directory_fd, name))
+            finally:
+                os.close(mutex_fd)
         elif command == "remove":
-            remove(directory_fd, name)
-            os.fsync(directory_fd)
+            mutex_fd = operation_lock(directory_fd, name)
+            try:
+                recover_replace(directory_fd, name)
+                remove(directory_fd, name)
+                os.fsync(directory_fd)
+            finally:
+                os.close(mutex_fd)
         elif command == "replace":
             if len(sys.argv) != 7:
                 fail("replace requires a source and expected destination state")
@@ -379,23 +528,28 @@ def main():
             source, staging = sys.argv[5:7]
             if not valid_name(staging):
                 fail("unsafe publication staging name")
+            mutex_fd = operation_lock(directory_fd, name)
             try:
-                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                raise SystemExit(2)
-            except FileNotFoundError:
-                pass
-            try:
-                copy_to_new(source, directory_fd, staging)
+                recover_replace(directory_fd, name)
                 try:
-                    os.link(staging, name, src_dir_fd=directory_fd,
-                            dst_dir_fd=directory_fd, follow_symlinks=False)
-                except FileExistsError:
-                    remove(directory_fd, staging)
+                    os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                     raise SystemExit(2)
-                remove(directory_fd, staging)
-                os.fsync(directory_fd)
-            except FileExistsError:
-                fail("publication staging entry already exists")
+                except FileNotFoundError:
+                    pass
+                try:
+                    copy_to_new(source, directory_fd, staging)
+                    try:
+                        os.link(staging, name, src_dir_fd=directory_fd,
+                                dst_dir_fd=directory_fd, follow_symlinks=False)
+                    except FileExistsError:
+                        remove(directory_fd, staging)
+                        raise SystemExit(2)
+                    remove(directory_fd, staging)
+                    os.fsync(directory_fd)
+                except FileExistsError:
+                    fail("publication staging entry already exists")
+            finally:
+                os.close(mutex_fd)
         elif command == "lock-try":
             if len(sys.argv) != 8:
                 fail("lock-try requires pid, token, and stale age")

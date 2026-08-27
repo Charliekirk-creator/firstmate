@@ -603,9 +603,9 @@ fm_backend_cmux_composer_state() {  # <target> [expected-label] -> empty|pending
 # of the proof-carrying submit vocabulary.
 fm_backend_cmux_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-}
-  fm_backend_submit_entering_evidence || { printf 'send-failed'; return 0; }
   fm_backend_cmux_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_cmux_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }
+  fm_backend_submit_entering_evidence || { printf 'pending-unproven'; return 0; }
   fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
   sleep "$settle"
   fm_composer_submit_retry_core fm_backend_cmux_send_key fm_backend_cmux_composer_state \
