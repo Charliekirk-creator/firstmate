@@ -1552,8 +1552,9 @@ completion_inventory_persist_locked() {  # <origin-id> <keys> <current> <histori
   [ "$links" = 1 ] || fail "decision completion inventory is hardlinked: $path"
 }
 
-CURRENT_GENERATION_SCHEMA=fm-decision-current-generation.v1
+CURRENT_GENERATION_SCHEMA=fm-decision-current-generation.v2
 CURRENT_GENERATION_OWNER=''
+CURRENT_GENERATION_BACKLOG=''
 
 current_generation_dir() {
   local dir physical_dir
@@ -1581,13 +1582,14 @@ current_generation_path() {  # <origin-id> <decision-key>
 }
 
 current_generation_content() {  # <origin-id> <decision-key> <retention-owner>
-  printf 'schema=%s\norigin=%s\ndecision_key=%s\nretention_owner=%s\n' \
-    "$CURRENT_GENERATION_SCHEMA" "$1" "$2" "$3"
+  printf 'schema=%s\norigin=%s\ndecision_key=%s\nretention_owner=%s\nbacklog=%s\n' \
+    "$CURRENT_GENERATION_SCHEMA" "$1" "$2" "$3" "$DECISION_BACKLOG"
 }
 
 current_generation_load() {  # <origin-id> <decision-key>
-  local origin=$1 key=$2 path links owner expected actual
+  local origin=$1 key=$2 path links schema owner backlog expected actual
   CURRENT_GENERATION_OWNER=''
+  CURRENT_GENERATION_BACKLOG=''
   path=$(current_generation_path "$origin" "$key")
   [ -e "$path" ] || [ -L "$path" ] || return 1
   [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] \
@@ -1595,13 +1597,28 @@ current_generation_load() {  # <origin-id> <decision-key>
   links=$(file_link_count "$path") \
     || fail "could not inspect decision generation binding link count: $path"
   [ "$links" = 1 ] || fail "decision generation binding is hardlinked: $path"
+  schema=$(meta_value "$path" schema)
   owner=$(meta_value "$path" retention_owner)
   [ "${#owner}" -eq 64 ] || fail "decision generation binding is malformed: $path"
   case "$owner" in *[!0-9a-f]*) fail "decision generation binding is malformed: $path" ;; esac
-  expected=$(current_generation_content "$origin" "$key" "$owner")
+  case "$schema" in
+    fm-decision-current-generation.v1)
+      expected=$(printf 'schema=%s\norigin=%s\ndecision_key=%s\nretention_owner=%s\n' \
+        "$schema" "$origin" "$key" "$owner")
+      backlog=''
+      ;;
+    "$CURRENT_GENERATION_SCHEMA")
+      backlog=$(meta_value "$path" backlog)
+      [ -n "$backlog" ] || fail "decision generation binding is malformed: $path"
+      expected=$(printf 'schema=%s\norigin=%s\ndecision_key=%s\nretention_owner=%s\nbacklog=%s\n' \
+        "$schema" "$origin" "$key" "$owner" "$backlog")
+      ;;
+    *) fail "decision generation binding is malformed: $path" ;;
+  esac
   actual=$(cat "$path") || fail "could not read decision generation binding: $path"
   [ "$actual" = "$expected" ] || fail "decision generation binding is malformed: $path"
   CURRENT_GENERATION_OWNER=$owner
+  CURRENT_GENERATION_BACKLOG=$backlog
 }
 
 persist_current_generation_owner() {  # <origin-id> <decision-key>
@@ -1639,6 +1656,18 @@ check_current_generation_owner_if_present() {  # <origin-id> <decision-key>
     [ "$CURRENT_GENERATION_OWNER" = "$RETENTION_OWNER_TOKEN" ] \
       || fail "captain decision $1/$2 belongs to a different retention generation"
   fi
+}
+
+persist_visible_resolved_generation_owner() {  # <origin-id> <decision-key>
+  local origin=$1 key=$2
+  ensure_retention_owner
+  if current_generation_load "$origin" "$key" \
+    && [ "$CURRENT_GENERATION_OWNER" != "$RETENTION_OWNER_TOKEN" ]; then
+    [ -n "$CURRENT_GENERATION_BACKLOG" ] \
+      && [ "$CURRENT_GENERATION_BACKLOG" = "$DECISION_BACKLOG" ] \
+      || fail "captain decision $origin/$key belongs to a different retention generation"
+  fi
+  persist_current_generation_owner "$origin" "$key"
 }
 
 LEGACY_ATTESTATION_SCHEMA=fm-decision-legacy-resolution.v1
@@ -2189,7 +2218,7 @@ verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
     [ "$hold_kind" = captain ] || return 1
     body_has_resolution_record "$body" "$origin" "$key" || return 1
     reject_archived_generation_collision "$id"
-    persist_current_generation_owner "$origin" "$key"
+    persist_visible_resolved_generation_owner "$origin" "$key"
     RESOLVED_HOLD_BODY=$body
     return 0
   fi
@@ -2263,7 +2292,7 @@ verify_hold_durable() {  # <origin-id> <decision-key>
   if [ "$state" = "done" ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
     && body_has_resolution_record "$body" "$origin" "$key"; then
     reject_archived_generation_collision "$id"
-    persist_current_generation_owner "$origin" "$key"
+    persist_visible_resolved_generation_owner "$origin" "$key"
     persist_parsed_legacy_resolution "$id" "$origin" "$key"
     return 0
   fi
@@ -2302,7 +2331,7 @@ classify_legacy_source_generations() {  # <origin-id> <comma-keys>
     elif [ "$state" = done ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ] \
       && body_has_resolution_record "$body" "$origin" "$key"; then
       reject_archived_generation_collision "$id"
-      persist_current_generation_owner "$origin" "$key"
+      persist_visible_resolved_generation_owner "$origin" "$key"
       persist_parsed_legacy_resolution "$id" "$origin" "$key"
     else
       fail "captain decision $id is not a source-verifiable active or retained Done generation"

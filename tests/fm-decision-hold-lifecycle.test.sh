@@ -815,6 +815,57 @@ test_current_generation_rejects_an_older_archive_owner() {
   pass "current generations cannot fall back to older archive owners"
 }
 
+test_current_generation_rejects_an_older_retained_done_owner() {
+  local home origin key hold
+  home=$(make_home retained-owner-generation)
+  origin=sample-retained-owner-review
+  key=route-choice
+  tasks_in "$home" add "$origin" "Review retained-owner generations" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create retained-owner origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the old retained route" --reason "captain old route pending" --repo sample) \
+    || fail "could not create the old retained generation"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory the old retained generation"
+  printf 'Captain resolved the old retained route.\n' > "$home/old-retained-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/old-retained-answer.txt" >/dev/null \
+    || fail "could not resolve the old retained generation"
+
+  : > "$home/data/replacement-backlog.md"
+  awk '
+    $0 == "path = \"data/backlog.md\"" { print "path = \"data/replacement-backlog.md\""; next }
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/replacement-archive.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not switch to the replacement retention owner"
+  run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the replacement route" --reason "captain replacement route pending" --repo sample >/dev/null \
+    || fail "could not create the replacement retained generation"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory the replacement retained generation"
+  tasks_in "$home" rm "$hold" >/dev/null \
+    || fail "could not reproduce loss of the replacement retained generation"
+  awk '
+    $0 == "path = \"data/replacement-backlog.md\"" { print "path = \"data/backlog.md\""; next }
+    $0 == "archive = \"data/replacement-archive.md\"" { print "archive = \"data/done-archive.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not restore the old retention owner"
+
+  if run_decisions "$home" complete "$origin" --none --resolved "$key" \
+    > "$home/retained-owner.out" 2> "$home/retained-owner.err"; then
+    fail "an older retained Done row replaced the missing current generation"
+  fi
+  assert_grep "different retention generation" "$home/retained-owner.err" \
+    "retained Done generation mismatch was not reported"
+  pass "current generations cannot fall back to older retained Done owners"
+}
+
 test_source_verifiable_legacy_inventories_migrate_automatically() {
   local home origin active retained first second hold decision digest body token inventory later later_hold
   home=$(make_home source-verifiable-legacy-inventory)
@@ -3148,6 +3199,7 @@ test_pruned_resolved_history_does_not_block_later_review
 test_pre_boundary_retention_requires_exact_migration
 test_legacy_completion_inventory_requires_explicit_provenance
 test_current_generation_rejects_an_older_archive_owner
+test_current_generation_rejects_an_older_retained_done_owner
 test_source_verifiable_legacy_inventories_migrate_automatically
 test_metadata_free_completion_retries_remain_idempotent
 test_live_completion_provenance_survives_teardown
