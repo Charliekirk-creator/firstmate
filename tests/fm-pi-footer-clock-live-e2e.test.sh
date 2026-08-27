@@ -123,7 +123,8 @@ wait_counter_gt() {  # <file> <baseline> <pid>
 }
 
 ack_stopped_cycle() {  # <state>
-  local state=$1 err="$state/drain.err" sequence generation
+  local state=$1
+  local err="$state/drain.err" sequence generation
   PATH="$LAB/shim:$BASE_PATH" FM_ROOT_OVERRIDE="$LAB/root" FM_STATE_OVERRIDE="$state" \
     "$DRAIN" >/dev/null 2> "$err" || return 1
   sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
@@ -150,7 +151,7 @@ for harness in pi pi-signed; do
     continue
   fi
   version=$("$binary" --version 2>/dev/null | head -1 | tr -d '\r')
-  [ -n "$version" ] || version=version-unknown
+  [ -n "$version" ] || version='version-unknown'
   target="$SESSION:$harness"
   state="$LAB/$harness/state"
   out="$LAB/$harness/watch.out"
