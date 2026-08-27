@@ -32,6 +32,10 @@ REAL_TASKS_AXI=$(resolve_real_tasks_axi) || {
   exit 127
 }
 
+if [ "${FM_DECISION_RETENTION_ACTIVE:-}" = 1 ]; then
+  exec "$REAL_TASKS_AXI" "$@"
+fi
+
 case "${1:-}" in
   done|close)
     for arg in "$@"; do

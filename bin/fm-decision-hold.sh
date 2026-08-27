@@ -956,10 +956,19 @@ const path = require("node:path");
 
 function destination(value) {
   const missing = [];
+  const followed = new Set();
   let current = path.resolve(value);
   while (true) {
     try {
       return path.join(fs.realpathSync.native(current), ...missing);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") process.exit(2);
+    }
+    try {
+      const stat = fs.lstatSync(current);
+      if (!stat.isSymbolicLink() || followed.has(current)) process.exit(2);
+      followed.add(current);
+      current = path.resolve(path.dirname(current), fs.readlinkSync(current));
     } catch (error) {
       if (!error || error.code !== "ENOENT") process.exit(2);
       const parent = path.dirname(current);
@@ -1438,6 +1447,7 @@ NODE
     export FM_DECISION_RETENTION_OWNER=$RETENTION_OWNER_TOKEN
     export FM_DECISION_RETENTION_SECRET=$RETENTION_OWNER_SECRET
     export FM_DECISION_RETENTION_SCHEMA=$RETENTION_RECORD_SCHEMA
+    export FM_DECISION_RETENTION_ACTIVE=1
     export NODE_OPTIONS="--require=$hook${prior_node_options:+ $prior_node_options}"
     tasks_axi "$@"
   ); then

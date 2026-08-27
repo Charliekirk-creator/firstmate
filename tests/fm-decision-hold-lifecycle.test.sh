@@ -1564,6 +1564,79 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   pass "only canonical retention sections and owned archives prove historical decisions"
 }
 
+test_nested_public_retention_hook_prunes_once() {
+  local home origin key hold n
+  home=$(make_home nested-retention-hook)
+  origin=sample-nested-retention-review
+  key=old-choice
+  tasks_in "$home" add "$origin" "Review nested retention" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create nested-retention origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the nested retention option" \
+    --reason "captain nested retention option pending" --repo sample) \
+    || fail "could not create nested-retention hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory nested-retention hold"
+  printf 'Captain resolved the nested retention option.\n' > "$home/nested-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/nested-answer.txt" >/dev/null \
+    || fail "could not resolve nested-retention hold"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "nested-filler-$n" "Nested filler $n" \
+      --kind ship --repo sample >/dev/null \
+      || fail "could not create nested-retention filler $n"
+    tasks_in "$home" done "nested-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain nested-retention filler $n"
+  done
+  if ! PATH="$home/fakebin:$ROOT/bin:$PATH" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    "$ROOT/bin/fm-decision-hold.sh" retention-prune \
+    > "$home/nested-prune.out" 2> "$home/nested-prune.err"; then
+    fail "project-bin retention re-entry failed: $(cat "$home/nested-prune.err")"
+  fi
+  assert_no_grep "- [x] $hold -" "$home/data/backlog.md" \
+    "nested public retention left the resolved decision in the Done window"
+  assert_grep "- [x] $hold -" "$home/data/done-archive.md" \
+    "nested public retention did not archive the resolved decision"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "nested public retention did not preserve usable provenance"
+  pass "project-bin retention re-entry emits provenance exactly once"
+}
+
+test_dangling_note_archive_alias_is_rejected() {
+  local home origin
+  home=$(make_home dangling-note-archive-alias)
+  origin=sample-dangling-alias-review
+  awk '
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/history.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure dangling-alias retention"
+  tasks_in "$home" add "$origin" "Review dangling alias retention" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create dangling-alias origin"
+  write_origin_meta "$home" "$origin"
+  ln -s history.md "$home/data/note-archive.md" \
+    || fail "could not create dangling note-archive alias"
+  if run_decisions "$home" hold "$origin" route \
+    --title "Choose the dangling alias route" \
+    --reason "captain dangling alias route pending" --repo sample \
+    > "$home/dangling-alias.out" 2> "$home/dangling-alias.err"; then
+    fail "a dangling note-archive symlink was accepted as a distinct destination"
+  fi
+  assert_grep "aliases the tasks-axi note archive" "$home/dangling-alias.err" \
+    "dangling note-archive alias did not fail before retention"
+  [ -L "$home/data/note-archive.md" ] \
+    || fail "alias preflight changed the dangling note-archive symlink"
+  assert_absent "$home/data/history.md" \
+    "alias preflight created the dangling symlink target"
+  assert_no_grep "$origin-decision-route" "$home/data/backlog.md" \
+    "rejected dangling alias still created a captain hold"
+  pass "dangling note-archive aliases fail before retention"
+}
+
 test_absent_case_alias_is_rejected_before_retention() {
   local home origin probe alternate case_insensitive=0 hold
   home=$(make_home absent-case-alias)
@@ -2992,6 +3065,8 @@ test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
 test_legacy_identity_compatibility_is_bounded_and_authorized
 test_nonarchive_rows_cannot_prove_pruned_history
+test_nested_public_retention_hook_prunes_once
+test_dangling_note_archive_alias_is_rejected
 test_absent_case_alias_is_rejected_before_retention
 test_queued_repaired_resolution_is_rejected
 test_retained_resolution_rejects_oversized_decision
