@@ -2790,6 +2790,7 @@ fm_backend_herdr_queued_enter_busy() {  # <target> <allow-rendered>
 fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
   local raw_status footer_baseline='' allow_rendered=0 enter_sent=0
+  fm_backend_submit_entering_evidence || { printf 'send-failed'; return 0; }
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }

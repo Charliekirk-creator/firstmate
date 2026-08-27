@@ -618,8 +618,42 @@ SH
   pass "identity locks refuse replaced storage parents without publication"
 }
 
+test_identity_lock_refuses_unsafe_lock_entry_without_waiting() {
+  local home task lock_key lock output pid rc=0 i
+  home=$(make_home identity-lock-unsafe-entry)
+  task=unsafe-lock-entry
+  if command -v shasum >/dev/null 2>&1; then
+    lock_key=$(printf '%s' "$task" | shasum -a 256 | awk '{print $1}')
+  else
+    lock_key=$(printf '%s' "$task" | sha256sum | awk '{print $1}')
+  fi
+  lock="$home/state/.work-identity-task-$lock_key.lock"
+  mkdir -p "$home/unsafe-lock-target"
+  ln -s "$home/unsafe-lock-target" "$lock"
+  output="$home/unsafe-lock-output"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" > "$output" 2>&1 &
+  pid=$!
+  i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "unsafe identity lock entry caused an unbounded wait"
+  fi
+  wait "$pid" || rc=$?
+  [ "$rc" -ne 0 ] || fail "unsafe identity lock entry was accepted"
+  assert_contains "$(cat "$output")" "lock path is unsafe or was replaced" \
+    "unsafe identity lock entry was not refused explicitly"
+  [ -z "$(find "$home/unsafe-lock-target" -mindepth 1 -print -quit)" ] \
+    || fail "unsafe identity lock entry received partial publication"
+  pass "unsafe identity lock entries refuse without waiting"
+}
+
 test_projection_serializes_identity_ownership() {
-  local home task lock lock_key entered release holder projection wait_count
+  local home task lock lock_name lock_key state_inode entered release holder projection wait_count
   home=$(make_home projection-lock)
   task=serialized-projection
   if command -v shasum >/dev/null 2>&1; then
@@ -628,16 +662,19 @@ test_projection_serializes_identity_ownership() {
     lock_key=$(printf '%s' "$task" | sha256sum | awk '{print $1}')
   fi
   lock="$home/state/.work-identity-task-$lock_key.lock"
+  lock_name=${lock##*/}
+  state_inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$home/state")
   entered="$home/lock.entered"
   release="$home/lock.release"
-  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" /bin/bash -c '
+  /bin/bash -c '
     set -eu
-    . "$1"
-    fm_lock_acquire_wait "$2"
-    : > "$3"
-    while [ ! -e "$4" ]; do sleep 0.02; done
-    fm_lock_release "$2"
-  ' _ "$ROOT/bin/fm-wake-lib.sh" "$lock" "$entered" "$release" &
+    owner=${BASHPID:-$$}
+    python3 "$1" lock-try "$2" "$3" "$4" "$owner" projection-owner 2
+    : > "$5"
+    while [ ! -e "$6" ]; do sleep 0.02; done
+    python3 "$1" lock-release "$2" "$3" "$4" "$owner" projection-owner
+  ' _ "$ROOT/bin/fm-work-identity-fs.py" "$home/state" "$state_inode" \
+    "$lock_name" "$entered" "$release" &
   holder=$!
   wait_count=0
   while [ ! -e "$entered" ]; do
@@ -2440,6 +2477,7 @@ test_no_clobber_publications_recover_after_interruption
 test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
 test_identity_lock_refuses_replaced_storage_parent
+test_identity_lock_refuses_unsafe_lock_entry_without_waiting
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff

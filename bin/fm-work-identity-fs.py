@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import ctypes
 import errno
+import fcntl
 import os
 import secrets
 import stat
@@ -80,22 +82,82 @@ def remove(directory_fd, name):
         pass
 
 
-def entry_state(directory_fd, name):
+def raw_entry_state(directory_fd, name):
     try:
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return "absent"
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        fail(f"owned destination entry is unsafe: {name}")
+    kind = "regular" if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 else "unsafe"
     return ":".join([
-        "regular",
+        kind,
         str(info.st_dev),
         str(info.st_ino),
         str(info.st_mode),
+        str(info.st_nlink),
         str(info.st_size),
         str(info.st_mtime_ns),
         str(info.st_ctime_ns),
     ])
+
+
+def entry_state(directory_fd, name):
+    state = raw_entry_state(directory_fd, name)
+    if state.startswith("unsafe:"):
+        fail(f"owned destination entry is unsafe: {name}")
+    return state
+
+
+def operation_lock(directory_fd, name):
+    del name
+    fd = os.dup(directory_fd)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def atomic_rename(directory_fd, first, second, exchange):
+    libc = ctypes.CDLL(None, use_errno=True)
+    first_b = os.fsencode(first)
+    second_b = os.fsencode(second)
+    if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):
+        function = libc.renameatx_np
+        flag = 0x00000002 if exchange else 0x00000004
+    elif hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        flag = 0x2 if exchange else 0x1
+    else:
+        fail("conditional destination rename is unavailable")
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(directory_fd, first_b, directory_fd, second_b, flag) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def replace_entry(directory_fd, name, source, expected_state):
+    if entry_state(directory_fd, name) != expected_state:
+        fail(f"owned destination changed before publication: {name}")
+    stage = f".{name}.replacing.{os.getpid()}.{secrets.token_hex(8)}"
+    try:
+        copy_to_new(source, directory_fd, stage)
+        if entry_state(directory_fd, name) != expected_state:
+            fail(f"owned destination changed during publication: {name}")
+        if expected_state == "absent":
+            try:
+                atomic_rename(directory_fd, stage, name, False)
+            except OSError as exc:
+                if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                    fail(f"owned destination changed during publication: {name}")
+                raise
+        else:
+            atomic_rename(directory_fd, stage, name, True)
+            displaced_state = raw_entry_state(directory_fd, stage)
+            if displaced_state.rsplit(":", 1)[0] != expected_state.rsplit(":", 1)[0]:
+                atomic_rename(directory_fd, stage, name, True)
+                fail(f"owned destination changed during publication: {name}")
+            remove(directory_fd, stage)
+        os.fsync(directory_fd)
+    finally:
+        remove(directory_fd, stage)
 
 
 def pid_alive(pid):
@@ -119,7 +181,7 @@ def lock_owner(directory_fd, name):
         return None
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise SystemExit(2)
+            raise SystemExit(3)
         raise
     try:
         lock_info = os.fstat(lock_fd)
@@ -153,12 +215,14 @@ def lock_owner(directory_fd, name):
 
 
 def create_lock(directory_fd, name, pid, token):
-    os.mkdir(name, 0o700, dir_fd=directory_fd)
+    candidate = f".{name}.candidate.{os.getpid()}.{secrets.token_hex(8)}"
+    os.mkdir(candidate, 0o700, dir_fd=directory_fd)
     lock_fd = os.open(
-        name,
+        candidate,
         os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         dir_fd=directory_fd,
     )
+    published = False
     try:
         owner_fd = os.open(
             "owner",
@@ -167,28 +231,43 @@ def create_lock(directory_fd, name, pid, token):
             dir_fd=lock_fd,
         )
         try:
-            os.write(owner_fd, f"{pid}\t{token}\n".encode("ascii"))
+            payload = f"{pid}\t{token}\n".encode("ascii")
+            if os.write(owner_fd, payload) != len(payload):
+                raise OSError(errno.EIO, "short lock owner write")
             os.fsync(owner_fd)
         finally:
             os.close(owner_fd)
         os.fsync(lock_fd)
-    except BaseException:
         try:
-            os.unlink("owner", dir_fd=lock_fd)
-        except OSError:
-            pass
+            atomic_rename(directory_fd, candidate, name, False)
+        except OSError as exc:
+            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                raise FileExistsError(exc.errno, exc.strerror)
+            raise
+        published = True
+        os.fsync(directory_fd)
+    finally:
+        if not published:
+            try:
+                os.unlink("owner", dir_fd=lock_fd)
+            except OSError:
+                pass
         os.close(lock_fd)
-        try:
-            os.rmdir(name, dir_fd=directory_fd)
-        except OSError:
-            pass
-        raise
-    os.close(lock_fd)
-    os.fsync(directory_fd)
+        if not published:
+            try:
+                os.rmdir(candidate, dir_fd=directory_fd)
+            except OSError:
+                pass
 
 
-def retire_lock(directory_fd, name, quarantine):
+def retire_lock(directory_fd, name, quarantine, expected_info):
+    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (expected_info.st_dev, expected_info.st_ino):
+        raise FileNotFoundError(name)
     os.rename(name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    retired = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+    if (retired.st_dev, retired.st_ino) != (expected_info.st_dev, expected_info.st_ino):
+        fail(f"owned lock changed during retirement: {name}")
     lock_fd = os.open(
         quarantine,
         os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -226,7 +305,7 @@ def lock_try(directory_fd, name, pid, token, stale_after):
         raise SystemExit(2)
     quarantine = f".{name}.retiring.{os.getpid()}.{secrets.token_hex(8)}"
     try:
-        retire_lock(directory_fd, name, quarantine)
+        retire_lock(directory_fd, name, quarantine, lock_info)
     except FileNotFoundError:
         raise SystemExit(2)
     try:
@@ -289,17 +368,11 @@ def main():
             if len(sys.argv) != 7:
                 fail("replace requires a source and expected destination state")
             source, expected_state = sys.argv[5:7]
-            if entry_state(directory_fd, name) != expected_state:
-                fail(f"owned destination changed before publication: {name}")
-            stage = f".{name}.replacing.{os.getpid()}.{secrets.token_hex(8)}"
+            mutex_fd = operation_lock(directory_fd, name)
             try:
-                copy_to_new(source, directory_fd, stage)
-                if entry_state(directory_fd, name) != expected_state:
-                    fail(f"owned destination changed during publication: {name}")
-                os.replace(stage, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                os.fsync(directory_fd)
+                replace_entry(directory_fd, name, source, expected_state)
             finally:
-                remove(directory_fd, stage)
+                os.close(mutex_fd)
         elif command == "no-clobber":
             if len(sys.argv) != 7:
                 fail("no-clobber requires a source and staging name")
@@ -335,14 +408,22 @@ def main():
                 fail("owned lock stale age is malformed")
             if stale_after < 0:
                 fail("owned lock stale age is malformed")
-            lock_try(directory_fd, name, int(pid_text), token, stale_after)
+            mutex_fd = operation_lock(directory_fd, name)
+            try:
+                lock_try(directory_fd, name, int(pid_text), token, stale_after)
+            finally:
+                os.close(mutex_fd)
         elif command == "lock-release":
             if len(sys.argv) != 7:
                 fail("lock-release requires pid and token")
             pid_text, token = sys.argv[5:7]
             if not pid_text.isdigit() or not valid_token(token):
                 fail("owned lock identity is malformed")
-            lock_release(directory_fd, name, int(pid_text), token)
+            mutex_fd = operation_lock(directory_fd, name)
+            try:
+                lock_release(directory_fd, name, int(pid_text), token)
+            finally:
+                os.close(mutex_fd)
         else:
             fail(f"unknown command: {command}")
     except OSError as exc:

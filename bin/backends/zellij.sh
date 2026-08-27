@@ -605,6 +605,7 @@ fm_backend_zellij_composer_observed_append() {  # <target> <before> <text> [expe
 # the old heuristic's false "delivery confirmed" cannot recur.
 fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} before
+  fm_backend_submit_entering_evidence || { printf 'send-failed'; return 0; }
   before=$(fm_backend_zellij_composer_content "$target" "$expected_label") \
     || { printf 'send-failed'; return 0; }
   fm_backend_zellij_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }

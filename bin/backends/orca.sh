@@ -686,6 +686,7 @@ fm_backend_orca_send_key() {  # <terminal-id> <key>
 # duplicating text.
 fm_backend_orca_send_text_submit() {  # <terminal-id> <text> <retries> <enter-sleep> <settle>
   local terminal=$1 text=$2 retries=$3 sleep_s=$4 settle=$5
+  fm_backend_submit_entering_evidence || { printf 'send-failed'; return 0; }
   fm_backend_orca_tool_check || { printf 'send-failed'; return 0; }
   fm_backend_orca_send_literal "$terminal" "$text" || { printf 'send-failed'; return 0; }
   fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
