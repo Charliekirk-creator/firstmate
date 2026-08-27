@@ -833,7 +833,7 @@ spawn_launch_request_paths() {
 }
 
 spawn_launch_guard_state() {
-  local owner child value pid token comm
+  local owner child value pid token
   if [ ! -e "$SPAWN_LAUNCH_GUARD" ] && [ ! -L "$SPAWN_LAUNCH_GUARD" ]; then
     printf 'absent'
     return 0
@@ -861,8 +861,7 @@ spawn_launch_guard_state() {
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
     if kill -0 "$pid" 2>/dev/null; then
-      comm=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{print $1}')
-      case "${comm##*/}" in sh|bash|dash|zsh|ksh|env|'') printf 'starting' ;; *) printf 'running' ;; esac
+      printf 'running'
     else
       printf 'exited'
     fi
@@ -936,11 +935,7 @@ spawn_launch_request_state() {
     return 0
   fi
   case "$guard_state" in
-    running)
-      printf 'executed'
-      return 0
-      ;;
-    starting)
+    running|starting)
       printf 'accepted'
       return 0
       ;;
@@ -3985,7 +3980,11 @@ kimi_submission_state() {
       && [ "$(spawn_file_link_count "$result")" = 1 ] || return 1
     IFS=$'\t' read -r token verdict < "$result" || return 1
     [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
-    case "$verdict" in accepted|pending|send-failed|ambiguous) printf '%s' "$verdict" ;; *) return 1 ;; esac
+    case "$verdict" in
+      accepted|pending|ambiguous) printf '%s' "$verdict" ;;
+      send-failed) printf 'ambiguous' ;;
+      *) return 1 ;;
+    esac
     return 0
   fi
   if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then
@@ -4025,16 +4024,19 @@ kimi_submission_helper() {
   tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-owner.tmp"
   printf '%s:%s\n' "${BASHPID:-$$}" "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" \
     && chmod 600 "$tmp" && mv -- "$tmp" "$owner" || exit 1
+  verdict=$(fm_backend_send_text_submit \
+    "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
+    "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || verdict=ambiguous
   tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-attempted.tmp"
   printf '%s\n' "$SPAWN_LAUNCH_REQUEST_TOKEN" > "$tmp" \
     && chmod 600 "$tmp" && mv -- "$tmp" "$attempted" || exit 1
-  verdict=$(fm_backend_send_text_submit \
-    "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
-    "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || verdict=send-failed
   case "$verdict" in
     empty|accepted) verdict=accepted ;;
     pending|pending-unproven) verdict=pending ;;
-    send-failed) ;;
+    send-failed)
+      verdict=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || verdict=unknown
+      case "$verdict" in pending|pending-unproven) verdict=pending ;; *) verdict=ambiguous ;; esac
+      ;;
     *) verdict=ambiguous ;;
   esac
   tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submit-result.tmp"
@@ -4068,7 +4070,7 @@ kimi_submission_wait() {
   local state i=0 max=${FM_KIMI_SUBMISSION_POLLS:-100} interval=${FM_KIMI_SUBMISSION_INTERVAL:-0.1}
   while [ "$i" -lt "$max" ]; do
     state=$(kimi_submission_state) || return 1
-    case "$state" in accepted|pending|send-failed) printf '%s' "$state"; return 0 ;; ambiguous) return 2 ;; esac
+    case "$state" in accepted|pending) printf '%s' "$state"; return 0 ;; ambiguous) return 2 ;; esac
     i=$((i + 1))
     [ "$i" -ge "$max" ] || sleep "$interval"
   done
@@ -4092,6 +4094,24 @@ kimi_deliver_launch_brief() {
       kimi_spawn_fail "kimi launch brief submission remains ambiguous"
       return 1
     }
+  elif [ "$submission_state" = prepared ] \
+    && { [ -e "$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" ] \
+      || [ -L "$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" ]; }; then
+    composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || composer_state=unknown
+    case "$composer_state" in
+      pending|pending-unproven)
+        kimi_submission_publish pending || {
+          kimi_spawn_fail "kimi pending launch brief submission could not be reconciled"
+          return 1
+        }
+        submission_state=pending
+        ;;
+      empty) ;;
+      *)
+        kimi_spawn_fail "kimi launch brief submission remains ambiguous"
+        return 1
+        ;;
+    esac
   elif [ "$submission_state" = ambiguous ]; then
     composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || composer_state=unknown
     case "$composer_state" in
@@ -4133,10 +4153,6 @@ kimi_deliver_launch_brief() {
         kimi_spawn_fail "kimi launch brief could not be submitted"
         return 1
       }
-    fi
-    if [ "$KIMI_SUBMIT_VERDICT" = send-failed ]; then
-      kimi_spawn_fail "kimi launch brief could not be submitted"
-      return 1
     fi
     if [ "$KIMI_SUBMIT_VERDICT" = pending ]; then submission_state=pending; else submission_state=accepted; fi
     if [ "$journal" -eq 1 ]; then
@@ -4969,9 +4985,10 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
   sq_launch_token=$(shell_quote "$SPAWN_LAUNCH_REQUEST_TOKEN")
   sq_launch_request=$(shell_quote "$SPAWN_LAUNCH_REQUEST")
   sq_launch_guard=$(shell_quote "$LAUNCH_GUARD")
-  LAUNCH_CHILD_COMMAND="printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.child.tmp && chmod 600 $sq_launch_guard/.child.tmp && mv $sq_launch_guard/.child.tmp $sq_launch_guard/child || exit 1; exec env $LAUNCH"
+  sq_launch_eval=$(shell_quote "$LAUNCH")
+  LAUNCH_CHILD_COMMAND="printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.child.tmp && chmod 600 $sq_launch_guard/.child.tmp && mv $sq_launch_guard/.child.tmp $sq_launch_guard/child || exit 1; exec sh -c $sq_launch_eval"
   sq_launch_child=$(shell_quote "$LAUNCH_CHILD_COMMAND")
-  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; sh -c $sq_launch_child & launch_pid=\$!; launch_wait=0; launch_exec=0; while kill -0 \"\$launch_pid\" 2>/dev/null && [ \"\$launch_wait\" -lt 100 ]; do if [ -f $sq_launch_guard/child ] && printf '%s:%s\\n' \"\$launch_pid\" $sq_launch_token | cmp -s $sq_launch_guard/child -; then launch_comm=\$(ps -p \"\$launch_pid\" -o comm= 2>/dev/null | awk '{print \$1}'); case \"\${launch_comm##*/}\" in sh|dash|env|'') ;; *) sleep 0.1; if kill -0 \"\$launch_pid\" 2>/dev/null; then launch_exec=1; break; fi ;; esac; fi; sleep 0.01; launch_wait=\$((launch_wait + 1)); done; if [ \"\$launch_exec\" -eq 1 ]; then printf 'running:%s\\n' $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome || exit 1; fi; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"
+  LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; sh -c $sq_launch_child & launch_pid=\$!; launch_wait=0; launch_exec=0; while kill -0 \"\$launch_pid\" 2>/dev/null && [ \"\$launch_wait\" -lt 100 ]; do if [ -f $sq_launch_guard/child ] && printf '%s:%s\\n' \"\$launch_pid\" $sq_launch_token | cmp -s $sq_launch_guard/child -; then sleep 0.1; if kill -0 \"\$launch_pid\" 2>/dev/null; then launch_exec=1; break; fi; fi; sleep 0.01; launch_wait=\$((launch_wait + 1)); done; if [ \"\$launch_exec\" -eq 1 ]; then printf 'running:%s\\n' $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome || exit 1; fi; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"
   spawn_endpoint_receipt_publish launch-prepared "$WT" || {
     echo "error: secondmate launch preparation could not be journaled" >&2
     exit 1

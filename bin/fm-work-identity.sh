@@ -201,18 +201,49 @@ resolve_existing_dir() {  # <name> <path>
   printf '%s\n' "$resolved"
 }
 
+directory_inode_identity() {  # <path>
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
+resolve_owned_dir() {  # <name> <path> [expected-real] [expected-inode]
+  local name=$1 path=$2 expected_real=${3:-} expected_inode=${4:-}
+  local before resolved resolved_inode after
+  [ ! -L "$path" ] || die "$name directory is symlinked: $path"
+  [ -d "$path" ] || die "$name directory is unavailable: $path"
+  before=$(directory_inode_identity "$path") \
+    || die "$name directory cannot be inspected: $path"
+  resolved=$(resolve_existing_dir "$name" "$path")
+  [ ! -L "$path" ] && [ -d "$path" ] \
+    || die "$name directory changed while it was being resolved: $path"
+  after=$(directory_inode_identity "$path") \
+    || die "$name directory cannot be reinspected: $path"
+  resolved_inode=$(directory_inode_identity "$resolved") \
+    || die "$name resolved directory cannot be inspected: $resolved"
+  [ "$before" = "$after" ] && [ "$before" = "$resolved_inode" ] \
+    || die "$name directory changed while it was being resolved: $path"
+  [ -z "$expected_real" ] || [ "$resolved" = "$expected_real" ] \
+    || die "$name directory changed from its validated location: $path"
+  [ -z "$expected_inode" ] || [ "$resolved_inode" = "$expected_inode" ] \
+    || die "$name directory was replaced after validation: $path"
+  printf '%s\t%s\n' "$resolved" "$resolved_inode"
+}
+
 FM_HOME_REAL=$(resolve_existing_dir FM_HOME "$FM_HOME_INPUT")
 DATA_INPUT=${FM_DATA_OVERRIDE:-$FM_HOME_REAL/data}
 STATE_INPUT=${FM_STATE_OVERRIDE:-$FM_HOME_REAL/state}
+DATA_DIR_ID=
+STATE_DIR_ID=
 if [ -e "$DATA_INPUT" ] || [ -L "$DATA_INPUT" ]; then
-  [ ! -L "$DATA_INPUT" ] || die "data directory is symlinked: $DATA_INPUT"
-  DATA_REAL=$(resolve_existing_dir data "$DATA_INPUT")
+  IFS=$'\t' read -r DATA_REAL DATA_DIR_ID < <(resolve_owned_dir data "$DATA_INPUT")
 else
   DATA_REAL=$DATA_INPUT
 fi
 if [ -e "$STATE_INPUT" ] || [ -L "$STATE_INPUT" ]; then
-  [ ! -L "$STATE_INPUT" ] || die "state directory is symlinked: $STATE_INPUT"
-  STATE_REAL=$(resolve_existing_dir state "$STATE_INPUT")
+  IFS=$'\t' read -r STATE_REAL STATE_DIR_ID < <(resolve_owned_dir state "$STATE_INPUT")
 else
   STATE_REAL=$STATE_INPUT
 fi
@@ -365,23 +396,29 @@ ensure_home_identity() {
 }
 
 ensure_data_dir() {
-  if [ -e "$DATA_INPUT" ] || [ -L "$DATA_INPUT" ]; then
-    [ ! -L "$DATA_INPUT" ] || die "data directory is symlinked: $DATA_INPUT"
-    [ -d "$DATA_INPUT" ] || die "data path is not a directory: $DATA_INPUT"
-  else
+  local resolved inode
+  if [ ! -e "$DATA_INPUT" ] && [ ! -L "$DATA_INPUT" ]; then
+    [ -z "$DATA_DIR_ID" ] \
+      || die "data directory disappeared after validation: $DATA_INPUT"
     mkdir -p -- "$DATA_INPUT" || die "cannot create data directory: $DATA_INPUT"
   fi
-  DATA_REAL=$(resolve_existing_dir data "$DATA_INPUT")
+  IFS=$'\t' read -r resolved inode \
+    < <(resolve_owned_dir data "$DATA_INPUT" "${DATA_DIR_ID:+$DATA_REAL}" "$DATA_DIR_ID")
+  DATA_REAL=$resolved
+  DATA_DIR_ID=$inode
 }
 
 ensure_state_dir() {
-  if [ -e "$STATE_INPUT" ] || [ -L "$STATE_INPUT" ]; then
-    [ ! -L "$STATE_INPUT" ] || die "state directory is symlinked: $STATE_INPUT"
-    [ -d "$STATE_INPUT" ] || die "state path is not a directory: $STATE_INPUT"
-  else
+  local resolved inode
+  if [ ! -e "$STATE_INPUT" ] && [ ! -L "$STATE_INPUT" ]; then
+    [ -z "$STATE_DIR_ID" ] \
+      || die "state directory disappeared after validation: $STATE_INPUT"
     mkdir -p -- "$STATE_INPUT" || die "cannot create state directory: $STATE_INPUT"
   fi
-  STATE_REAL=$(resolve_existing_dir state "$STATE_INPUT")
+  IFS=$'\t' read -r resolved inode \
+    < <(resolve_owned_dir state "$STATE_INPUT" "${STATE_DIR_ID:+$STATE_REAL}" "$STATE_DIR_ID")
+  STATE_REAL=$resolved
+  STATE_DIR_ID=$inode
 }
 
 lock_parent_preflight() {  # <directory> <label>
@@ -395,9 +432,11 @@ locate_task_dir() {  # <task-id>, read-only
   local id=$1 dir real
   LOCATED_TASK=$id
   if [ -e "$DATA_INPUT" ] || [ -L "$DATA_INPUT" ]; then
-    [ ! -L "$DATA_INPUT" ] || die "data directory is symlinked: $DATA_INPUT"
-    [ -d "$DATA_INPUT" ] || die "data path is not a directory: $DATA_INPUT"
-    DATA_REAL=$(resolve_existing_dir data "$DATA_INPUT")
+    local resolved inode
+    IFS=$'\t' read -r resolved inode \
+      < <(resolve_owned_dir data "$DATA_INPUT" "${DATA_DIR_ID:+$DATA_REAL}" "$DATA_DIR_ID")
+    DATA_REAL=$resolved
+    DATA_DIR_ID=$inode
   fi
   dir="$DATA_REAL/$id"
   if [ -e "$dir" ] || [ -L "$dir" ]; then
