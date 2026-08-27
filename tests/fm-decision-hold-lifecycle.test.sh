@@ -866,6 +866,58 @@ test_current_generation_rejects_an_older_retained_done_owner() {
   pass "current generations cannot fall back to older retained Done owners"
 }
 
+test_current_generation_rejects_an_older_queued_owner() {
+  local home origin key hold
+  home=$(make_home queued-owner-generation)
+  origin=sample-queued-owner-review
+  key=route-choice
+  tasks_in "$home" add "$origin" "Review queued-owner generations" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create queued-owner origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the old queued route" --reason "captain old route pending" --repo sample) \
+    || fail "could not create the old queued generation"
+
+  : > "$home/data/replacement-backlog.md"
+  awk '
+    $0 == "path = \"data/backlog.md\"" { print "path = \"data/replacement-backlog.md\""; next }
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/replacement-archive.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not switch to the replacement queued owner"
+  run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the replacement queued route" \
+    --reason "captain replacement route pending" --repo sample >/dev/null \
+    || fail "could not create the replacement queued generation"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory the replacement queued generation"
+  tasks_in "$home" rm "$hold" >/dev/null \
+    || fail "could not reproduce loss of the replacement queued generation"
+  awk '
+    $0 == "path = \"data/replacement-backlog.md\"" { print "path = \"data/backlog.md\""; next }
+    $0 == "archive = \"data/replacement-archive.md\"" { print "archive = \"data/done-archive.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" \
+    && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not restore the old queued owner"
+
+  if run_decisions "$home" verify "$origin" \
+    > "$home/queued-owner-verify.out" 2> "$home/queued-owner-verify.err"; then
+    fail "an older queued row replaced the missing current generation during verification"
+  fi
+  assert_grep "different retention generation" "$home/queued-owner-verify.err" \
+    "queued generation mismatch was not reported during verification"
+  if run_decisions "$home" complete "$origin" "$key" \
+    > "$home/queued-owner-complete.out" 2> "$home/queued-owner-complete.err"; then
+    fail "an older queued row replaced the missing current generation during completion"
+  fi
+  assert_grep "different retention generation" "$home/queued-owner-complete.err" \
+    "queued generation mismatch was not reported during completion"
+  pass "current generations cannot fall back to older queued owners"
+}
+
 test_source_verifiable_legacy_inventories_migrate_automatically() {
   local home origin active retained first second hold decision digest body token inventory later later_hold
   home=$(make_home source-verifiable-legacy-inventory)
@@ -2992,6 +3044,8 @@ test_pruned_answer_retry_uses_proven_retention_history() {
   hold=$(run_decisions "$home" hold "$id" final-choice \
     --title "Choose the final option" --reason "captain final choice pending" --repo sample) \
     || fail "could not create the immediately pruned hold"
+  run_decisions "$home" complete "$id" final-choice >/dev/null \
+    || fail "could not inventory the immediately pruned hold"
   printf 'Captain chose the final option.\n' > "$home/final-choice.txt"
   run_decisions "$home" answer "$id" final-choice --decision-file "$home/final-choice.txt" >/dev/null \
     || fail "answer reported failure after its resolution was immediately pruned"
@@ -3200,6 +3254,7 @@ test_pre_boundary_retention_requires_exact_migration
 test_legacy_completion_inventory_requires_explicit_provenance
 test_current_generation_rejects_an_older_archive_owner
 test_current_generation_rejects_an_older_retained_done_owner
+test_current_generation_rejects_an_older_queued_owner
 test_source_verifiable_legacy_inventories_migrate_automatically
 test_metadata_free_completion_retries_remain_idempotent
 test_live_completion_provenance_survives_teardown

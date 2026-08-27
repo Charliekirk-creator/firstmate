@@ -1621,9 +1621,15 @@ current_generation_load() {  # <origin-id> <decision-key>
   CURRENT_GENERATION_BACKLOG=$backlog
 }
 
-persist_current_generation_owner() {  # <origin-id> <decision-key>
-  local origin=$1 key=$2 path dir tmp links
+persist_current_generation_owner() {  # <origin-id> <decision-key> [replace]
+  local origin=$1 key=$2 replace=${3:-0} path dir tmp links
   ensure_retention_owner
+  if [ "$replace" != 1 ] && current_generation_load "$origin" "$key" \
+    && [ "$CURRENT_GENERATION_OWNER" != "$RETENTION_OWNER_TOKEN" ]; then
+    [ -n "$CURRENT_GENERATION_BACKLOG" ] \
+      && [ "$CURRENT_GENERATION_BACKLOG" = "$DECISION_BACKLOG" ] \
+      || fail "captain decision $origin/$key belongs to a different retention generation"
+  fi
   path=$(current_generation_path "$origin" "$key")
   dir=${path%/*}
   if [ -e "$path" ] || [ -L "$path" ]; then
@@ -2185,8 +2191,8 @@ EOF
   printf '%s' "$found"
 }
 
-verify_hold_active() {  # <hold-id> <origin-id> <decision-key>
-  local id=$1 origin=$2 key=$3 show state held kind hold_kind body
+verify_hold_active() {  # <hold-id> <origin-id> <decision-key> [new-generation]
+  local id=$1 origin=$2 key=$3 new_generation=${4:-0} show state held kind hold_kind body
   show=$(task_show "$id") || fail "captain hold $id is absent from $FM_HOME/data/backlog.md"
   state=$(show_field "$show" state)
   held=$(show_field "$show" held)
@@ -2200,7 +2206,7 @@ verify_hold_active() {  # <hold-id> <origin-id> <decision-key>
   queued_hold_body_valid "$body" "$origin" "$key" \
     || fail "captain hold $id has malformed or mismatched active provenance"
   reject_archived_generation_collision "$id"
-  persist_current_generation_owner "$origin" "$key"
+  persist_current_generation_owner "$origin" "$key" "$new_generation"
 }
 
 RESOLVED_HOLD_BODY=''
@@ -2474,6 +2480,7 @@ command_id() {
 
 command_hold() {
   local origin=${1:-} key=${2:-} title='' reason='' repo='' id show state kind existing_title body
+  local new_generation=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   shift 2
   while [ "$#" -gt 0 ]; do
@@ -2519,10 +2526,11 @@ command_hold() {
     body=$(printf 'Origin: %s\nDecision key: %s\nState: awaiting captain decision.' "$origin" "$key")
     tasks_axi add "$id" "$title" --kind captain --repo "$repo" --body "$body" >/dev/null \
       || fail "could not create captain decision item $id"
+    new_generation=1
   fi
   tasks_axi hold "$id" --reason "$reason" --kind captain >/dev/null \
     || fail "could not activate captain hold $id"
-  verify_hold_active "$id" "$origin" "$key"
+  verify_hold_active "$id" "$origin" "$key" "$new_generation"
   printf '%s\n' "$id"
 }
 

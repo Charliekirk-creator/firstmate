@@ -102,6 +102,9 @@ ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
 ok - pre-boundary retention history requires exact explicit migration
 ok - completion provenance distinguishes missing current and historical generations
+ok - current generations cannot fall back to older archive owners
+ok - current generations cannot fall back to older retained Done owners
+ok - current generations cannot fall back to older queued owners
 ok - source-verifiable legacy inventories migrate without weakening archive generations
 ok - metadata-free completion provenance makes resolved retries idempotent
 ok - live completion provenance survives teardown and enforces ownership
