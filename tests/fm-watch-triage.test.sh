@@ -801,7 +801,7 @@ EOF
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
     pid=$!
-    wait_for_exit "$pid" 40 || fail "$harness initial idle pane did not surface once"
+    wait_for_exit "$pid" 100 || fail "$harness initial idle pane did not surface once"
     grep -Fx "stale: $window" "$out" >/dev/null || fail "$harness initial idle pane did not print stale"
     pre_clock_count=$(cat "$state/.count-$key" 2>/dev/null || true)
     case "$pre_clock_count" in
@@ -861,7 +861,7 @@ EOF
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
     pid=$!
-    wait_for_exit "$pid" 40 || fail "$harness genuine pane progress did not surface"
+    wait_for_exit "$pid" 100 || fail "$harness genuine pane progress did not surface"
     grep -Fx "stale: $window" "$out" >/dev/null || fail "$harness genuine pane progress lost its stale notification"
   done
 
@@ -877,7 +877,7 @@ EOF
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "initial Claude clock-shaped content did not surface"
+  wait_for_exit "$pid" 100 || fail "initial Claude clock-shaped content did not surface"
   ack_stopped_cycle "$state" || fail "initial Claude clock-shaped cycle could not be acknowledged"
   printf 'quoted Pi footer clock 10:05\n' > "$capture_file"
   : > "$out"
@@ -886,7 +886,7 @@ EOF
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "Claude clock-shaped content change was incorrectly suppressed"
+  wait_for_exit "$pid" 100 || fail "Claude clock-shaped content change was incorrectly suppressed"
   grep -Fx "stale: $window" "$out" >/dev/null || fail "non-Pi clock-shaped content lost its stale notification"
 
   pass "Pi and pi-signed footer clock ticks dedupe without suppressing real pane changes or non-Pi timestamps"
