@@ -100,25 +100,26 @@ shift 2
 [ "$entry" = fm-remote-entrypoint.sh ] || exit 92
 argv_b64=$4
 command_name=$(perl -MMIME::Base64=decode_base64 -e '$d=decode_base64($ARGV[0]); ($c)=split(/\0/, $d); print $c' "$argv_b64")
-case "${FM_FAKE_SSH_MODE:-normal}:$command_name" in
-  *:fm-remote-secondmate-control.sh)
+command_arg=$(perl -MMIME::Base64=decode_base64 -e '$d=decode_base64($ARGV[0]); @p=split(/\0/, $d); print $p[1] // ""' "$argv_b64")
+case "${FM_FAKE_SSH_MODE:-normal}:$command_name:$command_arg" in
+  *:fm-remote-secondmate-control.sh:*)
     printf '%s\n' "$command_name" >> "$FM_FAKE_REMOTE_WAKE_LOG"
     [ "${FM_FAKE_REMOTE_WAKE_RC:-0}" -eq 0 ] || printf 'remote receiver wake failed\n' >&2
     exit "${FM_FAKE_REMOTE_WAKE_RC:-0}"
     ;;
   unreachable:*) exit 255 ;;
-  serialize:fm-backlog-receive.sh)
+  serialize:fm-backlog-receive.sh:state/handoff/*)
     if mkdir "$FM_FAKE_SERIALIZE_ONCE" 2>/dev/null; then
       touch "$FM_FAKE_SERIALIZE_ENTERED"
       while [ ! -f "$FM_FAKE_SERIALIZE_RELEASE" ]; do sleep 0.02; done
     fi
     exec "$FM_FAKE_REMOTE_ENTRYPOINT" "$@"
     ;;
-  after-put:fm-remote-file.sh)
+  after-put:fm-remote-file.sh:*)
     "$FM_FAKE_REMOTE_ENTRYPOINT" "$@"
     exit 255
     ;;
-  after-receive:fm-backlog-receive.sh)
+  after-receive:fm-backlog-receive.sh:state/handoff/*)
     "$FM_FAKE_REMOTE_ENTRYPOINT" "$@"
     exit 255
     ;;
@@ -233,7 +234,10 @@ FM_FAKE_SSH_MODE=after-receive handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "handoff claimed success after ambiguous remote receipt"
-assert_no_grep 'ios-a' "$PARENT/data/backlog.md" "ambiguous handoff left ios-a dispatchable in the primary backlog"
+if grep -F ios-a "$PARENT/data/backlog.md" >/dev/null; then
+  printf 'handoff output:\n%s\n' "$(cat "$TMP_ROOT/ambiguous.out")" >&2
+  fail "ambiguous handoff left ios-a dispatchable in the primary backlog"
+fi
 assert_no_grep 'ios-b' "$PARENT/data/backlog.md" "ambiguous handoff left ios-b dispatchable in the primary backlog"
 assert_present "$PARENT/data/handoff/ios.outbox.md" "ambiguous handoff lost its durable outbox"
 if [ ! -f "$REMOTE/data/backlog.md" ]; then
@@ -245,7 +249,7 @@ if ! grep -F ios-a "$REMOTE/data/backlog.md" >/dev/null; then
   fail "remote atomic receipt did not deliver ios-a before the dropped acknowledgement"
 fi
 assert_grep 'ios-b' "$REMOTE/data/backlog.md" "remote atomic receipt did not deliver ios-b before the dropped acknowledgement"
-[ "$(cat "$SSH_COUNT")" -eq 4 ] || fail "transport retried an ambiguously completed command"
+[ "$(cat "$SSH_COUNT")" -eq 6 ] || fail "transport retried an ambiguously completed command"
 pass "ambiguous receipt leaves one durable outbox and no duplicate dispatchable source"
 
 write_backlog '- [ ] ios-c - new work joining a pending outbox (repo: alpha)'
@@ -301,7 +305,10 @@ wait_for_serialization=0
 while [ ! -f "$TMP_ROOT/serialize.entered" ]; do
   kill -0 "$handoff_a" 2>/dev/null || fail "first serialized handoff exited before receipt"
   wait_for_serialization=$((wait_for_serialization + 1))
-  [ "$wait_for_serialization" -le 250 ] || fail "first serialized handoff never reached receipt"
+  if [ "$wait_for_serialization" -gt 250 ]; then
+    printf 'serialized handoff output:\n%s\n' "$(cat "$TMP_ROOT/serialized-a.out")" >&2
+    fail "first serialized handoff never reached receipt"
+  fi
   sleep 0.02
 done
 write_backlog '- [ ] serialized-b - second concurrent handoff (repo: alpha)'
@@ -385,16 +392,27 @@ pass "remote handoff commits an exact destination identity and source tombstone"
 recovered_task=receipt-recovery-a
 conflicting_task=receipt-recovery-b
 write_backlog $'- [ ] receipt-recovery-a - committed target awaiting source completion (repo: alpha)\n- [ ] receipt-recovery-b - conflicting later prepare (repo: alpha)'
+printf '%s\n' '- [ ] receipt-recovery-a - committed target awaiting source completion (repo: alpha)' \
+  > "$TMP_ROOT/recovered-block"
+recovered_hash=$(sha256_file "$TMP_ROOT/recovered-block")
 recovered_transfer=$(FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" \
-  handoff-prepare "$recovered_task" --to-home "$REMOTE" --to-home-id secondmate:ios)
+  handoff-prepare "$recovered_task" --to-home "$REMOTE" --to-home-id secondmate:ios \
+    --backlog-sha256 "$recovered_hash")
 printf '%s\n' "$recovered_transfer" | FM_HOME="$REMOTE" \
   "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-stage "$recovered_task" --file - >/dev/null
-printf '%s\n' "$recovered_transfer" | FM_HOME="$REMOTE" \
-  "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-commit "$recovered_task" --file - >/dev/null
+printf '%s\n' "$recovered_transfer" | FM_HOME="$REMOTE" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+  "$REMOTE_ROOT/bin/fm-backlog-receive.sh" --prepare-handoff "$recovered_task" >/dev/null
 mkdir -p "$PARENT/data/handoff"
 printf '## In flight\n\n## Queued\n\n## Done\n' > "$PARENT/data/handoff/ios.outbox.md"
 tasks-axi mv "$recovered_task" --file "$PARENT/data/backlog.md" \
   --to "$PARENT/data/handoff/ios.outbox.md" >/dev/null
+cp "$PARENT/data/handoff/ios.outbox.md" "$TMP_ROOT/recovered-delivery.md"
+tasks-axi mv "$recovered_task" --file "$TMP_ROOT/recovered-delivery.md" \
+  --to "$REMOTE/data/backlog.md" >/dev/null
+printf '%s\n' "$recovered_transfer" | FM_HOME="$REMOTE" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+  "$REMOTE_ROOT/bin/fm-backlog-receive.sh" --complete-handoff "$recovered_task" >/dev/null
+printf '%s\n' "$recovered_transfer" | FM_HOME="$REMOTE" \
+  "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-commit "$recovered_task" --file - >/dev/null
 printf 'kind=ship\n' > "$PARENT/state/$conflicting_task.meta"
 rc=0
 handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios \

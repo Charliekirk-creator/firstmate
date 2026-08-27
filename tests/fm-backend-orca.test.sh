@@ -428,6 +428,29 @@ test_json_get_ignores_undocumented_terminal_id_shapes() {
   pass "fm_backend_orca_json_get: ignores undocumented terminal id shapes"
 }
 
+test_partial_worktree_response_reconciles_exact_transaction_name() {
+  local response out status=0 creates lists
+  orca_case partial-worktree-reconcile
+  response="$CASE_DIR/create-response.json"
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-partial"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":' > "$RESP/3.out"
+  printf '7\n' > "$RESP/3.exit"
+  printf '{"ok":true,"result":{"worktrees":[{"name":"fm-task-tx-42","id":"wt-partial","path":"/tmp/orca-partial"}]}}\n' > "$RESP/4.out"
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_WORKTREE_RECONCILE_POLLS=1 FM_ORCA_WORKTREE_RECONCILE_INTERVAL=0 \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create_durable /repo/path fm-task-tx-42 "$1"' \
+      "$ROOT" "$response") || status=$?
+  [ "$status" -eq 0 ] || fail "partial Orca response did not reconcile its exact worktree (status=$status): $out"
+  [ "$out" = $'wt-partial\t/tmp/orca-partial' ] \
+    || fail "partial Orca response reconciled the wrong worktree: $out"
+  creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
+  lists=$(grep -c $'orca\x1fworktree\x1flist\x1f--repo\x1fid:repo-partial\x1f--json' "$LOG")
+  [ "$creates" -eq 1 ] || fail "partial response recovery created $creates worktrees"
+  [ "$lists" -eq 1 ] || fail "partial response recovery did not reconcile by exact repo/name"
+  pass "partial Orca creation responses reconcile one exact transaction-named worktree"
+}
+
 test_worktree_and_terminal_helpers_parse_json() {
   local out wt_id wt_path term
   orca_case lifecycle-helpers
@@ -658,7 +681,7 @@ SH
     FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1) \
-    || fail "Orca spawn did not recover transient result publication: $out"
+    || fail "Orca spawn did not recover transient result publication: $out$(printf '\nOrca calls:\n%s\nHelper errors:\n%s' "$(cat "$LOG")" "$(cat "$state/$id.spawn-orca-operation/helper.err" 2>/dev/null || true)")"
   assert_present "$CASE_DIR/result-publication-failed" \
     "Orca result publication failure fixture did not execute"
   creates=$(grep -c $'orca\x1fworktree\x1fcreate' "$LOG")
@@ -1881,6 +1904,7 @@ test_kill_is_best_effort_close
 test_remove_worktree_refuses_empty_id
 test_remove_worktree_rejects_orca_error_json
 test_worktree_path_resolves_id
+test_partial_worktree_response_reconciles_exact_transaction_name
 test_dispatcher_sources_orca_and_routes_primitives
 test_json_get_ignores_undocumented_terminal_id_shapes
 test_worktree_and_terminal_helpers_parse_json

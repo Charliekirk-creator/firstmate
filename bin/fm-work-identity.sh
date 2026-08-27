@@ -112,8 +112,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME_INPUT="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 SCHEMA=fm-work-identity.v1
-HANDOFF_SCHEMA=fm-work-identity-handoff.v1
-HANDOFF_STATE_SCHEMA=fm-work-identity-handoff-state.v1
+HANDOFF_SCHEMA=fm-work-identity-handoff.v2
+HANDOFF_STATE_SCHEMA=fm-work-identity-handoff-state.v2
 DISPATCH_STATE_SCHEMA=fm-work-identity-dispatch-state.v2
 UNLINKED_GUARD_SCHEMA=fm-work-identity-unlinked-guard.v1
 UNLINKED_RESERVATION_SCHEMA=fm-work-identity-unlinked-reservation.v1
@@ -898,13 +898,15 @@ validate_handoff_envelope() {  # <path> <task-id>; sets HANDOFF_*
   canonical=$(jq -e -S -c -s --arg schema "$HANDOFF_SCHEMA" '
     def exact_keys($ks): (keys | sort) == ($ks | sort);
     select(length == 1) | .[0] | . as $transfer | select(
-    type == "object" and exact_keys(["schema","transfer_id","source","target","identity"])
+    type == "object" and exact_keys(["schema","transfer_id","source","target","backlog","identity"])
     and .schema == $schema
     and (.transfer_id | type == "string" and test("^[0-9a-f]{64}$"))
     and (.source | type == "object" and exact_keys(["home","home_id","task_id"])
       and (.home | type) == "string" and (.home_id | type) == "string" and (.task_id | type) == "string")
     and (.target | type == "object" and exact_keys(["home","home_id","task_id"])
       and (.home | type) == "string" and (.home_id | type) == "string" and (.task_id | type) == "string")
+    and (.backlog | type == "object" and exact_keys(["task_sha256"])
+      and (.task_sha256 == null or (.task_sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
     and (.identity | type == "object" and exact_keys(["status","source_sha256","target_sha256","record"])
       and ((.status == "linked"
             and (.source_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
@@ -933,6 +935,7 @@ validate_handoff_envelope() {  # <path> <task-id>; sets HANDOFF_*
   [ "$HANDOFF_SOURCE_HOME" != "$HANDOFF_TARGET_HOME" ] \
     || [ "$HANDOFF_SOURCE_HOME_ID" != "$HANDOFF_TARGET_HOME_ID" ] \
     || die "handoff source and target identities match"
+  HANDOFF_BACKLOG_SHA=$(printf '%s' "$canonical" | jq -r '.backlog.task_sha256 // ""')
   HANDOFF_STATUS=$(printf '%s' "$canonical" | jq -r '.identity.status')
   HANDOFF_SOURCE_SHA=$(printf '%s' "$canonical" | jq -r '.identity.source_sha256 // ""')
   HANDOFF_TARGET_SHA=$(printf '%s' "$canonical" | jq -r '.identity.target_sha256 // ""')
@@ -981,7 +984,8 @@ read_handoff_state() {  # <path> <source|target> <task-id>; sets HANDOFF_STATE/H
     type == "object" and exact_keys(["schema","role","state","transfer"])
     and .schema == $schema and .role == $role
     and (if $role == "source" then (.state == "prepared" or .state == "completed")
-         else (.state == "prepared" or .state == "completed"
+         else (.state == "prepared" or .state == "backlog-prepared"
+           or .state == "backlog-completed" or .state == "completed"
            or .state == "intake-prepared" or .state == "intake-completed") end)
     and (.transfer | type) == "object"
     ) | $wrapper
@@ -1425,8 +1429,8 @@ validate_source_transfer() {  # <task-id>; HANDOFF_* already loaded
   fi
 }
 
-build_handoff_transfer() {  # <task-id> <target-home> <target-home-id>; sets HANDOFF_CANONICAL
-  local task=$1 target_home=$2 target_home_id=$3 meta status source_hash target_hash record material transfer_id
+build_handoff_transfer() {  # <task-id> <target-home> <target-home-id> <backlog-sha256>; sets HANDOFF_CANONICAL
+  local task=$1 target_home=$2 target_home_id=$3 backlog_sha=${4:-} meta status source_hash target_hash record material transfer_id
   ensure_home_identity
   meta="$STATE_REAL/$task.meta"
   if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
@@ -1456,10 +1460,11 @@ build_handoff_transfer() {  # <task-id> <target-home> <target-home-id>; sets HAN
     --arg schema "$HANDOFF_SCHEMA" --arg source_home "$FM_HOME_REAL" --arg source_home_id "$FM_HOME_ID" \
     --arg target_home "$target_home" --arg target_home_id "$target_home_id" --arg task "$task" \
     --arg status "$status" --arg source_hash "$source_hash" --arg target_hash "$target_hash" \
-    --argjson record "$record" '
+    --arg backlog_sha "$backlog_sha" --argjson record "$record" '
       {schema:$schema,
        source:{home:$source_home,home_id:$source_home_id,task_id:$task},
        target:{home:$target_home,home_id:$target_home_id,task_id:$task},
+       backlog:{task_sha256:(if $backlog_sha == "" then null else $backlog_sha end)},
        identity:{status:$status,
          source_sha256:(if $status == "linked" then $source_hash else null end),
          target_sha256:(if $status == "linked" then $target_hash else null end),
@@ -1482,8 +1487,12 @@ emit_handoff_prepare() {
   fi
 }
 
-handoff_prepare() {  # <task-id> <target-home> <target-home-id> [transfer|result]
-  local task=$1 target_home=$2 target_home_id=$3 mode=${4:-transfer}
+handoff_prepare() {  # <task-id> <target-home> <target-home-id> <backlog-sha256> [transfer|result]
+  local task=$1 target_home=$2 target_home_id=$3 backlog_sha=${4:-} mode=${5:-transfer}
+  if [ -n "$backlog_sha" ]; then
+    case "$backlog_sha" in *[!0-9a-f]*) die "handoff backlog task digest is malformed" ;; esac
+    [ "${#backlog_sha}" -eq 64 ] || die "handoff backlog task digest is malformed"
+  fi
   validate_home_literal "$target_home"
   home_id_literal_valid "$target_home_id" || die "work identity handoff target home id is malformed"
   ensure_home_identity
@@ -1504,11 +1513,13 @@ handoff_prepare() {  # <task-id> <target-home> <target-home-id> [transfer|result
     read_handoff_state "$SOURCE_HANDOFF" source "$task"
     [ "$HANDOFF_TARGET_HOME" = "$target_home" ] && [ "$HANDOFF_TARGET_HOME_ID" = "$target_home_id" ] \
       || die "task $task is already prepared for a different handoff target"
+    [ "$HANDOFF_BACKLOG_SHA" = "$backlog_sha" ] \
+      || die "task $task is already prepared for different backlog content ($HANDOFF_BACKLOG_SHA != $backlog_sha)"
     validate_source_transfer "$task"
     emit_handoff_prepare "$mode" false "$HANDOFF_TRANSFER"
     return 0
   fi
-  build_handoff_transfer "$task" "$target_home" "$target_home_id"
+  build_handoff_transfer "$task" "$target_home" "$target_home_id" "$backlog_sha"
   write_handoff_state "$SOURCE_HANDOFF" source prepared "$HANDOFF_CANONICAL"
   emit_handoff_prepare "$mode" true "$HANDOFF_CANONICAL"
 }
@@ -1541,12 +1552,7 @@ handoff_stage() {  # <task-id> <transfer-path>
   meta="$STATE_REAL/$task.meta"
   if [ "$HANDOFF_STATUS" = linked ]; then
     if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
-      validate_sidecar "$SIDECAR" "$task"
-      [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
-        || die "handoff target already has a different linked record"
-      [ ! -e "$BRIEF_DEFAULT" ] && [ ! -L "$BRIEF_DEFAULT" ] \
-        || validate_brief_binding "$BRIEF_DEFAULT" linked "$WORK_HASH" "$WORK_CANONICAL"
-      [ ! -e "$meta" ] && [ ! -L "$meta" ] || validate_meta_binding "$meta" linked "$WORK_HASH"
+      die "handoff target already has an unowned linked record"
     elif [ -e "$BRIEF_DEFAULT" ] || [ -L "$BRIEF_DEFAULT" ] || [ -e "$meta" ] || [ -L "$meta" ]; then
       die "linked handoff identity must arrive before destination instructions and metadata"
     fi
@@ -1614,6 +1620,44 @@ publish_handoff_sidecar() {  # <task-id>; HANDOFF_RECORD/HANDOFF_TARGET_SHA load
     || die "published handoff work identity record is conflicting"
 }
 
+handoff_backlog_prepare() {  # <task-id> <transfer-path>
+  local task=$1 path=$2 requested
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  [ -n "$HANDOFF_BACKLOG_SHA" ] || die "task $task handoff has no exact backlog commitment"
+  handoff_target_matches_current
+  identity_mutation_lock_acquire "$task"
+  [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ] \
+    || die "task $task has no prepared incoming handoff"
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
+  case "$HANDOFF_STATE" in
+    prepared) write_handoff_state "$TARGET_HANDOFF" target backlog-prepared "$requested" ;;
+    backlog-prepared|backlog-completed|completed) ;;
+    *) die "task $task has an invalid backlog handoff state" ;;
+  esac
+}
+
+handoff_backlog_complete() {  # <task-id> <transfer-path> <backlog-sha256>
+  local task=$1 path=$2 observed_sha=$3 requested
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  [ -n "$HANDOFF_BACKLOG_SHA" ] || die "task $task handoff has no exact backlog commitment"
+  [ "$observed_sha" = "$HANDOFF_BACKLOG_SHA" ] \
+    || die "task $task destination backlog content does not match its transfer"
+  handoff_target_matches_current
+  identity_mutation_lock_acquire "$task"
+  [ -e "$TARGET_HANDOFF" ] || [ -L "$TARGET_HANDOFF" ] \
+    || die "task $task has no prepared incoming handoff"
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
+  case "$HANDOFF_STATE" in
+    backlog-prepared) write_handoff_state "$TARGET_HANDOFF" target backlog-completed "$requested" ;;
+    backlog-completed|completed) ;;
+    *) die "task $task destination backlog was not reserved before receipt" ;;
+  esac
+}
+
 handoff_commit() {  # <task-id> <transfer-path>
   local task=$1 path=$2 requested
   validate_handoff_envelope "$path" "$task"
@@ -1634,6 +1678,13 @@ handoff_commit() {  # <task-id> <transfer-path>
   fi
   [ "$HANDOFF_STATE" != intake-prepared ] \
     || die "task $task has an incomplete post-handoff intake"
+  if [ -n "$HANDOFF_BACKLOG_SHA" ]; then
+    [ "$HANDOFF_STATE" = backlog-completed ] \
+      || die "task $task exact backlog receipt is incomplete"
+  else
+    [ "$HANDOFF_STATE" = prepared ] \
+      || die "task $task has an invalid incoming handoff state"
+  fi
   if [ "$HANDOFF_STATUS" = linked ]; then
     publish_handoff_sidecar "$task"
   fi
@@ -1648,14 +1699,6 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
   handoff_target_matches_current
   identity_mutation_lock_acquire "$task"
   if [ ! -e "$TARGET_HANDOFF" ] && [ ! -L "$TARGET_HANDOFF" ]; then
-    if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
-      validate_sidecar "$SIDECAR" "$task"
-      if [ "$HANDOFF_STATUS" = linked ] \
-         && [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] \
-         && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ]; then
-        return 4
-      fi
-    fi
     return 0
   fi
   read_handoff_state "$TARGET_HANDOFF" target "$task"
@@ -1670,6 +1713,7 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
   fi
   [ "$HANDOFF_STATE" != intake-prepared ] \
     || die "task $task has an incomplete post-handoff intake"
+  [ "$HANDOFF_STATE" != backlog-completed ] || return 4
   if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
     [ "$HANDOFF_STATUS" = linked ] || die "unlinked handoff target gained a linked record"
     validate_sidecar "$SIDECAR" "$task"
@@ -1681,6 +1725,24 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
   rm -f -- "$TARGET_HANDOFF" || die "cannot abort handoff target state"
 }
 
+handoff_backlog_state() {  # <task-id> <transfer-path>
+  local task=$1 path=$2 requested
+  validate_handoff_envelope "$path" "$task"
+  requested=$HANDOFF_CANONICAL
+  handoff_target_matches_current
+  identity_mutation_lock_acquire "$task"
+  if [ ! -e "$TARGET_HANDOFF" ] && [ ! -L "$TARGET_HANDOFF" ]; then
+    printf 'absent\n'
+    return 0
+  fi
+  read_handoff_state "$TARGET_HANDOFF" target "$task"
+  [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
+  case "$HANDOFF_STATE" in
+    prepared|backlog-prepared|backlog-completed|completed) printf '%s\n' "$HANDOFF_STATE" ;;
+    *) die "task $task has no valid exact backlog handoff state" ;;
+  esac
+}
+
 handoff_target_state() {  # <task-id> <transfer-path>
   local task=$1 path=$2 requested
   validate_handoff_envelope "$path" "$task"
@@ -1688,17 +1750,7 @@ handoff_target_state() {  # <task-id> <transfer-path>
   handoff_target_matches_current
   identity_mutation_lock_acquire "$task"
   if [ ! -e "$TARGET_HANDOFF" ] && [ ! -L "$TARGET_HANDOFF" ]; then
-    if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
-      [ "$HANDOFF_STATUS" = linked ] || die "unlinked handoff target has a linked record"
-      validate_sidecar "$SIDECAR" "$task"
-      [ "$WORK_HASH" = "$HANDOFF_TARGET_SHA" ] && [ "$WORK_CANONICAL" = "$HANDOFF_RECORD" ] \
-        || die "committed handoff target linked record is conflicting"
-      validate_committed_target "$task"
-      write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
-      printf 'completed\n'
-    else
-      printf 'absent\n'
-    fi
+    printf 'absent\n'
     return 0
   fi
   read_handoff_state "$TARGET_HANDOFF" target "$task"
@@ -2432,7 +2484,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections|publication-run) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|reserve-unlinked|unlinked-prepare|unlinked-commit|unlinked-abort|handoff-prepare|handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|reserve-unlinked|unlinked-prepare|unlinked-commit|unlinked-abort|handoff-prepare|handoff-stage|handoff-backlog-prepare|handoff-backlog-complete|handoff-backlog-state|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -2646,30 +2698,47 @@ case "$COMMAND" in
     esac
     ;;
   handoff-prepare)
-    [ "$#" -eq 4 ] || [ "$#" -eq 5 ] \
-      || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]"
-    [ "$1" = --to-home ] && [ "$3" = --to-home-id ] \
-      || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]"
+    HANDOFF_TARGET_HOME_ARG=
+    HANDOFF_TARGET_HOME_ID_ARG=
+    HANDOFF_BACKLOG_SHA_ARG=
     HANDOFF_PREPARE_MODE=transfer
-    if [ "$#" -eq 5 ]; then
-      [ "$5" = --result ] \
-        || die "handoff-prepare usage: fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]"
-      HANDOFF_PREPARE_MODE=result
-    fi
-    handoff_prepare "$TASK" "$2" "$4" "$HANDOFF_PREPARE_MODE"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --to-home) shift; [ "$#" -gt 0 ] || die "--to-home requires a path"; HANDOFF_TARGET_HOME_ARG=$1 ;;
+        --to-home-id) shift; [ "$#" -gt 0 ] || die "--to-home-id requires an id"; HANDOFF_TARGET_HOME_ID_ARG=$1 ;;
+        --backlog-sha256) shift; [ "$#" -gt 0 ] || die "--backlog-sha256 requires a digest"; HANDOFF_BACKLOG_SHA_ARG=$1 ;;
+        --result) HANDOFF_PREPARE_MODE=result ;;
+        *) die "unknown handoff-prepare argument: $1" ;;
+      esac
+      shift
+    done
+    [ -n "$HANDOFF_TARGET_HOME_ARG" ] && [ -n "$HANDOFF_TARGET_HOME_ID_ARG" ] \
+      || die "handoff-prepare requires --to-home and --to-home-id"
+    handoff_prepare "$TASK" "$HANDOFF_TARGET_HOME_ARG" "$HANDOFF_TARGET_HOME_ID_ARG" \
+      "$HANDOFF_BACKLOG_SHA_ARG" "$HANDOFF_PREPARE_MODE"
     ;;
-  handoff-stage|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel)
+  handoff-stage|handoff-backlog-prepare|handoff-backlog-state|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel)
     [ "$#" -eq 2 ] && [ "$1" = --file ] \
       || die "$COMMAND usage: fm-work-identity.sh $COMMAND <task-id> --file <transfer.json|->"
     capture_contract_input "$2" "work identity handoff transfer" "$HANDOFF_MAX_BYTES"
     case "$COMMAND" in
       handoff-stage) handoff_stage "$TASK" "$CONTRACT_INPUT" ;;
+      handoff-backlog-prepare) handoff_backlog_prepare "$TASK" "$CONTRACT_INPUT" ;;
+      handoff-backlog-state) handoff_backlog_state "$TASK" "$CONTRACT_INPUT" ;;
       handoff-commit) handoff_commit "$TASK" "$CONTRACT_INPUT" ;;
       handoff-abort) handoff_abort "$TASK" "$CONTRACT_INPUT" ;;
       handoff-target-state) handoff_target_state "$TASK" "$CONTRACT_INPUT" ;;
       handoff-complete) handoff_complete "$TASK" "$CONTRACT_INPUT" ;;
       handoff-cancel) handoff_cancel "$TASK" "$CONTRACT_INPUT" ;;
     esac
+    [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
+    CONTRACT_INPUT_TMP=
+    ;;
+  handoff-backlog-complete)
+    [ "$#" -eq 4 ] && [ "$1" = --file ] && [ "$3" = --backlog-sha256 ] \
+      || die "handoff-backlog-complete usage: fm-work-identity.sh handoff-backlog-complete <task-id> --file <transfer.json|-> --backlog-sha256 <digest>"
+    capture_contract_input "$2" "work identity handoff transfer" "$HANDOFF_MAX_BYTES"
+    handoff_backlog_complete "$TASK" "$CONTRACT_INPUT" "$4"
     [ -z "$CONTRACT_INPUT_TMP" ] || rm -f -- "$CONTRACT_INPUT_TMP"
     CONTRACT_INPUT_TMP=
     ;;

@@ -1302,6 +1302,42 @@ EOF
 
 # An entry that genuinely lacks (home: ...) must still fail cleanly (empty parse
 # surfaces as "has no home"), not succeed or mis-parse prose.
+test_same_id_destination_requires_exact_handoff_receipt() {
+  local home="$TMP_ROOT/same-id-main" sub="$TMP_ROOT/same-id-sub" out rc=0
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] colliding-task - source work that must remain (repo: alpha)
+  exact source body
+
+## Done
+EOF
+  cat > "$sub/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+- [ ] colliding-task - unrelated destination work (repo: beta)
+  unrelated destination body
+
+## Done
+EOF
+  cp "$home/data/backlog.md" "$home/source.before"
+  cp "$sub/data/backlog.md" "$sub/destination.before"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design colliding-task 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "same-id destination row was accepted without an exact handoff receipt"
+  cmp -s "$home/source.before" "$home/data/backlog.md" \
+    || fail "same-id destination conflict removed or changed source work"
+  cmp -s "$sub/destination.before" "$sub/data/backlog.md" \
+    || fail "same-id destination conflict changed unrelated destination work"
+  assert_absent "$home/data/colliding-task/work-identity-handoff-source.json" \
+    "same-id destination conflict retained source ownership preparation"
+  assert_absent "$sub/data/colliding-task/work-identity-handoff-target.json" \
+    "same-id destination conflict retained target ownership preparation"
+  assert_contains "$out" "exact destination backlog reservation failed" \
+    "same-id destination conflict did not fail at the exact receipt boundary"
+  pass "same-id destination rows require an exact transferred-content receipt"
+}
+
 test_registry_home_missing_field_fails_cleanly() {
   local home="$TMP_ROOT/reg-nohome-main"
   local sub="$TMP_ROOT/reg-nohome-sub"
@@ -1354,6 +1390,7 @@ test_noncanonical_indented_continuations_refuse_without_changes
 test_indented_heading_is_not_section_boundary
 test_registry_home_with_pre_home_parentheses
 test_registry_home_missing_field_fails_cleanly
+test_same_id_destination_requires_exact_handoff_receipt
 test_handoff_warns_when_a_moved_item_still_owes_a_public_reply
 test_handoff_is_silent_about_public_commitments_without_the_relay
 

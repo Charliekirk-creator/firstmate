@@ -971,7 +971,7 @@ SH
     FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
     FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
     FM_TEST_ZELLIJ_DELAY_WORKTREE=1 FM_TEST_TREEHOUSE_GET_LOG="$home/treehouse-gets" \
-    FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
+    FM_SPAWN_WORKTREE_POLLS=100 FM_SPAWN_WORKTREE_INTERVAL=0.01 PATH="$fakebin:$PATH" \
     "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
       --harness codex --backend zellij 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "delayed zellij worktree transition unexpectedly completed"
@@ -993,7 +993,7 @@ SH
     FM_TEST_ZELLIJ_WORKTREE="$home/zellij-worktree" \
     FM_TEST_ZELLIJ_PROJECT="$project" FM_TEST_ZELLIJ_WT="$wt" \
     FM_TEST_TREEHOUSE_GET_LOG="$home/treehouse-gets" \
-    FM_SPAWN_WORKTREE_POLLS=2 FM_SPAWN_WORKTREE_INTERVAL=0 PATH="$fakebin:$PATH" \
+    FM_SPAWN_WORKTREE_POLLS=20 FM_SPAWN_WORKTREE_INTERVAL=0.01 PATH="$fakebin:$PATH" \
     "$SPAWN" "$task" "$project" --mode no-mistakes --yolo off \
       --harness codex --backend zellij 2>&1) || rc=$?
   [ "$rc" -eq 0 ] || fail "zellij did not resume its exact acquired worktree: $out"
@@ -1724,7 +1724,7 @@ EOF
 }
 
 test_handoff_rebinds_identity_and_decision_surfaces() {
-  local parent mate mate_real task manifest decision main_decision decision_manifest wt fakebin canonical bearings hash gen out rc
+  local parent mate mate_real task manifest decision main_decision decision_manifest wt fakebin canonical bearings hash gen out rc child_out
   command -v tasks-axi >/dev/null 2>&1 || { pass "linked handoff coverage skipped without tasks-axi"; return; }
   parent=$(make_home handoff-parent)
   mate="$TMP_ROOT/handoff-mate"
@@ -1812,6 +1812,9 @@ EOF
 ## Done
 EOF
   fakebin=$(make_fakebin "$parent/fakes")
+  child_out=$(PATH="$fakebin:$PATH" FM_FAKE_PANE_COMMAND=claude FM_HOME="$mate" \
+    FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --secondmate-home-summary 2>&1) \
+    || fail "delegated handoff home could not publish its structured summary: $child_out"
   canonical=$(PATH="$fakebin:$PATH" FM_FAKE_PANE_COMMAND=claude FM_HOME="$parent" \
     FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
   printf '%s' "$canonical" | jq -e '
@@ -1895,7 +1898,7 @@ test_missing_state_directory_is_created_before_locking() {
 }
 
 test_handoff_preparation_is_durable_and_rollback_safe() {
-  local parent mate task_a task_b task_c race manifest transfer out rc
+  local parent mate task_a task_b task_c race manifest transfer out rc backlog_hash
   command -v tasks-axi >/dev/null 2>&1 || { pass "handoff transaction coverage skipped without tasks-axi"; return; }
   parent=$(make_home handoff-transaction-parent)
   mate="$TMP_ROOT/handoff-transaction-mate"
@@ -1935,15 +1938,23 @@ EOF
   FM_HOME="$parent" "$WORK_IDENTITY" verify "$task_a" | jq -e '.status == "linked"' >/dev/null \
     || fail "failed multi-item staging damaged the source identity"
 
+  printf '%s\n' "- [ ] $task_a - first transactional identity (repo: firstmate)" > "$parent/$task_a.block"
+  backlog_hash=$(sha256_file_for_test "$parent/$task_a.block")
   transfer=$(FM_HOME="$parent" "$WORK_IDENTITY" handoff-prepare "$task_a" \
-    --to-home "$mate" --to-home-id secondmate:transaction)
+    --to-home "$mate" --to-home-id secondmate:transaction --backlog-sha256 "$backlog_hash")
   printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" handoff-stage "$task_a" --file - >/dev/null \
     || fail "could not stage the interrupted committed-target fixture"
-  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" handoff-commit "$task_a" --file - >/dev/null \
-    || fail "could not commit the interrupted target fixture"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-backlog-receive.sh" --prepare-handoff "$task_a" >/dev/null \
+    || fail "could not prepare the committed target backlog receipt"
   printf '## In flight\n\n## Queued\n\n## Done\n' > "$mate/data/backlog.md"
   tasks-axi mv "$task_a" --file "$parent/data/backlog.md" --to "$mate/data/backlog.md" >/dev/null \
     || fail "could not move the interrupted target backlog fixture"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-backlog-receive.sh" --complete-handoff "$task_a" >/dev/null \
+    || fail "could not complete the committed target backlog receipt"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" handoff-commit "$task_a" --file - >/dev/null \
+    || fail "could not commit the interrupted target fixture"
   jq -e '.state == "prepared"' "$parent/data/$task_a/work-identity-handoff-source.json" >/dev/null \
     || fail "interrupted target fixture unexpectedly completed source ownership"
   rc=0
@@ -1966,16 +1977,21 @@ EOF
   out=$(FM_HOME="$parent" "$WORK_IDENTITY" verify "$task_a" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "mixed retry made the completed source identity publishable again"
 
+  printf '%s\n' "- [ ] $task_c - recovered prepared identity (repo: firstmate)" > "$parent/$task_c.block"
+  backlog_hash=$(sha256_file_for_test "$parent/$task_c.block")
   transfer=$(FM_HOME="$parent" "$WORK_IDENTITY" handoff-prepare "$task_c" \
-    --to-home "$mate" --to-home-id secondmate:transaction)
+    --to-home "$mate" --to-home-id secondmate:transaction --backlog-sha256 "$backlog_hash")
   printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" \
     handoff-stage "$task_c" --file - >/dev/null \
     || fail "could not stage the interrupted prepared-target fixture"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-backlog-receive.sh" --prepare-handoff "$task_c" >/dev/null \
+    || fail "could not prepare the interrupted target backlog receipt"
   tasks-axi mv "$task_c" --file "$parent/data/backlog.md" --to "$mate/data/backlog.md" >/dev/null \
     || fail "could not move the interrupted prepared-target backlog fixture"
-  jq -e '.state == "prepared"' \
+  jq -e '.state == "backlog-prepared"' \
     "$mate/data/$task_c/work-identity-handoff-target.json" >/dev/null \
-    || fail "interrupted prepared-target fixture was not prepared"
+    || fail "interrupted prepared-target fixture was not backlog-prepared"
   rc=0
   out=$(FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" \
     transaction "$task_c" "$task_b" 2>&1) || rc=$?
@@ -2099,7 +2115,8 @@ test_schema_maximum_delegated_identities_are_streamed_once() {
       and all(.[1:][].work_identity; .status == "linked")
   ' >/dev/null || fail "schema-maximum identity stream envelope or order was malformed"
   fakebin=$(make_fakebin "$parent/fakes")
-  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SNAPSHOT_SECONDMATE_TIMEOUT=120 \
+    FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --json)
   printf '%s' "$canonical" | jq -e '
     .secondmate_current.records[] | select(.id == "maximum")
     | .provenance.selected == "structured-home"
@@ -2248,6 +2265,38 @@ EOF
   pass "display labels cannot masquerade as additional exact identities"
 }
 
+test_handoff_rejects_unowned_identical_target_sidecar() {
+  local source target task manifest transfer target_record out rc=0
+  source=$(make_home unowned-sidecar-source)
+  target=$(make_home unowned-sidecar-target)
+  printf 'unowned-target\n' > "$target/.fm-secondmate-home"
+  task=unowned-identical-target
+  manifest="$source/manifest.json"
+  make_manifest "$source" "$task" "$manifest"
+  FM_HOME="$source" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  transfer=$(FM_HOME="$source" "$WORK_IDENTITY" handoff-prepare "$task" \
+    --to-home "$target" --to-home-id secondmate:unowned-target)
+  target_record=$(printf '%s' "$transfer" | jq -S -c '.identity.record')
+  mkdir -p "$target/data/$task"
+  printf '%s\n' "$target_record" > "$target/data/$task/work-identity.json"
+  out=$(printf '%s\n' "$transfer" | FM_HOME="$target" "$WORK_IDENTITY" \
+    handoff-stage "$task" --file - 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "unowned identical target sidecar was accepted as a staged transfer"
+  assert_contains "$out" "unowned linked record" \
+    "identical target sidecar refusal did not identify missing transfer ownership"
+  printf '%s\n' "$transfer" | FM_HOME="$target" "$WORK_IDENTITY" \
+    handoff-abort "$task" --file - >/dev/null \
+    || fail "unowned target sidecar was mistaken for a committed transfer during abort"
+  printf '%s\n' "$transfer" | FM_HOME="$source" "$WORK_IDENTITY" \
+    handoff-cancel "$task" --file - >/dev/null \
+    || fail "source ownership could not cancel after unowned target refusal"
+  assert_absent "$target/data/$task/work-identity-handoff-target.json" \
+    "unowned target refusal published a transfer receipt"
+  FM_HOME="$source" "$WORK_IDENTITY" verify "$task" | jq -e '.status == "linked"' >/dev/null \
+    || fail "unowned target refusal damaged source ownership"
+  pass "identical target sidecars require a pre-existing exact transfer receipt"
+}
+
 test_secondmate_parent_decisions_and_nested_caps_are_disclosed() {
   local parent mate fakebin child gen bearings
   parent=$(make_home capped-parent)
@@ -2351,6 +2400,7 @@ test_handoff_rebinds_identity_and_decision_surfaces
 test_completed_unlinked_handoff_accepts_exact_intake
 test_missing_state_directory_is_created_before_locking
 test_handoff_preparation_is_durable_and_rollback_safe
+test_handoff_rejects_unowned_identical_target_sidecar
 test_unsafe_publication_setup_uses_integrity_exit
 test_delegated_integrity_failure_stops_parent_publication
 test_schema_maximum_delegated_identities_are_streamed_once

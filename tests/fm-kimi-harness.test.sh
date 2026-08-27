@@ -231,6 +231,39 @@ test_kimi_launch_then_send_is_verified() {
   pass "fm-spawn: kimi launches, delivers its brief, and registers a guarded turn-end token"
 }
 
+test_kimi_secondmate_commits_identity_only_after_delivery() {
+  local id rec sub out rc=0
+  id="kimi-secondmate-delivery-z9-$$"
+  rec=$(make_spawn_case secondmate-delivery "$id")
+  read_spawn_record "$rec"
+  sub="$CASE_DIR/secondmate-home"
+  mkdir -p "$sub/bin" "$sub/data" "$sub/state" "$sub/config" "$sub/projects"
+  printf '# Firstmate\n' > "$sub/AGENTS.md"
+  printf '%s\n' "$id" > "$sub/.fm-secondmate-home"
+  printf 'secondmate charter\n' > "$sub/data/charter.md"
+  out=$(HOME="$HOME_DIR" FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 FM_SKIP_SECONDMATE_INHERIT=1 FM_FAKE_PANE_PATH="$sub" \
+    TMUX='fake,1,0' FM_FAKE_LAUNCH_LOG="$CASE_DIR/launch.log" \
+    FM_FAKE_POINTER_LOG="$CASE_DIR/pointer.log" FM_FAKE_KIMI_STATE="$CASE_DIR/kimi.state" \
+    FM_FAKE_KIMI_SWALLOWED="$CASE_DIR/kimi.swallowed" FM_FAKE_KIMI_DELIVERY=no \
+    FM_FAKE_TMUX_CALL_LOG="$CASE_DIR/tmux-calls.log" FM_FAKE_BRIEF_REAL="$sub/data/charter.md" \
+    FM_FAKE_LAUNCH_BRIEF="$HOME_DIR/state/$id.launch-brief.md" \
+    FM_KIMI_READY_POLLS=2 FM_KIMI_DELIVERY_POLLS=2 FM_KIMI_POLL_INTERVAL=0 \
+    PATH="$FAKEBIN_DIR:$BASE_PATH" "$SPAWN" "$id" "$sub" --harness kimi --secondmate 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "unconfirmed Kimi secondmate delivery unexpectedly committed"
+  assert_contains "$out" "kimi launch brief delivery was not confirmed" \
+    "Kimi secondmate did not fail at delivery confirmation"
+  assert_absent "$HOME_DIR/data/$id/work-identity-unlinked-guard.json" \
+    "failed Kimi delivery permanently classified the secondmate task"
+  assert_present "$HOME_DIR/data/$id/work-identity-unlinked-reservation.json" \
+    "failed Kimi delivery lost its recoverable identity reservation"
+  jq -e '.phase == "launch-submitted"' "$HOME_DIR/state/$id.spawn-endpoint.json" >/dev/null \
+    || fail "failed Kimi delivery lost exact launch acceptance"
+  pass "Kimi secondmate identity commits only after confirmed brief delivery"
+}
+
 test_kimi_hook_install_is_surgical_idempotent_and_removable() {
   local home config original once stripped count
   home="$TMP_ROOT/config-surgery"
@@ -678,6 +711,7 @@ test_kimi_bordered_prompt_needs_no_override() {
 }
 
 test_kimi_hook_install_is_surgical_idempotent_and_removable
+test_kimi_secondmate_commits_identity_only_after_delivery
 test_kimi_hook_remove_preserves_owned_newline_boundary
 test_kimi_hook_fails_closed_on_missing_malformed_or_partial_config
 test_kimi_hook_install_refuses_without_jq

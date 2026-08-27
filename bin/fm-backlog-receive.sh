@@ -33,6 +33,10 @@ sha256_file() {
   if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'; else sha256sum "$1" | awk '{print $1}'; fi
 }
 
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'; else sha256sum | awk '{print $1}'; fi
+}
+
 backlog_key_section() { # <file> <key>
   awk -v key="$2" '
     BEGIN { section = "## Queued" }
@@ -52,6 +56,81 @@ list_keys() { # <file>
       if (id != "" && !seen[id]++) print id
     }
   ' "$1"
+}
+
+backlog_task_sha256() {
+  local file=$1 task=$2
+  [ "$(backlog_key_section "$file" "$task" 2>/dev/null || true)" = '## Queued' ] || return 1
+  awk -v key="$task" '
+    function item_id(line, rest, id) {
+      rest=line; sub(/^- \[[ x]\] +/, "", rest); id=rest; sub(/[ \t].*/, "", id); return id
+    }
+    /^- \[[ x]\] / {
+      if (capturing) exit
+      if (item_id($0) == key) { capturing=1; print }
+      next
+    }
+    capturing && /^##[[:space:]]+/ { exit }
+    capturing && /^[[:space:]]*$/ { blanks++; next }
+    capturing {
+      while (blanks > 0) { print ""; blanks-- }
+      print
+    }
+  ' "$file" | sha256_stream
+}
+
+handoff_backlog_transition() {
+  local action=$1 task=$2 transfer expected section observed state action_rc
+  transfer=$(umask 077; mktemp "$FM_HOME/state/.handoff-transfer.XXXXXX") || return 1
+  if ! dd bs=73729 count=1 of="$transfer" 2>/dev/null; then
+    rm -f -- "$transfer"
+    return 1
+  fi
+  [ "$(LC_ALL=C wc -c < "$transfer" | tr -d ' ')" -le 73728 ] || {
+    rm -f -- "$transfer"
+    return 1
+  }
+  expected=$(jq -er '.backlog.task_sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))' "$transfer" 2>/dev/null) || {
+    rm -f -- "$transfer"
+    return 1
+  }
+  state=$(FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-work-identity.sh" handoff-target-state "$task" --file "$transfer") || {
+    rm -f -- "$transfer"
+    return 1
+  }
+  if [ "$state" = completed ]; then
+    rm -f -- "$transfer"
+    return 0
+  fi
+  section=$(backlog_key_section "$DEST" "$task" 2>/dev/null || true)
+  if [ "$action" = prepare ] && [ -z "$section" ]; then
+    action_rc=0
+    FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" handoff-backlog-prepare "$task" --file "$transfer" >/dev/null \
+      || action_rc=$?
+    rm -f -- "$transfer"
+    return "$action_rc"
+  fi
+  [ "$section" = '## Queued' ] || {
+    rm -f -- "$transfer"
+    return 1
+  }
+  observed=$(backlog_task_sha256 "$DEST" "$task") || {
+    rm -f -- "$transfer"
+    return 1
+  }
+  [ "$observed" = "$expected" ] || {
+    rm -f -- "$transfer"
+    return 1
+  }
+  action_rc=0
+  FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-work-identity.sh" handoff-backlog-complete "$task" \
+      --file "$transfer" --backlog-sha256 "$observed" >/dev/null \
+    || action_rc=$?
+  rm -f -- "$transfer"
+  return "$action_rc"
 }
 
 lock_age() {
@@ -81,6 +160,24 @@ remove_dead_stale_lock() { # <lock-path>
 run_move() { # <keys...>
   tasks-axi mv "$@" --file "$DELIVERED" --to "$DEST"
 }
+
+case "${1:-}" in
+  --prepare-handoff|--complete-handoff)
+    [ "$#" -eq 2 ] || usage
+    ACTION=${1#--}
+    ACTION=${ACTION%-handoff}
+    TASK=$2
+    case "$TASK" in ''|.*|*[!A-Za-z0-9._-]*) die "handoff task id is unsafe" ;; esac
+    [ -f "$FM_HOME/.fm-secondmate-home" ] && [ ! -L "$FM_HOME/.fm-secondmate-home" ] \
+      || die "FM_HOME is not a seeded secondmate home"
+    [ -f "$FM_HOME/AGENTS.md" ] && [ -d "$FM_HOME/bin" ] || die "FM_HOME is not a Firstmate home"
+    mkdir -p "$FM_HOME/data" "$FM_HOME/state"
+    [ ! -L "$DEST" ] || die "destination backlog must not be a symlink"
+    if [ -e "$DEST" ] && [ ! -f "$DEST" ]; then die "destination backlog is not a regular file"; fi
+    handoff_backlog_transition "$ACTION" "$TASK" || die "exact destination backlog receipt refused for $TASK"
+    exit 0
+    ;;
+esac
 
 [ "$#" -eq 4 ] || usage
 REL=$1
@@ -180,6 +277,13 @@ fi
 for key in "${KEYS[@]}"; do
   backlog_key_section "$DEST" "$key" >/dev/null 2>&1 \
     || die "receipt verification failed for $key; delivered outbox is preserved"
+  TARGET_RECEIPT="$FM_HOME/data/$key/work-identity-handoff-target.json"
+  [ -f "$TARGET_RECEIPT" ] && [ ! -L "$TARGET_RECEIPT" ] \
+    || die "exact destination backlog receipt is absent for $key"
+  TARGET_TRANSFER=$(jq -e -S -c '.transfer' "$TARGET_RECEIPT" 2>/dev/null) \
+    || die "exact destination backlog receipt is malformed for $key"
+  printf '%s\n' "$TARGET_TRANSFER" | handoff_backlog_transition complete "$key" \
+    || die "exact destination backlog receipt is incomplete for $key"
 done
 rm -f -- "$DELIVERED" || die "receipt succeeded but delivered scratch cleanup failed"
 fm_lock_release "$TRANSFER_LOCK" || die "receipt succeeded but transfer lock cleanup failed"

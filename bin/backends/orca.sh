@@ -282,6 +282,37 @@ fm_backend_orca_worktree_response_ready() {  # <response-path>
   printf '%s' "$out" | fm_backend_orca_json_get worktree-path >/dev/null 2>&1
 }
 
+fm_backend_orca_worktree_reconcile() {  # <repo-id> <name>; 2 absent, 3 ambiguous
+  local repo_id=$1 name=$2 out
+  out=$(orca worktree list --repo "id:$repo_id" --json 2>/dev/null) || return 1
+  printf '%s' "$out" | node -e '
+const fs = require("fs");
+const wanted = process.argv[1];
+let data;
+try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(1); }
+if (data && data.ok === false) process.exit(1);
+const root = data && Object.prototype.hasOwnProperty.call(data, "result") ? data.result : data;
+let values = Array.isArray(root) ? root : ((root && (root.worktrees || root.items)) || []);
+if (!Array.isArray(values)) process.exit(1);
+const scalar = (v) => (typeof v === "string" || typeof v === "number") ? String(v) : "";
+const rows = values.map((item) => {
+  const wt = item && (item.worktree || item.item || item);
+  const terminal = item && item.terminal;
+  return {
+    name: scalar(wt && (wt.name || wt.title)),
+    id: scalar(wt && (wt.id || wt.worktreeId)),
+    path: scalar(wt && (wt.path || (wt.git && wt.git.path))),
+    terminal: scalar(terminal && (terminal.handle || terminal))
+  };
+}).filter((row) => row.name === wanted);
+if (rows.length === 0) process.exit(2);
+if (rows.length !== 1) process.exit(3);
+const row = rows[0];
+if (!row.id || !row.path || /[\t\r\n]/.test(row.id + row.path + row.terminal)) process.exit(1);
+process.stdout.write(row.id + "\t" + row.path + (row.terminal ? "\t" + row.terminal : ""));
+' "$name"
+}
+
 fm_backend_orca_worktree_create() {  # <project-path> <name>
   local project=$1 name=$2 repo_id response rc
   repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
@@ -299,19 +330,57 @@ fm_backend_orca_worktree_create() {  # <project-path> <name>
   return "$rc"
 }
 
+FM_BACKEND_ORCA_WORKTREE_CREATE_IN_PROGRESS=201
+
 fm_backend_orca_worktree_create_durable() {  # <project-path> <name> <response-path>
-  local project=$1 name=$2 response=$3 repo_id creator rc
-  [ ! -e "$response" ] && [ ! -L "$response" ] || return 1
+  local project=$1 name=$2 response=$3 repo_id creator rc=1 create_rc=1 raw reconcile_rc=1 i=0
+  local max=${FM_ORCA_WORKTREE_RECONCILE_POLLS:-20} interval=${FM_ORCA_WORKTREE_RECONCILE_INTERVAL:-0.1}
+  if [ -e "$response" ] || [ -L "$response" ]; then
+    [ -f "$response" ] && [ ! -L "$response" ] || return 1
+    [ "$(fm_backend_orca_file_link_count "$response")" = 1 ] || return 1
+    rc=0
+    raw=$(fm_backend_orca_worktree_response_parse "$response" "$name" 2>/dev/null) || rc=$?
+    case "$rc" in
+      0) printf '%s' "$raw"; return 0 ;;
+      2|3) [ -z "$raw" ] || printf '%s' "$raw"; return "$rc" ;;
+    esac
+  fi
   repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
-  (
-    umask 077
-    set -C
-    exec orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json > "$response"
-  ) &
-  creator=$!
-  if wait "$creator"; then rc=0; else rc=$?; fi
-  [ "$rc" -eq 0 ] || return "$rc"
-  fm_backend_orca_worktree_response_parse "$response" "$name"
+  if [ ! -e "$response" ] && [ ! -L "$response" ]; then
+    (
+      umask 077
+      set -C
+      exec orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json > "$response"
+    ) &
+    creator=$!
+    if wait "$creator"; then rc=0; else rc=$?; fi
+    create_rc=$rc
+    rc=0
+    raw=$(fm_backend_orca_worktree_response_parse "$response" "$name" 2>/dev/null) || rc=$?
+    case "$rc" in
+      0) printf '%s' "$raw"; return 0 ;;
+      2|3) [ -z "$raw" ] || printf '%s' "$raw"; return "$rc" ;;
+    esac
+    rc=$create_rc
+  fi
+  while [ "$i" -lt "$max" ]; do
+    reconcile_rc=0
+    raw=$(fm_backend_orca_worktree_reconcile "$repo_id" "$name") || reconcile_rc=$?
+    case "$reconcile_rc" in
+      0) printf '%s' "$raw"; return 0 ;;
+      2) ;;
+      3) echo "error: several Orca worktrees match the exact creation name $name" >&2; return 1 ;;
+      *) ;;
+    esac
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "$interval"
+  done
+  if [ "$reconcile_rc" -eq 2 ] && [ -s "$response" ] \
+    && fm_backend_orca_json_error_code < "$response" >/dev/null 2>&1; then
+    [ "$rc" -ge 1 ] && [ "$rc" -le 125 ] || rc=1
+    return "$rc"
+  fi
+  return "$FM_BACKEND_ORCA_WORKTREE_CREATE_IN_PROGRESS"
 }
 
 fm_backend_orca_terminal_response_parse() {  # <response-path> <title>

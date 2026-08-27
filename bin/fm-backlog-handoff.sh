@@ -535,6 +535,27 @@ task_array_contains() { # <task-id> [task-id...]
   return 1
 }
 
+backlog_task_sha256() {
+  local file=$1 task=$2
+  [ "$(backlog_key_section "$file" "$task" 2>/dev/null || true)" = '## Queued' ] || return 1
+  awk -v key="$task" '
+    function item_id(line, rest, id) {
+      rest=line; sub(/^- \[[ x]\] +/, "", rest); id=rest; sub(/[ \t].*/, "", id); return id
+    }
+    /^- \[[ x]\] / {
+      if (capturing) exit
+      if (item_id($0) == key) { capturing=1; print }
+      next
+    }
+    capturing && /^##[[:space:]]+/ { exit }
+    capturing && /^[[:space:]]*$/ { blanks++; next }
+    capturing {
+      while (blanks > 0) { print ""; blanks-- }
+      print
+    }
+  ' "$file" | if command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'; else sha256sum | awk '{print $1}'; fi
+}
+
 TASKS_AXI_BACKLOG_IDS=()
 load_tasks_axi_queued_ids() { # <path>
   local path=$1 output count parsed id state
@@ -601,6 +622,7 @@ EOF
 
 EXPECTED_MOVE_KEYS=()
 RESOLVED_MOVE_KEYS=()
+RESOLVED_MOVE_HASHES=()
 MOVE_PLAN_SOURCE_HASH=
 MOVE_PLAN_TARGET_HASH=
 MOVE_PLAN_TARGET_PRESENT=0
@@ -609,6 +631,7 @@ resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
   shift 2
   EXPECTED_MOVE_KEYS=()
   RESOLVED_MOVE_KEYS=()
+  RESOLVED_MOVE_HASHES=()
   MOVE_PLAN_SOURCE_HASH=
   MOVE_PLAN_TARGET_HASH=
   MOVE_PLAN_TARGET_PRESENT=0
@@ -642,8 +665,23 @@ resolve_tasks_axi_move_keys() { # <source> <target> <task-id>...
     return 1
   }
   RESOLVED_MOVE_KEYS=("${EXPECTED_MOVE_KEYS[@]}")
+  for task in "${RESOLVED_MOVE_KEYS[@]}"; do
+    RESOLVED_MOVE_HASHES+=("$(backlog_task_sha256 "$HANDOFF_PLAN_DIR/target.md" "$task")")
+  done
   rm -rf -- "$HANDOFF_PLAN_DIR"
   HANDOFF_PLAN_DIR=
+}
+
+resolved_move_hash() { # <task-id>
+  local wanted=$1 i=0
+  while [ "$i" -lt "${#RESOLVED_MOVE_KEYS[@]}" ]; do
+    if [ "${RESOLVED_MOVE_KEYS[$i]}" = "$wanted" ]; then
+      printf '%s\n' "${RESOLVED_MOVE_HASHES[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
 }
 
 move_plan_inputs_unchanged() { # <source> <target>
@@ -674,13 +712,15 @@ task_sets_match() { # <expected-array-name> <actual-array-name>
 HANDOFF_IDENTITY_TASKS=()
 HANDOFF_IDENTITY_PAYLOADS=()
 HANDOFF_IDENTITY_CREATED=()
+HANDOFF_IDENTITY_BACKLOG_HASHES=()
 
-prepare_handoff_identity() { # <task-id> <target-home> <target-home-id>
-  local task=$1 target_home=$2 target_home_id=$3 result
+prepare_handoff_identity() { # <task-id> <target-home> <target-home-id> <backlog-sha256>
+  local task=$1 target_home=$2 target_home_id=$3 backlog_sha=$4 result
   result=$(
     FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
       FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
-      handoff-prepare "$task" --to-home "$target_home" --to-home-id "$target_home_id" --result
+      handoff-prepare "$task" --to-home "$target_home" --to-home-id "$target_home_id" \
+        --backlog-sha256 "$backlog_sha" --result
   ) || return $?
   HANDOFF_IDENTITY_PAYLOAD=$(printf '%s' "$result" | jq -e -S -c '
     select(type == "object" and (keys | sort) == ["created","transfer"]
@@ -720,6 +760,59 @@ remote_target_handoff_state() { # <secondmate-id> <task-id> <payload>
         handoff-target-state "$task" --file -
 }
 
+local_target_backlog_action() { # <target-home> <prepare|complete> <task-id> <payload>
+  local target_home=$1 action=$2 task=$3 payload=$4
+  printf '%s\n' "$payload" \
+    | FM_HOME="$target_home" FM_ROOT_OVERRIDE="$FM_ROOT" \
+        "$SCRIPT_DIR/fm-backlog-receive.sh" "--${action}-handoff" "$task" >/dev/null
+}
+
+remote_target_backlog_action() { # <secondmate-id> <prepare|complete> <task-id> <payload>
+  local id=$1 action=$2 task=$3 payload=$4 rc=0 state state_rc=0
+  printf '%s\n' "$payload" \
+    | "$SCRIPT_DIR/fm-on.sh" "$id" fm-backlog-receive.sh \
+        "--${action}-handoff" "$task" || rc=$?
+  if [ "$rc" -eq 255 ]; then
+    state=$(printf '%s\n' "$payload" \
+      | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh \
+          handoff-backlog-state "$task" --file -) || state_rc=$?
+    if [ "$state_rc" -eq 0 ]; then
+      case "$action:$state" in
+        prepare:backlog-prepared|prepare:backlog-completed|prepare:completed|complete:backlog-completed|complete:completed) rc=0 ;;
+      esac
+    fi
+  fi
+  [ "$rc" -eq 0 ] || echo "error: remote exact backlog $action failed for $task (status $rc)" >&2
+  return "$rc"
+}
+
+prepare_local_handoff_backlog_receipts() { # <target-home>
+  local target_home=$1 i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    local_target_backlog_action "$target_home" prepare \
+      "${HANDOFF_IDENTITY_TASKS[$i]}" "${HANDOFF_IDENTITY_PAYLOADS[$i]}" || return 1
+    i=$((i + 1))
+  done
+}
+
+complete_local_handoff_backlog_receipts() { # <target-home>
+  local target_home=$1 i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    local_target_backlog_action "$target_home" complete \
+      "${HANDOFF_IDENTITY_TASKS[$i]}" "${HANDOFF_IDENTITY_PAYLOADS[$i]}" || return 1
+    i=$((i + 1))
+  done
+}
+
+prepare_remote_handoff_backlog_receipts() { # <secondmate-id>
+  local id=$1 i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    remote_target_backlog_action "$id" prepare \
+      "${HANDOFF_IDENTITY_TASKS[$i]}" "${HANDOFF_IDENTITY_PAYLOADS[$i]}" || return 1
+    i=$((i + 1))
+  done
+}
+
 rollback_local_handoff_identities() { # <target-home> <target-backlog>
   local target_home=$1 target_backlog=$2 i task payload created failed=0 preserved=0 rc
   i=0
@@ -727,7 +820,8 @@ rollback_local_handoff_identities() { # <target-home> <target-backlog>
     task=${HANDOFF_IDENTITY_TASKS[$i]}
     payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
     created=${HANDOFF_IDENTITY_CREATED[$i]}
-    if backlog_key_section "$target_backlog" "$task" >/dev/null 2>&1; then
+    if backlog_key_section "$target_backlog" "$task" >/dev/null 2>&1 \
+      && local_target_backlog_action "$target_home" complete "$task" "$payload"; then
       if local_target_handoff_action "$target_home" commit "$task" "$payload" \
         && source_handoff_action complete "$task" "$payload"; then
         :
@@ -753,13 +847,15 @@ rollback_local_handoff_identities() { # <target-home> <target-backlog>
 }
 
 stage_local_handoff_identities() { # <target-home> <target-home-id> <target-backlog> <task-id>...
-  local target_home=$1 target_home_id=$2 target_backlog=$3 task
+  local target_home=$1 target_home_id=$2 target_backlog=$3 task i=0
   shift 3
   HANDOFF_IDENTITY_TASKS=()
   HANDOFF_IDENTITY_PAYLOADS=()
   HANDOFF_IDENTITY_CREATED=()
+  [ "$#" -eq "${#HANDOFF_IDENTITY_BACKLOG_HASHES[@]}" ] || return 1
   for task in "$@"; do
-    if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id"; then
+    if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id" \
+      "${HANDOFF_IDENTITY_BACKLOG_HASHES[$i]}"; then
       rollback_local_handoff_identities "$target_home" "$target_backlog" || true
       return 1
     fi
@@ -770,6 +866,7 @@ stage_local_handoff_identities() { # <target-home> <target-home-id> <target-back
       rollback_local_handoff_identities "$target_home" "$target_backlog" || true
       return 1
     fi
+    i=$((i + 1))
   done
 }
 
@@ -831,19 +928,22 @@ reconcile_remote_handoff_identities() { # <secondmate-id> <outbox>
 }
 
 prepare_remote_handoff_identities() { # <secondmate-id> <target-home> <target-home-id> <outbox> <task-id>...
-  local id=$1 target_home=$2 target_home_id=$3 outbox=$4 task
+  local id=$1 target_home=$2 target_home_id=$3 outbox=$4 task i=0
   shift 4
   HANDOFF_IDENTITY_TASKS=()
   HANDOFF_IDENTITY_PAYLOADS=()
   HANDOFF_IDENTITY_CREATED=()
+  [ "$#" -eq "${#HANDOFF_IDENTITY_BACKLOG_HASHES[@]}" ] || return 1
   for task in "$@"; do
-    if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id"; then
+    if ! prepare_handoff_identity "$task" "$target_home" "$target_home_id" \
+      "${HANDOFF_IDENTITY_BACKLOG_HASHES[$i]}"; then
       reconcile_remote_handoff_identities "$id" "$outbox" || true
       return 1
     fi
     HANDOFF_IDENTITY_TASKS+=("$task")
     HANDOFF_IDENTITY_PAYLOADS+=("$HANDOFF_IDENTITY_PAYLOAD")
     HANDOFF_IDENTITY_CREATED+=("$HANDOFF_IDENTITY_WAS_CREATED")
+    i=$((i + 1))
   done
 }
 
@@ -1100,6 +1200,14 @@ remote_handoff() { # <secondmate-id> <keys...>
   for key in "${RESOLVED_MOVE_KEYS[@]}"; do
     task_array_contains "$key" "${delivery_keys[@]}" || delivery_keys+=("$key")
   done
+  HANDOFF_IDENTITY_BACKLOG_HASHES=()
+  for key in "${delivery_keys[@]}"; do
+    if backlog_key_section "$outbox" "$key" >/dev/null 2>&1; then
+      HANDOFF_IDENTITY_BACKLOG_HASHES+=("$(backlog_task_sha256 "$outbox" "$key")")
+    else
+      HANDOFF_IDENTITY_BACKLOG_HASHES+=("$(resolved_move_hash "$key")")
+    fi
+  done
   prepare_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "$outbox" "${delivery_keys[@]}" || {
     echo "error: exact work identity preparation failed; nothing new was handed off" >&2
     return 1
@@ -1107,6 +1215,11 @@ remote_handoff() { # <secondmate-id> <keys...>
   stage_prepared_remote_handoff_identities "$id" || {
     rollback_remote_handoff_identities "$id" "$outbox" || true
     echo "error: remote exact work identity reservation failed; nothing new was handed off" >&2
+    return 1
+  }
+  prepare_remote_handoff_backlog_receipts "$id" || {
+    rollback_remote_handoff_identities "$id" "$outbox" || true
+    echo "error: remote exact backlog reservation failed; nothing new was handed off" >&2
     return 1
   }
   if [ "${#to_move[@]}" -gt 0 ] \
@@ -1195,8 +1308,16 @@ resume_remote_outbox() { # <secondmate-id> <outbox-path>
     return 1
   }
   keys=("${TASKS_AXI_BACKLOG_IDS[@]}")
+  HANDOFF_IDENTITY_BACKLOG_HASHES=()
+  for key in "${keys[@]}"; do
+    HANDOFF_IDENTITY_BACKLOG_HASHES+=("$(backlog_task_sha256 "$outbox" "$key")")
+  done
   stage_remote_handoff_identities "$id" "$target_home" "secondmate:$id" "$outbox" "${keys[@]}" || {
     echo "error: pending exact work identity staging failed; outbox preserved at $outbox" >&2
+    return 1
+  }
+  prepare_remote_handoff_backlog_receipts "$id" || {
+    echo "error: pending exact backlog staging failed; outbox preserved at $outbox" >&2
     return 1
   }
   remote_deliver_outbox "$id" "$outbox" || return 1
@@ -1251,8 +1372,8 @@ IN_FLIGHT=()
 DONE=()
 NOT_QUEUED=()
 for key in "$@"; do
-  if backlog_key_section "$SUB_BACKLOG" "$key" >/dev/null; then
-    ALREADY+=("$key")
+  if section=$(backlog_key_section "$SUB_BACKLOG" "$key"); then
+    if [ "$section" = "## Queued" ]; then ALREADY+=("$key"); else NOT_QUEUED+=("$key"); fi
   elif section=$(backlog_key_section "$MAIN_BACKLOG" "$key"); then
     case "$section" in
       "## Queued") TO_MOVE+=("$key") ;;
@@ -1340,15 +1461,31 @@ for key in "${RESOLVED_MOVE_KEYS[@]}"; do
   done < <(backlog_key_noncanonical_body_lines "$MAIN_BACKLOG" "$key")
 done
 LOCAL_IDENTITY_KEYS=()
+HANDOFF_IDENTITY_BACKLOG_HASHES=()
 for key in "${ALREADY[@]}" "${RESOLVED_MOVE_KEYS[@]}"; do
-  task_array_contains "$key" "${LOCAL_IDENTITY_KEYS[@]}" || LOCAL_IDENTITY_KEYS+=("$key")
+  task_array_contains "$key" "${LOCAL_IDENTITY_KEYS[@]}" && continue
+  LOCAL_IDENTITY_KEYS+=("$key")
+  if task_array_contains "$key" "${RESOLVED_MOVE_KEYS[@]}"; then
+    HANDOFF_IDENTITY_BACKLOG_HASHES+=("$(resolved_move_hash "$key")")
+  else
+    HANDOFF_IDENTITY_BACKLOG_HASHES+=("$(backlog_task_sha256 "$SUB_BACKLOG" "$key")")
+  fi
 done
 stage_local_handoff_identities "$SUB_HOME" "secondmate:$ID" "$SUB_BACKLOG" "${LOCAL_IDENTITY_KEYS[@]}" || {
   echo "error: exact work identity preparation failed; nothing was moved." >&2
   exit 1
 }
+prepare_local_handoff_backlog_receipts "$SUB_HOME" || {
+  rollback_local_handoff_identities "$SUB_HOME" "$SUB_BACKLOG" || true
+  echo "error: exact destination backlog reservation failed; nothing was moved." >&2
+  exit 1
+}
 
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
+  complete_local_handoff_backlog_receipts "$SUB_HOME" || {
+    echo "error: existing destination row does not match its exact handoff receipt." >&2
+    exit 1
+  }
   remove_interrupted_source_duplicates "$SUB_BACKLOG" "${LOCAL_IDENTITY_KEYS[@]}" || exit 1
   commit_local_handoff_identities "$SUB_HOME" || {
     echo "error: backlog is already present but exact work identity commit is incomplete." >&2
@@ -1419,6 +1556,10 @@ fi
 parse_tasks_axi_move_result "$MV_OUT" \
   && task_sets_match RESOLVED_MOVE_KEYS PARSED_MOVE_KEYS || {
   echo "error: tasks-axi moved a different set than its prepared transaction; identity preparation is preserved for recovery." >&2
+  exit 1
+}
+complete_local_handoff_backlog_receipts "$SUB_HOME" || {
+  echo "error: moved destination row does not match its exact handoff receipt." >&2
   exit 1
 }
 
