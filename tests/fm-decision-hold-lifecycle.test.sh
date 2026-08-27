@@ -588,6 +588,12 @@ test_pruned_resolved_history_does_not_block_later_review() {
   show=$(tasks_in "$home" show "$later" --full)
   assert_contains "$show" "state: queued" "later unresolved decision lost its active owner"
   assert_contains "$show" "held: yes" "later unresolved decision was released during completion"
+  if run_decisions "$home" complete "$id" --none --resolved later-choice \
+    > "$home/unresolved-as-resolved.out" 2> "$home/unresolved-as-resolved.err"; then
+    fail "resolved inventory accepted an unresolved current decision"
+  fi
+  assert_grep "captain decision $later is not durably resolved" "$home/unresolved-as-resolved.err" \
+    "resolved inventory did not require the current generation to be resolved"
 
   printf 'Captain resolved the later choice.\n' > "$home/later.txt"
   run_decisions "$home" answer "$id" later-choice --decision-file "$home/later.txt" >/dev/null \

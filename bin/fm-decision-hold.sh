@@ -2199,6 +2199,14 @@ verify_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
   RESOLVED_HOLD_BODY=$ARCHIVED_HOLD_BODY
 }
 
+verify_hold_current_resolved() {  # <origin-id> <decision-key>
+  local origin=$1 key=$2 id
+  id=$(hold_id "$origin" "$key")
+  verify_hold_resolved "$id" "$origin" "$key" \
+    || fail "captain decision $id is not durably resolved"
+  require_current_generation_owner "$origin" "$key"
+}
+
 verify_hold_historical() {  # <origin-id> <decision-key>
   local origin=$1 key=$2 id show state kind hold_kind body
   id=$(hold_id "$origin" "$key")
@@ -2657,7 +2665,7 @@ EOF
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     if list_has_key "$previous_current" "$key"; then
-      verify_hold_durable "$origin" "$key"
+      verify_hold_current_resolved "$origin" "$key"
     else
       verify_hold_historical "$origin" "$key"
       historical_keys=$(sorted_key_union "$historical_keys" "$key")
