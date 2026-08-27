@@ -34,6 +34,8 @@
 #   fm-decision-hold.sh repair <origin-id> <decision-key> --decision-file <path>
 #   fm-decision-hold.sh migrate-legacy <origin-id> <decision-key> \
 #     --decision-file <path> [--identity-file <path>]
+#   fm-decision-hold.sh migrate-retention <origin-id> <decision-key> \
+#     --authorization-file <path>
 #   fm-decision-hold.sh task-done <task-id> [tasks-axi done flags]
 #   fm-decision-hold.sh retention-prune
 #   fm-decision-hold.sh tasks-axi <retention-affecting tasks-axi arguments>
@@ -51,9 +53,11 @@
 # Done records; archive-only generations require explicit current or `--resolved`
 # classification. A resolved historical key
 # may be proven by its structured record in the effective backlog's configured
-# archive after normal bounded Done retention prunes it through `task-done` or
-# `retention-prune`, which bind the exact archived bytes to that transition; the
-# gate never restores archived rows.
+# archive after normal bounded Done retention prunes it through the public
+# `bin/tasks-axi` boundary (also used by `task-done` and `retention-prune`), which
+# binds the exact archived bytes to that transition; the gate never restores
+# archived rows. Pre-boundary archives require an explicit, exact
+# `migrate-retention` authorization before they can prove history.
 # A missing key with no valid archived resolution still fails. A post-teardown
 # visual review can complete against the surviving report and holds without
 # recreating task state. `verify` is called by scout teardown so teardown cannot
@@ -80,6 +84,23 @@
 # The command validates that mapping against the retained record and captain
 # decision before publishing the durable attestation. Claimant metadata and a
 # replayed decision file alone never establish ambiguous ownership.
+#
+# An archive created before the project-scoped retention boundary requires an
+# independently authored `migrate-retention` authorization with this exact
+# content before its record can become historical proof:
+#
+# schema=fm-decision-retention-migration.v1
+# owner=<configured-retention-owner-token>
+# backlog=<physical-effective-backlog-path>
+# archive=<physical-effective-archive-path>
+# hold_id=<composed-hold-id>
+# origin=<origin-id>
+# decision_key=<decision-key>
+# record_digest=<sha256-of-the-canonical-archived-task-record>
+#
+# Migration checks that complete mapping against an ordinary, contained archive
+# record and publishes only its authenticated provenance marker under the
+# effective backlog lock. It does not restore or rewrite the archived task.
 #
 # `resolve` is the routed path. It requires every --routed-to task to exist and to
 # be blocked by the hold. It writes the captain decision and routed identities into
@@ -256,6 +277,16 @@ sha256_text() {  # <text>
   fi
 }
 
+sha256_file() {  # <path>
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    fail "shasum or sha256sum is required"
+  fi
+}
+
 hold_id() {  # <origin-id> <decision-key>
   validate_slug origin-id "$1"
   validate_slug decision-key "$2"
@@ -286,7 +317,7 @@ tasks_axi() {
   (
     cd "$FM_HOME"
     unset TASKS_AXI_FILE TASKS_AXI_BACKEND
-    tasks-axi "$@"
+    "${FM_TASKS_AXI_REAL:-tasks-axi}" "$@"
   )
 }
 
@@ -916,6 +947,75 @@ paths_physically_alias() {
   [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ]
 }
 
+paths_destination_alias() {
+  local rc
+  paths_physically_alias "$1" "$2" && return 0
+  if node - "$1" "$2" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+function destination(value) {
+  const missing = [];
+  let current = path.resolve(value);
+  while (true) {
+    try {
+      return path.join(fs.realpathSync.native(current), ...missing);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") process.exit(2);
+      const parent = path.dirname(current);
+      if (parent === current) process.exit(2);
+      missing.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function toggled(value) {
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i];
+    if (/[a-z]/.test(ch)) return value.slice(0, i) + ch.toUpperCase() + value.slice(i + 1);
+    if (/[A-Z]/.test(ch)) return value.slice(0, i) + ch.toLowerCase() + value.slice(i + 1);
+  }
+  return value;
+}
+
+function caseInsensitiveAt(value) {
+  let current = fs.realpathSync.native(value);
+  while (true) {
+    const parent = path.dirname(current);
+    const base = path.basename(current);
+    const alternate = toggled(base);
+    if (alternate !== base) {
+      try {
+        const left = fs.statSync(current);
+        const right = fs.statSync(path.join(parent, alternate));
+        return left.dev === right.dev && left.ino === right.ino;
+      } catch (_) {
+        return false;
+      }
+    }
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+const left = destination(process.argv[2]);
+const right = destination(process.argv[3]);
+if (left === right) process.exit(0);
+if (left.toLocaleLowerCase("en-US") !== right.toLocaleLowerCase("en-US")) process.exit(1);
+let existing = path.dirname(left);
+while (!fs.existsSync(existing)) existing = path.dirname(existing);
+process.exit(caseInsensitiveAt(existing) ? 0 : 1);
+NODE
+  then
+    return 0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] && return 1
+  fail "could not compare configured archive destinations safely"
+}
+
 authoritative_archive_path() {
   local physical_home expected_data physical_data project_config home_config
   local archive_value='' backlog_value='' configured_backlog configured_archive archive_dir archive_name
@@ -997,13 +1097,13 @@ authoritative_archive_path() {
     || fail "configured decision archive directory is unsafe: $archive_dir"
   DECISION_ARCHIVE="$archive_dir/$archive_name"
   if [ "$DECISION_ARCHIVE" = "$configured_backlog" ] \
-    || paths_physically_alias "$DECISION_ARCHIVE" "$configured_backlog"; then
+    || paths_destination_alias "$DECISION_ARCHIVE" "$configured_backlog"; then
     fail "configured decision archive aliases the active backlog: $DECISION_ARCHIVE"
   fi
   note_archive="$physical_backlog_dir/note-archive.md"
   DECISION_NOTE_ARCHIVE=$note_archive
   if [ "$DECISION_ARCHIVE" = "$note_archive" ] \
-    || paths_physically_alias "$DECISION_ARCHIVE" "$note_archive"; then
+    || paths_destination_alias "$DECISION_ARCHIVE" "$note_archive"; then
     fail "configured decision archive aliases the tasks-axi note archive: $DECISION_ARCHIVE"
   fi
 }
@@ -1116,6 +1216,120 @@ ensure_retention_owner() {
   DECISION_RETENTION_LOCK_HELD=0
   retention_owner_load "$dir" \
     || fail "could not validate decision retention owner"
+}
+
+RETENTION_MIGRATION_SCHEMA=fm-decision-retention-migration.v1
+
+retention_migration_authorization_content() {  # <hold-id> <origin-id> <decision-key> <record-digest>
+  printf 'schema=%s\nowner=%s\nbacklog=%s\narchive=%s\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
+    "$RETENTION_MIGRATION_SCHEMA" "$RETENTION_OWNER_TOKEN" "$DECISION_BACKLOG" \
+    "$DECISION_ARCHIVE" "$1" "$2" "$3" "$4"
+}
+
+require_retention_migration_authorization() {  # <path> <hold-id> <origin-id> <decision-key> <record-digest>
+  local input=$1 id=$2 origin=$3 key=$4 record_digest=$5
+  local cwd physical_home logical_home input_path normalized input_parent expected_parent
+  local physical_parent links expected expected_bytes actual_bytes actual
+  [ -n "$input" ] || fail "pre-boundary retention history requires an independent --authorization-file"
+  [ -d "$FM_HOME" ] || fail "active home is not a directory: $FM_HOME"
+  cwd=$(pwd -P) || fail "could not resolve the current directory"
+  physical_home=$(cd "$FM_HOME" && pwd -P) || fail "could not resolve active home: $FM_HOME"
+  case "$FM_HOME" in /*) logical_home=$FM_HOME ;; *) logical_home="$cwd/$FM_HOME" ;; esac
+  case "$input" in /*) input_path=$input ;; *) input_path="$cwd/$input" ;; esac
+  normalize_home_owned_path "$input_path" "$logical_home" "$physical_home" \
+    || fail "retention migration authorization is outside the active home: $input"
+  normalized=$NORMALIZED_HOME_PATH
+  input_parent=${input_path%/*}
+  expected_parent=${normalized%/*}
+  [ -d "$input_parent" ] && [ ! -L "$input_parent" ] \
+    || fail "retention migration authorization directory is unsafe: $input"
+  physical_parent=$(cd "$input_parent" && pwd -P) \
+    || fail "could not resolve retention migration authorization directory: $input"
+  [ "$physical_parent" = "$expected_parent" ] \
+    || fail "retention migration authorization has an unsafe symlink path: $input"
+  [ -f "$input_path" ] && [ ! -L "$input_path" ] && [ -r "$input_path" ] \
+    || fail "retention migration authorization is not an ordinary readable file: $input"
+  links=$(file_link_count "$input_path") \
+    || fail "could not inspect retention migration authorization link count: $input"
+  [ "$links" = 1 ] || fail "retention migration authorization is hardlinked: $input"
+  expected=$(retention_migration_authorization_content "$id" "$origin" "$key" "$record_digest")
+  expected_bytes=$(printf '%s\n' "$expected" | LC_ALL=C wc -c | tr -d ' ')
+  actual_bytes=$(LC_ALL=C wc -c < "$input_path" | tr -d ' ')
+  [ "$actual_bytes" = "$expected_bytes" ] \
+    || fail "retention migration authorization does not match $origin/$key: $input"
+  actual=$(cat "$input_path") \
+    || fail "could not read retention migration authorization: $input"
+  [ "$actual" = "$expected" ] \
+    || fail "retention migration authorization does not match $origin/$key: $input"
+}
+
+retention_record_marker() {  # <hold-id> <record-digest>
+  FM_DECISION_RETENTION_OWNER=$RETENTION_OWNER_TOKEN \
+  FM_DECISION_RETENTION_SECRET=$RETENTION_OWNER_SECRET \
+  FM_DECISION_RETENTION_BACKLOG=$DECISION_BACKLOG \
+  FM_DECISION_RETENTION_ARCHIVE=$DECISION_ARCHIVE \
+  FM_DECISION_RETENTION_SCHEMA=$RETENTION_RECORD_SCHEMA \
+  node - "$1" "$2" <<'NODE'
+const crypto = require("node:crypto");
+const id = process.argv[2];
+const digest = process.argv[3];
+const owner = process.env.FM_DECISION_RETENTION_OWNER;
+const secret = process.env.FM_DECISION_RETENTION_SECRET;
+const backlog = process.env.FM_DECISION_RETENTION_BACKLOG;
+const archive = process.env.FM_DECISION_RETENTION_ARCHIVE;
+const schema = process.env.FM_DECISION_RETENTION_SCHEMA;
+const payload = `${schema}\n${owner}\n${backlog}\n${archive}\n${id}\n${digest}`;
+const mac = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+process.stdout.write(`<!-- fm-decision-retention:v1 owner=${owner} id=${id} record=${digest} mac=${mac} -->`);
+NODE
+}
+
+publish_retention_migration_marker() {  # <marker> <expected-archive-digest>
+  local marker=$1 expected_digest=$2 stamp
+  stamp=$(date +%Y-%m-%d) || fail "could not determine retention migration date"
+  node - "$DECISION_ARCHIVE" "$DECISION_BACKLOG" "$expected_digest" "$marker" "$stamp" <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const archive = process.argv[2];
+const backlog = process.argv[3];
+const expectedDigest = process.argv[4];
+const marker = process.argv[5];
+const stamp = process.argv[6];
+const lock = `${backlog}.lock`;
+const token = `fm-decision-retention-migration:${process.pid}:${crypto.randomBytes(16).toString("hex")}`;
+let locked = false;
+function ordinarySingle(path) {
+  const stat = fs.lstatSync(path);
+  return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1;
+}
+function digest(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+try {
+  if (!ordinarySingle(backlog) || !ordinarySingle(archive)) throw new Error("unsafe retention owner");
+  const fd = fs.openSync(lock, "wx", 0o600);
+  fs.writeFileSync(fd, token, "utf8");
+  fs.closeSync(fd);
+  locked = true;
+  if (!ordinarySingle(backlog) || !ordinarySingle(archive)) throw new Error("retention owner changed while locking");
+  const before = fs.readFileSync(archive);
+  if (digest(before) !== expectedDigest || !before.toString("utf8").endsWith("\n")) {
+    throw new Error("retention archive changed before migration");
+  }
+  try {
+    fs.appendFileSync(archive, `\n## Archived ${stamp}\n${marker}\n`, "utf8");
+  } catch (error) {
+    fs.truncateSync(archive, before.length);
+    throw error;
+  }
+} finally {
+  if (locked) {
+    let observed = "";
+    try { observed = fs.readFileSync(lock, "utf8"); } catch (_) {}
+    if (observed === token) fs.unlinkSync(lock);
+  }
+}
+NODE
 }
 
 tasks_axi_with_retention_provenance() {
@@ -1555,6 +1769,9 @@ archived_header_has_captain_provenance() {  # <header> <hold-id>
 # durable history owner. Only an exact, single, ordinary captain-hold record with
 # this owner's resolution body can prove a historical decision.
 ARCHIVED_HOLD_BODY=''
+ARCHIVED_HOLD_RECORD=''
+ARCHIVED_HOLD_RECORD_DIGEST=''
+ARCHIVED_HOLD_PROVENANCE=''
 
 prepare_decision_archive_cache() {
   local archive=$1 id=$2 dir rc owner='' secret=''
@@ -1713,9 +1930,21 @@ NODE
   fi
 }
 
-archived_hold_body() {  # <hold-id>
+reset_decision_archive_cache() {
+  if [ -n "$DECISION_ARCHIVE_CACHE_DIR" ] && [ -d "$DECISION_ARCHIVE_CACHE_DIR" ] \
+    && [ ! -L "$DECISION_ARCHIVE_CACHE_DIR" ]; then
+    rm -rf -- "$DECISION_ARCHIVE_CACHE_DIR"
+  fi
+  DECISION_ARCHIVE_CACHE_DIR=''
+  DECISION_ARCHIVE_CACHE_PATH=''
+}
+
+archived_hold_record() {  # <hold-id>
   local id=$1 archive links record provenance header='' body='' token duplicate
   ARCHIVED_HOLD_BODY=''
+  ARCHIVED_HOLD_RECORD=''
+  ARCHIVED_HOLD_RECORD_DIGEST=''
+  ARCHIVED_HOLD_PROVENANCE=''
   authoritative_archive_path
   archive=$DECISION_ARCHIVE
   [ -e "$archive" ] || [ -L "$archive" ] || return 1
@@ -1730,11 +1959,6 @@ archived_hold_body() {  # <hold-id>
   [ ! -e "$duplicate" ] \
     || fail "captain decision $id has duplicate archived records"
   [ -e "$record" ] || return 1
-  [ -f "$provenance" ] && [ ! -L "$provenance" ] \
-    || fail "captain decision $id lacks provenance from its configured Done retention transition"
-  links=$(file_link_count "$provenance") \
-    || fail "could not inspect captain decision $id archived provenance"
-  [ "$links" = 1 ] || fail "captain decision $id has hardlinked archived provenance"
   [ -f "$record" ] && [ ! -L "$record" ] \
     || fail "captain decision $id has an unsafe archived index record"
   links=$(file_link_count "$record") \
@@ -1748,7 +1972,22 @@ archived_hold_body() {  # <hold-id>
   while [ "${body%$'\n'}" != "$body" ]; do body=${body%$'\n'}; done
   archived_header_has_captain_provenance "$header" "$id" \
     || fail "captain decision $id has mismatched archived captain-hold provenance"
+  ARCHIVED_HOLD_RECORD=$(cat "$record") \
+    || fail "could not read captain decision $id archived index record"
+  ARCHIVED_HOLD_RECORD_DIGEST=$(sha256_text "$ARCHIVED_HOLD_RECORD")
+  ARCHIVED_HOLD_PROVENANCE=$provenance
   ARCHIVED_HOLD_BODY=$body
+}
+
+archived_hold_body() {  # <hold-id>
+  local id=$1 links provenance
+  archived_hold_record "$id" || return 1
+  provenance=$ARCHIVED_HOLD_PROVENANCE
+  [ -f "$provenance" ] && [ ! -L "$provenance" ] \
+    || fail "captain decision $id lacks provenance from its configured Done retention transition"
+  links=$(file_link_count "$provenance") \
+    || fail "could not inspect captain decision $id archived provenance"
+  [ "$links" = 1 ] || fail "captain decision $id has hardlinked archived provenance"
 }
 
 archived_hold_resolved() {  # <hold-id> <origin-id> <decision-key>
@@ -1966,6 +2205,47 @@ verify_resolution_identity() {  # <hold-id> <origin-id> <decision-key> <body> <d
     || fail "captain hold $id records different routed work"
 }
 
+command_migrate_retention() {
+  local origin=${1:-} key=${2:-} authorization_file='' id marker archive_digest
+  [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --authorization-file) shift; authorization_file=${1:-} ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  validate_slug origin-id "$origin"
+  validate_slug decision-key "$key"
+  require_tasks_axi
+  origin_exists_here "$origin" || fail "origin $origin is not owned by the active home $FM_HOME"
+  ensure_retention_owner
+  id=$(hold_id "$origin" "$key")
+  archived_hold_record "$id" \
+    || fail "captain decision $id is absent from the configured retention archive"
+  if [ -f "$ARCHIVED_HOLD_PROVENANCE" ] && [ ! -L "$ARCHIVED_HOLD_PROVENANCE" ]; then
+    archived_hold_resolved "$id" "$origin" "$key" \
+      || fail "captain decision $id is not a valid archived resolution"
+    printf 'migrated-retention: %s already proven\n' "$id"
+    return 0
+  fi
+  resolution_record_valid "$ARCHIVED_HOLD_BODY" "$origin" "$key" \
+    || fail "captain decision $id has a malformed or mismatched archived resolution"
+  require_retention_migration_authorization "$authorization_file" "$id" "$origin" "$key" \
+    "$ARCHIVED_HOLD_RECORD_DIGEST"
+  archive_digest=$(sha256_file "$DECISION_ARCHIVE")
+  marker=$(retention_record_marker "$id" "$ARCHIVED_HOLD_RECORD_DIGEST") \
+    || fail "could not create retention migration provenance for $id"
+  publish_retention_migration_marker "$marker" "$archive_digest" \
+    || fail "could not publish retention migration provenance for $id"
+  reset_decision_archive_cache
+  archived_hold_resolved "$id" "$origin" "$key" \
+    || fail "retention migration did not prove captain decision $id"
+  persist_parsed_legacy_resolution "$id" "$origin" "$key"
+  printf 'migrated-retention: %s\n' "$id"
+}
+
 command_migrate_legacy() {
   local origin=${1:-} key=${2:-} decision_file='' identity_file='' id meta show state held kind hold_kind body
   local has_meta=0
@@ -2013,7 +2293,7 @@ command_migrate_legacy() {
       *) fail "captain decision $id is not queued or done (state=$state)" ;;
     esac
   else
-    archived_hold_body "$id" \
+    archived_hold_record "$id" \
       || fail "captain decision $id is absent from the backlog and configured archive"
     state=done
     body=$ARCHIVED_HOLD_BODY
@@ -2817,6 +3097,7 @@ case "${1:-}" in
   decline) shift; command_decline "$@" ;;
   repair) shift; command_repair "$@" ;;
   migrate-legacy) shift; command_migrate_legacy "$@" ;;
+  migrate-retention) shift; command_migrate_retention "$@" ;;
   task-done) shift; command_task_done "$@" ;;
   retention-prune) shift; command_retention_prune "$@" ;;
   tasks-axi) shift; command_retention_tasks_axi "$@" ;;

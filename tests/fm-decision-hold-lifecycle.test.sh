@@ -11,6 +11,7 @@ TEARDOWN="$ROOT/bin/fm-teardown.sh"
 BEARINGS="$ROOT/bin/fm-bearings-snapshot.sh"
 TMP_ROOT=$(fm_test_tmproot fm-decision-hold)
 TASKS_AXI_BIN=$(command -v tasks-axi || true)
+TASKS_AXI_PUBLIC="$ROOT/bin/tasks-axi"
 
 command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found"; exit 0; }
 
@@ -116,7 +117,13 @@ EOF
 tasks_in() {  # <home> <tasks-axi args...>
   local home=$1
   shift
-  (cd "$home" && tasks-axi "$@")
+  (cd "$home" && "$TASKS_AXI_BIN" "$@")
+}
+
+retention_tasks_in() {  # <home> <tasks-axi args...>
+  local home=$1
+  shift
+  (cd "$home" && FM_HOME="$home" FM_TASKS_AXI_REAL="$TASKS_AXI_BIN" "$TASKS_AXI_PUBLIC" "$@")
 }
 
 run_decisions() {  # <home> <command args...>
@@ -143,6 +150,54 @@ write_legacy_identity_authorization() {  # <path> <hold-id> <origin-id> <decisio
   record_digest=$(printf '%s' "$body" | shasum -a 256 | awk '{print $1}')
   printf 'schema=fm-decision-legacy-identity.v1\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
     "$id" "$origin" "$key" "$record_digest" > "$path"
+}
+
+archived_record_digest() {  # <archive> <hold-id>
+  node - "$1" "$2" <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const archive = fs.readFileSync(process.argv[2], "utf8");
+const id = process.argv[3];
+const lines = archive.split("\n");
+let archived = false;
+let current = null;
+let found = null;
+function finish() {
+  if (!current) return;
+  while (current.body.length && current.body[current.body.length - 1] === "") current.body.pop();
+  if (current.header.startsWith(`- [x] ${id} - `)) {
+    if (found !== null) process.exit(2);
+    found = `${current.header}\n${current.body.join("\n")}`;
+  }
+  current = null;
+}
+for (const line of lines) {
+  if (/^## Archived \d{4}-\d{2}-\d{2}$/.test(line)) { finish(); archived = true; continue; }
+  if (/^## /.test(line)) { finish(); archived = false; continue; }
+  if (/^- \[[ x]\] /.test(line)) { finish(); current = archived ? { header: line, body: [] } : null; continue; }
+  if (current) {
+    if (line === "") current.body.push("");
+    else if (line.startsWith("  ")) current.body.push(line.slice(2));
+    else finish();
+  }
+}
+finish();
+if (found === null) process.exit(1);
+process.stdout.write(crypto.createHash("sha256").update(found).digest("hex"));
+NODE
+}
+
+write_retention_authorization() {  # <path> <home> <hold-id> <origin-id> <decision-key> <archive>
+  local path=$1 home=$2 id=$3 origin=$4 key=$5 archive=$6 owner_file owner backlog configured_archive digest
+  owner_file=$(find "$home/data/decision-retention-provenance" -type f -name '*.owner' | head -1)
+  [ -n "$owner_file" ] || fail "retention owner was not established before migration"
+  owner=$(sed -n 's/^owner=//p' "$owner_file")
+  backlog=$(sed -n 's/^backlog=//p' "$owner_file")
+  configured_archive=$(sed -n 's/^archive=//p' "$owner_file")
+  digest=$(archived_record_digest "$archive" "$id") \
+    || fail "could not derive the serialized archived-record contract for $id"
+  printf 'schema=fm-decision-retention-migration.v1\nowner=%s\nbacklog=%s\narchive=%s\nhold_id=%s\norigin=%s\ndecision_key=%s\nrecord_digest=%s\n' \
+    "$owner" "$backlog" "$configured_archive" "$id" "$origin" "$key" "$digest" > "$path"
 }
 
 test_structured_holds_survive_teardown_and_route_resolution() {
@@ -442,7 +497,7 @@ test_pruned_resolved_history_does_not_block_later_review() {
     tasks_in "$home" add "sample-filler-$n" "Sample filler $n" --kind ship --repo sample >/dev/null \
       || fail "could not create retention filler $n"
     if [ "$n" -eq 12 ]; then
-      run_decisions "$home" task-done "sample-filler-$n" >/dev/null \
+      retention_tasks_in "$home" done "sample-filler-$n" >/dev/null \
         || fail "could not complete retention filler $n through the public retention boundary"
     else
       tasks_in "$home" "done" "sample-filler-$n" --no-prune >/dev/null \
@@ -570,6 +625,70 @@ test_pruned_resolved_history_does_not_block_later_review() {
   [ "$before" = "$after" ] \
     || fail "post-teardown compatibility changed the backlog or configured archive"
   pass "pruned resolved history permits later decisions without retention oscillation"
+}
+
+test_pre_boundary_retention_requires_exact_migration() {
+  local home origin key hold n archive authorization wrong before after
+  home=$(make_home pre-boundary-retention)
+  origin=sample-pre-boundary-review
+  key=historical-choice
+  archive="$home/data/done-archive.md"
+  tasks_in "$home" add "$origin" "Review pre-boundary history" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create pre-boundary origin"
+  write_origin_meta "$home" "$origin"
+  hold=$(run_decisions "$home" hold "$origin" "$key" \
+    --title "Choose the historical option" \
+    --reason "captain historical option pending" --repo sample) \
+    || fail "could not create pre-boundary hold"
+  run_decisions "$home" complete "$origin" "$key" >/dev/null \
+    || fail "could not inventory pre-boundary hold"
+  printf 'Captain resolved the historical option.\n' > "$home/historical-answer.txt"
+  run_decisions "$home" answer "$origin" "$key" \
+    --decision-file "$home/historical-answer.txt" >/dev/null \
+    || fail "could not resolve pre-boundary hold"
+  for n in $(seq 1 10); do
+    tasks_in "$home" add "pre-boundary-filler-$n" "Pre-boundary filler $n" \
+      --kind ship --repo sample >/dev/null \
+      || fail "could not create pre-boundary filler $n"
+    tasks_in "$home" done "pre-boundary-filler-$n" --no-prune >/dev/null \
+      || fail "could not retain pre-boundary filler $n"
+  done
+  (cd "$home" && "$TASKS_AXI_BIN" prune --state done >/dev/null) \
+    || fail "could not reproduce retention from before the shared transition boundary"
+  assert_grep "- [x] $hold -" "$archive" \
+    "pre-boundary decision was not moved into configured retention history"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/unmigrated.out" 2> "$home/unmigrated.err"; then
+    fail "unproven pre-boundary history bypassed explicit compatibility migration"
+  fi
+  assert_grep "lacks provenance from its configured Done retention transition" \
+    "$home/unmigrated.err" "pre-boundary history did not fail closed"
+  authorization="$home/pre-boundary-retention.authorization"
+  wrong="$home/wrong-retention.authorization"
+  write_retention_authorization "$authorization" "$home" "$hold" "$origin" "$key" "$archive"
+  awk '
+    /^record_digest=/ { print "record_digest=0000000000000000000000000000000000000000000000000000000000000000"; next }
+    { print }
+  ' "$authorization" > "$wrong"
+  before=$(shasum -a 256 "$archive")
+  if run_decisions "$home" migrate-retention "$origin" "$key" \
+    --authorization-file "$wrong" > "$home/wrong-migration.out" 2> "$home/wrong-migration.err"; then
+    fail "mismatched pre-boundary authorization migrated retained history"
+  fi
+  after=$(shasum -a 256 "$archive")
+  [ "$before" = "$after" ] || fail "rejected retention migration changed the configured archive"
+  run_decisions "$home" migrate-retention "$origin" "$key" \
+    --authorization-file "$authorization" >/dev/null \
+    || fail "exact pre-boundary retention authorization did not migrate"
+  run_decisions "$home" migrate-retention "$origin" "$key" \
+    --authorization-file "$authorization" >/dev/null \
+    || fail "pre-boundary retention migration was not idempotent"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "explicitly migrated pre-boundary history did not verify"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "migrated pre-boundary verification was not idempotent"
+  pass "pre-boundary retention history requires exact explicit migration"
 }
 
 test_legacy_completion_inventory_requires_explicit_provenance() {
@@ -1443,6 +1562,46 @@ test_nonarchive_rows_cannot_prove_pruned_history() {
   assert_grep "lacks provenance from its configured Done retention transition" "$home/copied-note.err" \
     "copied note history was not rejected at the retention transition boundary"
   pass "only canonical retention sections and owned archives prove historical decisions"
+}
+
+test_absent_case_alias_is_rejected_before_retention() {
+  local home origin probe alternate case_insensitive=0 hold
+  home=$(make_home absent-case-alias)
+  origin=sample-case-alias-review
+  awk '
+    $0 == "archive = \"data/done-archive.md\"" { print "archive = \"data/NOTE-ARCHIVE.md\""; next }
+    { print }
+  ' "$home/.tasks.toml" > "$home/.tasks.toml.tmp" && mv "$home/.tasks.toml.tmp" "$home/.tasks.toml" \
+    || fail "could not configure an absent case-variant archive destination"
+  tasks_in "$home" add "$origin" "Review case-variant retention" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create case-variant origin"
+  write_origin_meta "$home" "$origin"
+  probe="$home/data/.fm-case-probe-Aa"
+  alternate="$home/data/.fm-case-probe-aa"
+  : > "$probe"
+  if [ -e "$alternate" ] && [ "$probe" -ef "$alternate" ]; then case_insensitive=1; fi
+  rm -f -- "$probe"
+  if [ "$case_insensitive" -eq 1 ]; then
+    if run_decisions "$home" hold "$origin" route \
+      --title "Choose the case-variant route" \
+      --reason "captain case route pending" --repo sample \
+      > "$home/case-alias.out" 2> "$home/case-alias.err"; then
+      fail "an absent case-variant note archive alias was accepted"
+    fi
+    assert_grep "aliases the tasks-axi note archive" "$home/case-alias.err" \
+      "absent case-variant destinations were not compared on the active filesystem"
+    assert_absent "$home/data/NOTE-ARCHIVE.md" \
+      "alias validation created the future retention destination"
+  else
+    hold=$(run_decisions "$home" hold "$origin" route \
+      --title "Choose the case-variant route" \
+      --reason "captain case route pending" --repo sample) \
+      || fail "case-sensitive distinct archive destinations were over-rejected"
+    [ "$hold" = "$origin-decision-route" ] \
+      || fail "case-sensitive archive validation changed hold identity"
+  fi
+  pass "future archive aliases follow filesystem case semantics"
 }
 
 test_queued_repaired_resolution_is_rejected() {
@@ -2824,6 +2983,7 @@ test_structured_holds_survive_teardown_and_route_resolution
 test_origin_slug_validation_precedes_path_construction
 test_visual_review_uses_shared_completion_owner
 test_pruned_resolved_history_does_not_block_later_review
+test_pre_boundary_retention_requires_exact_migration
 test_legacy_completion_inventory_requires_explicit_provenance
 test_source_verifiable_legacy_inventories_migrate_automatically
 test_metadata_free_completion_retries_remain_idempotent
@@ -2832,6 +2992,7 @@ test_queued_legacy_resolution_is_attested_before_teardown
 test_legacy_migration_rejects_missing_conflicting_or_foreign_owners
 test_legacy_identity_compatibility_is_bounded_and_authorized
 test_nonarchive_rows_cannot_prove_pruned_history
+test_absent_case_alias_is_rejected_before_retention
 test_queued_repaired_resolution_is_rejected
 test_retained_resolution_rejects_oversized_decision
 test_pruned_history_fallback_rejects_unproven_decisions

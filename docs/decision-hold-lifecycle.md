@@ -6,7 +6,7 @@ This document records integration context, structured surfaces, and privacy-safe
 ## Mechanism
 
 The semantic lifecycle is owned by `.agents/skills/decision-hold-lifecycle/SKILL.md`.
-The executable interface, identity and retry rules, operation ordering, retained-history validation, path and file protections, and legacy compatibility mechanics are owned by `bin/fm-decision-hold.sh`; run `bin/fm-decision-hold.sh --help` for that contract.
+The executable interface, identity and retry rules, operation ordering, retained-history validation, path and file protections, and legacy compatibility mechanics are owned by `bin/fm-decision-hold.sh`; run `bin/fm-decision-hold.sh --help` for that contract. The project-scoped `bin/tasks-axi` entrypoint delegates retention-affecting tasks-axi commands to that owner.
 Scout teardown points to the script's `verify` command, and the shared classifier points to its durable transfer record.
 This document intentionally keeps only integration context and regression evidence rather than duplicating those owners.
 
@@ -75,7 +75,7 @@ A live-completion case proves that provenance survives normal metadata teardown,
 The same explicit unresolved inventory is required to have an active hold even when no matching status event exists, so status text cannot select historical fallback.
 After normal teardown removes origin metadata and its generated attestation is removed to reproduce a pre-upgrade home, repeated completion still recognizes the uniquely decomposable legacy record and a hold retry cannot recreate it.
 It proves the bounded Done window and archive stay byte-identical across repeated completion and verification instead of oscillating through row restoration.
-The archive-boundary cases also configure a contained root-level backlog, migrate its configured archive while exact retained Done proof survives, and prove that an edited copy of a tasks-axi note snapshot cannot establish Done retention.
+The archive-boundary cases also configure a contained root-level backlog, migrate its configured archive while exact retained Done proof survives, prove that an edited copy of a tasks-axi note snapshot cannot establish Done retention, migrate an exact pre-boundary archive only with independent authorization, and reject future case-variant note-archive aliases according to the active filesystem.
 Companion failure cases reopen an archived key without an active owner, surface a backlog read error while matching history exists, remove an active decision record, mismatch an active record's origin and key, normally prune an out-of-band close with no resolution block, collide two origin/key pairs onto one concatenated id, refuse automatic or claimant-derived migration of that collision, spoof captain metadata in an ordinary captain-kind title, exceed the captain decision size bound, mismatch resolution modes, digests, and routed-work lists, and point archive, state, metadata, or report ownership evidence across unsafe boundaries; none can masquerade as historical resolution.
 An ambiguous released-version record remains fail-closed when only claimant metadata and the recorded answer survive, while an independently authorized exact mapping migrates its original identity compatibly from durable post-teardown evidence. A queued repair-only resolution is separately rejected and a uniquely decomposable queued released-version resolution remains retryable after teardown. Another case proves overlong released task identities use bounded attestation filenames, authenticated interrupted publication recovers, and unrelated hardlinks remain untouched and rejected.
 The public completion gate also accepts option-shaped decision keys and verifies active and resolved records while `jq` is unavailable, relying only on the universal toolchain.
@@ -100,6 +100,7 @@ ok - captain holds are idempotent, distinct, teardown-safe, Bearings-visible, an
 ok - completion and verification validate origins before constructing paths
 ok - ended visual review follows the same decision-hold completion owner
 ok - pruned resolved history permits later decisions without retention oscillation
+ok - pre-boundary retention history requires exact explicit migration
 ok - completion provenance distinguishes missing current and historical generations
 ok - source-verifiable legacy inventories migrate without weakening archive generations
 ok - metadata-free completion provenance makes resolved retries idempotent
@@ -108,6 +109,7 @@ ok - queued legacy resolution identity survives teardown and retry
 ok - legacy migration rejects missing, conflicting, and foreign ownership
 ok - legacy compatibility stays bounded and ambiguous migration requires independent authorization
 ok - only canonical retention sections and owned archives prove historical decisions
+ok - future archive aliases follow filesystem case semantics
 ok - queued holds reject the repair-only resolution mode
 ok - retained resolutions enforce the captain decision size bound
 ok - pruned-history fallback rejects missing, malformed, and mismatched decisions
