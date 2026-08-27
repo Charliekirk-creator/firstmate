@@ -2737,13 +2737,17 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ] \
       }
       SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
       ;;
-    absent|unattempted-dead|failed|attempted-dead)
+    absent|unattempted-dead)
       spawn_launch_request_cleanup || {
         echo "error: retryable secondmate launch evidence could not be retired for $ID" >&2
         exit 1
       }
       SPAWN_LAUNCH_PREPARED_RECOVERY=1
       SPAWN_METADATA_RECOVERY=1
+      ;;
+    failed|attempted-dead)
+      echo "error: secondmate launch submission is ambiguous; exact request evidence is preserved for $ID" >&2
+      exit 1
       ;;
     *)
       echo "error: secondmate launch acceptance is ambiguous; exact request evidence is preserved for $ID" >&2
@@ -3873,7 +3877,7 @@ kimi_submission_publish() {  # <submitting|pending|accepted>
 }
 
 kimi_deliver_launch_brief() {
-  local recovery=${1:-fresh} submission_state journal=0
+  local recovery=${1:-fresh} submission_state composer_state journal=0
   if [ "$recovery" = recovery ] && kimi_wait_for_delivery; then return 0; fi
   if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
     journal=1
@@ -3883,6 +3887,17 @@ kimi_deliver_launch_brief() {
     }
   else
     submission_state=absent
+  fi
+  if [ "$submission_state" = submitting ]; then
+    composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || composer_state=unknown
+    case "$composer_state" in
+      empty) submission_state=absent ;;
+      pending|pending-unproven) submission_state=pending ;;
+      *)
+        kimi_spawn_fail "kimi launch brief submission remains ambiguous"
+        return 1
+        ;;
+    esac
   fi
   if [ "$submission_state" = absent ]; then
     if ! kimi_wait_for_ready; then
@@ -3916,7 +3931,7 @@ kimi_deliver_launch_brief() {
         return 1
       }
     fi
-  elif [ "$submission_state" = submitting ] || [ "$submission_state" = pending ]; then
+  elif [ "$submission_state" = pending ]; then
     spawn_send_key "$T" Enter || {
       kimi_spawn_fail "kimi pending launch brief could not be resubmitted"
       return 1

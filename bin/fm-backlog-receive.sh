@@ -207,8 +207,18 @@ NAME=$(basename "$REL")
 ID=${NAME%.outbox.md}
 case "$ID" in ''|*[!A-Za-z0-9._-]*) die "delivered outbox id is unsafe" ;; esac
 TRANSFER_LOCK="$PARENT_REAL/.$ID.upload.lock"
+BACKLOG_LOCK="$FM_HOME/state/.backlog-mutation.lock"
+TRANSFER_LOCK_HELD=0
+BACKLOG_LOCK_HELD=0
+receive_locks_release() {
+  [ "$BACKLOG_LOCK_HELD" -eq 0 ] || fm_lock_release "$BACKLOG_LOCK" || true
+  [ "$TRANSFER_LOCK_HELD" -eq 0 ] || fm_lock_release "$TRANSFER_LOCK" || true
+}
+trap receive_locks_release EXIT
 fm_lock_acquire_wait "$TRANSFER_LOCK" || die "cannot lock delivered outbox"
-trap 'fm_lock_release "$TRANSFER_LOCK" || true' EXIT
+TRANSFER_LOCK_HELD=1
+fm_lock_acquire_wait "$BACKLOG_LOCK" || die "cannot lock destination backlog"
+BACKLOG_LOCK_HELD=1
 [ -f "$DELIVERED" ] && [ ! -L "$DELIVERED" ] || die "delivered outbox is not a non-symlink regular file"
 GENERATION_FILE="$PARENT_REAL/.$ID.upload-generation"
 [ -f "$GENERATION_FILE" ] && [ ! -L "$GENERATION_FILE" ] || die "delivered outbox generation is unavailable or unsafe"
@@ -286,6 +296,9 @@ for key in "${KEYS[@]}"; do
     || die "exact destination backlog receipt is incomplete for $key"
 done
 rm -f -- "$DELIVERED" || die "receipt succeeded but delivered scratch cleanup failed"
+fm_lock_release "$BACKLOG_LOCK" || die "receipt succeeded but backlog lock cleanup failed"
+BACKLOG_LOCK_HELD=0
 fm_lock_release "$TRANSFER_LOCK" || die "receipt succeeded but transfer lock cleanup failed"
+TRANSFER_LOCK_HELD=0
 trap - EXIT
 printf 'received: %s moved=%s already=%s\n' "$(basename "$REL" .outbox.md)" "${#TO_MOVE[@]}" "${#ALREADY[@]}"

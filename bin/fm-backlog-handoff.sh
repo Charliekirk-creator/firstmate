@@ -1354,6 +1354,8 @@ REMOTE=$(secondmate_registry_field "$REG" "$ID" remote 2>/dev/null || true)
 if [ "$REMOTE" = 1 ]; then
   ACTIVE_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
   fm_lock_acquire_wait "$ACTIVE_HANDOFF_LOCK"
+  ACTIVE_BACKLOG_LOCK="$STATE/.backlog-mutation.lock"
+  fm_lock_acquire_wait "$ACTIVE_BACKLOG_LOCK"
   if remote_handoff "$ID" "$@"; then rc=0; else rc=$?; fi
   release_remote_locks
   exit "$rc"
