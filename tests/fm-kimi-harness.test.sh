@@ -90,6 +90,9 @@ case "${1:-}" in
       esac
       exit 0
     fi
+    case "${4:-}" in
+      *'.launch-execution.'*) bash -c "$4" </dev/null >/dev/null 2>&1 & ;;
+    esac
     case " $* " in
       *' Enter '*)
         case "$state" in
@@ -136,7 +139,12 @@ exit 0
 SH
   chmod +x "$fakebin/tmux"
   fm_fake_exit0 "$fakebin" treehouse gh-axi gh
-  fm_fake_exit0 "$fakebin" kimi
+  cat > "$fakebin/kimi" <<'SH'
+#!/usr/bin/env bash
+printf 'ready\n' > "$FM_FAKE_KIMI_STATE"
+sleep 5
+SH
+  chmod +x "$fakebin/kimi"
   ln -s "$JQ_BIN" "$fakebin/jq"
   printf '%s\n' "$fakebin"
 }

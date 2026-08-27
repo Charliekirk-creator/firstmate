@@ -244,8 +244,24 @@ validate_secondmate_home() {
   printf '%s\n' "$abs_home"
 }
 
+backlog_file_link_count() {
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%l' "$1" 2>/dev/null
+  else
+    stat -c '%h' "$1" 2>/dev/null
+  fi
+}
+
+backlog_file_inode() {
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
 validate_backlog_file() {
-  local label=$1 path=$2
+  local label=$1 path=$2 links
   if [ -L "$path" ]; then
     echo "error: $label must not be a symlink: $path" >&2
     return 1
@@ -253,6 +269,16 @@ validate_backlog_file() {
   if [ -e "$path" ] && [ ! -f "$path" ]; then
     echo "error: $label is not a regular file: $path" >&2
     return 1
+  fi
+  if [ -e "$path" ]; then
+    links=$(backlog_file_link_count "$path") || {
+      echo "error: cannot inspect $label link count: $path" >&2
+      return 1
+    }
+    if [ "$links" != 1 ]; then
+      echo "error: $label must not be hardlinked: $path" >&2
+      return 1
+    fi
   fi
 }
 
@@ -302,8 +328,55 @@ backlog_key_noncanonical_body_lines() {
 }
 
 seed_backlog_scaffold() { # <path>
-  mkdir -p "$(dirname "$1")"
-  [ -f "$1" ] || printf '## In flight\n\n## Queued\n\n## Done\n' > "$1"
+  local target=$1 dir staging tmp target_links staging_links target_inode staging_inode rc=0
+  dir=$(dirname "$target")
+  staging="${target}.scaffold-publishing"
+  mkdir -p "$dir" || return 1
+  if [ -e "$staging" ] || [ -L "$staging" ]; then
+    [ -f "$staging" ] && [ ! -L "$staging" ] || return 1
+    printf '## In flight\n\n## Queued\n\n## Done\n' | cmp -s "$staging" - || return 1
+  else
+    tmp=$(umask 077; mktemp "$dir/.backlog-scaffold.XXXXXX") || return 1
+    if ! printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
+      || ! chmod 600 "$tmp" || ! command link "$tmp" "$staging" 2>/dev/null; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+    rm -f -- "$tmp" || return 1
+  fi
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if [ ! -f "$target" ] || [ -L "$target" ]; then
+      rm -f -- "$staging" || return 1
+      return 1
+    fi
+    target_links=$(backlog_file_link_count "$target") || return 1
+    staging_links=$(backlog_file_link_count "$staging") || return 1
+    target_inode=$(backlog_file_inode "$target") || return 1
+    staging_inode=$(backlog_file_inode "$staging") || return 1
+    if [ "$target_inode" = "$staging_inode" ] \
+      && [ "$target_links" = 2 ] && [ "$staging_links" = 2 ]; then
+      rm -f -- "$staging" || return 1
+      return 0
+    fi
+    rm -f -- "$staging" || return 1
+    [ "$target_links" = 1 ] || return 1
+    return 0
+  fi
+  command link "$staging" "$target" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      if [ -L "$target" ]; then
+        rm -f -- "$staging" || return 1
+        return 1
+      fi
+      rm -f -- "$staging" || return 1
+      validate_backlog_file "backlog scaffold target" "$target"
+      return $?
+    fi
+    return "$rc"
+  fi
+  rm -f -- "$staging" || return 1
+  validate_backlog_file "backlog scaffold target" "$target"
 }
 
 # A public commitment made through the relay binds its work by home AND id, so an
@@ -878,6 +951,54 @@ stage_local_handoff_identities() { # <target-home> <target-home-id> <target-back
   done
 }
 
+abort_local_handoff_identities() { # <target-home>
+  local target_home=$1 i=0 task payload created rc failed=0 preserved=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    created=${HANDOFF_IDENTITY_CREATED[$i]}
+    if [ "$created" = true ]; then
+      set +e
+      local_target_handoff_action "$target_home" abort "$task" "$payload"
+      rc=$?
+      set -e
+      case "$rc" in
+        0) source_handoff_action cancel "$task" "$payload" || failed=1 ;;
+        4) source_handoff_action complete "$task" "$payload" || failed=1 ;;
+        *) failed=1 ;;
+      esac
+    else
+      preserved=1
+    fi
+    i=$((i + 1))
+  done
+  [ "$failed" -eq 0 ] && [ "$preserved" -eq 0 ]
+}
+
+abort_remote_handoff_identities() { # <secondmate-id>
+  local id=$1 i=0 task payload created rc failed=0 preserved=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    payload=${HANDOFF_IDENTITY_PAYLOADS[$i]}
+    created=${HANDOFF_IDENTITY_CREATED[$i]}
+    if [ "$created" = true ]; then
+      set +e
+      remote_target_handoff_action "$id" abort "$task" "$payload"
+      rc=$?
+      set -e
+      case "$rc" in
+        0) source_handoff_action cancel "$task" "$payload" || failed=1 ;;
+        4) source_handoff_action complete "$task" "$payload" || failed=1 ;;
+        *) failed=1 ;;
+      esac
+    else
+      preserved=1
+    fi
+    i=$((i + 1))
+  done
+  [ "$failed" -eq 0 ] && [ "$preserved" -eq 0 ]
+}
+
 rollback_remote_handoff_identities() { # <secondmate-id> <outbox>
   local id=$1 outbox=$2 i task payload created rc failed=0 preserved=0
   i=0
@@ -1236,7 +1357,11 @@ remote_handoff() { # <secondmate-id> <keys...>
     echo "error: backlog revisions changed after identity preparation; nothing new was handed off" >&2
     return 1
   fi
-  seed_backlog_scaffold "$outbox"
+  if ! seed_backlog_scaffold "$outbox"; then
+    abort_remote_handoff_identities "$id" || true
+    echo "error: remote handoff outbox scaffold could not be published safely; nothing new was handed off" >&2
+    return 1
+  fi
   if [ "${#to_move[@]}" -gt 0 ]; then
     if ! mv_out=$(tasks-axi mv "${RESOLVED_MOVE_KEYS[@]}" --file "$MAIN_BACKLOG" --to "$outbox" \
       --if-source-sha256 "$MOVE_PLAN_SOURCE_HASH" --if-target-sha256 "$MOVE_PLAN_TARGET_HASH" \
@@ -1539,9 +1664,13 @@ receiver_wake_mark_prepared "$ID" "$REQUESTED_BATCH" || {
 # which is not firstmate's home-backlog convention.)
 mkdir -p "$SUB_HOME/data"
 SUB_CREATED=0
-if [ ! -f "$SUB_BACKLOG" ]; then
-  printf '## In flight\n\n## Queued\n\n## Done\n' > "$SUB_BACKLOG"
+if [ ! -e "$SUB_BACKLOG" ] && [ ! -L "$SUB_BACKLOG" ]; then
   SUB_CREATED=1
+fi
+if ! seed_backlog_scaffold "$SUB_BACKLOG"; then
+  abort_local_handoff_identities "$SUB_HOME" || true
+  echo "error: destination backlog scaffold could not be published safely; nothing was moved." >&2
+  exit 1
 fi
 
 # Delegate the move to tasks-axi. Passing the whole in-scope set to one call is a
