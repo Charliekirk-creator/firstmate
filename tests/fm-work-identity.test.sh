@@ -564,7 +564,7 @@ SH
 }
 
 test_owned_replace_refuses_changed_unsafe_destination() {
-  local home parent inode source target sink expected digest out rc=0
+  local home parent inode source target sink details expected digest out rc=0
   home=$(make_home replace-destination-race)
   parent="$home/state"
   source="$home/replacement"
@@ -574,12 +574,15 @@ test_owned_replace_refuses_changed_unsafe_destination() {
   printf 'original\n' > "$target"
   printf 'unchanged\n' > "$sink"
   inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$parent")
-  expected=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe "$parent" "$inode" authoritative) \
-    || fail "could not capture owned destination state"
+  details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-replace \
+    "$parent" "$inode" authoritative) \
+    || fail "could not capture owned destination identity"
+  expected=${details%%$'\t'*}
+  digest=${details#*$'\t'}
   rm -f "$target"
   ln -s "$sink" "$target"
   out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" replace \
-    "$parent" "$inode" authoritative "$source" "$expected" 2>&1) || rc=$?
+    "$parent" "$inode" authoritative "$source" "$expected" "$digest" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "changed symlink destination was replaced"
   [ "$(cat "$sink")" = unchanged ] || fail "replace wrote through a changed destination symlink"
   [ "$(cat "$source")" = replacement ] || fail "refused replace changed its publication source"
@@ -2556,6 +2559,11 @@ case "${FM_TEST_ONLY:-}" in
     ;;
   owned-snapshot)
     test_owned_snapshot_binds_validated_entry
+    exit 0
+    ;;
+  replacement-publication)
+    test_replacement_dispatch_recovers_prior_retirement
+    test_replacement_dispatch_resumes_before_metadata_publication
     exit 0
     ;;
 esac

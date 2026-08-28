@@ -403,22 +403,28 @@ owned_parent_details() {  # <target>
 }
 
 owned_atomic_replace() {  # <source> <target> <label>
-  local source=$1 target=$2 label=$3 parent expected base destination_state
+  local source=$1 target=$2 label=$3 parent expected base details destination_state destination_digest
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
-  destination_state=$(python3 "$FS_OWNER" describe "$parent" "$expected" "$base") \
+  details=$(python3 "$FS_OWNER" describe-replace "$parent" "$expected" "$base") \
     || die "$label destination is unsafe: $target"
-  owned_atomic_replace_expected "$source" "$target" "$label" "$destination_state"
+  destination_state=${details%%$'\t'*}
+  destination_digest=${details#*$'\t'}
+  [ "$destination_state" != "$details" ] || die "$label destination identity is malformed: $target"
+  owned_atomic_replace_expected "$source" "$target" "$label" \
+    "$destination_state" "$destination_digest"
 }
 
-owned_atomic_replace_expected() {  # <source> <target> <label> <validated-destination-state>
-  local source=$1 target=$2 label=$3 destination_state=$4 parent expected base
-  [ -n "$destination_state" ] || die "$label has no validated destination identity"
+owned_atomic_replace_expected() {  # <source> <target> <label> <validated-state> <validated-digest>
+  local source=$1 target=$2 label=$3 destination_state=$4 destination_digest=$5 parent expected base
+  [ -n "$destination_state" ] && [ -n "$destination_digest" ] \
+    || die "$label has no validated destination identity"
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
-  python3 "$FS_OWNER" replace "$parent" "$expected" "$base" "$source" "$destination_state" \
+  python3 "$FS_OWNER" replace "$parent" "$expected" "$base" "$source" \
+    "$destination_state" "$destination_digest" \
     || die "cannot publish $label: $target"
   rm -f -- "$source" || die "cannot retire $label publication source"
   [ "${TMP:-}" != "$source" ] || TMP=
@@ -900,15 +906,11 @@ brief_contract_count() {  # <brief>
   grep -c '^Work identity contract:' "$1" 2>/dev/null || true
 }
 
-finish_brief_capture() {  # <source> <source-identity>
-  local source=$1 before=$2 after
+finish_brief_capture() {
   BRIEF_HASH=$(sha256_file "$BRIEF_INPUT_TMP") || die "SHA-256 is unavailable for generated instructions"
   case "$BRIEF_HASH" in ''|*[!A-Fa-f0-9]*) die "generated instructions SHA-256 is invalid" ;; esac
   [ "${#BRIEF_HASH}" -eq 64 ] || die "generated instructions SHA-256 has the wrong length"
   BRIEF_HASH=$(printf '%s' "$BRIEF_HASH" | tr 'A-F' 'a-f')
-  after=$(file_identity "$source") || die "cannot reinspect generated instructions: $source"
-  [ "$before" = "$after" ] && cmp -s "$source" "$BRIEF_INPUT_TMP" \
-    || die "generated instructions changed while they were validated: $source"
   if [ "$RETAIN_BRIEF_CAPTURE" -eq 1 ]; then
     BRIEF_VALIDATED_CAPTURE=$BRIEF_INPUT_TMP
     BRIEF_INPUT_TMP=
@@ -919,23 +921,19 @@ finish_brief_capture() {  # <source> <source-identity>
 }
 
 validate_brief_binding() {  # <brief> <linked|unlinked> [hash] [canonical]
-  local brief=$1 expected=$2 hash=${3:-} canonical=${4:-} count marker payload_count expected_marker before after
+  local brief=$1 expected=$2 hash=${3:-} canonical=${4:-} count marker payload_count expected_marker
   BRIEF_HASH=
   [ -e "$brief" ] || [ -L "$brief" ] || { BRIEF_PROVENANCE=absent; return 0; }
-  safe_regular_file "$brief" "generated instructions"
-  before=$(file_identity "$brief") || die "cannot inspect generated instructions: $brief"
   BRIEF_INPUT_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-brief.XXXXXX") \
     || die "cannot capture generated instructions"
-  cp -- "$brief" "$BRIEF_INPUT_TMP" || die "cannot capture generated instructions: $brief"
-  after=$(file_identity "$brief") || die "cannot reinspect generated instructions: $brief"
-  [ "$before" = "$after" ] && cmp -s "$brief" "$BRIEF_INPUT_TMP" \
-    || die "generated instructions changed while they were captured: $brief"
+  python3 "$FS_OWNER" snapshot-path "$brief" "$MAX_BYTES" > "$BRIEF_INPUT_TMP" \
+    || die "cannot capture generated instructions: $brief"
   safe_regular_file "$BRIEF_INPUT_TMP" "captured generated instructions"
   count=$(brief_contract_count "$BRIEF_INPUT_TMP")
   if [ "$count" = 0 ]; then
     [ "$expected" = unlinked ] || die "linked work identity is missing from generated instructions: $brief"
     BRIEF_PROVENANCE=legacy
-    finish_brief_capture "$brief" "$before"
+    finish_brief_capture
     return 0
   fi
   [ "$count" = 1 ] || die "generated instructions contain duplicate work identity contracts: $brief"
@@ -954,7 +952,7 @@ validate_brief_binding() {  # <brief> <linked|unlinked> [hash] [canonical]
     [ "$payload_count" = 0 ] || die "unlinked generated instructions must not carry a work identity payload: $brief"
   fi
   BRIEF_PROVENANCE=generated-instructions
-  finish_brief_capture "$brief" "$before"
+  finish_brief_capture
 }
 
 validate_home_literal() {  # <absolute-home>
@@ -2475,7 +2473,10 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
       || die "replacement dispatch requires prior metadata and instructions"
     [ -e "$meta" ] || [ -L "$meta" ] || die "replacement dispatch metadata is absent: $meta"
     [ -e "$prior_brief" ] || [ -L "$prior_brief" ] || die "replacement dispatch instructions are absent: $prior_brief"
+    RETAIN_BRIEF_CAPTURE=1
     capture_identity_projection_locked "$task" "$prior_brief" "$meta" "$instructions_path"
+    RETAIN_BRIEF_CAPTURE=0
+    [ -n "$BRIEF_VALIDATED_CAPTURE" ] || die "cannot retain prior dispatch instructions"
     projection=$IDENTITY_PROJECTION
     previous_hash=$BRIEF_HASH
     if [ "$existing_status" = completed ]; then
@@ -2486,7 +2487,10 @@ dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction
       || die "replacement dispatch already has retained prior instructions"
     DISPATCH_PRIOR_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-dispatch-prior.XXXXXX") \
       || die "cannot retain prior dispatch instructions"
-    cp -- "$prior_brief" "$DISPATCH_PRIOR_TMP" || die "cannot retain prior dispatch instructions"
+    cp -- "$BRIEF_VALIDATED_CAPTURE" "$DISPATCH_PRIOR_TMP" \
+      || die "cannot retain prior dispatch instructions"
+    rm -f -- "$BRIEF_VALIDATED_CAPTURE" || die "cannot retire captured prior dispatch instructions"
+    BRIEF_VALIDATED_CAPTURE=
     chmod 400 "$DISPATCH_PRIOR_TMP" || die "cannot protect retained prior dispatch instructions"
     owned_atomic_replace "$DISPATCH_PRIOR_TMP" "$DISPATCH_PRIOR" "retained prior dispatch instructions"
     DISPATCH_PRIOR_TMP=
@@ -2668,7 +2672,7 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
 }
 
 metadata_publish_unlinked() {  # <task-id> <candidate>
-  local task=$1 candidate=$2 target="$STATE_REAL/$1.meta" captured target_state
+  local task=$1 candidate=$2 target="$STATE_REAL/$1.meta" captured target_state target_digest
   identity_mutation_lock_acquire "$task"
   validate_unlinked_guard "$task"
   [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ] \
@@ -2704,7 +2708,9 @@ metadata_publish_unlinked() {  # <task-id> <candidate>
     capture_metadata "$target"
     validate_meta_binding_captured "$target" unlinked
     target_state=$META_CAPTURE_ENTRY_STATE
-    [ -n "$target_state" ] || die "unlinked task metadata target is not owner-managed: $target"
+    target_digest=$META_CAPTURE_ENTRY_DIGEST
+    [ -n "$target_state" ] && [ -n "$target_digest" ] \
+      || die "unlinked task metadata target is not owner-managed: $target"
     if cmp -s "$captured" "$META_CAPTURE_TMP"; then
       rm -f -- "$captured"
       TMP=
@@ -2712,7 +2718,8 @@ metadata_publish_unlinked() {  # <task-id> <candidate>
       return 0
     fi
     finish_metadata_capture "$target"
-    owned_atomic_replace_expected "$captured" "$target" "unlinked task metadata" "$target_state"
+    owned_atomic_replace_expected "$captured" "$target" "unlinked task metadata" \
+      "$target_state" "$target_digest"
   else
     owned_atomic_replace "$captured" "$target" "unlinked task metadata"
   fi

@@ -4085,7 +4085,7 @@ kimi_submission_state() {
       printf 'ambiguous'
     elif [ -e "$entering" ] || [ -L "$entering" ]; then
       spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-      printf 'unsent'
+      printf 'ambiguous'
     else
       if [ -e "$operation_started" ] || [ -L "$operation_started" ]; then
         spawn_launch_request_file_matches "$operation_started" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
@@ -4119,7 +4119,7 @@ kimi_submission_state() {
         printf 'ambiguous'
       elif [ -e "$entering" ] || [ -L "$entering" ]; then
         spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-        printf 'unsent'
+        printf 'ambiguous'
       else
         printf 'prepared'
       fi

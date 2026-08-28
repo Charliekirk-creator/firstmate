@@ -425,8 +425,8 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       zellij target brief 1 0 0 label
   ) || fail "dead entering submission evidence was not recoverable"
-  [ "$out" = pending-unproven ] \
-    || fail "dead entering submission recovered as '$out' instead of pending-unproven"
+  [ "$out" = ambiguous ] \
+    || fail "dead entering submission recovered as '$out' instead of ambiguous"
   pass "non-tmux submission preserves accepted-or-ambiguous input without retyping"
 }
 
