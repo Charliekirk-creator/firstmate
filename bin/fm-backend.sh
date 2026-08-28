@@ -744,7 +744,6 @@ fm_backend_dead_entering_verdict() {  # <backend> <target> [expected-label]
     state=$(fm_backend_composer_state "$backend" "$target" "$expected_label" 2>/dev/null) \
       || state=unknown
     case "$state" in
-      empty) printf 'unsent' ;;
       pending|pending-unproven) printf 'pending-unproven' ;;
       *) printf 'ambiguous' ;;
     esac

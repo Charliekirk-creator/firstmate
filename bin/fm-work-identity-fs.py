@@ -1044,6 +1044,18 @@ def lock_try(directory_fd, name, pid, token, stale_after):
         raise SystemExit(2)
 
 
+def lock_held(directory_fd, name, pid, token):
+    details = lock_owner(directory_fd, name)
+    if details is None:
+        fail(f"owned lock authorization is absent: {name}")
+    _, owner_pid, owner_token, owner_start, _ = details
+    if owner_pid != pid or owner_token != token:
+        fail(f"owned lock authorization is mismatched: {name}")
+    current_start = process_start_identity(owner_pid)
+    if owner_start is None or current_start is None or current_start != owner_start:
+        fail(f"owned lock authorization process is stale: {name}")
+
+
 def lock_release(directory_fd, name, pid, token):
     details = lock_owner(directory_fd, name)
     if details is None:
@@ -1286,15 +1298,18 @@ def main():
                 lock_try(directory_fd, name, int(pid_text), token, stale_after)
             finally:
                 os.close(mutex_fd)
-        elif command == "lock-release":
+        elif command in ("lock-held", "lock-release"):
             if len(sys.argv) != 7:
-                fail("lock-release requires pid and token")
+                fail(f"{command} requires pid and token")
             pid_text, token = sys.argv[5:7]
             if not pid_text.isdigit() or not valid_token(token):
                 fail("owned lock identity is malformed")
             mutex_fd = operation_lock(directory_fd, name)
             try:
-                lock_release(directory_fd, name, int(pid_text), token)
+                if command == "lock-held":
+                    lock_held(directory_fd, name, int(pid_text), token)
+                else:
+                    lock_release(directory_fd, name, int(pid_text), token)
             finally:
                 os.close(mutex_fd)
         else:

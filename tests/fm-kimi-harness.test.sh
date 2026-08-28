@@ -473,8 +473,8 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       herdr target brief 1 0 0 label
   ) || fail "dead Herdr pre-send submission was not recoverable"
-  [ "$out" = unsent ] \
-    || fail "dead Herdr pre-send submission recovered as '$out' instead of unsent"
+  [ "$out" = ambiguous ] \
+    || fail "dead Herdr entering submission recovered as '$out' instead of ambiguous"
   out=$(
     # shellcheck source=bin/fm-backend.sh disable=SC1091
     . "$ROOT/bin/fm-backend.sh"

@@ -602,7 +602,8 @@ SH
   set +e
   FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
     FM_STATE_OVERRIDE="$case_dir/state" FM_DATA_OVERRIDE="$case_dir/data" \
-    FM_CONFIG_OVERRIDE="$case_dir/config" FM_TEST_TREEHOUSE_LOG="$case_dir/treehouse.log" \
+    FM_CONFIG_OVERRIDE="$case_dir/config" FM_TEARDOWN_DISPATCH_RETIRE_HELD=task-x1 \
+    FM_TEST_TREEHOUSE_LOG="$case_dir/treehouse.log" \
     PATH="$case_dir/fakebin:$PATH" "$TEARDOWN" task-x1 \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
@@ -2642,6 +2643,11 @@ EOF
 case "${FM_TEST_ONLY:-}" in
   dispatch-retirement)
     test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+    exit 0
+    ;;
+  review-fixes)
+    test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+    test_forced_secondmate_herdr_child_preflight_refuses_before_changes
     exit 0
     ;;
 esac

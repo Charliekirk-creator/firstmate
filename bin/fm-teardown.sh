@@ -199,16 +199,40 @@ fm_backlog_directory_present "$STATE" "state directory" || {
   echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 }
-if [ -n "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
-   && [ "$FM_TEARDOWN_DISPATCH_RETIRE_HELD" != "$ID" ]; then
-  echo "error: teardown dispatch authorization is task-mismatched" >&2
-  exit 1
-fi
-if [ -z "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
-   && { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
-     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; }; then
-  exec env FM_TEARDOWN_DISPATCH_RETIRE_HELD="$ID" \
-    FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+TEARDOWN_ORIGINAL_ARGS=("$@")
+TEARDOWN_DISPATCH_AUTH_PID=
+teardown_pid_is_ancestor() {
+  local wanted=$1 current=$$ parent
+  case "$wanted" in ''|*[!0-9]*) return 1 ;; esac
+  while [ "$current" -gt 1 ] 2>/dev/null; do
+    [ "$current" != "$wanted" ] || return 0
+    parent=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d ' ') || return 1
+    case "$parent" in ''|*[!0-9]*) return 1 ;; esac
+    current=$parent
+  done
+  return 1
+}
+teardown_dispatch_authorized() {
+  local state=$1 task=$2 state_real auth_state auth_inode auth_task auth_lock auth_pid auth_token extra
+  [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 1
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  state_real=$(cd -- "$state" 2>/dev/null && pwd -P) || return 1
+  while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock auth_pid auth_token extra; do
+    [ -z "$extra" ] || continue
+    [ "$auth_state" = "$state_real" ] && [ "$auth_task" = "$task" ] || continue
+    teardown_pid_is_ancestor "$auth_pid" || continue
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-held \
+      "$auth_state" "$auth_inode" "$auth_lock" "$auth_pid" "$auth_token" \
+      >/dev/null 2>&1 || continue
+    TEARDOWN_DISPATCH_AUTH_PID=$auth_pid
+    return 0
+  done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
+  return 1
+}
+if { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
+     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; } \
+   && ! teardown_dispatch_authorized "$STATE" "$ID"; then
+  exec env FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
     FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
     dispatch-retire-run "$ID" -- "$0" "$@"
 fi
@@ -2296,6 +2320,44 @@ preflight_descendant_task_locks() {
   done
 }
 
+teardown_dispatch_retire_preflight() {
+  local home=$1 data=$2 state=$3 task=$4 receipt="$2/$4/work-identity-dispatch.json"
+  if [ -e "$receipt" ] || [ -L "$receipt" ]; then
+    if ! teardown_dispatch_authorized "$state" "$task"; then
+      echo "REFUSED: descendant task $task has no owner-held dispatch retirement authorization; forced teardown changed nothing" >&2
+      return 1
+    fi
+  fi
+}
+
+authorize_firstmate_home_children() {
+  local home=$1 sub_state child_meta child_id child_kind child_wt child_home receipt
+  sub_state="$home/state"
+  [ -d "$sub_state" ] || return 0
+  for child_meta in "$sub_state"/*.meta; do
+    [ -e "$child_meta" ] || continue
+    child_id=$(basename "$child_meta" .meta)
+    receipt="$home/data/$child_id/work-identity-dispatch.json"
+    if { [ -e "$receipt" ] || [ -L "$receipt" ]; } \
+       && ! teardown_dispatch_authorized "$sub_state" "$child_id"; then
+      exec env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$sub_state" \
+        FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+        dispatch-retire-run "$child_id" -- env \
+        FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+        FM_CONFIG_OVERRIDE="$CONFIG" FM_ROOT_OVERRIDE="$FM_ROOT" \
+        "$0" "${TEARDOWN_ORIGINAL_ARGS[@]}"
+    fi
+    child_kind=$(meta_value "$child_meta" kind)
+    [ -n "$child_kind" ] || child_kind=ship
+    if [ "$child_kind" = secondmate ]; then
+      child_wt=$(meta_value "$child_meta" worktree)
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+      authorize_firstmate_home_children "$child_home" || return 1
+    fi
+  done
+}
+
 validate_firstmate_home_children_removal() {
   local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
   sub_state="$home/state"
@@ -2586,6 +2648,7 @@ if [ "$KIND" = secondmate ]; then
   handoff_wake_retire_validate || exit 1
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
+    authorize_firstmate_home_children "$HOME_PATH" || exit 1
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
     preflight_descendant_task_locks "$HOME_PATH" || exit 1
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
@@ -2900,9 +2963,9 @@ rmdir -- "$STATE/.$ID.worktree-request."* 2>/dev/null || true
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.
 rm -rf "$STATE/$ID.inbox"
-if [ -z "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
-   && { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
-     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; }; then
+if { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
+     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; } \
+   && ! teardown_dispatch_authorized "$STATE" "$ID"; then
   echo "error: work identity dispatch retirement was not authorized before teardown" >&2
   exit 1
 fi
@@ -2933,9 +2996,18 @@ else
 fi
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
-if [ -z "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
-   && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
-  "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
+if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
+  if { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
+       || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; } \
+     && teardown_dispatch_authorized "$STATE" "$ID"; then
+    (
+      trap '' HUP INT TERM
+      while kill -0 "$TEARDOWN_DISPATCH_AUTH_PID" 2>/dev/null; do sleep 0.05; done
+      "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
+    ) </dev/null >/dev/null 2>&1 &
+  else
+    "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
+  fi
 fi
 # A secondmate retirement may remove the home containing an overridden control
 # state directory. Do not let the side-band refresh recreate that retired home.

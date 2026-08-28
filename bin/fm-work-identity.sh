@@ -2752,14 +2752,22 @@ dispatch_retire_preflight() {  # <task-id>
 
 dispatch_retire_run() {  # <task-id> -- <command> [args...]
   local task=$1 rc meta="$STATE_REAL/$1.meta" launch="$STATE_REAL/$1.launch-brief.md"
+  local authorization authorizations
   shift
   [ "$#" -gt 1 ] && [ "$1" = -- ] || die "dispatch-retire-run requires -- and a command"
   shift
   publication_lock_acquire
   identity_lock_acquire "$task"
   validate_dispatch_retirement_locked "$task"
+  authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$STATE_REAL" "$STATE_DIR_ID" "$task" "$ACTIVE_IDENTITY_LOCK" \
+    "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN")
+  authorizations=$authorization
+  if [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ]; then
+    authorizations="${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS}"$'\n'"$authorization"
+  fi
   set +e
-  "$@"
+  FM_TEARDOWN_DISPATCH_AUTHORIZATIONS=$authorizations "$@"
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || return "$rc"
