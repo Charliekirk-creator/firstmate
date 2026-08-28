@@ -579,7 +579,7 @@ def replace_entry(directory_fd, name, source, expected_state, expected_digest):
     recover_replace(directory_fd, name)
 
 
-def read_no_clobber_journal(directory_fd, journal, name, staging):
+def read_no_clobber_journal(directory_fd, journal, name, staging=None):
     try:
         fd = os.open(
             journal,
@@ -600,13 +600,15 @@ def read_no_clobber_journal(directory_fd, journal, name, staging):
         os.close(fd)
     lines = payload.splitlines()
     pin_prefix = f".{name}.no-clobber-pin."
-    if len(lines) != 4 or lines[0] != "v1" or lines[1] != staging \
+    if len(lines) != 4 or lines[0] != "v1" \
+            or not valid_name(lines[1]) or lines[1] == name \
+            or (staging is not None and lines[1] != staging) \
             or not valid_name(lines[2]) or not lines[2].startswith(pin_prefix) \
             or len(lines[2]) <= len(pin_prefix) \
             or len(lines[3]) != 64 \
             or any(char not in "0123456789abcdef" for char in lines[3]):
         fail(f"publication journal is malformed: {journal}")
-    return lines[2], lines[3]
+    return lines[1], lines[2], lines[3]
 
 
 def publish_no_clobber_journal(directory_fd, journal, name, staging, pin, digest):
@@ -659,14 +661,47 @@ def same_inode(first, second):
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
-def recover_no_clobber(directory_fd, name, staging, source_digest):
+def rollback_no_clobber_conflict(directory_fd, name, staging, pin, digest, journal):
+    target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    try:
+        pin_info = os.stat(pin, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pin_info = None
+    try:
+        staging_info = os.stat(staging, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        staging_info = None
+    if pin_info is None and staging_info is None:
+        fail("publication conflict lost its retained candidate")
+    if pin_info is not None:
+        pin_info = opened_entry(directory_fd, pin, digest, (1, 2))
+        if same_inode(target_info, pin_info):
+            fail("publication conflict aliases its retained candidate")
+    if staging_info is not None:
+        staging_info = opened_entry(directory_fd, staging, digest, (1, 2))
+        if same_inode(target_info, staging_info) \
+                or (pin_info is not None and not same_inode(pin_info, staging_info)):
+            fail("publication conflict does not match its retained candidate")
+    if pin_info is not None:
+        remove(directory_fd, pin)
+    if staging_info is not None:
+        allowed_links = (1,) if pin_info is not None else (1, 2)
+        opened_entry(directory_fd, staging, digest, allowed_links)
+        remove(directory_fd, staging)
+    remove(directory_fd, journal)
+    os.fsync(directory_fd)
+
+
+def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
+                       conflict_is_error=False):
     journal = f".{name}.no-clobber-journal"
     loaded = read_no_clobber_journal(directory_fd, journal, name, staging)
     if loaded is None:
         return False
-    pin, journal_digest = loaded
-    if journal_digest != source_digest:
+    staging, pin, journal_digest = loaded
+    if source_digest is not None and journal_digest != source_digest:
         fail("publication source changed while recovering")
+    source_digest = journal_digest
 
     try:
         target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -680,6 +715,16 @@ def recover_no_clobber(directory_fd, name, staging, source_digest):
         staging_info = os.stat(staging, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         staging_info = None
+
+    if target_info is not None \
+            and ((pin_info is not None and not same_inode(target_info, pin_info))
+                 or (staging_info is not None and not same_inode(target_info, staging_info))):
+        rollback_no_clobber_conflict(
+            directory_fd, name, staging, pin, source_digest, journal
+        )
+        if conflict_is_error:
+            raise SystemExit(2)
+        return False
 
     if target_info is None:
         if pin_info is None:
@@ -709,7 +754,17 @@ def recover_no_clobber(directory_fd, name, staging, source_digest):
             if staging_info is None or not same_inode(pin_info, staging_info):
                 fail("publication pin is not bound to its staging entry")
             opened_entry(directory_fd, pin, source_digest, (2,))
-        atomic_rename(directory_fd, pin, name, False)
+        try:
+            atomic_rename(directory_fd, pin, name, False)
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+            rollback_no_clobber_conflict(
+                directory_fd, name, staging, pin, source_digest, journal
+            )
+            if conflict_is_error:
+                raise SystemExit(2)
+            return False
         target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         pin_info = None
 
@@ -988,6 +1043,7 @@ def main():
         elif command in ("describe", "describe-raw", "describe-digest", "describe-replace"):
             mutex_fd = operation_lock(directory_fd, name)
             try:
+                recover_no_clobber(directory_fd, name)
                 recover_replace(directory_fd, name)
                 recover_remove(directory_fd, name)
                 if command == "describe":
@@ -1014,6 +1070,7 @@ def main():
                 fail("owned snapshot SHA-256 is malformed")
             mutex_fd = operation_lock(directory_fd, name)
             try:
+                recover_no_clobber(directory_fd, name)
                 recover_replace(directory_fd, name)
                 recover_remove(directory_fd, name)
                 read_exact(directory_fd, name, expected_state, expected_digest)
@@ -1030,6 +1087,7 @@ def main():
                 fail("owned removal SHA-256 is malformed")
             mutex_fd = operation_lock(directory_fd, name)
             try:
+                recover_no_clobber(directory_fd, name)
                 recover_replace(directory_fd, name)
                 if command == "remove-staging":
                     conditional_remove(
@@ -1068,10 +1126,12 @@ def main():
                         fail("replacement peer identity is malformed")
                     peer_fd = open_owned_dir(peer_directory, peer_inode)
                     peer_mutex_fd = operation_lock(peer_fd, peer_name)
+                    recover_no_clobber(peer_fd, peer_name)
                     recover_replace(peer_fd, peer_name)
                     recover_remove(peer_fd, peer_name)
                     if not exact_entry_matches(peer_fd, peer_name, peer_state, peer_digest):
                         fail(f"owned replacement peer changed before publication: {peer_name}")
+                recover_no_clobber(directory_fd, name)
                 recover_remove(directory_fd, name)
                 replace_entry(directory_fd, name, source, expected_state, expected_digest)
                 if command == "replace-if-peer" \
@@ -1104,7 +1164,9 @@ def main():
                     source_digest = source_digest.hexdigest()
                 finally:
                     os.close(source_fd)
-                if recover_no_clobber(directory_fd, name, staging, source_digest):
+                if recover_no_clobber(
+                        directory_fd, name, staging, source_digest,
+                        conflict_is_error=True):
                     return
                 try:
                     staging_info = os.stat(staging, dir_fd=directory_fd, follow_symlinks=False)
@@ -1143,7 +1205,10 @@ def main():
                 publish_no_clobber_journal(
                     directory_fd, journal, name, staging, pin, source_digest
                 )
-                recover_no_clobber(directory_fd, name, staging, source_digest)
+                recover_no_clobber(
+                    directory_fd, name, staging, source_digest,
+                    conflict_is_error=True
+                )
             finally:
                 os.close(mutex_fd)
         elif command == "lock-try":

@@ -485,7 +485,7 @@ test_secondmate_unlinked_reservation_is_transactional() {
 }
 
 test_no_clobber_publications_recover_after_interruption() {
-  local home task manifest sidecar brief guard out links
+  local home task manifest sidecar brief guard out links pin journal digest
   home=$(make_home publication-recovery)
   task=publication-recovery-linked
   manifest="$home/manifest.json"
@@ -499,6 +499,17 @@ test_no_clobber_publications_recover_after_interruption() {
   assert_contains "$out" "(unchanged)" \
     "sidecar publication recovery did not converge idempotently"
   assert_absent "$sidecar.publishing" "sidecar publication recovery retained its staging link"
+
+  pin="$(dirname "$sidecar")/.work-identity.json.no-clobber-pin.recovery"
+  journal="$(dirname "$sidecar")/.work-identity.json.no-clobber-journal"
+  digest=$(sha256_file_for_test "$sidecar")
+  ln "$sidecar" "$pin" || fail "could not simulate interrupted no-clobber pin retirement"
+  printf 'v1\nwork-identity.json.publishing\n%s\n%s\n' \
+    "${pin##*/}" "$digest" > "$journal"
+  FM_HOME="$home" "$WORK_IDENTITY" verify "$task" >/dev/null \
+    || fail "ordinary preflight did not recover a retained no-clobber pin"
+  assert_absent "$pin" "ordinary preflight retained a no-clobber pin"
+  assert_absent "$journal" "ordinary preflight retained a no-clobber journal"
 
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
     || fail "could not publish brief recovery fixture"
@@ -526,6 +537,37 @@ test_no_clobber_publications_recover_after_interruption() {
   fi
   [ "$links" = 1 ] || fail "recovered sidecar publication did not restore one link"
   pass "no-clobber identity publications recover interrupted staging links"
+}
+
+test_no_clobber_conflict_retires_owned_transaction() {
+  local dir inode source staging target pin journal digest rc=0
+  dir=$(make_home publication-conflict)
+  inode=$(python3 - "$dir" <<'PY'
+import os, sys
+info = os.stat(sys.argv[1], follow_symlinks=False)
+print(f"{info.st_dev}:{info.st_ino}")
+PY
+)
+  source="$dir/source"
+  staging=.record.publishing
+  target="$dir/record"
+  pin="$dir/.record.no-clobber-pin.conflict"
+  journal="$dir/.record.no-clobber-journal"
+  printf 'candidate\n' > "$source"
+  cp "$source" "$dir/$staging"
+  ln "$dir/$staging" "$pin"
+  digest=$(sha256_file_for_test "$source")
+  printf 'v1\n%s\n%s\n%s\n' "$staging" "${pin##*/}" "$digest" > "$journal"
+  printf 'concurrent destination\n' > "$target"
+  python3 "$ROOT/bin/fm-work-identity-fs.py" no-clobber \
+    "$dir" "$inode" record "$source" "$staging" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "no-clobber conflict returned $rc instead of target-exists"
+  [ "$(cat "$target")" = "concurrent destination" ] \
+    || fail "no-clobber conflict changed the concurrent destination"
+  assert_absent "$dir/$staging" "no-clobber conflict retained owned staging"
+  assert_absent "$pin" "no-clobber conflict retained owned pin"
+  assert_absent "$journal" "no-clobber conflict retained owned journal"
+  pass "no-clobber conflicts retire their exact owned transaction"
 }
 
 test_no_clobber_publication_does_not_follow_raced_target() {
@@ -2566,6 +2608,11 @@ case "${FM_TEST_ONLY:-}" in
     test_replacement_dispatch_resumes_before_metadata_publication
     exit 0
     ;;
+  no-clobber-recovery)
+    test_no_clobber_publications_recover_after_interruption
+    test_no_clobber_conflict_retires_owned_transaction
+    exit 0
+    ;;
 esac
 
 test_intake_through_fleet_projection
@@ -2575,6 +2622,7 @@ test_manifest_capture_rejects_same_size_rewrite
 test_concurrent_idempotence_and_explicit_unlinked
 test_secondmate_unlinked_reservation_is_transactional
 test_no_clobber_publications_recover_after_interruption
+test_no_clobber_conflict_retires_owned_transaction
 test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
 test_owned_snapshot_binds_validated_entry

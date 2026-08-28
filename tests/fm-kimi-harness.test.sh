@@ -290,6 +290,33 @@ test_kimi_secondmate_commits_identity_only_after_delivery() {
   pass "Kimi secondmate identity commits only after confirmed brief delivery"
 }
 
+test_non_tmux_persistent_kimi_refuses_before_identity_reservation() {
+  local id rec sub out rc=0
+  id="kimi-non-tmux-secondmate-$$"
+  rec=$(make_spawn_case non-tmux-secondmate "$id")
+  read_spawn_record "$rec"
+  sub="$CASE_DIR/secondmate-home"
+  mkdir -p "$sub/bin" "$sub/data" "$sub/state" "$sub/config" "$sub/projects"
+  printf '# Firstmate\n' > "$sub/AGENTS.md"
+  printf '%s\n' "$id" > "$sub/.fm-secondmate-home"
+  printf 'secondmate charter\n' > "$sub/data/charter.md"
+  out=$(HOME="$HOME_DIR" FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 FM_SKIP_SECONDMATE_INHERIT=1 \
+    PATH="$FAKEBIN_DIR:$BASE_PATH" "$SPAWN" "$id" "$sub" \
+      --harness kimi --secondmate --backend zellij 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "non-tmux persistent Kimi spawn unexpectedly succeeded"
+  assert_contains "$out" "persistent Kimi secondmates require backend=tmux" \
+    "non-tmux persistent Kimi refusal did not identify its acceptance boundary"
+  assert_absent "$HOME_DIR/data/$id/work-identity-unlinked-reservation.json" \
+    "inapplicable Kimi backend published an identity reservation"
+  assert_absent "$HOME_DIR/data/$id/work-identity-unlinked-guard.json" \
+    "inapplicable Kimi backend permanently classified the task"
+  [ ! -s "$CASE_DIR/launch.log" ] || fail "inapplicable Kimi backend launched an agent"
+  pass "persistent Kimi rejects backends without atomic submission receipts"
+}
+
 test_kimi_interrupted_submit_never_retypes_ambiguous_input() {
   local id rec sub out rc=0 lines
   id="kimi-submit-interrupted-r4-$$"
@@ -937,15 +964,22 @@ test_kimi_bordered_prompt_needs_no_override() {
   pass "composer classifier: kimi's existing bordered > shape is already safe without an override"
 }
 
-if [ "${FM_TEST_ONLY:-}" = non-tmux-submit-recovery ]; then
-  test_non_tmux_definitive_submit_failure_is_retryable
-  test_non_tmux_submission_operation_survives_caller_interruption
-  test_non_tmux_submission_distinguishes_dead_presend_operation
-  exit 0
-fi
+case "${FM_TEST_ONLY:-}" in
+  non-tmux-submit-recovery)
+    test_non_tmux_definitive_submit_failure_is_retryable
+    test_non_tmux_submission_operation_survives_caller_interruption
+    test_non_tmux_submission_distinguishes_dead_presend_operation
+    exit 0
+    ;;
+  persistent-kimi-applicability)
+    test_non_tmux_persistent_kimi_refuses_before_identity_reservation
+    exit 0
+    ;;
+esac
 
 test_kimi_hook_install_is_surgical_idempotent_and_removable
 test_kimi_secondmate_commits_identity_only_after_delivery
+test_non_tmux_persistent_kimi_refuses_before_identity_reservation
 test_kimi_interrupted_submit_never_retypes_ambiguous_input
 test_non_tmux_definitive_submit_failure_is_retryable
 test_non_tmux_submission_operation_survives_caller_interruption

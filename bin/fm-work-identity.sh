@@ -353,8 +353,13 @@ safe_regular_file() {  # <path> <label> [max-bytes]
 }
 
 recover_no_clobber_target() {  # <target> <label>
-  local target=$1 label=$2 staging target_links staging_links target_inode staging_inode
+  local target=$1 label=$2 staging target_links staging_links target_inode staging_inode parent expected base
   staging="${target}.publishing"
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
+  python3 "$FS_OWNER" describe-raw "$parent" "$expected" "$base" >/dev/null \
+    || die "cannot recover $label publication: $target"
   [ -e "$staging" ] || [ -L "$staging" ] || return 0
   [ ! -L "$staging" ] || die "$label publication staging path is symlinked: $staging"
   [ -f "$staging" ] || die "$label publication staging path is not a regular file: $staging"

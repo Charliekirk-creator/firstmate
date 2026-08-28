@@ -391,11 +391,13 @@ seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
 }
 
 recover_backlog_scaffold_publication() { # <path> <parent-inode>
-  local target=$1 dir base staging
+  local target=$1 dir base staging journal
   dir=$(dirname "$target")
   base=$(basename "$target")
   staging="$dir/.${base}.scaffold-publishing"
-  if [ -e "$staging" ] || [ -L "$staging" ]; then
+  journal="$dir/.${base}.no-clobber-journal"
+  if [ -e "$staging" ] || [ -L "$staging" ] \
+    || [ -e "$journal" ] || [ -L "$journal" ]; then
     seed_backlog_scaffold "$target" "$2"
   fi
 }
