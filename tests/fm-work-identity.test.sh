@@ -568,6 +568,16 @@ PY
   assert_absent "$pin" "no-clobber conflict retained owned pin"
   assert_absent "$journal" "no-clobber conflict retained owned journal"
 
+  printf 'v2\n%s\n%s\n%s\npublishing\n' \
+    "$staging" "${pin##*/}" "$digest" > "$journal"
+  rc=0
+  python3 "$ROOT/bin/fm-work-identity-fs.py" no-clobber \
+    "$dir" "$inode" record "$source" "$staging" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "completed conflict cleanup returned $rc instead of target-exists"
+  assert_absent "$journal" "completed conflict cleanup retained its journal"
+  [ "$(cat "$target")" = "concurrent destination" ] \
+    || fail "completed conflict cleanup changed the concurrent destination"
+
   printf 'v2\n%s\n%s\n%s\nconflict\n' \
     "$staging" "${pin##*/}" "$digest" > "$journal"
   rc=0

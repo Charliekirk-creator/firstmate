@@ -620,22 +620,18 @@ def read_no_clobber_journal(directory_fd, journal, name, staging=None):
     return lines[1], lines[2], lines[3], phase
 
 
-def publish_no_clobber_journal(directory_fd, journal, name, staging, pin, digest,
-                               phase="publishing", replace=False):
+def publish_no_clobber_journal(directory_fd, journal, name, staging, pin, digest):
     temporary = f".{journal}.{os.getpid()}.{secrets.token_hex(8)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
     published = False
     try:
-        payload = f"v2\n{staging}\n{pin}\n{digest}\n{phase}\n".encode("ascii")
+        payload = f"v2\n{staging}\n{pin}\n{digest}\npublishing\n".encode("ascii")
         if os.write(fd, payload) != len(payload):
             raise OSError(errno.EIO, "short publication journal write")
         os.fsync(fd)
-        if replace:
-            os.replace(temporary, journal, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        else:
-            atomic_rename(directory_fd, temporary, journal, False)
+        atomic_rename(directory_fd, temporary, journal, False)
         published = True
         os.fsync(directory_fd)
     finally:
@@ -737,13 +733,21 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
     except FileNotFoundError:
         staging_info = None
 
+    if target_info is not None and pin_info is None and staging_info is None:
+        if not stat.S_ISREG(target_info.st_mode) or target_info.st_nlink != 1:
+            fail(f"publication target is unsafe: {name}")
+        committed = file_digest(directory_fd, name) == source_digest
+        remove(directory_fd, journal)
+        os.fsync(directory_fd)
+        if committed:
+            return True
+        if conflict_is_error:
+            raise SystemExit(2)
+        return False
+
     if target_info is not None \
             and ((pin_info is not None and not same_inode(target_info, pin_info))
                  or (staging_info is not None and not same_inode(target_info, staging_info))):
-        publish_no_clobber_journal(
-            directory_fd, journal, name, staging, pin, source_digest,
-            phase="conflict", replace=True
-        )
         rollback_no_clobber_conflict(
             directory_fd, name, staging, pin, source_digest, journal
         )
@@ -784,10 +788,6 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
         except OSError as exc:
             if exc.errno != errno.EEXIST:
                 raise
-            publish_no_clobber_journal(
-                directory_fd, journal, name, staging, pin, source_digest,
-                phase="conflict", replace=True
-            )
             rollback_no_clobber_conflict(
                 directory_fd, name, staging, pin, source_digest, journal
             )

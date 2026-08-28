@@ -136,7 +136,7 @@ cmd_route() {
 
 cmd_launch() {
   local id=$1 harness=$2 model=$3 effort=$4 selected_backend=$5 traceparent=${6:-}
-  local current meta out herdr_session
+  local current meta out herdr_session recovery_receipt
 
   validate_id "$id"
   validate_home "$id"
@@ -151,13 +151,16 @@ cmd_launch() {
   case "$selected_backend" in herdr) ;; *) die "a remote secondmate runs only on the herdr backend, not '$selected_backend'" ;; esac
   mkdir -p "$CONTROL_STATE" "$CONTROL_DATA"
   meta=$(meta_path "$id")
+  recovery_receipt="$CONTROL_STATE/$id.spawn-endpoint.json"
   if [ -f "$meta" ]; then
     remote_endpoint_require "$id"
     current=$(fm_backend_agent_state "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null || printf 'unreadable\n')
     case "$current" in
       alive)
-        print_route "$id"
-        return 0
+        if [ ! -e "$recovery_receipt" ] && [ ! -L "$recovery_receipt" ]; then
+          print_route "$id"
+          return 0
+        fi
         ;;
       dead)
         fm_backend_kill "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null \
