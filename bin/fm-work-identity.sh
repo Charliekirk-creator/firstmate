@@ -2752,6 +2752,7 @@ dispatch_retire_preflight() {  # <task-id>
 
 dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [args...]
   local task rc meta launch authorization authorizations= whole_home=0 owner_pid=${BASHPID:-$$}
+  local receipt_parent receipt_parent_id receipt_name receipt_state receipt_digest
   local -a tasks=("$1")
   shift
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
@@ -2768,12 +2769,20 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
   publication_lock_acquire
   for task in "${tasks[@]}"; do
     identity_lock_acquire "$task"
+    DISPATCH_STATE_ENTRY_STATE=
+    DISPATCH_STATE_ENTRY_DIGEST=
     validate_dispatch_retirement_locked "$task"
+    receipt_parent=$TASK_DIR
+    receipt_parent_id=$TASK_DIR_ID
+    receipt_name=${DISPATCH_STATE##*/}
+    receipt_state=${DISPATCH_STATE_ENTRY_STATE:-absent}
+    receipt_digest=${DISPATCH_STATE_ENTRY_DIGEST:--}
     identity_lock_release
-    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$STATE_REAL" "$STATE_DIR_ID" "$task" \
       "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
-      "$ACTIVE_PUBLICATION_LOCK" "$owner_pid" "$ACTIVE_PUBLICATION_LOCK_TOKEN")
+      "$ACTIVE_PUBLICATION_LOCK" "$owner_pid" "$ACTIVE_PUBLICATION_LOCK_TOKEN" \
+      "$receipt_parent" "$receipt_parent_id" "$receipt_name" "$receipt_state" "$receipt_digest")
     if [ -n "$authorizations" ]; then
       authorizations="$authorizations"$'\n'"$authorization"
     else

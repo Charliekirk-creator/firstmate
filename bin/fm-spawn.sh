@@ -2530,6 +2530,10 @@ case "$LAUNCH" in
       echo "error: persistent Kimi secondmates require backend=tmux outside the journaled remote Herdr route" >&2
       exit 1
     fi
+    if [ "$KIND" = secondmate ] && [ "$BACKEND" = herdr ]; then
+      fm_backend_source herdr || exit 1
+      fm_backend_herdr_prompt_version_check "$(fm_backend_herdr_session)" || exit 1
+    fi
     if [ "$KIND" != secondmate ]; then
       "$FM_ROOT/bin/fm-kimi-turnend-hook.sh" install || {
         echo "error: refusing Kimi spawn because the global turn-end hook could not be installed safely" >&2

@@ -469,22 +469,24 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     # shellcheck source=bin/fm-backend.sh disable=SC1091
     . "$ROOT/bin/fm-backend.sh"
     fm_backend_send_text_submit() { fail "dead Herdr pre-send operation invoked the backend"; }
-    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_prompt_receipt_state() { printf 'unsent'; }
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       herdr target brief 1 0 0 label
   ) || fail "dead Herdr pre-send submission was not recoverable"
-  [ "$out" = ambiguous ] \
-    || fail "dead Herdr entering submission recovered as '$out' instead of ambiguous"
+  [ "$out" = unsent ] \
+    || fail "dead Herdr pre-send submission recovered as '$out' instead of unsent"
   out=$(
     # shellcheck source=bin/fm-backend.sh disable=SC1091
     . "$ROOT/bin/fm-backend.sh"
     fm_backend_send_text_submit() { fail "accepted Herdr operation invoked the backend"; }
-    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_prompt_receipt_state() { printf 'accepted'; }
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       herdr target brief 1 0 0 label
   ) || fail "accepted Herdr submission was not recoverable"
-  [ "$out" = ambiguous ] \
-    || fail "unreceipted Herdr submission recovered as '$out' instead of ambiguous"
+  [ "$out" = accepted ] \
+    || fail "receipted Herdr submission recovered as '$out' instead of accepted"
   rm -f -- "$evidence" "${evidence}.entering" "${evidence}.operation-owner" \
     "${evidence}.operation-started" "${evidence}.operation-result"
   out=$(
@@ -508,6 +510,8 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
   assert_absent "${evidence}.entering" "Herdr accepted prompt retained pre-acceptance evidence"
   assert_grep "session-a agent prompt pane-a brief" "$TMP_ROOT/herdr-prompt.log" \
     "Herdr journaled submission did not use the atomic agent prompt boundary"
+  assert_grep "FM_SUBMIT:durable-presend" "$TMP_ROOT/herdr-prompt.log" \
+    "Herdr journaled submission omitted its transaction-scoped recovery receipt"
   pass "non-tmux submission uses backend-owned Herdr prompt acceptance"
 }
 

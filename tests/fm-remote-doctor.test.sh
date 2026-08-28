@@ -179,7 +179,11 @@ case "${1:-} ${2:-}" in
         running=true
       fi
     fi
-    printf '{"client":{"version":"0.7.5","protocol":16},"server":{"running":%s}}\n' "$running"
+    if [ "$running" = true ]; then
+      printf '%s\n' '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true,"version":"0.7.5","protocol":17}}'
+    else
+      printf '%s\n' '{"client":{"version":"0.7.5","protocol":17},"server":{"running":false}}'
+    fi
     ;;
   "server "*|"server ")
     printf 'true\n' > "$FM_FAKE_HERDR_RUNNING"
@@ -276,6 +280,21 @@ assert_contains "$DOCTOR_OUT" 'check herdr=human:' "--fix stopped reporting the 
 assert_not_contains "$DOCTOR_OUT" 'fix herdr=applied' "--fix claimed to have installed herdr"
 assert_no_dangerous_calls "the doctor reached for auto-login, FileVault, or the keychain"
 pass "a missing herdr CLI is a human gap that --fix never claims to close"
+
+new_case Darwin with-herdr gui
+cat > "$CASE_BIN/herdr" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "status --json") printf '%s\n' '{"client":{"version":"0.7.4","protocol":16},"server":{"running":false}}' ;;
+esac
+SH
+chmod +x "$CASE_BIN/herdr"
+doctor
+expect_code 1 "$DOCTOR_RC" "a remote host without atomic Herdr prompt support was reported ready"
+assert_contains "$DOCTOR_OUT" 'check herdr=human:' "an old Herdr release was not reported as a readiness gap"
+assert_contains "$DOCTOR_OUT" 'protocol 17' "the Herdr readiness gap did not name the prompt protocol floor"
+pass "remote doctor requires Herdr prompt submission support"
+[ "${FM_TEST_ONLY:-}" != herdr-prompt-floor ] || exit 0
 
 new_case Darwin with-herdr gui
 rm -f "$TOOLS/python3"

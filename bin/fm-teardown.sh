@@ -221,13 +221,16 @@ teardown_directory_identity() {
 }
 teardown_dispatch_authorized() {
   local state=$1 task=$2 state_real state_inode auth_state auth_inode auth_task
-  local auth_lock_parent auth_lock_parent_inode auth_lock auth_pid auth_token extra
+  local auth_lock_parent auth_lock_parent_inode auth_lock auth_pid auth_token
+  local auth_receipt_parent auth_receipt_parent_inode auth_receipt_name
+  local auth_receipt_state auth_receipt_digest extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 1
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   state_real=$(cd -- "$state" 2>/dev/null && pwd -P) || return 1
   state_inode=$(teardown_directory_identity "$state_real") || return 1
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
-    auth_lock_parent_inode auth_lock auth_pid auth_token extra; do
+    auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
+    auth_receipt_parent_inode auth_receipt_name auth_receipt_state auth_receipt_digest extra; do
     [ -z "$extra" ] || continue
     [ "$auth_state" = "$state_real" ] && [ "$auth_inode" = "$state_inode" ] \
       && [ "$auth_task" = "$task" ] || continue
@@ -235,6 +238,9 @@ teardown_dispatch_authorized() {
     python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-held \
       "$auth_lock_parent" "$auth_lock_parent_inode" "$auth_lock" "$auth_pid" "$auth_token" \
       >/dev/null 2>&1 || continue
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+      "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_receipt_name" \
+      "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 || continue
     TEARDOWN_DISPATCH_AUTH_PID=$auth_pid
     return 0
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
@@ -2060,6 +2066,7 @@ remove_firstmate_home() {
   [ -e "$home" ] || return 0
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
   [ -n "$abs_home_path" ] || return 0
+  validate_firstmate_home_children_removal "$abs_home_path" || return 1
   process_event_backup=$(snapshot_firstmate_home_process_events "$abs_home_path" "$label") || return 1
   if ! cleanup_firstmate_home_process_events "$abs_home_path" "$label"; then
     restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?

@@ -100,6 +100,8 @@ FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL=16
 # presentation path uses one narrowly whitelisted raw-socket request after
 # verifying the exact method and parameter schema.
 FM_BACKEND_HERDR_MIN_WORKSPACE_MOVE_PROTOCOL=16
+FM_BACKEND_HERDR_MIN_PROMPT_PROTOCOL=17
+FM_BACKEND_HERDR_MIN_PROMPT_VERSION=0.7.5
 # The version floor for DEFAULT-ON presentation projection. Projection turns
 # every crewmate teardown into a workspace-emptying removal, and the focus-safe
 # removal plan can only avoid Herdr's focus-stealing explicit close while the
@@ -410,6 +412,36 @@ fm_backend_herdr_version_check() {
     return 1
   fi
   return 0
+}
+
+fm_backend_herdr_prompt_version_check() {  # [<session>]
+  local session=${1:-} status running client_protocol client_version server_protocol server_version
+  fm_backend_herdr_tool_check || return 1
+  [ -n "$session" ] || session=$(fm_backend_herdr_session)
+  status=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null) || {
+    echo "error: cannot verify Herdr prompt submission support for session $session" >&2
+    return 1
+  }
+  client_protocol=$(printf '%s' "$status" | jq -r '.client.protocol // empty' 2>/dev/null)
+  client_version=$(printf '%s' "$status" | jq -r '.client.version // empty' 2>/dev/null)
+  case "$client_protocol" in ''|*[!0-9]*) client_protocol=0 ;; esac
+  if [ "$client_protocol" -lt "$FM_BACKEND_HERDR_MIN_PROMPT_PROTOCOL" ]; then
+    echo "error: persistent Kimi delivery requires Herdr $FM_BACKEND_HERDR_MIN_PROMPT_VERSION or newer (protocol $FM_BACKEND_HERDR_MIN_PROMPT_PROTOCOL); client ${client_version:-unknown} reports protocol $client_protocol" >&2
+    return 1
+  fi
+  running=$(printf '%s' "$status" | jq -r 'if .server.running == true then "true" elif .server.running == false then "false" else "unknown" end' 2>/dev/null) || running=unknown
+  if [ "$running" = true ]; then
+    server_protocol=$(printf '%s' "$status" | jq -r '.server.protocol // empty' 2>/dev/null)
+    server_version=$(printf '%s' "$status" | jq -r '.server.version // empty' 2>/dev/null)
+    case "$server_protocol" in ''|*[!0-9]*) server_protocol=0 ;; esac
+    if [ "$server_protocol" -lt "$FM_BACKEND_HERDR_MIN_PROMPT_PROTOCOL" ]; then
+      echo "error: persistent Kimi delivery requires Herdr $FM_BACKEND_HERDR_MIN_PROMPT_VERSION or newer (protocol $FM_BACKEND_HERDR_MIN_PROMPT_PROTOCOL); session $session server ${server_version:-unknown} reports protocol $server_protocol" >&2
+      return 1
+    fi
+  elif [ "$running" != false ]; then
+    echo "error: cannot verify the Herdr server release for persistent Kimi delivery in session $session" >&2
+    return 1
+  fi
 }
 
 # fm_backend_herdr_session: resolve which named herdr session this normal
@@ -2555,14 +2587,41 @@ fm_backend_herdr_send_literal() {  # <target> <text>
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-text "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
 }
 
+fm_backend_herdr_prompt_receipt_state() {  # <target> <token>
+  local target=$1 token=$2 out marker
+  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  marker="FM_SUBMIT:$token"
+  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent read \
+    "$FM_BACKEND_HERDR_PANE" --source recent-unwrapped --lines 400 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if printf '%s\n' "$out" | grep -Fxq -- "$marker"; then
+    printf 'accepted'
+  else
+    printf 'unsent'
+  fi
+}
+
 fm_backend_herdr_submit_journaled_prompt() {  # <target> <text>
-  local target=$1 text=$2
+  local target=$1 text=$2 token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-} receipt_state prompt
+  [ -n "$token" ] || { printf 'pending-unproven'; return 0; }
   fm_backend_herdr_target_ready "$target" || { fm_backend_submit_unsent_verdict; return 0; }
   fm_backend_submit_entering_evidence || { printf 'pending-unproven'; return 0; }
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent prompt \
-    "$FM_BACKEND_HERDR_PANE" "$text" >/dev/null 2>&1 \
-    || { printf 'pending-unproven'; return 0; }
-  fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
+  prompt=$(printf '%s\n\nFM_SUBMIT:%s' "$text" "$token") || { printf 'pending-unproven'; return 0; }
+  if ! fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent prompt \
+    "$FM_BACKEND_HERDR_PANE" "$prompt" >/dev/null 2>&1; then
+    receipt_state=$(fm_backend_herdr_prompt_receipt_state "$target" "$token")
+    case "$receipt_state" in
+      accepted) printf 'empty' ;;
+      unsent) fm_backend_submit_unsent_verdict ;;
+      *) printf 'pending-unproven' ;;
+    esac
+    return 0
+  fi
+  fm_backend_submit_typed_evidence || {
+    receipt_state=$(fm_backend_herdr_prompt_receipt_state "$target" "$token")
+    [ "$receipt_state" = accepted ] && printf 'empty' || printf 'pending-unproven'
+    return 0
+  }
   printf 'empty'
 }
 

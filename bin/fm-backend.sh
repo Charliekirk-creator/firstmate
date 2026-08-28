@@ -739,7 +739,19 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 }
 
 fm_backend_dead_entering_verdict() {  # <backend> <target> <expected-label> <entering> <token>
-  printf 'ambiguous'
+  local backend=$1 target=$2 token=$5 state
+  case "$backend" in
+    herdr)
+      fm_backend_source herdr || { printf 'ambiguous'; return 0; }
+      state=$(fm_backend_herdr_prompt_receipt_state "$target" "$token") || state=unknown
+      case "$state" in
+        accepted) printf 'accepted' ;;
+        unsent) printf 'unsent' ;;
+        *) printf 'ambiguous' ;;
+      esac
+      ;;
+    *) printf 'ambiguous' ;;
+  esac
 }
 
 fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]

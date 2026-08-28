@@ -1796,6 +1796,34 @@ test_forced_secondmate_teardown_accepts_completed_receipt_only_home() {
   pass "forced teardown retires completed receipt-only homes exactly"
 }
 
+test_forced_secondmate_teardown_revalidates_authorized_receipt() {
+  local case_dir home receipt replacement rc=0
+  case_dir=$(make_case receipt-authorization-change)
+  write_meta "$case_dir" local-only secondmate
+  configure_secondmate_with_receipt_only_child "$case_dir" completed
+  home="$case_dir/secondmate-home"
+  receipt="$home/data/receipt-only-child/work-identity-dispatch.json"
+  replacement="$case_dir/replacement-dispatch.json"
+  printf '%s\n' '{}' > "$replacement"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    RECEIPT="$receipt" REPLACEMENT="$replacement" CASE_DIR="$case_dir" \
+    ROOT="$ROOT" TEARDOWN="$TEARDOWN" \
+    "$ROOT/bin/fm-work-identity.sh" dispatch-retire-run receipt-only-child --whole-home -- \
+    bash -c '
+      rm -f -- "$RECEIPT"
+      ln -s -- "$REPLACEMENT" "$RECEIPT"
+      FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$CASE_DIR/state" \
+        FM_CONFIG_OVERRIDE="$CASE_DIR/config" PATH="$CASE_DIR/fakebin:$PATH" \
+        "$TEARDOWN" task-x1 --force
+    ' > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "changed whole-home dispatch authorization allowed forced teardown"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "changed whole-home dispatch authorization allowed parent metadata removal"
+  [ -d "$home" ] || fail "changed whole-home dispatch authorization allowed home removal"
+  [ -L "$receipt" ] || fail "changed whole-home dispatch receipt was removed before refusal"
+  pass "forced teardown binds whole-home authorization to the exact dispatch receipt"
+}
+
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks() {
   local case_dir home lock ready release holder_pid rc waited=0 child
   case_dir=$(make_case descendant-locks)
@@ -2711,6 +2739,7 @@ case "${FM_TEST_ONLY:-}" in
     test_forced_secondmate_herdr_child_preflight_refuses_before_changes
     test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt
     test_forced_secondmate_teardown_accepts_completed_receipt_only_home
+    test_forced_secondmate_teardown_revalidates_authorized_receipt
     exit 0
     ;;
 esac
@@ -2732,6 +2761,7 @@ test_herdr_flat_teardown_preflight_refuses_before_changes
 test_forced_secondmate_herdr_child_preflight_refuses_before_changes
 test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt
 test_forced_secondmate_teardown_accepts_completed_receipt_only_home
+test_forced_secondmate_teardown_revalidates_authorized_receipt
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
 test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconfirmed
