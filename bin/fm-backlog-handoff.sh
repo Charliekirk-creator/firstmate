@@ -366,59 +366,38 @@ seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
   base=$(basename "$target")
   case "$base" in ''|.|..|*/*) return 1 ;; esac
   (
-    local staging tmp target_links staging_links target_inode staging_inode rc=0 report=${3:-}
+    local staging tmp target_inode rc=0 report=${3:-}
     cd -P "$dir" || exit 1
     [ "$(backlog_file_inode .)" = "$expected_dir_inode" ] || exit 1
     target=$base
-    staging="${target}.scaffold-publishing"
-    if [ -e "$staging" ] || [ -L "$staging" ]; then
-      [ -f "$staging" ] && [ ! -L "$staging" ] || exit 1
-      printf '## In flight\n\n## Queued\n\n## Done\n' | cmp -s "$staging" - || exit 1
-    else
-      tmp=$(umask 077; mktemp './.backlog-scaffold.XXXXXX') || exit 1
-      if ! printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
-        || ! chmod 600 "$tmp" || ! command link "$tmp" "$staging" 2>/dev/null; then
-        rm -f -- "$tmp"
-        exit 1
-      fi
-      rm -f -- "$tmp" || exit 1
-    fi
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      if [ ! -f "$target" ] || [ -L "$target" ]; then
-        rm -f -- "$staging" || exit 1
-        exit 1
-      fi
-      target_links=$(backlog_file_link_count "$target") || exit 1
-      staging_links=$(backlog_file_link_count "$staging") || exit 1
-      target_inode=$(backlog_file_inode "$target") || exit 1
-      staging_inode=$(backlog_file_inode "$staging") || exit 1
-      if [ "$target_inode" = "$staging_inode" ] \
-        && [ "$target_links" = 2 ] && [ "$staging_links" = 2 ]; then
-        rm -f -- "$staging" || exit 1
-        exit 0
-      fi
-      rm -f -- "$staging" || exit 1
-      [ "$target_links" = 1 ] || exit 1
-      exit 0
-    fi
-    command link "$staging" "$target" 2>/dev/null || rc=$?
-    if [ "$rc" -ne 0 ]; then
-      if [ -e "$target" ] || [ -L "$target" ]; then
-        if [ -L "$target" ]; then
-          rm -f -- "$staging" || exit 1
-          exit 1
-        fi
-        rm -f -- "$staging" || exit 1
-        validate_backlog_file "backlog scaffold target" "$target"
-        exit $?
-      fi
-      exit "$rc"
-    fi
-    target_inode=$(backlog_file_inode "$target") || exit 1
-    rm -f -- "$staging" || exit 1
-    validate_backlog_file "backlog scaffold target" "$target" || exit 1
-    [ -z "$report" ] || printf '%s\n' "$target_inode"
+    staging=".${target}.scaffold-publishing"
+    tmp=$(umask 077; mktemp './.backlog-scaffold.XXXXXX') || exit 1
+    printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
+      && chmod 600 "$tmp" || { rm -f -- "$tmp"; exit 1; }
+    python3 "$FS_OWNER" no-clobber . "$expected_dir_inode" "$target" "$tmp" "$staging" || rc=$?
+    rm -f -- "$tmp" || exit 1
+    case "$rc" in
+      0)
+        validate_backlog_file "backlog scaffold target" "$target" || exit 1
+        target_inode=$(backlog_file_inode "$target") || exit 1
+        [ -z "$report" ] || printf '%s\n' "$target_inode"
+        ;;
+      2)
+        validate_backlog_file "backlog scaffold target" "$target" || exit 1
+        ;;
+      *) exit "$rc" ;;
+    esac
   )
+}
+
+recover_backlog_scaffold_publication() { # <path> <parent-inode>
+  local target=$1 dir base staging
+  dir=$(dirname "$target")
+  base=$(basename "$target")
+  staging="$dir/.${base}.scaffold-publishing"
+  if [ -e "$staging" ] || [ -L "$staging" ]; then
+    seed_backlog_scaffold "$target" "$2"
+  fi
 }
 
 remove_owned_backlog_file() { # <path> <parent-inode> <file-inode> <sha256>
@@ -1465,6 +1444,7 @@ remote_handoff() { # <secondmate-id> <keys...>
   handoff_dir=${handoff_info%%$'\t'*}
   handoff_inode=${handoff_info#*$'\t'}
   outbox="$handoff_dir/$id.outbox.md"
+  recover_backlog_scaffold_publication "$outbox" "$handoff_inode" || return 1
   validate_backlog_file "main backlog" "$MAIN_BACKLOG" || return 1
   validate_backlog_file "remote handoff outbox" "$outbox" || return 1
   if [ ! -e "$outbox" ] && [ ! -L "$outbox" ]; then
@@ -1765,6 +1745,7 @@ SUB_STATE_DIR=${SUB_STATE_INFO%%$'\t'*}
 SUB_BACKLOG="$SUB_DATA_DIR/backlog.md"
 ACTIVE_TARGET_BACKLOG_LOCK="$SUB_STATE_DIR/.backlog-mutation.lock"
 fm_lock_acquire_wait "$ACTIVE_TARGET_BACKLOG_LOCK"
+recover_backlog_scaffold_publication "$SUB_BACKLOG" "$SUB_DATA_INODE" || exit 1
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
 

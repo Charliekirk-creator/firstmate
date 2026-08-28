@@ -747,6 +747,10 @@ extract_item_block() {
   ' "$file"
 }
 
+file_link_count() {
+  if [ "$(uname -s)" = Darwin ]; then stat -f '%l' "$1"; else stat -c '%h' "$1"; fi
+}
+
 assert_block_equals() {
   local label=$1 expected=$2 actual=$3
   if [ "$expected" != "$actual" ]; then
@@ -1375,6 +1379,39 @@ EOF
   pass "handoff scaffold stays anchored across a destination parent swap"
 }
 
+test_scaffold_publication_recovers_retained_hardlink() {
+  local home="$TMP_ROOT/scaffold-recovery-main" sub="$TMP_ROOT/scaffold-recovery-sub"
+  local staging
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] scaffold-recovery-item - must move exactly once (repo: alpha)
+
+## Done
+EOF
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  staging="$sub/data/.backlog.md.scaffold-publishing"
+  ln "$sub/data/backlog.md" "$staging"
+
+  local out rc=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design scaffold-recovery-item 2>&1) || rc=$?
+  assert_absent "$staging" "recovered scaffold retained its publication hardlink"
+  [ "$(file_link_count "$sub/data/backlog.md")" = 1 ] \
+    || fail "recovered destination backlog remained hardlinked"
+  if [ "$rc" -eq 0 ]; then
+    assert_grep 'scaffold-recovery-item' "$sub/data/backlog.md" \
+      "recovered destination did not receive the handed-off work"
+    assert_no_grep 'scaffold-recovery-item' "$home/data/backlog.md" \
+      "recovered handoff retained source work"
+  else
+    assert_contains "$out" "compatible tasks-axi" \
+      "handoff failed after scaffold recovery for an unexpected reason"
+    assert_grep 'scaffold-recovery-item' "$home/data/backlog.md" \
+      "dependency refusal changed source work after scaffold recovery"
+  fi
+  pass "handoff recovers interrupted scaffold publication without hardlinks"
+}
+
 test_registry_home_missing_field_fails_cleanly() {
   local home="$TMP_ROOT/reg-nohome-main"
   local sub="$TMP_ROOT/reg-nohome-sub"
@@ -1407,6 +1444,7 @@ EOF
 
 case "${FM_TEST_ONLY:-}" in
   scaffold-parent-swap) test_scaffold_parent_swap_refuses_without_external_write ;;
+  scaffold-publication-recovery) test_scaffold_publication_recovers_retained_hardlink ;;
   same-id-conflict) test_same_id_destination_requires_exact_handoff_receipt ;;
   '') ;;
   *) fail "unknown FM_TEST_ONLY selector: $FM_TEST_ONLY" ;;
@@ -1439,6 +1477,7 @@ test_indented_heading_is_not_section_boundary
 test_registry_home_with_pre_home_parentheses
 test_registry_home_missing_field_fails_cleanly
 test_scaffold_parent_swap_refuses_without_external_write
+test_scaffold_publication_recovers_retained_hardlink
 test_same_id_destination_requires_exact_handoff_receipt
 test_handoff_warns_when_a_moved_item_still_owes_a_public_reply
 test_handoff_is_silent_about_public_commitments_without_the_relay

@@ -741,7 +741,7 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local evidence=$1 token=$2 backend=${3:-} target=${4:-} expected_label=${9:-} entering="${1}.entering"
   local owner="${1}.operation-owner" result="${1}.operation-result"
-  local tmp worker_pid owner_value owner_pid result_token evidence_token verdict composer_state
+  local tmp worker_pid owner_value owner_pid result_token evidence_token verdict
   shift 2
   if [ "$backend" = tmux ]; then
     FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE= \
@@ -773,13 +773,7 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
         [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
         evidence_token=$(tr -d '\n' < "$entering") || return 1
         [ "$evidence_token" = "$token" ] || return 1
-        composer_state=$(fm_backend_composer_state "$backend" "$target" "$expected_label" 2>/dev/null) \
-          || composer_state=unknown
-        case "$composer_state" in
-          empty) printf 'unsent' ;;
-          pending|pending-unproven) printf 'pending-unproven' ;;
-          *) printf 'ambiguous' ;;
-        esac
+        printf 'ambiguous'
       else
         printf 'unsent'
       fi
@@ -826,13 +820,7 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
           [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
           evidence_token=$(tr -d '\n' < "$entering") || return 1
           [ "$evidence_token" = "$token" ] || return 1
-          composer_state=$(fm_backend_composer_state "$backend" "$target" "$expected_label" 2>/dev/null) \
-            || composer_state=unknown
-          case "$composer_state" in
-            empty) printf 'unsent' ;;
-            pending|pending-unproven) printf 'pending-unproven' ;;
-            *) printf 'ambiguous' ;;
-          esac
+          printf 'ambiguous'
         else
           printf 'unsent'
         fi

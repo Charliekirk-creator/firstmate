@@ -5157,23 +5157,29 @@ spawn_record_traceparent() {
   # independent critical section so other metadata interfaces can serialize.
   if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
     SPAWN_META_LOCK=$(fm_meta_lock_path "$meta") || return 1
-    fm_lock_acquire_wait "$SPAWN_META_LOCK"
+    fm_lock_acquire_wait "$SPAWN_META_LOCK" || return 1
     SPAWN_META_LOCK_HELD=1
     acquired=1
   fi
-  fm_meta_replace_expect "$meta" || return 1
-  SPAWN_META_TMP="$STATE/.$ID.meta.trace.${BASHPID:-$$}"
-  if [ ! -f "$meta" ] || [ ! -w "$meta" ] \
-     || ! awk -F= '$1 != "traceparent"' "$meta" > "$SPAWN_META_TMP" \
-     || ! printf 'traceparent=%s\n' "$SPAWN_TRACEPARENT" >> "$SPAWN_META_TMP" \
-     || ! fm_meta_atomic_replace "$SPAWN_META_TMP" "$meta"; then
+  if ! fm_meta_replace_expect "$meta"; then
     status=1
-    rm -f "$SPAWN_META_TMP" 2>/dev/null || true
+  else
+    SPAWN_META_TMP="$STATE/.$ID.meta.trace.${BASHPID:-$$}"
+    if [ ! -f "$meta" ] || [ ! -w "$meta" ] \
+       || ! awk -F= '$1 != "traceparent"' "$meta" > "$SPAWN_META_TMP" \
+       || ! printf 'traceparent=%s\n' "$SPAWN_TRACEPARENT" >> "$SPAWN_META_TMP" \
+       || ! fm_meta_atomic_replace "$SPAWN_META_TMP" "$meta"; then
+      status=1
+      rm -f "$SPAWN_META_TMP" 2>/dev/null || true
+    fi
   fi
   SPAWN_META_TMP=
   if [ "$acquired" = 1 ]; then
-    fm_lock_release "$SPAWN_META_LOCK" || status=1
-    SPAWN_META_LOCK_HELD=0
+    if fm_lock_release "$SPAWN_META_LOCK"; then
+      SPAWN_META_LOCK_HELD=0
+    else
+      status=1
+    fi
   fi
   return "$status"
 }
@@ -5181,10 +5187,10 @@ spawn_record_traceparent() {
 if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
   spawn_launch_request_paths || exit 1
   if [ -n "$SPAWN_TRACEPARENT" ]; then
-    if ! spawn_record_traceparent; then
-      LAUNCH="unset TRACEPARENT; $LAUNCH"
-      SPAWN_TRACEPARENT=
-    fi
+    spawn_record_traceparent || {
+      echo "error: trace metadata could not be validated and published safely for $ID" >&2
+      exit 1
+    }
   fi
   LAUNCH_COMMAND="export GOTMPDIR=$(shell_quote "$TASK_TMP/gotmp")"
   if [ -n "$SPAWN_TRACEPARENT" ]; then
@@ -5223,9 +5229,10 @@ else
   spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
   if [ -n "$SPAWN_TRACEPARENT" ]; then
     if spawn_send_text_line "$T" "export TRACEPARENT=$SPAWN_TRACEPARENT"; then
-      if ! spawn_record_traceparent; then
-        LAUNCH="unset TRACEPARENT; $LAUNCH"
-      fi
+      spawn_record_traceparent || {
+        echo "error: trace metadata could not be validated and published safely for $ID" >&2
+        exit 1
+      }
     else
       TRACE_SEND_STATUS=$?
       if [ "$TRACE_SEND_STATUS" -eq 2 ]; then

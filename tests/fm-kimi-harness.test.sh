@@ -426,8 +426,8 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       zellij target brief 1 0 0 label
   ) || fail "dead entering submission evidence was not recoverable"
-  [ "$out" = unsent ] \
-    || fail "dead empty-composer submission recovered as '$out' instead of unsent"
+  [ "$out" = ambiguous ] \
+    || fail "dead entering submission recovered as '$out' instead of ambiguous"
   out=$(
     # shellcheck source=bin/fm-backend.sh disable=SC1091
     . "$ROOT/bin/fm-backend.sh"
@@ -436,8 +436,8 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       zellij target brief 1 0 0 label
   ) || fail "accepted entering submission evidence was not recoverable"
-  [ "$out" = pending-unproven ] \
-    || fail "accepted entering submission recovered as '$out' instead of pending-unproven"
+  [ "$out" = ambiguous ] \
+    || fail "accepted entering submission recovered as '$out' instead of ambiguous"
   pass "non-tmux submission reconciles pre-send and accepted input without retyping"
 }
 

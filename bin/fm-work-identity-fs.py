@@ -916,29 +916,74 @@ def main():
             if len(sys.argv) != 7:
                 fail("no-clobber requires a source and staging name")
             source, staging = sys.argv[5:7]
-            if not valid_name(staging):
+            if not valid_name(staging) or staging == name:
                 fail("unsafe publication staging name")
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_replace(directory_fd, name)
                 recover_remove(directory_fd, name)
+                source_fd, source_info = open_source(source)
                 try:
-                    os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                    raise SystemExit(2)
+                    source_digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(source_fd, 131072)
+                        if not chunk:
+                            break
+                        source_digest.update(chunk)
+                    source_digest = source_digest.hexdigest()
+                finally:
+                    os.close(source_fd)
+                try:
+                    staging_info = os.stat(staging, dir_fd=directory_fd, follow_symlinks=False)
                 except FileNotFoundError:
-                    pass
+                    staging_info = None
                 try:
-                    copy_to_new(source, directory_fd, staging)
+                    target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    target_info = None
+                if staging_info is not None:
+                    if not stat.S_ISREG(staging_info.st_mode) or staging_info.st_nlink not in (1, 2):
+                        fail("publication staging entry is unsafe")
+                    staging_fd = os.open(
+                        staging,
+                        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
                     try:
-                        os.link(staging, name, src_dir_fd=directory_fd,
-                                dst_dir_fd=directory_fd, follow_symlinks=False)
-                    except FileExistsError:
+                        staging_digest = hashlib.sha256()
+                        while True:
+                            chunk = os.read(staging_fd, 131072)
+                            if not chunk:
+                                break
+                            staging_digest.update(chunk)
+                        if staging_digest.hexdigest() != source_digest:
+                            fail("publication staging content changed")
+                    finally:
+                        os.close(staging_fd)
+                    if target_info is not None:
+                        if not stat.S_ISREG(target_info.st_mode) \
+                                or staging_info.st_nlink != 2 \
+                                or target_info.st_nlink != 2 \
+                                or (staging_info.st_dev, staging_info.st_ino) \
+                                != (target_info.st_dev, target_info.st_ino):
+                            fail("publication target conflicts with retained staging")
                         remove(directory_fd, staging)
+                        os.fsync(directory_fd)
+                        return
+                    if staging_info.st_nlink != 1:
+                        fail("publication staging entry has an unexpected link count")
+                else:
+                    if target_info is not None:
                         raise SystemExit(2)
-                    remove(directory_fd, staging)
-                    os.fsync(directory_fd)
+                    copy_to_new(source, directory_fd, staging)
+                try:
+                    os.link(staging, name, src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd, follow_symlinks=False)
                 except FileExistsError:
-                    fail("publication staging entry already exists")
+                    remove(directory_fd, staging)
+                    raise SystemExit(2)
+                remove(directory_fd, staging)
+                os.fsync(directory_fd)
             finally:
                 os.close(mutex_fd)
         elif command == "lock-try":
