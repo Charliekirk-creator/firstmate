@@ -5180,7 +5180,7 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
   sq_launch_request=$(shell_quote "$SPAWN_LAUNCH_REQUEST")
   sq_launch_guard=$(shell_quote "$LAUNCH_GUARD")
   if [ "$RAW_LAUNCH" -eq 1 ]; then
-    sq_launch_eval=$(shell_quote "exec $LAUNCH")
+    sq_launch_eval=$(shell_quote "exec env $LAUNCH")
   else
     sq_launch_eval=$(shell_quote "$LAUNCH")
   fi

@@ -151,6 +151,11 @@ SIDECAR_SNAPSHOT_TMP=
 META_CAPTURE_TMP=
 META_CAPTURE_SOURCE=
 META_CAPTURE_IDENTITY=
+META_CAPTURE_PARENT=
+META_CAPTURE_PARENT_ID=
+META_CAPTURE_BASE=
+META_CAPTURE_ENTRY_STATE=
+META_CAPTURE_ENTRY_DIGEST=
 BRIEF_INPUT_TMP=
 BRIEF_HASH=
 BRIEF_VALIDATED_CAPTURE=
@@ -404,6 +409,15 @@ owned_atomic_replace() {  # <source> <target> <label>
   base=$(basename -- "$target") || die "cannot resolve $label target name"
   destination_state=$(python3 "$FS_OWNER" describe "$parent" "$expected" "$base") \
     || die "$label destination is unsafe: $target"
+  owned_atomic_replace_expected "$source" "$target" "$label" "$destination_state"
+}
+
+owned_atomic_replace_expected() {  # <source> <target> <label> <validated-destination-state>
+  local source=$1 target=$2 label=$3 destination_state=$4 parent expected base
+  [ -n "$destination_state" ] || die "$label has no validated destination identity"
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
   python3 "$FS_OWNER" replace "$parent" "$expected" "$base" "$source" "$destination_state" \
     || die "cannot publish $label: $target"
   rm -f -- "$source" || die "cannot retire $label publication source"
@@ -673,27 +687,24 @@ canonicalize_manifest() {  # <path> <task-id> [expected-home] [expected-home-id]
 }
 
 capture_manifest() {  # <path>
-  local path=$1 before after
-  safe_regular_file "$path" "work identity manifest"
-  before=$(file_identity "$path") || die "cannot inspect work identity manifest"
+  local path=$1
   MANIFEST_CAPTURE_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-manifest.XXXXXX") \
     || die "cannot capture work identity manifest"
-  cp -- "$path" "$MANIFEST_CAPTURE_TMP" || die "cannot capture work identity manifest"
-  after=$(file_identity "$path") || die "cannot reinspect work identity manifest"
-  [ "$before" = "$after" ] && cmp -s "$path" "$MANIFEST_CAPTURE_TMP" \
-    || die "work identity manifest changed while it was captured"
+  python3 "$FS_OWNER" snapshot-path "$path" "$MAX_BYTES" > "$MANIFEST_CAPTURE_TMP" \
+    || die "cannot capture work identity manifest"
   safe_regular_file "$MANIFEST_CAPTURE_TMP" "captured work identity manifest"
   MANIFEST_CAPTURE_SOURCE=$path
-  MANIFEST_CAPTURE_IDENTITY=$before
 }
 
 verify_manifest_capture() {
-  local after
-  safe_regular_file "$MANIFEST_CAPTURE_SOURCE" "work identity manifest"
-  after=$(file_identity "$MANIFEST_CAPTURE_SOURCE") || die "cannot reinspect work identity manifest"
-  [ "$after" = "$MANIFEST_CAPTURE_IDENTITY" ] \
-    && cmp -s "$MANIFEST_CAPTURE_SOURCE" "$MANIFEST_CAPTURE_TMP" \
-    || die "work identity manifest changed before publication"
+  local current
+  current=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-manifest-check.XXXXXX") \
+    || die "cannot recapture work identity manifest"
+  python3 "$FS_OWNER" snapshot-path "$MANIFEST_CAPTURE_SOURCE" "$MAX_BYTES" > "$current" \
+    || { rm -f -- "$current"; die "work identity manifest changed before publication"; }
+  cmp -s "$MANIFEST_CAPTURE_TMP" "$current" \
+    || { rm -f -- "$current"; die "work identity manifest changed before publication"; }
+  rm -f -- "$current"
 }
 
 validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; sets WORK_CANONICAL/WORK_HASH
@@ -744,35 +755,59 @@ validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; set
 }
 
 capture_metadata() {  # <meta>
-  local meta=$1 before after
+  local meta=$1 details
   [ -z "$META_CAPTURE_SOURCE" ] || {
     [ "$META_CAPTURE_SOURCE" = "$meta" ] || die "cannot validate two task metadata files concurrently"
     return 0
   }
-  safe_regular_file "$meta" "task metadata"
-  before=$(file_identity "$meta") || die "cannot inspect task metadata: $meta"
   META_CAPTURE_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-meta.XXXXXX") \
     || die "cannot capture task metadata: $meta"
-  cp -- "$meta" "$META_CAPTURE_TMP" || die "cannot capture task metadata: $meta"
-  after=$(file_identity "$meta") || die "cannot reinspect task metadata: $meta"
-  [ "$before" = "$after" ] && cmp -s "$meta" "$META_CAPTURE_TMP" \
-    || die "task metadata changed while it was captured: $meta"
+  if IFS=$'\t' read -r META_CAPTURE_PARENT META_CAPTURE_PARENT_ID < <(owned_parent_details "$meta"); then
+    META_CAPTURE_BASE=$(basename -- "$meta") || die "cannot resolve task metadata name: $meta"
+    details=$(python3 "$FS_OWNER" describe-digest \
+      "$META_CAPTURE_PARENT" "$META_CAPTURE_PARENT_ID" "$META_CAPTURE_BASE") \
+      || die "task metadata is unsafe: $meta"
+    META_CAPTURE_ENTRY_STATE=${details%%$'\t'*}
+    META_CAPTURE_ENTRY_DIGEST=${details#*$'\t'}
+    [ "$META_CAPTURE_ENTRY_STATE" != "$details" ] || die "cannot inspect task metadata: $meta"
+    python3 "$FS_OWNER" snapshot "$META_CAPTURE_PARENT" "$META_CAPTURE_PARENT_ID" \
+      "$META_CAPTURE_BASE" "$META_CAPTURE_ENTRY_STATE" "$META_CAPTURE_ENTRY_DIGEST" \
+      > "$META_CAPTURE_TMP" || die "cannot capture task metadata: $meta"
+  else
+    python3 "$FS_OWNER" snapshot-path "$meta" "$MAX_BYTES" > "$META_CAPTURE_TMP" \
+      || die "cannot capture task metadata: $meta"
+  fi
   safe_regular_file "$META_CAPTURE_TMP" "captured task metadata"
   META_CAPTURE_SOURCE=$meta
-  META_CAPTURE_IDENTITY=$before
 }
 
 finish_metadata_capture() {  # <meta>
-  local meta=$1 after
+  local meta=$1 details current
   [ "$META_CAPTURE_SOURCE" = "$meta" ] || die "task metadata capture ownership is mismatched: $meta"
-  safe_regular_file "$meta" "task metadata"
-  after=$(file_identity "$meta") || die "cannot reinspect task metadata: $meta"
-  [ "$after" = "$META_CAPTURE_IDENTITY" ] && cmp -s "$meta" "$META_CAPTURE_TMP" \
-    || die "task metadata changed while it was validated: $meta"
+  if [ -n "$META_CAPTURE_PARENT" ]; then
+    details=$(python3 "$FS_OWNER" describe-digest \
+      "$META_CAPTURE_PARENT" "$META_CAPTURE_PARENT_ID" "$META_CAPTURE_BASE") \
+      || die "cannot reinspect task metadata: $meta"
+    [ "$details" = "$META_CAPTURE_ENTRY_STATE"$'\t'"$META_CAPTURE_ENTRY_DIGEST" ] \
+      || die "task metadata changed while it was validated: $meta"
+  else
+    current=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-meta-check.XXXXXX") \
+      || die "cannot recapture task metadata: $meta"
+    python3 "$FS_OWNER" snapshot-path "$meta" "$MAX_BYTES" > "$current" \
+      || { rm -f -- "$current"; die "task metadata changed while it was validated: $meta"; }
+    cmp -s "$META_CAPTURE_TMP" "$current" \
+      || { rm -f -- "$current"; die "task metadata changed while it was validated: $meta"; }
+    rm -f -- "$current"
+  fi
   rm -f -- "$META_CAPTURE_TMP"
   META_CAPTURE_TMP=
   META_CAPTURE_SOURCE=
   META_CAPTURE_IDENTITY=
+  META_CAPTURE_PARENT=
+  META_CAPTURE_PARENT_ID=
+  META_CAPTURE_BASE=
+  META_CAPTURE_ENTRY_STATE=
+  META_CAPTURE_ENTRY_DIGEST=
 }
 
 meta_field_exact() {  # <meta> <key>; sets META_VALUE, 0 exact, 1 absent, 2 malformed
@@ -2633,7 +2668,7 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
 }
 
 metadata_publish_unlinked() {  # <task-id> <candidate>
-  local task=$1 candidate=$2 target="$STATE_REAL/$1.meta" captured
+  local task=$1 candidate=$2 target="$STATE_REAL/$1.meta" captured target_state
   identity_mutation_lock_acquire "$task"
   validate_unlinked_guard "$task"
   [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ] \
@@ -2658,19 +2693,29 @@ metadata_publish_unlinked() {  # <task-id> <candidate>
   META_CAPTURE_TMP=
   META_CAPTURE_SOURCE=
   META_CAPTURE_IDENTITY=
+  META_CAPTURE_PARENT=
+  META_CAPTURE_PARENT_ID=
+  META_CAPTURE_BASE=
+  META_CAPTURE_ENTRY_STATE=
+  META_CAPTURE_ENTRY_DIGEST=
   TMP=$captured
+  chmod 600 "$captured" || die "cannot protect unlinked task metadata candidate"
   if [ -e "$target" ] || [ -L "$target" ]; then
     capture_metadata "$target"
     validate_meta_binding_captured "$target" unlinked
-    cmp -s "$captured" "$META_CAPTURE_TMP" \
-      || die "task $task metadata is already published with different content"
-    rm -f -- "$captured"
-    TMP=
+    target_state=$META_CAPTURE_ENTRY_STATE
+    [ -n "$target_state" ] || die "unlinked task metadata target is not owner-managed: $target"
+    if cmp -s "$captured" "$META_CAPTURE_TMP"; then
+      rm -f -- "$captured"
+      TMP=
+      finish_metadata_capture "$target"
+      return 0
+    fi
     finish_metadata_capture "$target"
-    return 0
+    owned_atomic_replace_expected "$captured" "$target" "unlinked task metadata" "$target_state"
+  else
+    owned_atomic_replace "$captured" "$target" "unlinked task metadata"
   fi
-  chmod 600 "$captured" || die "cannot protect unlinked task metadata candidate"
-  owned_atomic_replace "$captured" "$target" "unlinked task metadata"
   TMP=
   validate_meta_binding "$target" unlinked
 }

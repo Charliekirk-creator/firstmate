@@ -1343,53 +1343,81 @@ finish_remote_handoff() { # <secondmate-id> <outbox-path>
 }
 
 remove_interrupted_source_duplicates() { # <outbox> <keys...>
-  local outbox=$1 key source_hash target_hash source_details source_digest
-  local target_details target_digest reconcile_out
+  local outbox=$1 key source_hash target_hash source_details source_state source_digest
+  local target_details target_state target_digest reconcile_out source_snapshot target_snapshot
   local source_dir source_base source_inode target_dir target_base target_inode
   local -a duplicates
   shift
+  source_snapshot=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-handoff-source.XXXXXX") || return 1
+  target_snapshot=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-handoff-target.XXXXXX") \
+    || { rm -f -- "$source_snapshot"; return 1; }
+  source_dir=$(dirname "$MAIN_BACKLOG")
+  source_base=$(basename "$MAIN_BACKLOG")
+  source_inode=$(backlog_file_inode "$source_dir") \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
+  source_details=$(python3 "$FS_OWNER" describe-digest \
+    "$source_dir" "$source_inode" "$source_base") \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  [ "$source_state" != "$source_details" ] \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
+  python3 "$FS_OWNER" snapshot "$source_dir" "$source_inode" "$source_base" \
+    "$source_state" "$source_digest" > "$source_snapshot" \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
+  target_dir=$(dirname "$outbox")
+  target_base=$(basename "$outbox")
+  target_inode=$(backlog_file_inode "$target_dir") \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
+  target_details=$(python3 "$FS_OWNER" describe-digest \
+    "$target_dir" "$target_inode" "$target_base") \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
+  target_state=${target_details%%$'\t'*}
+  target_digest=${target_details#*$'\t'}
+  [ "$target_state" != "$target_details" ] \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
+  python3 "$FS_OWNER" snapshot "$target_dir" "$target_inode" "$target_base" \
+    "$target_state" "$target_digest" > "$target_snapshot" \
+    || { rm -f -- "$source_snapshot" "$target_snapshot"; return 1; }
   duplicates=()
   for key in "$@"; do
-    backlog_key_section "$outbox" "$key" >/dev/null 2>&1 || continue
-    if backlog_key_section "$MAIN_BACKLOG" "$key" >/dev/null 2>&1; then
-      source_hash=$(backlog_task_sha256 "$MAIN_BACKLOG" "$key") || {
+    backlog_key_section "$target_snapshot" "$key" >/dev/null 2>&1 || continue
+    if backlog_key_section "$source_snapshot" "$key" >/dev/null 2>&1; then
+      source_hash=$(backlog_task_sha256 "$source_snapshot" "$key") || {
+        rm -f -- "$source_snapshot" "$target_snapshot"
         echo "error: refusing interrupted source removal for $key: source row is not Queued" >&2
         return 1
       }
-      target_hash=$(backlog_task_sha256 "$outbox" "$key") || return 1
+      target_hash=$(backlog_task_sha256 "$target_snapshot" "$key") || {
+        rm -f -- "$source_snapshot" "$target_snapshot"
+        return 1
+      }
       [ "$source_hash" = "$target_hash" ] || {
+        rm -f -- "$source_snapshot" "$target_snapshot"
         echo "error: refusing interrupted source removal for $key: source and destination content differ" >&2
         return 1
       }
       duplicates+=("$key")
     fi
   done
-  [ "${#duplicates[@]}" -gt 0 ] || return 0
+  if [ "${#duplicates[@]}" -eq 0 ]; then
+    rm -f -- "$source_snapshot" "$target_snapshot"
+    return 0
+  fi
   fm_tasks_axi_rm_has_peer_revision_cas || {
+    rm -f -- "$source_snapshot" "$target_snapshot"
     echo "error: tasks-axi lacks peer-revision CAS required for interrupted handoff reconciliation" >&2
     return 1
   }
-  source_dir=$(dirname "$MAIN_BACKLOG")
-  source_base=$(basename "$MAIN_BACKLOG")
-  source_inode=$(backlog_file_inode "$source_dir") || return 1
-  source_details=$(python3 "$FS_OWNER" describe-digest \
-    "$source_dir" "$source_inode" "$source_base") || return 1
-  source_digest=${source_details#*$'\t'}
-  [ "$source_digest" != "$source_details" ] || return 1
-  target_dir=$(dirname "$outbox")
-  target_base=$(basename "$outbox")
-  target_inode=$(backlog_file_inode "$target_dir") || return 1
-  target_details=$(python3 "$FS_OWNER" describe-digest \
-    "$target_dir" "$target_inode" "$target_base") || return 1
-  target_digest=${target_details#*$'\t'}
-  [ "$target_digest" != "$target_details" ] || return 1
   if ! reconcile_out=$(tasks-axi rm "${duplicates[@]}" --file "$MAIN_BACKLOG" \
     --if-source-sha256 "$source_digest" --if-peer "$outbox" \
     --if-peer-sha256 "$target_digest" --json 2>&1); then
+    rm -f -- "$source_snapshot" "$target_snapshot"
     [ -z "$reconcile_out" ] || printf '%s\n' "$reconcile_out" >&2
     echo "error: source or destination backlog changed during interrupted handoff reconciliation; no stale row was removed" >&2
     return 1
   fi
+  rm -f -- "$source_snapshot" "$target_snapshot"
   for key in "${duplicates[@]}"; do
     backlog_key_section "$MAIN_BACKLOG" "$key" >/dev/null 2>&1 || continue
     echo "error: tasks-axi peer-revision reconciliation retained source row $key" >&2

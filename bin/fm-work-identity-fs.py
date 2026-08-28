@@ -53,6 +53,35 @@ def open_source(path):
     return fd, info
 
 
+def snapshot_path(path, maximum):
+    source_fd, source_info = open_source(path)
+    if source_info.st_size > maximum:
+        os.close(source_fd)
+        fail(f"publication source exceeds {maximum} bytes: {path}")
+    before = state_from_info(source_info)
+    try:
+        with tempfile.SpooledTemporaryFile(max_size=1048576) as payload:
+            total = 0
+            while True:
+                chunk = os.read(source_fd, 131072)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > maximum:
+                    fail(f"publication source exceeds {maximum} bytes: {path}")
+                payload.write(chunk)
+            if state_from_info(os.fstat(source_fd)) != before:
+                fail(f"publication source changed during snapshot: {path}")
+            payload.seek(0)
+            while True:
+                chunk = payload.read(131072)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+    finally:
+        os.close(source_fd)
+
+
 def copy_to_new(source, directory_fd, name):
     source_fd, source_info = open_source(source)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -689,6 +718,15 @@ def lock_release(directory_fd, name, pid, token):
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "snapshot-path":
+        try:
+            maximum = int(sys.argv[3])
+        except ValueError:
+            fail("snapshot-path maximum size is malformed")
+        if maximum < 0:
+            fail("snapshot-path maximum size is malformed")
+        snapshot_path(sys.argv[2], maximum)
+        return
     if len(sys.argv) < 5:
         fail("usage: fm-work-identity-fs.py COMMAND DIRECTORY INODE NAME [ARG]")
     command, directory, expected, name = sys.argv[1:5]

@@ -773,7 +773,7 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
         [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
         evidence_token=$(tr -d '\n' < "$entering") || return 1
         [ "$evidence_token" = "$token" ] || return 1
-        printf 'unsent'
+        printf 'pending-unproven'
       else
         printf 'unsent'
       fi
@@ -820,7 +820,7 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
           [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
           evidence_token=$(tr -d '\n' < "$entering") || return 1
           [ "$evidence_token" = "$token" ] || return 1
-          printf 'unsent'
+          printf 'pending-unproven'
         else
           printf 'unsent'
         fi
