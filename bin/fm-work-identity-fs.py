@@ -542,6 +542,10 @@ def recover_replace(directory_fd, name):
                 atomic_rename(directory_fd, previous, name, False)
                 fail(f"owned destination changed during publication: {name}")
             remove(directory_fd, previous)
+            os.fsync(directory_fd)
+        if not state_matches(raw_entry_state(directory_fd, name), candidate_state) \
+                or file_digest(directory_fd, name) != candidate_digest:
+            fail(f"owned destination changed before publication commit: {name}")
         os.close(journal_fd)
         journal_fd = None
         remove(directory_fd, journal)

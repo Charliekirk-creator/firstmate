@@ -4281,6 +4281,21 @@ kimi_deliver_launch_brief() {
     composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || composer_state=unknown
     case "$composer_state" in
       pending|pending-unproven) submission_state=pending ;;
+      empty)
+        if { [ -e "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" ] \
+            || [ -L "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" ]; } \
+          && [ ! -e "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" ] \
+          && [ ! -L "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" ]; then
+          kimi_submission_reset_unsent || {
+            kimi_spawn_fail "kimi unsent launch brief submission could not be retired"
+            return 1
+          }
+          submission_state=prepared
+        else
+          kimi_spawn_fail "kimi launch brief submission remains ambiguous"
+          return 1
+        fi
+        ;;
       *)
         kimi_spawn_fail "kimi launch brief submission remains ambiguous"
         return 1
@@ -5146,11 +5161,12 @@ spawn_record_traceparent() {
     SPAWN_META_LOCK_HELD=1
     acquired=1
   fi
+  fm_meta_replace_expect "$meta" || return 1
   SPAWN_META_TMP="$STATE/.$ID.meta.trace.${BASHPID:-$$}"
   if [ ! -f "$meta" ] || [ ! -w "$meta" ] \
      || ! awk -F= '$1 != "traceparent"' "$meta" > "$SPAWN_META_TMP" \
      || ! printf 'traceparent=%s\n' "$SPAWN_TRACEPARENT" >> "$SPAWN_META_TMP" \
-     || ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$meta" "task record" "$STATE"; then
+     || ! fm_meta_atomic_replace "$SPAWN_META_TMP" "$meta"; then
     status=1
     rm -f "$SPAWN_META_TMP" 2>/dev/null || true
   fi
