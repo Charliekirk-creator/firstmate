@@ -1333,8 +1333,8 @@ EOF
     "same-id destination conflict retained source ownership preparation"
   assert_absent "$sub/data/colliding-task/work-identity-handoff-target.json" \
     "same-id destination conflict retained target ownership preparation"
-  assert_contains "$out" "exact destination backlog reservation failed" \
-    "same-id destination conflict did not fail at the exact receipt boundary"
+  assert_contains "$out" "same-ID source and destination rows with different content" \
+    "same-id destination conflict did not fail before identity preparation"
   pass "same-id destination rows require an exact transferred-content receipt"
 }
 
@@ -1405,8 +1405,13 @@ EOF
   pass "registry entry without (home: ...) fails cleanly with has no home"
 }
 
-if [ "${FM_TEST_ONLY:-}" = scaffold-parent-swap ]; then
-  test_scaffold_parent_swap_refuses_without_external_write
+case "${FM_TEST_ONLY:-}" in
+  scaffold-parent-swap) test_scaffold_parent_swap_refuses_without_external_write ;;
+  same-id-conflict) test_same_id_destination_requires_exact_handoff_receipt ;;
+  '') ;;
+  *) fail "unknown FM_TEST_ONLY selector: $FM_TEST_ONLY" ;;
+esac
+if [ -n "${FM_TEST_ONLY:-}" ]; then
   echo "ALL TESTS PASSED"
   exit 0
 fi

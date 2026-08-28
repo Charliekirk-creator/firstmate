@@ -1617,44 +1617,7 @@ spawn_abort_cleanup() {
       if fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
         orca_cleanup_compensated=1
       else
-        if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ]; then
-          if ! spawn_fresh_commit_rollback; then
-            status=1
-          fi
-          SPAWN_FRESH_COMMIT_PENDING=0
-        fi
-        mkdir -p "$STATE" 2>/dev/null || true
-        if [ -d "$STATE" ]; then
-          SPAWN_META_TMP="$STATE/.$ID.meta.orca-recovery.${BASHPID:-$$}"
-          {
-            echo "window=$W"
-            echo "endpoint_task_id=$ID"
-            echo "cleanup_recovery=orca"
-            echo "worktree=${WT:-}"
-            echo "project=$PROJ_ABS"
-            echo "launch_brief=${BRIEF:-}"
-            [ -z "${LAUNCH_BRIEF_HASH:-}" ] || echo "launch_brief_sha256=$LAUNCH_BRIEF_HASH"
-            [ -z "${SPAWN_DISPATCH_TRANSACTION:-}" ] \
-              || echo "work_identity_dispatch_transaction=$SPAWN_DISPATCH_TRANSACTION"
-            echo "harness=$HARNESS"
-            echo "kind=$KIND"
-            [ -z "${MODE:-}" ] || echo "mode=$MODE"
-            [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
-            echo "tasktmp=${TASK_TMP:-}"
-            echo "model=${MODEL:-default}"
-            echo "effort=${EFFORT:-default}"
-            if [ -n "${WORK_IDENTITY_STATUS:-}" ]; then
-              echo "work_identity_schema=$WORK_IDENTITY_SCHEMA"
-              echo "work_identity_status=$WORK_IDENTITY_STATUS"
-              [ "$WORK_IDENTITY_STATUS" != linked ] || echo "work_identity_sha256=$WORK_IDENTITY_HASH"
-            fi
-            echo "backend=orca"
-            echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-            [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-          } > "$SPAWN_META_TMP" 2>/dev/null \
-            && fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE" \
-            || true
-        fi
+        echo "warning: Orca cleanup failed; preserving the exact endpoint receipt and operation journal for recovery" >&2
       fi
     fi
   fi
@@ -3973,12 +3936,15 @@ kimi_spawn_fail() {  # <detail>
 }
 
 kimi_submission_state() {
-  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted entering result value links pid token verdict
+  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted entering result operation_owner operation_result
+  local value links pid token verdict
   owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner"
   go="$SPAWN_LAUNCH_REQUEST/kimi-submit-go"
   attempted="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted"
   entering="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering"
   result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
+  operation_owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-owner"
+  operation_result="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-result"
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'absent'; return 0; fi
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
   links=$(spawn_file_link_count "$path") || return 1
@@ -3995,6 +3961,30 @@ kimi_submission_state() {
       send-failed) printf 'ambiguous' ;;
       *) return 1 ;;
     esac
+    return 0
+  fi
+  if [ -e "$operation_result" ] || [ -L "$operation_result" ]; then
+    [ -f "$operation_result" ] && [ ! -L "$operation_result" ] \
+      && [ "$(spawn_file_link_count "$operation_result")" = 1 ] || return 1
+    IFS=$'\t' read -r token verdict < "$operation_result" || return 1
+    [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
+    case "$verdict" in
+      empty|accepted) printf 'accepted' ;;
+      pending|pending-unproven) printf 'pending' ;;
+      unsent) printf 'unsent' ;;
+      *) printf 'ambiguous' ;;
+    esac
+    return 0
+  fi
+  if [ -e "$operation_owner" ] || [ -L "$operation_owner" ]; then
+    [ -f "$operation_owner" ] && [ ! -L "$operation_owner" ] \
+      && [ "$(spawn_file_link_count "$operation_owner")" = 1 ] || return 1
+    value=$(tr -d '\n' < "$operation_owner") || return 1
+    pid=${value%%:*}
+    token=${value#*:}
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
+    if kill -0 "$pid" 2>/dev/null; then printf 'submitting'; else printf 'ambiguous'; fi
     return 0
   fi
   if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then
@@ -4037,6 +4027,8 @@ kimi_submission_reset_unsent() {
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-go" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-owner" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-result" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
   do
     if [ -e "$path" ] || [ -L "$path" ]; then

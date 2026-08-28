@@ -352,6 +352,47 @@ test_non_tmux_definitive_submit_failure_is_retryable() {
   pass "non-tmux definitive send failures remain retryable"
 }
 
+test_non_tmux_submission_operation_survives_caller_interruption() {
+  local evidence="$TMP_ROOT/non-tmux-durable-attempt" invoked="$TMP_ROOT/non-tmux-durable-invoked"
+  local release="$TMP_ROOT/non-tmux-durable-release" caller out i=0
+  (
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_send_text_submit() {
+      touch "$invoked"
+      while [ ! -e "$release" ]; do sleep 0.01; done
+      printf 'empty'
+    }
+    fm_backend_send_text_submit_journaled "$evidence" durable-token \
+      zellij target brief 1 0 0 label >/dev/null
+  ) &
+  caller=$!
+  while [ ! -e "$invoked" ] || [ ! -e "${evidence}.operation-owner" ]; do
+    kill -0 "$caller" 2>/dev/null || fail "durable non-tmux submit caller exited before interruption"
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || fail "durable non-tmux submit operation did not start"
+    sleep 0.01
+  done
+  kill -KILL "$caller" 2>/dev/null || fail "could not interrupt non-tmux submit caller"
+  wait "$caller" 2>/dev/null || true
+  touch "$release"
+  i=0
+  while [ ! -e "${evidence}.operation-result" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || fail "durable non-tmux submit operation lost its result"
+    sleep 0.01
+  done
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_send_text_submit() { return 99; }
+    fm_backend_send_text_submit_journaled "$evidence" durable-token \
+      zellij target brief 1 0 0 label
+  ) || fail "durable non-tmux submit result was not recoverable"
+  [ "$out" = empty ] || fail "durable non-tmux submit recovered '$out' instead of empty"
+  pass "non-tmux submission survives interruption through backend-owned evidence"
+}
+
 test_kimi_presend_crash_retries_without_wedging_identity() {
   local id rec sub out rc=0 lines
   id="kimi-submit-presend-p5-$$"
@@ -850,6 +891,7 @@ test_kimi_bordered_prompt_needs_no_override() {
 
 if [ "${FM_TEST_ONLY:-}" = non-tmux-submit-recovery ]; then
   test_non_tmux_definitive_submit_failure_is_retryable
+  test_non_tmux_submission_operation_survives_caller_interruption
   exit 0
 fi
 
@@ -857,6 +899,7 @@ test_kimi_hook_install_is_surgical_idempotent_and_removable
 test_kimi_secondmate_commits_identity_only_after_delivery
 test_kimi_interrupted_submit_never_retypes_ambiguous_input
 test_non_tmux_definitive_submit_failure_is_retryable
+test_non_tmux_submission_operation_survives_caller_interruption
 test_kimi_presend_crash_retries_without_wedging_identity
 test_kimi_hook_remove_preserves_owned_newline_boundary
 test_kimi_hook_fails_closed_on_missing_malformed_or_partial_config

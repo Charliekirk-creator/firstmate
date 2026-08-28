@@ -740,12 +740,72 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 
 fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local evidence=$1 token=$2 backend=${3:-} entering="${1}.entering"
+  local owner="${1}.operation-owner" result="${1}.operation-result"
+  local tmp worker_pid owner_value owner_pid result_token verdict
   shift 2
-  [ "$backend" != tmux ] || entering=
-  FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE=$entering \
-    FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
-    FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
-    fm_backend_send_text_submit "$@"
+  if [ "$backend" = tmux ]; then
+    FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE= \
+      FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
+      FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
+      fm_backend_send_text_submit "$@"
+    return
+  fi
+  if [ -e "$result" ] || [ -L "$result" ]; then
+    [ -f "$result" ] && [ ! -L "$result" ] || return 1
+    IFS=$'\t' read -r result_token verdict < "$result" || return 1
+    [ "$result_token" = "$token" ] || return 1
+    printf '%s' "$verdict"
+    return 0
+  fi
+  if [ -e "$owner" ] || [ -L "$owner" ]; then
+    [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
+    owner_value=$(tr -d '\n' < "$owner") || return 1
+    owner_pid=${owner_value%%:*}
+    [ "${owner_value#*:}" = "$token" ] || return 1
+    case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$owner_pid" 2>/dev/null || { printf 'pending-unproven'; return 0; }
+  else
+    (
+      trap - EXIT
+      trap '' HUP INT TERM
+      umask 077
+      tmp="${owner}.tmp.${BASHPID:-$$}"
+      printf '%s:%s\n' "${BASHPID:-$$}" "$token" > "$tmp" \
+        && chmod 600 "$tmp" && mv -- "$tmp" "$owner" || exit 1
+      verdict=$(FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE=$entering \
+        FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
+        FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
+        fm_backend_send_text_submit "$@") || verdict=pending-unproven
+      tmp="${result}.tmp.${BASHPID:-$$}"
+      printf '%s\t%s\n' "$token" "$verdict" > "$tmp" \
+        && chmod 600 "$tmp" && mv -- "$tmp" "$result" || exit 1
+      rm -f -- "$owner"
+    ) </dev/null >/dev/null 2>&1 &
+    worker_pid=$!
+    while [ ! -e "$owner" ] && [ ! -L "$owner" ] \
+      && [ ! -e "$result" ] && [ ! -L "$result" ] \
+      && kill -0 "$worker_pid" 2>/dev/null; do
+      sleep 0.01
+    done
+  fi
+  while [ ! -e "$result" ] && [ ! -L "$result" ]; do
+    if [ -e "$owner" ] || [ -L "$owner" ]; then
+      [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
+      owner_value=$(tr -d '\n' < "$owner") || return 1
+      owner_pid=${owner_value%%:*}
+      [ "${owner_value#*:}" = "$token" ] || return 1
+      case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
+      kill -0 "$owner_pid" 2>/dev/null || { printf 'pending-unproven'; return 0; }
+    else
+      printf 'pending-unproven'
+      return 0
+    fi
+    sleep 0.02
+  done
+  [ -f "$result" ] && [ ! -L "$result" ] || return 1
+  IFS=$'\t' read -r result_token verdict < "$result" || return 1
+  [ "$result_token" = "$token" ] || return 1
+  printf '%s' "$verdict"
 }
 
 # fm_backend_kill: remove the task's session endpoint (best-effort; a

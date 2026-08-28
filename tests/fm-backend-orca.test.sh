@@ -1256,12 +1256,15 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   [ "$status" -ne 0 ] || fail "Orca spawn should fail when terminal creation and abort cleanup fail"
   assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-cleanup-fail'$'\x1f''--force'$'\x1f''--json' \
     "Orca spawn should attempt helper cleanup before preserving metadata"
-  assert_present "$state/$id.meta" "failed Orca abort cleanup should preserve metadata"
-  assert_grep "window=fm-$id" "$state/$id.meta" "preserved metadata missing stable window alias"
-  assert_grep "backend=orca" "$state/$id.meta" "preserved metadata missing backend=orca"
-  assert_grep "orca_worktree_id=wt-cleanup-fail" "$state/$id.meta" "preserved metadata missing Orca worktree id"
-  assert_no_grep "terminal=" "$state/$id.meta" "preserved metadata should not invent a terminal handle"
-  pass "fm-spawn.sh --backend orca: preserves metadata when abort cleanup fails"
+  assert_absent "$state/$id.meta" "failed Orca abort cleanup bypassed atomic dispatch publication"
+  assert_present "$state/$id.spawn-endpoint.json" \
+    "failed Orca abort cleanup lost its exact endpoint recovery receipt"
+  assert_present "$state/$id.spawn-orca-operation/failure.json" \
+    "failed Orca abort cleanup lost its exact operation result"
+  jq -e '.reason == "terminal" and .worktree_id == "wt-cleanup-fail"' \
+    "$state/$id.spawn-orca-operation/failure.json" >/dev/null \
+    || fail "preserved Orca operation result lost the worktree id"
+  pass "fm-spawn.sh --backend orca: preserves owner journals when abort cleanup fails"
 }
 
 test_spawn_refuses_unsafe_metadata_path_before_orca_creation() {
@@ -1881,6 +1884,12 @@ test_dispatcher_sources_orca_and_routes_primitives() {
   [ "$out" = "via dispatch" ] || fail "dispatcher should route capture to the Orca adapter, got '$out'"
   pass "fm-backend dispatcher: accepts orca and routes capture through bin/backends/orca.sh"
 }
+
+if [ "${FM_TEST_ONLY:-}" = abort-cleanup-journal ]; then
+  test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
+  echo "ALL TESTS PASSED"
+  exit 0
+fi
 
 test_capture_reads_terminal_tail_json
 test_capture_falls_back_to_text_fields

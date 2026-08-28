@@ -1262,7 +1262,7 @@ finish_remote_handoff() { # <secondmate-id> <outbox-path>
 }
 
 remove_interrupted_source_duplicates() { # <outbox> <keys...>
-  local outbox=$1 key progress remaining pass=0
+  local outbox=$1 key progress remaining pass=0 source_hash target_hash
   shift
   while :; do
     remaining=0
@@ -1270,6 +1270,15 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
     for key in "$@"; do
       backlog_key_section "$outbox" "$key" >/dev/null 2>&1 || continue
       if backlog_key_section "$MAIN_BACKLOG" "$key" >/dev/null 2>&1; then
+        source_hash=$(backlog_task_sha256 "$MAIN_BACKLOG" "$key") || {
+          echo "error: refusing interrupted source removal for $key: source row is not Queued" >&2
+          return 1
+        }
+        target_hash=$(backlog_task_sha256 "$outbox" "$key") || return 1
+        [ "$source_hash" = "$target_hash" ] || {
+          echo "error: refusing interrupted source removal for $key: source and destination content differ" >&2
+          return 1
+        }
         remaining=$((remaining + 1))
         if tasks-axi rm "$key" --file "$MAIN_BACKLOG" >/dev/null 2>&1; then
           progress=$((progress + 1))
@@ -1290,7 +1299,7 @@ remote_handoff() { # <secondmate-id> <keys...>
   local id=$1 outbox section main_section out_section key mv_out target_home persisted
   local home_real data_parent data_parent_real data_base data_expected
   local data_info data_real data_inode handoff_info handoff_dir handoff_inode
-  local -a requested unique_requested to_move already missing in_flight done_items not_queued delivery_keys
+  local -a requested unique_requested to_move already missing in_flight done_items not_queued conflicting delivery_keys
   shift
   requested=("$@")
   unique_requested=()
@@ -1344,12 +1353,19 @@ remote_handoff() { # <secondmate-id> <keys...>
   in_flight=()
   done_items=()
   not_queued=()
+  conflicting=()
   for key in "${requested[@]}"; do
     out_section=$(backlog_key_section "$outbox" "$key" 2>/dev/null || true)
     main_section=$(backlog_key_section "$MAIN_BACKLOG" "$key" 2>/dev/null || true)
     if [ -n "$out_section" ]; then
-      [ "$out_section" = '## Queued' ] || not_queued+=("$key")
-      already+=("$key")
+      if [ "$out_section" != '## Queued' ] || { [ -n "$main_section" ] && [ "$main_section" != '## Queued' ]; }; then
+        not_queued+=("$key")
+      elif [ -n "$main_section" ] \
+        && [ "$(backlog_task_sha256 "$MAIN_BACKLOG" "$key")" != "$(backlog_task_sha256 "$outbox" "$key")" ]; then
+        conflicting+=("$key")
+      else
+        already+=("$key")
+      fi
       continue
     fi
     case "$main_section" in
@@ -1361,10 +1377,12 @@ remote_handoff() { # <secondmate-id> <keys...>
     esac
   done
   if [ "${#in_flight[@]}" -gt 0 ] || [ "${#done_items[@]}" -gt 0 ] \
-    || [ "${#not_queued[@]}" -gt 0 ] || [ "${#missing[@]}" -gt 0 ]; then
+    || [ "${#not_queued[@]}" -gt 0 ] || [ "${#conflicting[@]}" -gt 0 ] \
+    || [ "${#missing[@]}" -gt 0 ]; then
     [ "${#in_flight[@]}" -eq 0 ] || echo "error: refusing to hand off in-flight backlog items: ${in_flight[*]}" >&2
     [ "${#done_items[@]}" -eq 0 ] || echo "error: refusing to hand off Done backlog items: ${done_items[*]}" >&2
     [ "${#not_queued[@]}" -eq 0 ] || echo "error: refusing to hand off non-Queued outbox or backlog items: ${not_queued[*]}" >&2
+    [ "${#conflicting[@]}" -eq 0 ] || echo "error: refusing same-ID source and outbox rows with different content: ${conflicting[*]}" >&2
     [ "${#missing[@]}" -eq 0 ] || echo "error: no backlog or pending outbox item matched: ${missing[*]}" >&2
     echo "       nothing new was staged." >&2
     return 1
@@ -1609,9 +1627,18 @@ MISSING=()
 IN_FLIGHT=()
 DONE=()
 NOT_QUEUED=()
+CONFLICTING=()
 for key in "$@"; do
   if section=$(backlog_key_section "$SUB_BACKLOG" "$key"); then
-    if [ "$section" = "## Queued" ]; then ALREADY+=("$key"); else NOT_QUEUED+=("$key"); fi
+    source_section=$(backlog_key_section "$MAIN_BACKLOG" "$key" 2>/dev/null || true)
+    if [ "$section" != "## Queued" ] || { [ -n "$source_section" ] && [ "$source_section" != "## Queued" ]; }; then
+      NOT_QUEUED+=("$key")
+    elif [ -n "$source_section" ] \
+      && [ "$(backlog_task_sha256 "$MAIN_BACKLOG" "$key")" != "$(backlog_task_sha256 "$SUB_BACKLOG" "$key")" ]; then
+      CONFLICTING+=("$key")
+    else
+      ALREADY+=("$key")
+    fi
   elif section=$(backlog_key_section "$MAIN_BACKLOG" "$key"); then
     case "$section" in
       "## Queued") TO_MOVE+=("$key") ;;
@@ -1639,6 +1666,10 @@ if [ "${#NOT_QUEUED[@]}" -gt 0 ]; then
 fi
 if [ "${#MISSING[@]}" -gt 0 ]; then
   echo "error: no backlog item matched these keys in $MAIN_BACKLOG: ${MISSING[*]}" >&2
+  FAILED=1
+fi
+if [ "${#CONFLICTING[@]}" -gt 0 ]; then
+  echo "error: refusing same-ID source and destination rows with different content: ${CONFLICTING[*]}" >&2
   FAILED=1
 fi
 if [ "$FAILED" -ne 0 ]; then

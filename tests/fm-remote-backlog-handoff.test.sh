@@ -566,6 +566,39 @@ fi
 assert_grep 'route-race' "$PARENT/data/backlog.md" "route retirement stranded queued work outside the primary backlog"
 assert_absent "$PARENT/data/handoff/ios.outbox.md" "route retirement left an orphaned handoff outbox"
 pass "route classification serializes with retirement before staging"
+printf '%s\n' \
+  "- ios - iOS delivery (host: remote-mac; root: $REMOTE_ROOT; home: $REMOTE; scope: iOS work; projects: alpha; added 2026-08-02)" \
+  > "$PARENT/data/secondmates.md"
+
+write_backlog '- [ ] remote-collision - source work that must remain (repo: alpha)'
+mkdir -p "$PARENT/data/handoff"
+cat > "$PARENT/data/handoff/ios.outbox.md" <<'EOF'
+## In flight
+
+## Queued
+- [ ] remote-collision - unrelated pending outbox work (repo: beta)
+
+## Done
+EOF
+cp "$PARENT/data/backlog.md" "$TMP_ROOT/remote-collision-source.before"
+cp "$PARENT/data/handoff/ios.outbox.md" "$TMP_ROOT/remote-collision-outbox.before"
+rc=0
+handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios remote-collision \
+  > "$TMP_ROOT/remote-collision.out" 2>&1 || rc=$?
+[ "$rc" -ne 0 ] || fail "remote same-ID outbox collision was accepted"
+cmp -s "$TMP_ROOT/remote-collision-source.before" "$PARENT/data/backlog.md" \
+  || fail "remote same-ID collision changed source work"
+cmp -s "$TMP_ROOT/remote-collision-outbox.before" "$PARENT/data/handoff/ios.outbox.md" \
+  || fail "remote same-ID collision changed pending outbox work"
+assert_contains "$(cat "$TMP_ROOT/remote-collision.out")" \
+  "same-ID source and outbox rows with different content" \
+  "remote same-ID collision did not refuse at exact content classification"
+assert_absent "$PARENT/data/remote-collision/work-identity-handoff-source.json" \
+  "remote same-ID collision prepared source identity"
+assert_absent "$REMOTE/data/remote-collision/work-identity-handoff-target.json" \
+  "remote same-ID collision prepared target identity"
+rm -f -- "$PARENT/data/handoff/ios.outbox.md"
+pass "remote same-ID outbox rows require exact source content"
 
 # With no handoff directory or remote route, bootstrap neither invokes SSH nor
 # emits a remote handoff line.
