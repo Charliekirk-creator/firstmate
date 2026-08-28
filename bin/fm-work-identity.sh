@@ -696,15 +696,28 @@ verify_manifest_capture() {
 }
 
 validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; sets WORK_CANONICAL/WORK_HASH
-  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} expected_home_id=${4:-} before after canonical
-  safe_regular_file "$path" "work identity record"
-  before=$(file_identity "$path") || die "cannot inspect work identity record: $path"
+  local path=$1 task=$2 expected_home=${3:-$FM_HOME_REAL} expected_home_id=${4:-}
+  local before after canonical parent expected base details state digest owned=0
   SIDECAR_SNAPSHOT_TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-work-identity-record.XXXXXX") \
     || die "cannot capture work identity record"
-  cp -- "$path" "$SIDECAR_SNAPSHOT_TMP" || die "cannot capture work identity record: $path"
-  after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
-  [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
-    || die "work identity record changed while it was captured: $path"
+  if IFS=$'\t' read -r parent expected < <(owned_parent_details "$path"); then
+    base=$(basename -- "$path") || die "cannot resolve work identity record name"
+    details=$(python3 "$FS_OWNER" describe-digest "$parent" "$expected" "$base") \
+      || die "work identity record is unsafe: $path"
+    state=${details%%$'\t'*}
+    digest=${details#*$'\t'}
+    [ "$state" != "$details" ] || die "cannot inspect work identity record: $path"
+    python3 "$FS_OWNER" snapshot "$parent" "$expected" "$base" "$state" "$digest" \
+      > "$SIDECAR_SNAPSHOT_TMP" || die "cannot capture work identity record: $path"
+    owned=1
+  else
+    safe_regular_file "$path" "work identity record"
+    before=$(file_identity "$path") || die "cannot inspect work identity record: $path"
+    cp -- "$path" "$SIDECAR_SNAPSHOT_TMP" || die "cannot capture work identity record: $path"
+    after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
+    [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
+      || die "work identity record changed while it was captured: $path"
+  fi
   safe_regular_file "$SIDECAR_SNAPSHOT_TMP" "captured work identity record"
   canonical=$(canonicalize_manifest "$SIDECAR_SNAPSHOT_TMP" "$task" "$expected_home" "$expected_home_id")
   if ! printf '%s\n' "$canonical" | cmp -s "$SIDECAR_SNAPSHOT_TMP" -; then
@@ -714,9 +727,16 @@ validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; set
   case "$WORK_HASH" in ''|*[!A-Fa-f0-9]*) die "work identity SHA-256 is invalid" ;; esac
   [ "${#WORK_HASH}" -eq 64 ] || die "work identity SHA-256 has the wrong length"
   WORK_HASH=$(printf '%s' "$WORK_HASH" | tr 'A-F' 'a-f')
-  after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
-  [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
-    || die "work identity record changed while it was validated: $path"
+  if [ "$owned" -eq 1 ]; then
+    details=$(python3 "$FS_OWNER" describe-digest "$parent" "$expected" "$base") \
+      || die "cannot reinspect work identity record: $path"
+    [ "$details" = "$state"$'\t'"$digest" ] \
+      || die "work identity record changed while it was validated: $path"
+  else
+    after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
+    [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
+      || die "work identity record changed while it was validated: $path"
+  fi
   rm -f -- "$SIDECAR_SNAPSHOT_TMP"
   SIDECAR_SNAPSHOT_TMP=
   WORK_CANONICAL=$canonical

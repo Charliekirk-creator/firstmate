@@ -142,6 +142,12 @@ def state_from_info(info):
     ])
 
 
+def exact_entry_matches(directory_fd, name, expected_state, expected_digest):
+    if entry_state(directory_fd, name) != expected_state:
+        return False
+    return expected_state != "absent" and file_digest(directory_fd, name) == expected_digest
+
+
 def read_exact(directory_fd, name, expected_state, expected_digest):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(name, flags, dir_fd=directory_fd)
@@ -223,7 +229,7 @@ def read_remove_journal(directory_fd, journal, name):
     retired_token = lines[1][len(retired_prefix):]
     if len(state_fields) != 8 or state_fields[0] != "regular" \
             or any(not field.isdigit() for field in state_fields[1:]) \
-            or len(retired_token) != 32 \
+            or len(retired_token) not in (16, 32) \
             or any(char not in "0123456789abcdef" for char in retired_token):
         fail(f"owned removal journal is malformed: {journal}")
     if len(expected_digest) != 64 or any(char not in "0123456789abcdef" for char in expected_digest):
@@ -291,7 +297,7 @@ def remove_entry(directory_fd, name, expected_state, expected_digest):
         return
     if file_digest(directory_fd, name) != expected_digest:
         fail(f"owned destination content changed before removal: {name}")
-    retired = f".{name}.remove-retired.{secrets.token_hex(8)}"
+    retired = f".{name}.remove-retired.{secrets.token_hex(16)}"
     journal = f".{name}.remove-journal"
     publish_remove_journal(directory_fd, journal, retired, expected_state, expected_digest)
     atomic_rename(directory_fd, name, retired, False)
@@ -352,32 +358,40 @@ def read_replace_journal(directory_fd, journal):
         os.close(fd)
         fail(f"owned replacement journal is malformed: {journal}")
     lines = payload.splitlines()
-    if len(lines) not in (2, 3):
+    if len(lines) != 4:
         os.close(fd)
         fail(f"owned replacement journal is malformed: {journal}")
     header = lines[0].split("\t")
-    if len(header) != 3 or header[0] != "v1" or not valid_name(header[1]) or not valid_name(header[2]):
+    if len(header) != 3 or header[0] != "v2" or not valid_name(header[1]) or not valid_name(header[2]):
         os.close(fd)
         fail(f"owned replacement journal is malformed: {journal}")
     expected = lines[1]
     if expected != "absent" and not expected.startswith("regular:"):
         os.close(fd)
         fail(f"owned replacement journal is malformed: {journal}")
-    candidate_state = lines[2] if len(lines) == 3 else None
-    if candidate_state is not None and not candidate_state.startswith("regular:"):
+    candidate_state = lines[2]
+    candidate_digest = lines[3]
+    if not candidate_state.startswith("regular:"):
         os.close(fd)
         fail(f"owned replacement journal is malformed: {journal}")
-    return fd, header[1], header[2], expected, candidate_state
+    if len(candidate_digest) != 64 or any(char not in "0123456789abcdef" for char in candidate_digest):
+        os.close(fd)
+        fail(f"owned replacement journal is malformed: {journal}")
+    return fd, header[1], header[2], expected, candidate_state, candidate_digest
 
 
-def publish_replace_journal(directory_fd, journal, stage, previous, expected_state, candidate_state):
+def publish_replace_journal(
+        directory_fd, journal, stage, previous, expected_state, candidate_state, candidate_digest):
     temporary = f".{journal}.{os.getpid()}.{secrets.token_hex(8)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
     published = False
     try:
-        payload = f"v1\t{stage}\t{previous}\n{expected_state}\n{candidate_state}\n".encode("ascii")
+        payload = (
+            f"v2\t{stage}\t{previous}\n{expected_state}\n"
+            f"{candidate_state}\n{candidate_digest}\n"
+        ).encode("ascii")
         if os.write(fd, payload) != len(payload):
             raise OSError(errno.EIO, "short replacement journal write")
         os.fsync(fd)
@@ -405,15 +419,14 @@ def recover_replace(directory_fd, name):
         if raw_entry_state(directory_fd, previous) != "absent":
             fail(f"owned replacement predecessor has no journal: {previous}")
         return
-    journal_fd, stage, previous, expected_state, candidate_state = loaded
+    journal_fd, stage, previous, expected_state, candidate_state, candidate_digest = loaded
     try:
         target_state = raw_entry_state(directory_fd, name)
         stage_state = raw_entry_state(directory_fd, stage)
         previous_state = raw_entry_state(directory_fd, previous)
-        if candidate_state is None:
-            fail(f"owned replacement journal is incomplete for {name}")
         if previous_state == "absent" and stage_state == "absent" \
-                and state_matches(target_state, candidate_state):
+                and state_matches(target_state, candidate_state) \
+                and file_digest(directory_fd, name) == candidate_digest:
             os.close(journal_fd)
             journal_fd = None
             remove(directory_fd, journal)
@@ -433,12 +446,14 @@ def recover_replace(directory_fd, name):
                 atomic_rename(directory_fd, previous, name, False)
                 fail(f"owned destination changed during publication: {name}")
         if target_state == "absent":
-            if not state_matches(stage_state, candidate_state):
+            if not state_matches(stage_state, candidate_state) \
+                    or file_digest(directory_fd, stage) != candidate_digest:
                 fail(f"owned replacement candidate changed during publication: {stage}")
             atomic_rename(directory_fd, stage, name, False)
             target_state = raw_entry_state(directory_fd, name)
             stage_state = "absent"
-        if not state_matches(target_state, candidate_state) or stage_state != "absent":
+        if not state_matches(target_state, candidate_state) or stage_state != "absent" \
+                or file_digest(directory_fd, name) != candidate_digest:
             fail(f"owned destination changed during publication: {name}")
         if previous_state != "absent":
             remove(directory_fd, previous)
@@ -462,8 +477,9 @@ def replace_entry(directory_fd, name, source, expected_state):
     candidate_state = raw_entry_state(directory_fd, stage)
     if not candidate_state.startswith("regular:"):
         fail(f"owned replacement candidate is unsafe: {stage}")
+    candidate_digest = file_digest(directory_fd, stage)
     publish_replace_journal(
-        directory_fd, journal, stage, previous, expected_state, candidate_state
+        directory_fd, journal, stage, previous, expected_state, candidate_state, candidate_digest
     )
     recover_replace(directory_fd, name)
 
@@ -750,15 +766,37 @@ def main():
                     remove_entry(directory_fd, name, expected_state, expected_digest)
             finally:
                 os.close(mutex_fd)
-        elif command == "replace":
-            if len(sys.argv) != 7:
+        elif command in ("replace", "replace-if-peer"):
+            if command == "replace" and len(sys.argv) != 7:
                 fail("replace requires a source and expected destination state")
+            if command == "replace-if-peer" and len(sys.argv) != 12:
+                fail("replace-if-peer requires source, destination state, and exact peer identity")
             source, expected_state = sys.argv[5:7]
+            peer_fd = None
+            peer_mutex_fd = None
             mutex_fd = operation_lock(directory_fd, name)
             try:
+                if command == "replace-if-peer":
+                    peer_directory, peer_inode, peer_name, peer_state, peer_digest = sys.argv[7:12]
+                    if not valid_name(peer_name) or len(peer_digest) != 64 \
+                            or any(char not in "0123456789abcdef" for char in peer_digest):
+                        fail("replacement peer identity is malformed")
+                    peer_fd = open_owned_dir(peer_directory, peer_inode)
+                    peer_mutex_fd = operation_lock(peer_fd, peer_name)
+                    recover_replace(peer_fd, peer_name)
+                    recover_remove(peer_fd, peer_name)
+                    if not exact_entry_matches(peer_fd, peer_name, peer_state, peer_digest):
+                        fail(f"owned replacement peer changed before publication: {peer_name}")
                 recover_remove(directory_fd, name)
                 replace_entry(directory_fd, name, source, expected_state)
+                if command == "replace-if-peer" \
+                        and not exact_entry_matches(peer_fd, peer_name, peer_state, peer_digest):
+                    fail(f"owned replacement peer changed during publication: {peer_name}")
             finally:
+                if peer_mutex_fd is not None:
+                    os.close(peer_mutex_fd)
+                if peer_fd is not None:
+                    os.close(peer_fd)
                 os.close(mutex_fd)
         elif command == "no-clobber":
             if len(sys.argv) != 7:

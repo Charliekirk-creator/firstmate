@@ -106,8 +106,10 @@
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
 #   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|muse)
 #   overrides it for this spawn (either kind). A non-flag string containing
-#   whitespace is treated as a RAW launch command - the escape hatch for verifying
-#   new adapters. For pi and pi-signed, fm-spawn resolves the selected executable
+#   whitespace is treated as a RAW launch command - the crewmate/scout escape hatch
+#   for verifying new adapters. Persistent secondmates require a verified adapter
+#   whose launch boundary can be reconciled before identity commitment. For pi and
+#   pi-signed, fm-spawn resolves the selected executable
 #   name from PATH once, probes that concrete path with --help, and launches the
 #   same path. It adds --tui-mode regular only when that help advertises the flag;
 #   a failed or inconclusive probe omits it so older Pi versions remain launchable.
@@ -2220,8 +2222,10 @@ launch_template() {
   esac
 }
 
+RAW_LAUNCH=0
 case "$ARG3" in
   *' '*)  # raw launch command (unverified-adapter escape hatch)
+    RAW_LAUNCH=1
     LAUNCH=$ARG3
     HARNESS=""
     for word in $LAUNCH; do
@@ -2255,6 +2259,11 @@ case "$ARG3" in
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
 esac
+
+if [ "$KIND" = secondmate ] && [ "$RAW_LAUNCH" -eq 1 ]; then
+  echo "error: a secondmate requires a verified harness adapter; a raw launch command cannot prove the persistent agent launch boundary" >&2
+  exit 1
+fi
 
 # muse is verified as a CREWMATE/SCOUT adapter only. A secondmate is a firstmate
 # instance, so it needs a primary supervision protocol; muse has none, and its

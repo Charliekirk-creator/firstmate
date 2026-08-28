@@ -1345,6 +1345,7 @@ finish_remote_handoff() { # <secondmate-id> <outbox-path>
 remove_interrupted_source_duplicates() { # <outbox> <keys...>
   local outbox=$1 key progress remaining pass=0 source_hash target_hash
   local source_dir source_base source_inode source_details source_state source_digest candidate
+  local target_dir target_base target_inode target_details target_state target_digest
   local -a duplicates
   shift
   duplicates=()
@@ -1364,6 +1365,14 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
     fi
   done
   [ "${#duplicates[@]}" -gt 0 ] || return 0
+  target_dir=$(dirname "$outbox")
+  target_base=$(basename "$outbox")
+  target_inode=$(backlog_file_inode "$target_dir") || return 1
+  target_details=$(python3 "$FS_OWNER" describe-digest \
+    "$target_dir" "$target_inode" "$target_base") || return 1
+  target_state=${target_details%%$'\t'*}
+  target_digest=${target_details#*$'\t'}
+  [ "$target_state" != "$target_details" ] || return 1
   source_dir=$(dirname "$MAIN_BACKLOG")
   source_base=$(basename "$MAIN_BACKLOG")
   source_inode=$(backlog_file_inode "$source_dir") || return 1
@@ -1411,10 +1420,11 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
     pass=$((pass + 1))
     [ "$pass" -le "${#duplicates[@]}" ] || { rm -f -- "$candidate"; return 1; }
   done
-  if ! python3 "$FS_OWNER" replace "$source_dir" "$source_inode" "$source_base" \
-    "$candidate" "$source_state"; then
+  if ! python3 "$FS_OWNER" replace-if-peer "$source_dir" "$source_inode" "$source_base" \
+    "$candidate" "$source_state" "$target_dir" "$target_inode" "$target_base" \
+    "$target_state" "$target_digest"; then
     rm -f -- "$candidate"
-    echo "error: source backlog changed during interrupted handoff reconciliation; no changed row was removed" >&2
+    echo "error: source or destination backlog changed during interrupted handoff reconciliation; no stale row was removed" >&2
     return 1
   fi
   rm -f -- "$candidate"
