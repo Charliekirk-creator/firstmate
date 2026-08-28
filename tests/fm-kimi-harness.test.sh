@@ -465,6 +465,26 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
   ) || fail "accepted entering submission evidence was not recoverable"
   [ "$out" = ambiguous ] \
     || fail "accepted entering submission recovered as '$out' instead of ambiguous"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_send_text_submit() { fail "dead Herdr pre-send operation invoked the backend"; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit_journaled "$evidence" durable-presend \
+      herdr target brief 1 0 0 label
+  ) || fail "dead Herdr pre-send submission was not recoverable"
+  [ "$out" = unsent ] \
+    || fail "dead Herdr pre-send submission recovered as '$out' instead of unsent"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_send_text_submit() { fail "accepted Herdr operation invoked the backend"; }
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_send_text_submit_journaled "$evidence" durable-presend \
+      herdr target brief 1 0 0 label
+  ) || fail "accepted Herdr submission was not recoverable"
+  [ "$out" = pending-unproven ] \
+    || fail "accepted Herdr submission recovered as '$out' instead of pending-unproven"
   pass "non-tmux submission reconciles pre-send and accepted input without retyping"
 }
 

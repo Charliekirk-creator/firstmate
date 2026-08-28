@@ -964,9 +964,9 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   assert_contains "$out" "has no exact owner receipt" \
     "missing dispatch receipt refusal did not identify the orphan metadata transaction"
   mv "$home/dispatch.valid" "$home/data/$task/work-identity-dispatch.json"
-  rm "$home/state/$task.meta" "$launch"
-  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire "$task" \
-    || fail "completed dispatch receipt could not retire after lifecycle cleanup"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
+    sh -c 'rm -- "$1" "$2"' sh "$home/state/$task.meta" "$launch" \
+    || fail "completed dispatch receipt could not authorize lifecycle cleanup"
   assert_absent "$home/data/$task/work-identity-dispatch.json" \
     "completed dispatch receipt remained after lifecycle cleanup"
   FM_HOME="$home" "$WORK_IDENTITY" verify "$task" | jq -e \
@@ -2651,6 +2651,10 @@ case "${FM_TEST_ONLY:-}" in
   replacement-publication)
     test_replacement_dispatch_recovers_prior_retirement
     test_replacement_dispatch_resumes_before_metadata_publication
+    exit 0
+    ;;
+  dispatch-retirement)
+    test_dispatch_transaction_excludes_backlog_handoff
     exit 0
     ;;
   no-clobber-recovery)

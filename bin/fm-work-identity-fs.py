@@ -167,12 +167,12 @@ def entry_state(directory_fd, name):
     return state
 
 
-def file_digest(directory_fd, name):
+def entry_digest(directory_fd, name, allowed_links=(1,)):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(name, flags, dir_fd=directory_fd)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink not in allowed_links:
             fail(f"owned destination entry is unsafe: {name}")
         digest = hashlib.sha256()
         while True:
@@ -183,6 +183,10 @@ def file_digest(directory_fd, name):
         return digest.hexdigest()
     finally:
         os.close(fd)
+
+
+def file_digest(directory_fd, name):
+    return entry_digest(directory_fd, name)
 
 
 def state_from_info(info):
@@ -284,8 +288,11 @@ def read_remove_journal(directory_fd, journal, name):
     expected_state, expected_digest = commitment
     state_fields = expected_state.split(":")
     retired_token = lines[1][len(retired_prefix):]
-    if len(state_fields) != 8 or state_fields[0] != "regular" \
+    if len(state_fields) != 8 or state_fields[0] not in ("regular", "unsafe") \
             or any(not field.isdigit() for field in state_fields[1:]) \
+            or not stat.S_ISREG(int(state_fields[3])) \
+            or int(state_fields[4]) not in (1, 2) \
+            or (state_fields[0] == "regular") != (int(state_fields[4]) == 1) \
             or len(retired_token) not in (16, 32) \
             or any(char not in "0123456789abcdef" for char in retired_token):
         fail(f"owned removal journal is malformed: {journal}")
@@ -315,8 +322,9 @@ def publish_remove_journal(directory_fd, journal, retired, expected_state, expec
 
 
 def retired_entry_matches(directory_fd, retired, expected_state, expected_digest):
+    expected_links = int(expected_state.split(":")[4])
     return state_matches(raw_entry_state(directory_fd, retired), expected_state) \
-        and file_digest(directory_fd, retired) == expected_digest
+        and entry_digest(directory_fd, retired, (expected_links,)) == expected_digest
 
 
 def recover_remove(directory_fd, name):
@@ -346,13 +354,17 @@ def recover_remove(directory_fd, name):
     fail(f"owned destination changed before removal: {name}")
 
 
-def remove_entry(directory_fd, name, expected_state, expected_digest):
+def remove_entry(directory_fd, name, expected_state, expected_digest, allow_hardlink=False):
     recover_remove(directory_fd, name)
-    if entry_state(directory_fd, name) != expected_state:
+    actual_state = raw_entry_state(directory_fd, name) if allow_hardlink else entry_state(directory_fd, name)
+    if actual_state != expected_state:
         fail(f"owned destination changed before removal: {name}")
     if expected_state == "absent":
         return
-    if file_digest(directory_fd, name) != expected_digest:
+    expected_links = int(expected_state.split(":")[4])
+    if expected_links != 1 and not allow_hardlink:
+        fail(f"owned destination entry is unsafe: {name}")
+    if entry_digest(directory_fd, name, (expected_links,)) != expected_digest:
         fail(f"owned destination content changed before removal: {name}")
     retired = f".{name}.remove-retired.{secrets.token_hex(16)}"
     journal = f".{name}.remove-journal"
@@ -584,6 +596,7 @@ def allowed_no_clobber_staging(name, staging):
 
 
 def read_no_clobber_journal(directory_fd, journal, name, staging=None):
+    recover_remove(directory_fd, journal)
     try:
         fd = os.open(
             journal,
@@ -593,15 +606,22 @@ def read_no_clobber_journal(directory_fd, journal, name, staging=None):
     except FileNotFoundError:
         return None
     info = os.fstat(fd)
+    journal_state = state_from_info(info)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024:
         os.close(fd)
         fail(f"publication journal is unsafe: {journal}")
     try:
-        payload = os.read(fd, 1025).decode("ascii", "strict")
+        payload_bytes = os.read(fd, 1025)
+        payload = payload_bytes.decode("ascii", "strict")
+        after = os.fstat(fd)
+        current = os.stat(journal, dir_fd=directory_fd, follow_symlinks=False)
+        if state_from_info(after) != journal_state or state_from_info(current) != journal_state:
+            fail(f"publication journal changed during validation: {journal}")
     except UnicodeError:
         fail(f"publication journal is malformed: {journal}")
     finally:
         os.close(fd)
+    journal_digest = hashlib.sha256(payload_bytes).hexdigest()
     lines = payload.splitlines()
     pin_prefix = f".{name}.no-clobber-pin."
     if len(lines) == 4 and lines[0] == "v1":
@@ -617,7 +637,7 @@ def read_no_clobber_journal(directory_fd, journal, name, staging=None):
             or len(lines[3]) != 64 \
             or any(char not in "0123456789abcdef" for char in lines[3]):
         fail(f"publication journal is malformed: {journal}")
-    return lines[1], lines[2], lines[3], phase
+    return lines[1], lines[2], lines[3], phase, journal_state, journal_digest
 
 
 def publish_no_clobber_journal(directory_fd, journal, name, staging, pin, digest):
@@ -670,7 +690,11 @@ def same_inode(first, second):
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
-def rollback_no_clobber_conflict(directory_fd, name, staging, pin, digest, journal):
+def rollback_no_clobber_conflict(
+        directory_fd, name, staging, pin, digest, journal,
+        journal_state, journal_digest):
+    recover_remove(directory_fd, pin)
+    recover_remove(directory_fd, staging)
     try:
         target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -693,12 +717,14 @@ def rollback_no_clobber_conflict(directory_fd, name, staging, pin, digest, journ
                 or (pin_info is not None and not same_inode(pin_info, staging_info)):
             fail("publication conflict does not match its retained candidate")
     if pin_info is not None:
-        remove(directory_fd, pin)
+        remove_entry(
+            directory_fd, pin, state_from_info(pin_info), digest,
+            allow_hardlink=True
+        )
     if staging_info is not None:
-        allowed_links = (1,) if pin_info is not None else (1, 2)
-        opened_entry(directory_fd, staging, digest, allowed_links)
-        remove(directory_fd, staging)
-    remove(directory_fd, journal)
+        staging_info = opened_entry(directory_fd, staging, digest, (1,))
+        remove_entry(directory_fd, staging, state_from_info(staging_info), digest)
+    remove_entry(directory_fd, journal, journal_state, journal_digest)
     os.fsync(directory_fd)
 
 
@@ -708,13 +734,14 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
     loaded = read_no_clobber_journal(directory_fd, journal, name, staging)
     if loaded is None:
         return False
-    staging, pin, journal_digest, phase = loaded
-    if source_digest is not None and journal_digest != source_digest:
+    staging, pin, source_journal_digest, phase, journal_state, journal_digest = loaded
+    if source_digest is not None and source_journal_digest != source_digest:
         fail("publication source changed while recovering")
-    source_digest = journal_digest
+    source_digest = source_journal_digest
     if phase == "conflict":
         rollback_no_clobber_conflict(
-            directory_fd, name, staging, pin, source_digest, journal
+            directory_fd, name, staging, pin, source_digest, journal,
+            journal_state, journal_digest
         )
         if conflict_is_error:
             raise SystemExit(2)
@@ -737,7 +764,7 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
         if not stat.S_ISREG(target_info.st_mode) or target_info.st_nlink != 1:
             fail(f"publication target is unsafe: {name}")
         committed = file_digest(directory_fd, name) == source_digest
-        remove(directory_fd, journal)
+        remove_entry(directory_fd, journal, journal_state, journal_digest)
         os.fsync(directory_fd)
         if committed:
             return True
@@ -749,7 +776,8 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
             and ((pin_info is not None and not same_inode(target_info, pin_info))
                  or (staging_info is not None and not same_inode(target_info, staging_info))):
         rollback_no_clobber_conflict(
-            directory_fd, name, staging, pin, source_digest, journal
+            directory_fd, name, staging, pin, source_digest, journal,
+            journal_state, journal_digest
         )
         if conflict_is_error:
             raise SystemExit(2)
@@ -789,7 +817,8 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
             if exc.errno != errno.EEXIST:
                 raise
             rollback_no_clobber_conflict(
-                directory_fd, name, staging, pin, source_digest, journal
+                directory_fd, name, staging, pin, source_digest, journal,
+                journal_state, journal_digest
             )
             if conflict_is_error:
                 raise SystemExit(2)
@@ -829,7 +858,7 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
         fail("publication staging entry changed during commit")
 
     opened_entry(directory_fd, name, source_digest, (1,))
-    remove(directory_fd, journal)
+    remove_entry(directory_fd, journal, journal_state, journal_digest)
     os.fsync(directory_fd)
     return True
 

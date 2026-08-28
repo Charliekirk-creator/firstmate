@@ -2639,6 +2639,13 @@ EOF
   pass "the run abort and the leaked-process reap both complete before the destructive worktree return"
 }
 
+case "${FM_TEST_ONLY:-}" in
+  dispatch-retirement)
+    test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+    exit 0
+    ;;
+esac
+
 test_local_only_fork_remote_allows
 test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
 test_teardown_closes_the_backlog_item_itself

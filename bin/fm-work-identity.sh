@@ -22,6 +22,7 @@
 #   fm-work-identity.sh dispatch-commit <task-id> --brief <brief.md> --meta <task.meta> --transaction <id>
 #   fm-work-identity.sh dispatch-abort <task-id> --transaction <id>
 #   fm-work-identity.sh dispatch-retire-preflight <task-id>
+#   fm-work-identity.sh dispatch-retire-run <task-id> -- <command> [args...]
 #   fm-work-identity.sh dispatch-retire <task-id>
 #   fm-work-identity.sh metadata-publish-unlinked <task-id> --file <meta>
 #   fm-work-identity.sh reserve-unlinked <task-id> --reason persistent-secondmate
@@ -2732,9 +2733,8 @@ metadata_publish_unlinked() {  # <task-id> <candidate>
   validate_meta_binding "$target" unlinked
 }
 
-dispatch_retire_preflight() {  # <task-id>
+validate_dispatch_retirement_locked() {  # <task-id>
   local task=$1 launch="$STATE_REAL/$1.launch-brief.md"
-  identity_lock_acquire "$task"
   reject_handoff_guard "$task"
   if [ ! -e "$DISPATCH_STATE" ] && [ ! -L "$DISPATCH_STATE" ]; then return 0; fi
   read_dispatch_state "$task"
@@ -2742,6 +2742,40 @@ dispatch_retire_preflight() {  # <task-id>
   [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
     || die "task $task dispatch instructions path is mismatched"
   validate_completed_dispatch "$task"
+}
+
+dispatch_retire_preflight() {  # <task-id>
+  local task=$1
+  identity_lock_acquire "$task"
+  validate_dispatch_retirement_locked "$task"
+}
+
+dispatch_retire_run() {  # <task-id> -- <command> [args...]
+  local task=$1 rc meta="$STATE_REAL/$1.meta" launch="$STATE_REAL/$1.launch-brief.md"
+  shift
+  [ "$#" -gt 1 ] && [ "$1" = -- ] || die "dispatch-retire-run requires -- and a command"
+  shift
+  publication_lock_acquire
+  identity_lock_acquire "$task"
+  validate_dispatch_retirement_locked "$task"
+  set +e
+  "$@"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ ! -e "$meta" ] && [ ! -L "$meta" ] \
+    || die "task $task still has dispatch metadata"
+  [ ! -e "$launch" ] && [ ! -L "$launch" ] \
+    || die "task $task still has launch instructions"
+  if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
+    read_dispatch_state "$task"
+    [ "$DISPATCH_STATUS" = completed ] || die "task $task dispatch changed during teardown"
+    [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
+      || die "task $task dispatch instructions path changed during teardown"
+    retire_dispatch_prior_locked
+    owned_remove "$DISPATCH_STATE" "work identity dispatch" \
+      "$DISPATCH_STATE_ENTRY_STATE" "$DISPATCH_STATE_ENTRY_DIGEST"
+  fi
 }
 
 dispatch_retire() {  # <task-id>
@@ -2861,7 +2895,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections|publication-run) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|metadata-publish-unlinked|reserve-unlinked|unlinked-prepare|unlinked-commit|unlinked-abort|handoff-prepare|handoff-stage|handoff-backlog-prepare|handoff-backlog-complete|handoff-backlog-state|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire-run|dispatch-retire|metadata-publish-unlinked|reserve-unlinked|unlinked-prepare|unlinked-commit|unlinked-abort|handoff-prepare|handoff-stage|handoff-backlog-prepare|handoff-backlog-complete|handoff-backlog-state|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -3051,6 +3085,9 @@ case "$COMMAND" in
   dispatch-retire-preflight)
     [ "$#" -eq 0 ] || die "dispatch-retire-preflight accepts only a task id"
     dispatch_retire_preflight "$TASK"
+    ;;
+  dispatch-retire-run)
+    dispatch_retire_run "$TASK" "$@"
     ;;
   dispatch-retire)
     [ "$#" -eq 0 ] || die "dispatch-retire accepts only a task id"

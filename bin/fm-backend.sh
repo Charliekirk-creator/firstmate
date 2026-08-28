@@ -738,6 +738,21 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
   esac
 }
 
+fm_backend_dead_entering_verdict() {  # <backend> <target> [expected-label]
+  local backend=$1 target=$2 expected_label=${3:-} state
+  if [ "$backend" = herdr ]; then
+    state=$(fm_backend_composer_state "$backend" "$target" "$expected_label" 2>/dev/null) \
+      || state=unknown
+    case "$state" in
+      empty) printf 'unsent' ;;
+      pending|pending-unproven) printf 'pending-unproven' ;;
+      *) printf 'ambiguous' ;;
+    esac
+  else
+    printf 'ambiguous'
+  fi
+}
+
 fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local evidence=$1 token=$2 backend=${3:-} target=${4:-} expected_label=${9:-} entering="${1}.entering"
   local owner="${1}.operation-owner" result="${1}.operation-result"
@@ -773,7 +788,7 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
         [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
         evidence_token=$(tr -d '\n' < "$entering") || return 1
         [ "$evidence_token" = "$token" ] || return 1
-        printf 'ambiguous'
+        fm_backend_dead_entering_verdict "$backend" "$target" "$expected_label"
       else
         printf 'unsent'
       fi
@@ -820,7 +835,7 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
           [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
           evidence_token=$(tr -d '\n' < "$entering") || return 1
           [ "$evidence_token" = "$token" ] || return 1
-          printf 'ambiguous'
+          fm_backend_dead_entering_verdict "$backend" "$target" "$expected_label"
         else
           printf 'unsent'
         fi

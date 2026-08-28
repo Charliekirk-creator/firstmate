@@ -199,6 +199,19 @@ fm_backlog_directory_present "$STATE" "state directory" || {
   echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 }
+if [ -n "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
+   && [ "$FM_TEARDOWN_DISPATCH_RETIRE_HELD" != "$ID" ]; then
+  echo "error: teardown dispatch authorization is task-mismatched" >&2
+  exit 1
+fi
+if [ -z "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
+   && { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
+     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; }; then
+  exec env FM_TEARDOWN_DISPATCH_RETIRE_HELD="$ID" \
+    FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+    dispatch-retire-run "$ID" -- "$0" "$@"
+fi
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # Supervision lease guard: post-landing cleanup is overlap territory between
@@ -689,14 +702,6 @@ remote_secondmate_teardown() {
   return 0
 }
 
-teardown_dispatch_retire_preflight() {  # <home> <data> <state> <task-id>
-  local home=$1 data=$2 state=$3 task=$4 receipt="$2/$4/work-identity-dispatch.json"
-  [ -e "$receipt" ] || [ -L "$receipt" ] || return 0
-  FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_STATE_OVERRIDE="$state" \
-    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
-    dispatch-retire-preflight "$task"
-}
-
 remote_secondmate_teardown_locked() {
   local rc
   [ -n "$(fm_meta_get "$META" remote_host)" ] || return 3
@@ -716,8 +721,6 @@ remote_secondmate_teardown_locked() {
   remote_teardown_locks_release
   return "$rc"
 }
-
-teardown_dispatch_retire_preflight "$FM_HOME" "$DATA" "$STATE" "$ID" || exit 1
 
 if remote_secondmate_teardown_locked; then
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
@@ -2897,11 +2900,11 @@ rmdir -- "$STATE/.$ID.worktree-request."* 2>/dev/null || true
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.
 rm -rf "$STATE/$ID.inbox"
-if [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
-   || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; then
-  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
-    FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
-    dispatch-retire "$ID" || exit 1
+if [ -z "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
+   && { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
+     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; }; then
+  echo "error: work identity dispatch retirement was not authorized before teardown" >&2
+  exit 1
 fi
 # The record is gone, so the backlog must not still show this task in flight
 # when teardown reports success. Still under this task's meta lock, so a steer
@@ -2930,7 +2933,8 @@ else
 fi
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
-if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
+if [ -z "${FM_TEARDOWN_DISPATCH_RETIRE_HELD:-}" ] \
+   && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 # A secondmate retirement may remove the home containing an overridden control
