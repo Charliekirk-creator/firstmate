@@ -1011,7 +1011,7 @@ spawn_launch_request_cleanup() {
   fi
   for entry in "$SPAWN_LAUNCH_REQUEST"/* "$SPAWN_LAUNCH_REQUEST"/.[!.]* "$SPAWN_LAUNCH_REQUEST"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
-    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-go|kimi-submit-attempted|kimi-submit-attempted.entering|kimi-submit-attempted.operation-owner|kimi-submit-attempted.operation-started|kimi-submit-attempted.operation-result|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-go.tmp|.kimi-submit-attempted.tmp|.kimi-submit-attempted.entering.tmp.*|.kimi-submit-attempted.operation-owner.tmp.*|.kimi-submit-attempted.operation-started.tmp.*|.kimi-submit-attempted.operation-result.tmp.*|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
+    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-go|kimi-submit-attempted|kimi-submit-attempted.entering|kimi-submit-attempted.entering.baseline|kimi-submit-attempted.operation-owner|kimi-submit-attempted.operation-started|kimi-submit-attempted.operation-result|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-go.tmp|.kimi-submit-attempted.tmp|.kimi-submit-attempted.entering.tmp.*|.kimi-submit-attempted.entering.baseline.tmp.*|.kimi-submit-attempted.operation-owner.tmp.*|.kimi-submit-attempted.operation-started.tmp.*|.kimi-submit-attempted.operation-result.tmp.*|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
     [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
     [ "$(spawn_file_link_count "$entry")" = 1 ] || return 1
     rm -f -- "$entry" || return 1
@@ -4015,6 +4015,14 @@ kimi_submission_cleanup_preflight() {
     [ -e "$path" ] || [ -L "$path" ] || continue
     spawn_launch_request_file_matches "$path" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
   done
+  path="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering.baseline"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] \
+      && [ "$(spawn_file_link_count "$path")" = 1 ] || return 1
+    IFS=$'\t' read -r token value verdict < "$path" || return 1
+    [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] && [ -z "$verdict" ] || return 1
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  fi
   path="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-result"
   if [ -e "$path" ] || [ -L "$path" ]; then
     [ -f "$path" ] && [ ! -L "$path" ] \
@@ -4139,6 +4147,7 @@ kimi_submission_reset_unsent() {
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-go" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering.baseline" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-owner" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-started" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-result" \

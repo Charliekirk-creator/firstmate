@@ -485,6 +485,35 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
   ) || fail "accepted Herdr submission was not recoverable"
   [ "$out" = pending-unproven ] \
     || fail "accepted Herdr submission recovered as '$out' instead of pending-unproven"
+  printf '%s\t%s\n' durable-presend 41 > "${evidence}.entering.baseline"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 1
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_pane_revision() { printf '41'; }
+    fm_backend_send_text_submit() { fail "revision-proven pre-send operation invoked the backend"; }
+    fm_backend_composer_state() { fail "revision-proven pre-send operation probed the composer"; }
+    FM_BACKEND_HERDR_SUBMIT_RECOVERY_POLLS=1 \
+      fm_backend_send_text_submit_journaled "$evidence" durable-presend \
+      herdr target brief 1 0 0 label
+  ) || fail "revision-proven Herdr pre-send submission was not recoverable"
+  [ "$out" = unsent ] \
+    || fail "revision-proven Herdr pre-send submission recovered as '$out' instead of unsent"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 1
+    fm_backend_source() { return 0; }
+    fm_backend_herdr_pane_revision() { printf '42'; }
+    fm_backend_send_text_submit() { fail "revision-proven accepted operation invoked the backend"; }
+    fm_backend_composer_state() { printf 'pending'; }
+    FM_BACKEND_HERDR_SUBMIT_RECOVERY_POLLS=1 \
+      fm_backend_send_text_submit_journaled "$evidence" durable-presend \
+      herdr target brief 1 0 0 label
+  ) || fail "revision-proven Herdr accepted submission was not recoverable"
+  [ "$out" = pending-unproven ] \
+    || fail "revision-proven Herdr accepted submission recovered as '$out' instead of pending-unproven"
   pass "non-tmux submission reconciles pre-send and accepted input without retyping"
 }
 

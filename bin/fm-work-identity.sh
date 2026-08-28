@@ -2750,40 +2750,59 @@ dispatch_retire_preflight() {  # <task-id>
   validate_dispatch_retirement_locked "$task"
 }
 
-dispatch_retire_run() {  # <task-id> -- <command> [args...]
-  local task=$1 rc meta="$STATE_REAL/$1.meta" launch="$STATE_REAL/$1.launch-brief.md"
-  local authorization authorizations
+dispatch_retire_run() {  # <task-id> [task-id...] -- <command> [args...]
+  local task rc meta launch authorization authorizations=
+  local -a tasks=("$1")
   shift
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    fm_pr_task_id_valid "$1" || die "invalid task id"
+    tasks+=("$1")
+    shift
+  done
   [ "$#" -gt 1 ] && [ "$1" = -- ] || die "dispatch-retire-run requires -- and a command"
   shift
   publication_lock_acquire
-  identity_lock_acquire "$task"
-  validate_dispatch_retirement_locked "$task"
-  authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$STATE_REAL" "$STATE_DIR_ID" "$task" "$ACTIVE_IDENTITY_LOCK" \
-    "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN")
-  authorizations=$authorization
+  for task in "${tasks[@]}"; do
+    identity_lock_acquire "$task"
+    validate_dispatch_retirement_locked "$task"
+    identity_lock_release
+    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$STATE_REAL" "$STATE_DIR_ID" "$task" \
+      "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
+      "$ACTIVE_PUBLICATION_LOCK" "${BASHPID:-$$}" "$ACTIVE_PUBLICATION_LOCK_TOKEN")
+    if [ -n "$authorizations" ]; then
+      authorizations="$authorizations"$'\n'"$authorization"
+    else
+      authorizations=$authorization
+    fi
+  done
   if [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ]; then
-    authorizations="${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS}"$'\n'"$authorization"
+    authorizations="${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS}"$'\n'"$authorizations"
   fi
   set +e
   FM_TEARDOWN_DISPATCH_AUTHORIZATIONS=$authorizations "$@"
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || return "$rc"
-  [ ! -e "$meta" ] && [ ! -L "$meta" ] \
-    || die "task $task still has dispatch metadata"
-  [ ! -e "$launch" ] && [ ! -L "$launch" ] \
-    || die "task $task still has launch instructions"
-  if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
-    read_dispatch_state "$task"
-    [ "$DISPATCH_STATUS" = completed ] || die "task $task dispatch changed during teardown"
-    [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
-      || die "task $task dispatch instructions path changed during teardown"
-    retire_dispatch_prior_locked
-    owned_remove "$DISPATCH_STATE" "work identity dispatch" \
-      "$DISPATCH_STATE_ENTRY_STATE" "$DISPATCH_STATE_ENTRY_DIGEST"
-  fi
+  for task in "${tasks[@]}"; do
+    meta="$STATE_REAL/$task.meta"
+    launch="$STATE_REAL/$task.launch-brief.md"
+    identity_lock_acquire "$task"
+    [ ! -e "$meta" ] && [ ! -L "$meta" ] \
+      || die "task $task still has dispatch metadata"
+    [ ! -e "$launch" ] && [ ! -L "$launch" ] \
+      || die "task $task still has launch instructions"
+    if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
+      read_dispatch_state "$task"
+      [ "$DISPATCH_STATUS" = completed ] || die "task $task dispatch changed during teardown"
+      [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
+        || die "task $task dispatch instructions path changed during teardown"
+      retire_dispatch_prior_locked
+      owned_remove "$DISPATCH_STATE" "work identity dispatch" \
+        "$DISPATCH_STATE_ENTRY_STATE" "$DISPATCH_STATE_ENTRY_DIGEST"
+    fi
+    identity_lock_release
+  done
 }
 
 dispatch_retire() {  # <task-id>

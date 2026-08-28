@@ -212,17 +212,28 @@ teardown_pid_is_ancestor() {
   done
   return 1
 }
+teardown_directory_identity() {
+  if stat -f '%d:%i' "$1" >/dev/null 2>&1; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
 teardown_dispatch_authorized() {
-  local state=$1 task=$2 state_real auth_state auth_inode auth_task auth_lock auth_pid auth_token extra
+  local state=$1 task=$2 state_real state_inode auth_state auth_inode auth_task
+  local auth_lock_parent auth_lock_parent_inode auth_lock auth_pid auth_token extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 1
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   state_real=$(cd -- "$state" 2>/dev/null && pwd -P) || return 1
-  while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock auth_pid auth_token extra; do
+  state_inode=$(teardown_directory_identity "$state_real") || return 1
+  while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
+    auth_lock_parent_inode auth_lock auth_pid auth_token extra; do
     [ -z "$extra" ] || continue
-    [ "$auth_state" = "$state_real" ] && [ "$auth_task" = "$task" ] || continue
+    [ "$auth_state" = "$state_real" ] && [ "$auth_inode" = "$state_inode" ] \
+      && [ "$auth_task" = "$task" ] || continue
     teardown_pid_is_ancestor "$auth_pid" || continue
     python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-held \
-      "$auth_state" "$auth_inode" "$auth_lock" "$auth_pid" "$auth_token" \
+      "$auth_lock_parent" "$auth_lock_parent_inode" "$auth_lock" "$auth_pid" "$auth_token" \
       >/dev/null 2>&1 || continue
     TEARDOWN_DISPATCH_AUTH_PID=$auth_pid
     return 0
@@ -2332,6 +2343,7 @@ teardown_dispatch_retire_preflight() {
 
 authorize_firstmate_home_children() {
   local home=$1 sub_state child_meta child_id child_kind child_wt child_home receipt
+  local -a pending_ids=()
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -2340,13 +2352,19 @@ authorize_firstmate_home_children() {
     receipt="$home/data/$child_id/work-identity-dispatch.json"
     if { [ -e "$receipt" ] || [ -L "$receipt" ]; } \
        && ! teardown_dispatch_authorized "$sub_state" "$child_id"; then
-      exec env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$sub_state" \
-        FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
-        dispatch-retire-run "$child_id" -- env \
-        FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
-        FM_CONFIG_OVERRIDE="$CONFIG" FM_ROOT_OVERRIDE="$FM_ROOT" \
-        "$0" "${TEARDOWN_ORIGINAL_ARGS[@]}"
+      pending_ids+=("$child_id")
     fi
+  done
+  if [ "${#pending_ids[@]}" -gt 0 ]; then
+    exec env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$sub_state" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+      dispatch-retire-run "${pending_ids[@]}" -- env \
+      FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+      FM_CONFIG_OVERRIDE="$CONFIG" FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$0" "${TEARDOWN_ORIGINAL_ARGS[@]}"
+  fi
+  for child_meta in "$sub_state"/*.meta; do
+    [ -e "$child_meta" ] || continue
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     if [ "$child_kind" = secondmate ]; then

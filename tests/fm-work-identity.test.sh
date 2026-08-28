@@ -975,6 +975,41 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   pass "dispatch prepare and committed metadata exclude backlog ownership handoff"
 }
 
+test_dispatch_retire_run_authorizes_task_set() {
+  local home task launch transaction binding hash
+  local -a cleanup_paths=()
+  home=$(make_home dispatch-retire-set)
+  for task in dispatch-retire-set-a dispatch-retire-set-b; do
+    FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+      || fail "could not scaffold $task dispatch retirement fixture"
+    launch="$home/state/$task.launch-brief.md"
+    transaction="retire-$task"
+    binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+      --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+      --transaction "$transaction") || fail "could not prepare $task dispatch"
+    hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+    fm_write_meta "$home/state/$task.meta" \
+      "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+      "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+      "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+      "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+      "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+    FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+      --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+      || fail "could not commit $task dispatch"
+    cleanup_paths+=("$home/state/$task.meta" "$launch")
+  done
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run \
+    dispatch-retire-set-a dispatch-retire-set-b -- \
+    sh -c 'rm -- "$@"' sh "${cleanup_paths[@]}" \
+    || fail "one owner could not retire a complete task set"
+  for task in dispatch-retire-set-a dispatch-retire-set-b; do
+    assert_absent "$home/data/$task/work-identity-dispatch.json" \
+      "$task dispatch receipt remained after task-set retirement"
+  done
+  pass "dispatch retirement authorizes complete task sets without nested locks"
+}
+
 test_spawn_recovers_exact_created_endpoint() {
   local home task project wt fakebin manifest original_origin out rc=0 creates
   home=$(make_home endpoint-recovery)
@@ -2683,6 +2718,7 @@ test_identity_lock_reclaims_reused_pid_owner
 test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
+test_dispatch_retire_run_authorizes_task_set
 test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect
 test_spawn_resumes_unsent_worktree_request
