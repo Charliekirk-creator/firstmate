@@ -23,6 +23,7 @@
 #   fm-work-identity.sh dispatch-abort <task-id> --transaction <id>
 #   fm-work-identity.sh dispatch-retire-preflight <task-id>
 #   fm-work-identity.sh dispatch-retire <task-id>
+#   fm-work-identity.sh metadata-publish-unlinked <task-id> --file <meta>
 #   fm-work-identity.sh reserve-unlinked <task-id> --reason persistent-secondmate
 #   fm-work-identity.sh unlinked-prepare <task-id> --reason persistent-secondmate --transaction <id>
 #   fm-work-identity.sh unlinked-commit <task-id> --transaction <id>
@@ -2631,6 +2632,49 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
     "$DISPATCH_STATE_ENTRY_STATE" "$DISPATCH_STATE_ENTRY_DIGEST"
 }
 
+metadata_publish_unlinked() {  # <task-id> <candidate>
+  local task=$1 candidate=$2 target="$STATE_REAL/$1.meta" captured
+  identity_mutation_lock_acquire "$task"
+  validate_unlinked_guard "$task"
+  [ -e "$UNLINKED_GUARD" ] || [ -L "$UNLINKED_GUARD" ] \
+    || die "task $task has no committed unlinked identity"
+  capture_metadata "$candidate"
+  validate_meta_binding_captured "$candidate" unlinked
+  awk -F= '
+    !/^[A-Za-z_][A-Za-z0-9_]*=/ { exit 1 }
+    { key=$1; if (seen[key]++) exit 1 }
+    END { if (NR == 0) exit 1 }
+  ' "$META_CAPTURE_TMP" || die "unlinked task metadata is malformed or has duplicate fields: $candidate"
+  meta_field_exact "$candidate" endpoint_task_id \
+    && [ "$META_VALUE" = "$task" ] \
+    || die "unlinked task metadata has a mismatched endpoint task id: $candidate"
+  meta_field_exact "$candidate" kind \
+    && [ "$META_VALUE" = secondmate ] \
+    || die "unlinked task metadata is not for a secondmate: $candidate"
+  meta_field_exact "$candidate" mode \
+    && [ "$META_VALUE" = secondmate ] \
+    || die "unlinked task metadata has a mismatched mode: $candidate"
+  captured=$META_CAPTURE_TMP
+  META_CAPTURE_TMP=
+  META_CAPTURE_SOURCE=
+  META_CAPTURE_IDENTITY=
+  TMP=$captured
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    capture_metadata "$target"
+    validate_meta_binding_captured "$target" unlinked
+    cmp -s "$captured" "$META_CAPTURE_TMP" \
+      || die "task $task metadata is already published with different content"
+    rm -f -- "$captured"
+    TMP=
+    finish_metadata_capture "$target"
+    return 0
+  fi
+  chmod 600 "$captured" || die "cannot protect unlinked task metadata candidate"
+  owned_atomic_replace "$captured" "$target" "unlinked task metadata"
+  TMP=
+  validate_meta_binding "$target" unlinked
+}
+
 dispatch_retire_preflight() {  # <task-id>
   local task=$1 launch="$STATE_REAL/$1.launch-brief.md"
   identity_lock_acquire "$task"
@@ -2760,7 +2804,7 @@ COMMAND=${1:-}
 case "$COMMAND" in
   -h|--help|help) usage; exit 0 ;;
   home-id|limits|record-max-bytes|validate-index|validate-projections|publication-run) ;;
-  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|reserve-unlinked|unlinked-prepare|unlinked-commit|unlinked-abort|handoff-prepare|handoff-stage|handoff-backlog-prepare|handoff-backlog-complete|handoff-backlog-state|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
+  template|record|verify|brief-block|brief-publish|project|dispatch-binding|dispatch-prepare|dispatch-commit-preflight|dispatch-publish|dispatch-commit|dispatch-abort|dispatch-retire-preflight|dispatch-retire|metadata-publish-unlinked|reserve-unlinked|unlinked-prepare|unlinked-commit|unlinked-abort|handoff-prepare|handoff-stage|handoff-backlog-prepare|handoff-backlog-complete|handoff-backlog-state|handoff-commit|handoff-abort|handoff-target-state|handoff-complete|handoff-cancel) ;;
   *) usage >&2; exit 2 ;;
 esac
 shift
@@ -2954,6 +2998,11 @@ case "$COMMAND" in
   dispatch-retire)
     [ "$#" -eq 0 ] || die "dispatch-retire accepts only a task id"
     dispatch_retire "$TASK"
+    ;;
+  metadata-publish-unlinked)
+    [ "$#" -eq 2 ] && [ "$1" = --file ] \
+      || die "metadata-publish-unlinked usage: fm-work-identity.sh metadata-publish-unlinked <task-id> --file <meta>"
+    metadata_publish_unlinked "$TASK" "$2"
     ;;
   reserve-unlinked)
     [ "$#" -eq 2 ] && [ "$1" = --reason ] \

@@ -421,13 +421,13 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
   out=$(
     # shellcheck source=bin/fm-backend.sh disable=SC1091
     . "$ROOT/bin/fm-backend.sh"
-    fm_backend_send_text_submit() { fail "accepted dead operation invoked the backend"; }
+    fm_backend_send_text_submit() { fail "dead pre-send operation invoked the backend"; }
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       zellij target brief 1 0 0 label
-  ) || fail "dead accepted submission evidence was not recoverable"
-  [ "$out" = ambiguous ] \
-    || fail "dead accepted submission recovered as '$out' instead of ambiguous"
-  pass "non-tmux submission distinguishes definitely unsent from accepted operations"
+  ) || fail "dead entering submission evidence was not recoverable"
+  [ "$out" = unsent ] \
+    || fail "dead entering submission recovered as '$out' instead of unsent"
+  pass "non-tmux submission preserves pre-send attempts as retryable"
 }
 
 test_kimi_presend_crash_retries_without_wedging_identity() {

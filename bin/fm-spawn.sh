@@ -552,6 +552,7 @@ spawn_remote_secondmate() {
   meta="$STATE/$id.meta"
   if [ -e "$meta" ] || [ -L "$meta" ]; then
     if ! fm_backlog_record_present "$meta" "task record" "$STATE" \
+      || [ "$(fm_pr_file_link_count "$meta" 2>/dev/null || true)" != 1 ] \
       || [ "$(fm_meta_get "$meta" kind)" != secondmate ] \
       || [ "$(fm_meta_get "$meta" remote_host)" != "$host" ] \
       || [ "$(fm_meta_get "$meta" remote_root)" != "$root" ] \
@@ -688,8 +689,14 @@ spawn_remote_secondmate() {
   # reports it here so the parent does not deny the agent's actual identity.
   remote_recorded_traceparent=$(printf '%s\n' "$out" | sed -n 's/^traceparent=//p' | tail -1)
   fm_trace_context_valid "$remote_recorded_traceparent" || remote_recorded_traceparent=
-  tmp="$meta.tmp.$$"
-  {
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-remote-secondmate-meta.XXXXXX") || {
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id launched, but its metadata candidate could not be created; preserving the remote route for reconciliation" >&2
+    return 1
+  }
+  if ! {
     echo "window=remote:$id"
     echo "endpoint_task_id=$id"
     echo "worktree=$home"
@@ -711,8 +718,9 @@ spawn_remote_secondmate() {
     echo "work_identity_schema=$SECONDMATE_WORK_IDENTITY_SCHEMA"
     echo "work_identity_status=$SECONDMATE_WORK_IDENTITY_STATUS"
     [ -z "$remote_recorded_traceparent" ] || echo "traceparent=$remote_recorded_traceparent"
-  } > "$tmp"
-  if ! fm_backlog_atomic_transition publish "$tmp" "$meta" "task record" "$STATE"; then
+  } > "$tmp" || ! "$SCRIPT_DIR/fm-work-identity.sh" metadata-publish-unlinked \
+    "$id" --file "$tmp"; then
+    rm -f -- "$tmp"
     if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
       SPAWN_TASK_SET_LOCK_HELD=0
       fm_lock_release "$SPAWN_TASK_SET_LOCK" || true
@@ -720,9 +728,10 @@ spawn_remote_secondmate() {
     fm_lock_release "$remote_lock" || true
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: remote secondmate $id launched, but its task record could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
+    echo "error: remote secondmate $id launched, but its metadata could not be published safely; preserving the remote route for reconciliation" >&2
     return 1
   fi
+  rm -f -- "$tmp"
   if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_SET_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_SET_LOCK"
@@ -872,6 +881,24 @@ spawn_launch_guard_state() {
   else
     printf 'abandoned'
   fi
+}
+
+spawn_launch_child_exec_state() {
+  local child="$SPAWN_LAUNCH_GUARD/child" value pid token command
+  [ -f "$child" ] && [ ! -L "$child" ] \
+    && [ "$(spawn_file_link_count "$child")" = 1 ] || { printf 'starting'; return 0; }
+  value=$(tr -d '\n' < "$child") || return 1
+  pid=${value%%:*}
+  token=${value#*:}
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
+  kill -0 "$pid" 2>/dev/null || { printf 'exited'; return 0; }
+  command=$(ps -o comm= -p "$pid" 2>/dev/null | awk 'NF { print $1; exit }') || return 1
+  command=${command##*/}
+  case "$command" in
+    ''|sh|bash|dash|zsh|ksh) printf 'starting' ;;
+    *) printf 'executed' ;;
+  esac
 }
 
 spawn_launch_guard_cleanup_retryable() {
@@ -1038,7 +1065,10 @@ spawn_launch_request_wait() {
     case "$state" in
       accepted|executed|attempted-live)
         guard_state=$(spawn_launch_guard_state) || return 1
-        [ "$guard_state" != running ] || return 0
+        if [ "$guard_state" = running ] \
+          && [ "$(spawn_launch_child_exec_state)" = executed ]; then
+          return 0
+        fi
         agent_state=$(fm_backend_agent_state "$BACKEND" "$T")
         [ "$agent_state" != alive ] || return 0
         ;;
@@ -2261,8 +2291,11 @@ case "$ARG3" in
 esac
 
 if [ "$KIND" = secondmate ] && [ "$RAW_LAUNCH" -eq 1 ]; then
-  echo "error: a secondmate requires a verified harness adapter; a raw launch command cannot prove the persistent agent launch boundary" >&2
-  exit 1
+  if [[ "$LAUNCH" == *[';&|<>`']* || "$LAUNCH" == *'$('* \
+    || "$LAUNCH" == *$'\n'* || "$LAUNCH" == *$'\r'* ]]; then
+    echo "error: a local secondmate raw launch must be one simple executable command; shell pipelines, compounds, substitutions, and redirections cannot prove the persistent process boundary" >&2
+    exit 1
+  fi
 fi
 
 # muse is verified as a CREWMATE/SCOUT adapter only. A secondmate is a firstmate
@@ -4052,7 +4085,7 @@ kimi_submission_state() {
       printf 'ambiguous'
     elif [ -e "$entering" ] || [ -L "$entering" ]; then
       spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-      printf 'ambiguous'
+      printf 'unsent'
     else
       if [ -e "$operation_started" ] || [ -L "$operation_started" ]; then
         spawn_launch_request_file_matches "$operation_started" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
@@ -4086,7 +4119,7 @@ kimi_submission_state() {
         printf 'ambiguous'
       elif [ -e "$entering" ] || [ -L "$entering" ]; then
         spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-        printf 'ambiguous'
+        printf 'unsent'
       else
         printf 'prepared'
       fi
@@ -5146,7 +5179,11 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
   sq_launch_token=$(shell_quote "$SPAWN_LAUNCH_REQUEST_TOKEN")
   sq_launch_request=$(shell_quote "$SPAWN_LAUNCH_REQUEST")
   sq_launch_guard=$(shell_quote "$LAUNCH_GUARD")
-  sq_launch_eval=$(shell_quote "$LAUNCH")
+  if [ "$RAW_LAUNCH" -eq 1 ]; then
+    sq_launch_eval=$(shell_quote "exec $LAUNCH")
+  else
+    sq_launch_eval=$(shell_quote "$LAUNCH")
+  fi
   LAUNCH_CHILD_COMMAND="printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.child.tmp && chmod 600 $sq_launch_guard/.child.tmp && mv $sq_launch_guard/.child.tmp $sq_launch_guard/child || exit 1; exec sh -c $sq_launch_eval"
   sq_launch_child=$(shell_quote "$LAUNCH_CHILD_COMMAND")
   LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; sh -c $sq_launch_child & launch_pid=\$!; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"

@@ -100,7 +100,9 @@ fm_tasks_axi_mv_has_multi_id() {
 }
 
 fm_tasks_axi_handoff_compatible() {
-  fm_tasks_axi_compatible && fm_tasks_axi_mv_has_revision_cas
+  fm_tasks_axi_compatible \
+    && fm_tasks_axi_mv_has_revision_cas \
+    && fm_tasks_axi_rm_has_peer_revision_cas
 }
 
 fm_tasks_axi_mv_has_revision_cas() {
@@ -109,6 +111,16 @@ fm_tasks_axi_mv_has_revision_cas() {
   output=$(tasks-axi mv --help 2>&1) || return 1
   printf '%s\n' "$output" | grep -F -- '--if-source-sha256' >/dev/null \
     && printf '%s\n' "$output" | grep -F -- '--if-target-sha256' >/dev/null
+}
+
+fm_tasks_axi_rm_has_peer_revision_cas() {
+  local output
+  command -v tasks-axi >/dev/null 2>&1 || return 1
+  output=$(tasks-axi rm --help 2>&1) || return 1
+  printf '%s\n' "$output" | grep -F -- '[<id>...]' >/dev/null \
+    && printf '%s\n' "$output" | grep -F -- '--if-source-sha256' >/dev/null \
+    && printf '%s\n' "$output" | grep -F -- '--if-peer' >/dev/null \
+    && printf '%s\n' "$output" | grep -F -- '--if-peer-sha256' >/dev/null
 }
 
 fm_backlog_backend_value() {

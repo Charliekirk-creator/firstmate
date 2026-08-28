@@ -268,6 +268,7 @@ A bare harness line remains harness-only, so existing `config/secondmate-harness
 When the harness token is unset or `default`, launch falls back to `config/crew-harness`, then to the primary's own harness, and the model and effort tokens are ignored.
 Those optional tokens are re-read on every secondmate spawn or respawn and are overridden by explicit per-spawn `--model` or `--effort` flags.
 For a local route, an explicit per-spawn harness or raw launch command does not inherit model or effort tokens from `config/secondmate-harness`.
+A local raw secondmate launch remains supported for one simple executable command; shell compounds, pipelines, substitutions, and redirections are refused because they do not expose one process boundary to verify.
 Remote routes accept verified harness adapters only and reject raw launch commands.
 `config/crew-harness` remains the crewmate harness and is inherited into secondmate homes.
 `config/crew-dispatch.json` is inherited too; secondmates use the same natural-language dispatch profiles when spawning their own crewmates.

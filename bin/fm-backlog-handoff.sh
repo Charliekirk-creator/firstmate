@@ -1343,9 +1343,9 @@ finish_remote_handoff() { # <secondmate-id> <outbox-path>
 }
 
 remove_interrupted_source_duplicates() { # <outbox> <keys...>
-  local outbox=$1 key progress remaining pass=0 source_hash target_hash
-  local source_dir source_base source_inode source_details source_state source_digest candidate
-  local target_dir target_base target_inode target_details target_state target_digest
+  local outbox=$1 key source_hash target_hash source_details source_digest
+  local target_details target_digest reconcile_out
+  local source_dir source_base source_inode target_dir target_base target_inode
   local -a duplicates
   shift
   duplicates=()
@@ -1365,69 +1365,36 @@ remove_interrupted_source_duplicates() { # <outbox> <keys...>
     fi
   done
   [ "${#duplicates[@]}" -gt 0 ] || return 0
-  target_dir=$(dirname "$outbox")
-  target_base=$(basename "$outbox")
-  target_inode=$(backlog_file_inode "$target_dir") || return 1
-  target_details=$(python3 "$FS_OWNER" describe-digest \
-    "$target_dir" "$target_inode" "$target_base") || return 1
-  target_state=${target_details%%$'\t'*}
-  target_digest=${target_details#*$'\t'}
-  [ "$target_state" != "$target_details" ] || return 1
+  fm_tasks_axi_rm_has_peer_revision_cas || {
+    echo "error: tasks-axi lacks peer-revision CAS required for interrupted handoff reconciliation" >&2
+    return 1
+  }
   source_dir=$(dirname "$MAIN_BACKLOG")
   source_base=$(basename "$MAIN_BACKLOG")
   source_inode=$(backlog_file_inode "$source_dir") || return 1
   source_details=$(python3 "$FS_OWNER" describe-digest \
     "$source_dir" "$source_inode" "$source_base") || return 1
-  source_state=${source_details%%$'\t'*}
   source_digest=${source_details#*$'\t'}
-  [ "$source_state" != "$source_details" ] || return 1
-  candidate=$(umask 077; mktemp "$STATE/.backlog-source-reconcile.XXXXXX") || return 1
-  if ! python3 "$FS_OWNER" snapshot "$source_dir" "$source_inode" "$source_base" \
-    "$source_state" "$source_digest" > "$candidate"; then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  for key in "${duplicates[@]}"; do
-    source_hash=$(backlog_task_sha256 "$candidate" "$key") || {
-      rm -f -- "$candidate"
-      echo "error: refusing interrupted source removal for $key: captured source row is not Queued" >&2
-      return 1
-    }
-    target_hash=$(backlog_task_sha256 "$outbox" "$key") || { rm -f -- "$candidate"; return 1; }
-    [ "$source_hash" = "$target_hash" ] || {
-      rm -f -- "$candidate"
-      echo "error: refusing interrupted source removal for $key: captured source and destination content differ" >&2
-      return 1
-    }
-  done
-  while :; do
-    remaining=0
-    progress=0
-    for key in "${duplicates[@]}"; do
-      if backlog_key_section "$candidate" "$key" >/dev/null 2>&1; then
-        remaining=$((remaining + 1))
-        if tasks-axi rm "$key" --file "$candidate" >/dev/null 2>&1; then
-          progress=$((progress + 1))
-        fi
-      fi
-    done
-    [ "$remaining" -gt 0 ] || break
-    [ "$progress" -gt 0 ] || {
-      rm -f -- "$candidate"
-      echo "error: could not complete interrupted source removal; handoff destination remains authoritative at $outbox" >&2
-      return 1
-    }
-    pass=$((pass + 1))
-    [ "$pass" -le "${#duplicates[@]}" ] || { rm -f -- "$candidate"; return 1; }
-  done
-  if ! python3 "$FS_OWNER" replace-if-peer "$source_dir" "$source_inode" "$source_base" \
-    "$candidate" "$source_state" "$target_dir" "$target_inode" "$target_base" \
-    "$target_state" "$target_digest"; then
-    rm -f -- "$candidate"
+  [ "$source_digest" != "$source_details" ] || return 1
+  target_dir=$(dirname "$outbox")
+  target_base=$(basename "$outbox")
+  target_inode=$(backlog_file_inode "$target_dir") || return 1
+  target_details=$(python3 "$FS_OWNER" describe-digest \
+    "$target_dir" "$target_inode" "$target_base") || return 1
+  target_digest=${target_details#*$'\t'}
+  [ "$target_digest" != "$target_details" ] || return 1
+  if ! reconcile_out=$(tasks-axi rm "${duplicates[@]}" --file "$MAIN_BACKLOG" \
+    --if-source-sha256 "$source_digest" --if-peer "$outbox" \
+    --if-peer-sha256 "$target_digest" --json 2>&1); then
+    [ -z "$reconcile_out" ] || printf '%s\n' "$reconcile_out" >&2
     echo "error: source or destination backlog changed during interrupted handoff reconciliation; no stale row was removed" >&2
     return 1
   fi
-  rm -f -- "$candidate"
+  for key in "${duplicates[@]}"; do
+    backlog_key_section "$MAIN_BACKLOG" "$key" >/dev/null 2>&1 || continue
+    echo "error: tasks-axi peer-revision reconciliation retained source row $key" >&2
+    return 1
+  done
 }
 
 remote_handoff() { # <secondmate-id> <keys...>
