@@ -2597,7 +2597,7 @@ fm_backend_herdr_prompt_receipt_state() {  # <target> <token>
   if printf '%s\n' "$out" | grep -Fxq -- "$marker"; then
     printf 'accepted'
   else
-    printf 'unsent'
+    printf 'unknown'
   fi
 }
 

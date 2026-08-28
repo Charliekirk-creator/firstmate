@@ -294,6 +294,24 @@ expect_code 1 "$DOCTOR_RC" "a remote host without atomic Herdr prompt support wa
 assert_contains "$DOCTOR_OUT" 'check herdr=human:' "an old Herdr release was not reported as a readiness gap"
 assert_contains "$DOCTOR_OUT" 'protocol 17' "the Herdr readiness gap did not name the prompt protocol floor"
 pass "remote doctor requires Herdr prompt submission support"
+
+new_case Darwin with-herdr gui
+cat > "$CASE_BIN/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  "status --json --session fm-remote")
+    printf '%s\n' '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true,"version":"0.7.4","protocol":16}}'
+    ;;
+  "status --json")
+    printf '%s\n' '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true,"version":"0.7.5","protocol":17}}'
+    ;;
+esac
+SH
+chmod +x "$CASE_BIN/herdr"
+doctor
+assert_contains "$DOCTOR_OUT" 'check herdr=human: fm-remote server' \
+  "remote doctor checked the default Herdr session instead of fm-remote"
+pass "remote doctor checks the dedicated Herdr session protocol"
 [ "${FM_TEST_ONLY:-}" != herdr-prompt-floor ] || exit 0
 
 new_case Darwin with-herdr gui

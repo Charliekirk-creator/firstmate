@@ -487,6 +487,15 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
   ) || fail "accepted Herdr submission was not recoverable"
   [ "$out" = accepted ] \
     || fail "receipted Herdr submission recovered as '$out' instead of accepted"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 1
+    fm_backend_herdr_cli() { printf '%s\n' 'recent output without the transaction marker'; }
+    fm_backend_herdr_prompt_receipt_state session-a:pane-a durable-presend
+  ) || fail "Herdr missing-marker recovery could not be inspected"
+  [ "$out" = unknown ] \
+    || fail "missing durable Herdr receipt was classified as '$out' instead of unknown"
   rm -f -- "$evidence" "${evidence}.entering" "${evidence}.operation-owner" \
     "${evidence}.operation-started" "${evidence}.operation-result"
   out=$(
