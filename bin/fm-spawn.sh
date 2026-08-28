@@ -4282,19 +4282,8 @@ kimi_deliver_launch_brief() {
     case "$composer_state" in
       pending|pending-unproven) submission_state=pending ;;
       empty)
-        if { [ -e "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" ] \
-            || [ -L "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" ]; } \
-          && [ ! -e "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" ] \
-          && [ ! -L "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" ]; then
-          kimi_submission_reset_unsent || {
-            kimi_spawn_fail "kimi unsent launch brief submission could not be retired"
-            return 1
-          }
-          submission_state=prepared
-        else
-          kimi_spawn_fail "kimi launch brief submission remains ambiguous"
-          return 1
-        fi
+        kimi_spawn_fail "kimi launch brief submission remains ambiguous"
+        return 1
         ;;
       *)
         kimi_spawn_fail "kimi launch brief submission remains ambiguous"

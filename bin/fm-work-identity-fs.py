@@ -579,6 +579,177 @@ def replace_entry(directory_fd, name, source, expected_state, expected_digest):
     recover_replace(directory_fd, name)
 
 
+def read_no_clobber_journal(directory_fd, journal, name, staging):
+    try:
+        fd = os.open(
+            journal,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024:
+        os.close(fd)
+        fail(f"publication journal is unsafe: {journal}")
+    try:
+        payload = os.read(fd, 1025).decode("ascii", "strict")
+    except UnicodeError:
+        fail(f"publication journal is malformed: {journal}")
+    finally:
+        os.close(fd)
+    lines = payload.splitlines()
+    pin_prefix = f".{name}.no-clobber-pin."
+    if len(lines) != 4 or lines[0] != "v1" or lines[1] != staging \
+            or not valid_name(lines[2]) or not lines[2].startswith(pin_prefix) \
+            or len(lines[2]) <= len(pin_prefix) \
+            or len(lines[3]) != 64 \
+            or any(char not in "0123456789abcdef" for char in lines[3]):
+        fail(f"publication journal is malformed: {journal}")
+    return lines[2], lines[3]
+
+
+def publish_no_clobber_journal(directory_fd, journal, name, staging, pin, digest):
+    temporary = f".{journal}.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+    published = False
+    try:
+        payload = f"v1\n{staging}\n{pin}\n{digest}\n".encode("ascii")
+        if os.write(fd, payload) != len(payload):
+            raise OSError(errno.EIO, "short publication journal write")
+        os.fsync(fd)
+        atomic_rename(directory_fd, temporary, journal, False)
+        published = True
+        os.fsync(directory_fd)
+    finally:
+        os.close(fd)
+        if not published:
+            remove(directory_fd, temporary)
+
+
+def opened_entry(directory_fd, name, digest, allowed_links):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink not in allowed_links:
+            fail(f"publication entry is unsafe: {name}")
+        actual_digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 131072)
+            if not chunk:
+                break
+            actual_digest.update(chunk)
+        after = os.fstat(fd)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) \
+                or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino) \
+                or not stat.S_ISREG(current.st_mode) \
+                or current.st_nlink not in allowed_links \
+                or actual_digest.hexdigest() != digest:
+            fail(f"publication entry changed during validation: {name}")
+        return before
+    finally:
+        os.close(fd)
+
+
+def same_inode(first, second):
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def recover_no_clobber(directory_fd, name, staging, source_digest):
+    journal = f".{name}.no-clobber-journal"
+    loaded = read_no_clobber_journal(directory_fd, journal, name, staging)
+    if loaded is None:
+        return False
+    pin, journal_digest = loaded
+    if journal_digest != source_digest:
+        fail("publication source changed while recovering")
+
+    try:
+        target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        target_info = None
+    try:
+        pin_info = os.stat(pin, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pin_info = None
+    try:
+        staging_info = os.stat(staging, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        staging_info = None
+
+    if target_info is None:
+        if pin_info is None:
+            if staging_info is None:
+                fail("publication journal lost its staged candidate")
+            opened = opened_entry(directory_fd, staging, source_digest, (1,))
+            try:
+                os.link(staging, pin, src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd, follow_symlinks=False)
+            except FileExistsError:
+                fail("publication pin conflicts with another entry")
+            pin_info = os.stat(pin, dir_fd=directory_fd, follow_symlinks=False)
+            current_fd = os.open(
+                staging,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                current = os.fstat(current_fd)
+            finally:
+                os.close(current_fd)
+            if not same_inode(opened, pin_info) or not same_inode(opened, current) \
+                    or pin_info.st_nlink != 2 or current.st_nlink != 2:
+                remove(directory_fd, pin)
+                fail("publication staging entry changed while being pinned")
+        else:
+            if staging_info is None or not same_inode(pin_info, staging_info):
+                fail("publication pin is not bound to its staging entry")
+            opened_entry(directory_fd, pin, source_digest, (2,))
+        atomic_rename(directory_fd, pin, name, False)
+        target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        pin_info = None
+
+    if not stat.S_ISREG(target_info.st_mode) or target_info.st_nlink not in (1, 2):
+        fail(f"publication target is unsafe: {name}")
+    opened_entry(directory_fd, name, source_digest, (1, 2))
+
+    if pin_info is None:
+        try:
+            pin_info = os.stat(pin, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pin_info = None
+    if pin_info is None and staging_info is not None:
+        try:
+            atomic_rename(directory_fd, staging, pin, False)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+        try:
+            pin_info = os.stat(pin, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pin_info = None
+    if pin_info is not None:
+        target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not same_inode(pin_info, target_info):
+            try:
+                atomic_rename(directory_fd, pin, staging, False)
+            except OSError:
+                pass
+            fail("publication staging entry changed during commit")
+        remove(directory_fd, pin)
+    elif staging_info is not None:
+        fail("publication staging entry changed during commit")
+
+    opened_entry(directory_fd, name, source_digest, (1,))
+    remove(directory_fd, journal)
+    os.fsync(directory_fd)
+    return True
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -933,6 +1104,8 @@ def main():
                     source_digest = source_digest.hexdigest()
                 finally:
                     os.close(source_fd)
+                if recover_no_clobber(directory_fd, name, staging, source_digest):
+                    return
                 try:
                     staging_info = os.stat(staging, dir_fd=directory_fd, follow_symlinks=False)
                 except FileNotFoundError:
@@ -942,48 +1115,35 @@ def main():
                 except FileNotFoundError:
                     target_info = None
                 if staging_info is not None:
-                    if not stat.S_ISREG(staging_info.st_mode) or staging_info.st_nlink not in (1, 2):
-                        fail("publication staging entry is unsafe")
-                    staging_fd = os.open(
-                        staging,
-                        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-                        dir_fd=directory_fd,
-                    )
-                    try:
-                        staging_digest = hashlib.sha256()
-                        while True:
-                            chunk = os.read(staging_fd, 131072)
-                            if not chunk:
-                                break
-                            staging_digest.update(chunk)
-                        if staging_digest.hexdigest() != source_digest:
-                            fail("publication staging content changed")
-                    finally:
-                        os.close(staging_fd)
                     if target_info is not None:
-                        if not stat.S_ISREG(target_info.st_mode) \
+                        if not stat.S_ISREG(staging_info.st_mode) \
+                                or not stat.S_ISREG(target_info.st_mode) \
                                 or staging_info.st_nlink != 2 \
                                 or target_info.st_nlink != 2 \
-                                or (staging_info.st_dev, staging_info.st_ino) \
-                                != (target_info.st_dev, target_info.st_ino):
+                                or not same_inode(staging_info, target_info):
                             fail("publication target conflicts with retained staging")
+                        opened_entry(directory_fd, staging, source_digest, (2,))
+                        opened_entry(directory_fd, name, source_digest, (2,))
                         remove(directory_fd, staging)
                         os.fsync(directory_fd)
                         return
-                    if staging_info.st_nlink != 1:
-                        fail("publication staging entry has an unexpected link count")
+                    opened_entry(directory_fd, staging, source_digest, (1,))
                 else:
                     if target_info is not None:
                         raise SystemExit(2)
-                    copy_to_new(source, directory_fd, staging)
-                try:
-                    os.link(staging, name, src_dir_fd=directory_fd,
-                            dst_dir_fd=directory_fd, follow_symlinks=False)
-                except FileExistsError:
-                    remove(directory_fd, staging)
-                    raise SystemExit(2)
-                remove(directory_fd, staging)
-                os.fsync(directory_fd)
+                    candidate = f".{staging}.copy-candidate.{secrets.token_hex(16)}"
+                    try:
+                        copy_to_new(source, directory_fd, candidate)
+                        atomic_rename(directory_fd, candidate, staging, False)
+                    finally:
+                        remove(directory_fd, candidate)
+                    opened_entry(directory_fd, staging, source_digest, (1,))
+                pin = f".{name}.no-clobber-pin.{secrets.token_hex(16)}"
+                journal = f".{name}.no-clobber-journal"
+                publish_no_clobber_journal(
+                    directory_fd, journal, name, staging, pin, source_digest
+                )
+                recover_no_clobber(directory_fd, name, staging, source_digest)
             finally:
                 os.close(mutex_fd)
         elif command == "lock-try":
