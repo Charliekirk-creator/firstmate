@@ -540,12 +540,6 @@ spawn_remote_secondmate() {
       return 1
       ;;
   esac
-  if [ "$harness" = kimi ]; then
-    fm_lock_release "$registry_lock" || true
-    fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: persistent Kimi secondmates require backend=tmux because non-tmux text submission has no atomic acceptance receipt" >&2
-    return 1
-  fi
   case "$effort" in
     -|low|medium|high|xhigh|max) ;;
     *)
@@ -2531,8 +2525,9 @@ esac
 case "$LAUNCH" in
   *__KIMIBIN__*)
     KIMI_BIN=$(resolve_kimi_binary) || exit 1
-    if [ "$KIND" = secondmate ] && [ "$BACKEND" != tmux ]; then
-      echo "error: persistent Kimi secondmates require backend=tmux because non-tmux text submission has no atomic acceptance receipt" >&2
+    if [ "$KIND" = secondmate ] && [ "$BACKEND" != tmux ] \
+      && { [ "${FM_REMOTE_SECONDMATE_LAUNCH:-0}" != 1 ] || [ "$BACKEND" != herdr ]; }; then
+      echo "error: persistent Kimi secondmates require backend=tmux outside the journaled remote Herdr route" >&2
       exit 1
     fi
     if [ "$KIND" != secondmate ]; then

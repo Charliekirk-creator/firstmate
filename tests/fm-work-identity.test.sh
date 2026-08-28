@@ -549,7 +549,7 @@ print(f"{info.st_dev}:{info.st_ino}")
 PY
 )
   source="$dir/source"
-  staging=.record.publishing
+  staging=record.publishing
   target="$dir/record"
   pin="$dir/.record.no-clobber-pin.conflict"
   journal="$dir/.record.no-clobber-journal"
@@ -567,7 +567,42 @@ PY
   assert_absent "$dir/$staging" "no-clobber conflict retained owned staging"
   assert_absent "$pin" "no-clobber conflict retained owned pin"
   assert_absent "$journal" "no-clobber conflict retained owned journal"
+
+  printf 'v2\n%s\n%s\n%s\nconflict\n' \
+    "$staging" "${pin##*/}" "$digest" > "$journal"
+  rc=0
+  python3 "$ROOT/bin/fm-work-identity-fs.py" no-clobber \
+    "$dir" "$inode" record "$source" "$staging" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "interrupted conflict cleanup returned $rc instead of target-exists"
+  assert_absent "$journal" "interrupted conflict cleanup retained its journal"
+  [ "$(cat "$target")" = "concurrent destination" ] \
+    || fail "interrupted conflict cleanup changed the concurrent destination"
   pass "no-clobber conflicts retire their exact owned transaction"
+}
+
+test_no_clobber_journal_rejects_unrelated_staging() {
+  local home task dir brief target pin journal digest out rc=0
+  home=$(make_home publication-journal-binding)
+  task=publication-journal-binding
+  dir="$home/data/$task"
+  mkdir -p "$dir"
+  brief="$dir/brief.md"
+  target="$dir/work-identity.json"
+  pin="$dir/.work-identity.json.no-clobber-pin.forged"
+  journal="$dir/.work-identity.json.no-clobber-journal"
+  printf 'independent brief\n' > "$brief"
+  ln "$brief" "$pin" || fail "could not create unrelated journal fixture"
+  digest=$(sha256_file_for_test "$brief")
+  printf 'v1\nbrief.md\n%s\n%s\n' "${pin##*/}" "$digest" > "$journal"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" verify "$task" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "forged no-clobber journal unexpectedly passed preflight"
+  assert_contains "$out" "publication journal is malformed" \
+    "forged no-clobber journal was not rejected at the filesystem owner"
+  [ "$(cat "$brief")" = "independent brief" ] \
+    || fail "forged no-clobber journal changed the unrelated brief"
+  assert_absent "$target" "forged no-clobber journal published an identity sidecar"
+  assert_present "$pin" "forged no-clobber journal removed an unrelated hardlink"
+  pass "no-clobber journals cannot claim unrelated owned entries"
 }
 
 test_no_clobber_publication_does_not_follow_raced_target() {
@@ -2611,6 +2646,7 @@ case "${FM_TEST_ONLY:-}" in
   no-clobber-recovery)
     test_no_clobber_publications_recover_after_interruption
     test_no_clobber_conflict_retires_owned_transaction
+    test_no_clobber_journal_rejects_unrelated_staging
     exit 0
     ;;
 esac
@@ -2623,6 +2659,7 @@ test_concurrent_idempotence_and_explicit_unlinked
 test_secondmate_unlinked_reservation_is_transactional
 test_no_clobber_publications_recover_after_interruption
 test_no_clobber_conflict_retires_owned_transaction
+test_no_clobber_journal_rejects_unrelated_staging
 test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
 test_owned_snapshot_binds_validated_entry

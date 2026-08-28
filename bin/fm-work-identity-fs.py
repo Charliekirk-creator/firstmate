@@ -579,6 +579,10 @@ def replace_entry(directory_fd, name, source, expected_state, expected_digest):
     recover_replace(directory_fd, name)
 
 
+def allowed_no_clobber_staging(name, staging):
+    return staging in (f"{name}.publishing", f".{name}.scaffold-publishing")
+
+
 def read_no_clobber_journal(directory_fd, journal, name, staging=None):
     try:
         fd = os.open(
@@ -600,29 +604,38 @@ def read_no_clobber_journal(directory_fd, journal, name, staging=None):
         os.close(fd)
     lines = payload.splitlines()
     pin_prefix = f".{name}.no-clobber-pin."
-    if len(lines) != 4 or lines[0] != "v1" \
-            or not valid_name(lines[1]) or lines[1] == name \
+    if len(lines) == 4 and lines[0] == "v1":
+        phase = "publishing"
+    elif len(lines) == 5 and lines[0] == "v2" and lines[4] in ("publishing", "conflict"):
+        phase = lines[4]
+    else:
+        fail(f"publication journal is malformed: {journal}")
+    if not valid_name(lines[1]) or not allowed_no_clobber_staging(name, lines[1]) \
             or (staging is not None and lines[1] != staging) \
             or not valid_name(lines[2]) or not lines[2].startswith(pin_prefix) \
             or len(lines[2]) <= len(pin_prefix) \
             or len(lines[3]) != 64 \
             or any(char not in "0123456789abcdef" for char in lines[3]):
         fail(f"publication journal is malformed: {journal}")
-    return lines[1], lines[2], lines[3]
+    return lines[1], lines[2], lines[3], phase
 
 
-def publish_no_clobber_journal(directory_fd, journal, name, staging, pin, digest):
+def publish_no_clobber_journal(directory_fd, journal, name, staging, pin, digest,
+                               phase="publishing", replace=False):
     temporary = f".{journal}.{os.getpid()}.{secrets.token_hex(8)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
     published = False
     try:
-        payload = f"v1\n{staging}\n{pin}\n{digest}\n".encode("ascii")
+        payload = f"v2\n{staging}\n{pin}\n{digest}\n{phase}\n".encode("ascii")
         if os.write(fd, payload) != len(payload):
             raise OSError(errno.EIO, "short publication journal write")
         os.fsync(fd)
-        atomic_rename(directory_fd, temporary, journal, False)
+        if replace:
+            os.replace(temporary, journal, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        else:
+            atomic_rename(directory_fd, temporary, journal, False)
         published = True
         os.fsync(directory_fd)
     finally:
@@ -662,7 +675,10 @@ def same_inode(first, second):
 
 
 def rollback_no_clobber_conflict(directory_fd, name, staging, pin, digest, journal):
-    target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    try:
+        target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        target_info = None
     try:
         pin_info = os.stat(pin, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -671,15 +687,13 @@ def rollback_no_clobber_conflict(directory_fd, name, staging, pin, digest, journ
         staging_info = os.stat(staging, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         staging_info = None
-    if pin_info is None and staging_info is None:
-        fail("publication conflict lost its retained candidate")
     if pin_info is not None:
         pin_info = opened_entry(directory_fd, pin, digest, (1, 2))
-        if same_inode(target_info, pin_info):
+        if target_info is not None and same_inode(target_info, pin_info):
             fail("publication conflict aliases its retained candidate")
     if staging_info is not None:
         staging_info = opened_entry(directory_fd, staging, digest, (1, 2))
-        if same_inode(target_info, staging_info) \
+        if (target_info is not None and same_inode(target_info, staging_info)) \
                 or (pin_info is not None and not same_inode(pin_info, staging_info)):
             fail("publication conflict does not match its retained candidate")
     if pin_info is not None:
@@ -698,10 +712,17 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
     loaded = read_no_clobber_journal(directory_fd, journal, name, staging)
     if loaded is None:
         return False
-    staging, pin, journal_digest = loaded
+    staging, pin, journal_digest, phase = loaded
     if source_digest is not None and journal_digest != source_digest:
         fail("publication source changed while recovering")
     source_digest = journal_digest
+    if phase == "conflict":
+        rollback_no_clobber_conflict(
+            directory_fd, name, staging, pin, source_digest, journal
+        )
+        if conflict_is_error:
+            raise SystemExit(2)
+        return False
 
     try:
         target_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -719,6 +740,10 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
     if target_info is not None \
             and ((pin_info is not None and not same_inode(target_info, pin_info))
                  or (staging_info is not None and not same_inode(target_info, staging_info))):
+        publish_no_clobber_journal(
+            directory_fd, journal, name, staging, pin, source_digest,
+            phase="conflict", replace=True
+        )
         rollback_no_clobber_conflict(
             directory_fd, name, staging, pin, source_digest, journal
         )
@@ -759,6 +784,10 @@ def recover_no_clobber(directory_fd, name, staging=None, source_digest=None,
         except OSError as exc:
             if exc.errno != errno.EEXIST:
                 raise
+            publish_no_clobber_journal(
+                directory_fd, journal, name, staging, pin, source_digest,
+                phase="conflict", replace=True
+            )
             rollback_no_clobber_conflict(
                 directory_fd, name, staging, pin, source_digest, journal
             )
@@ -1147,7 +1176,7 @@ def main():
             if len(sys.argv) != 7:
                 fail("no-clobber requires a source and staging name")
             source, staging = sys.argv[5:7]
-            if not valid_name(staging) or staging == name:
+            if not valid_name(staging) or not allowed_no_clobber_staging(name, staging):
                 fail("unsafe publication staging name")
             mutex_fd = operation_lock(directory_fd, name)
             try:
