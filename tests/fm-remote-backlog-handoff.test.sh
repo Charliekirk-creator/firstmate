@@ -289,11 +289,36 @@ assert_no_grep 'transfer-cut' "$PARENT/data/backlog.md" "dropped transfer left t
 assert_present "$PARENT/data/handoff/ios.outbox.md" "dropped transfer lost the local outbox"
 assert_present "$REMOTE/state/handoff/ios.outbox.md" "dropped transfer did not atomically publish its remote scratch copy"
 assert_absent "$REMOTE/data/backlog.md" "dropped transfer applied a destination mutation"
+write_backlog '- [ ] transfer-cut - survives a dropped transfer (repo: alpha)'
 handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending >/dev/null \
   || fail "recovery after dropped transfer failed"
 assert_grep 'transfer-cut' "$REMOTE/data/backlog.md" "recovery after dropped transfer lost the item"
+assert_no_grep 'transfer-cut' "$PARENT/data/backlog.md" \
+  "recovery after target-first interruption retained a duplicate source row"
 assert_absent "$PARENT/data/handoff/ios.outbox.md" "recovery after dropped transfer left the local outbox"
-pass "dropped transfer recovery overwrites scratch and delivers exactly once"
+pass "dropped transfer recovery removes exact interrupted source duplicates"
+
+mkdir -p "$TMP_ROOT/external-resume-handoff"
+printf '## In flight\n\n## Queued\n\n## Done\n' > "$TMP_ROOT/external-resume-handoff/ios.outbox.md"
+mv "$PARENT/data/handoff" "$TMP_ROOT/anchored-resume-handoff"
+ln -s "$TMP_ROOT/external-resume-handoff" "$PARENT/data/handoff"
+if handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending >/dev/null 2>&1; then
+  fail "pending handoff recovery followed a symlinked handoff directory"
+fi
+assert_present "$TMP_ROOT/external-resume-handoff/ios.outbox.md" \
+  "pending handoff recovery removed an external symlink target"
+rm -f "$PARENT/data/handoff"
+mv "$TMP_ROOT/anchored-resume-handoff" "$PARENT/data/handoff"
+printf '## In flight\n\n## Queued\n- [ ] linked-resume - unsafe outbox\n\n## Done\n' \
+  > "$TMP_ROOT/hardlinked-resume.outbox.md"
+ln "$TMP_ROOT/hardlinked-resume.outbox.md" "$PARENT/data/handoff/ios.outbox.md"
+if handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending >/dev/null 2>&1; then
+  fail "pending handoff recovery accepted a hardlinked outbox"
+fi
+assert_present "$TMP_ROOT/hardlinked-resume.outbox.md" \
+  "pending handoff recovery removed a hardlinked external outbox"
+rm -f "$PARENT/data/handoff/ios.outbox.md" "$TMP_ROOT/hardlinked-resume.outbox.md"
+pass "pending handoff recovery refuses symlinked and hardlinked records"
 
 rm -f "$REMOTE/data/backlog.md" "$TMP_ROOT/serialize.entered" "$TMP_ROOT/serialize.release"
 rm -rf "$TMP_ROOT/serialize.once"

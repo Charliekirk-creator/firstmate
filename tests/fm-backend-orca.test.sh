@@ -1061,6 +1061,7 @@ test_spawn_retries_orca_journal_retirement_before_receipt_cleanup() {
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case journal-retry
+  state=$(cd "$state" && pwd -P)
   cat > "$FB/mv" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = -- ]; then source=$2; else source=$1; fi
@@ -1195,6 +1196,42 @@ test_spawn_refuses_orca_nonisolated_worktree() {
   assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-bad'$'\x1f''--force'$'\x1f''--json' \
     "Orca spawn should remove the worktree after validation aborts"
   pass "fm-spawn.sh --backend orca: refuses non-isolated worktrees and closes implicit terminals"
+}
+
+test_spawn_preserves_orca_worktree_when_terminal_close_is_unconfirmed() {
+  local proj data state config id out status
+  id="orcacloseunknownz5"
+  proj="$TMP_ROOT/close-unknown-project"
+  data="$TMP_ROOT/close-unknown-data"
+  state="$TMP_ROOT/close-unknown-state"
+  config="$TMP_ROOT/close-unknown-config"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case close-unknown
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-close-unknown"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-close-unknown","path":"%s"},"terminal":{"handle":"term-close-unknown"}}}\n' "$proj" > "$RESP/3.out"
+  printf '{"ok":false,"error":{"code":"terminal_close_failed"}}\n' > "$RESP/4.out"
+  printf '1\n' > "$RESP/4.exit"
+  out=$(PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "Orca spawn unexpectedly accepted a non-isolated worktree"
+  assert_contains "$out" "terminal cleanup could not be confirmed" \
+    "Orca abort did not report unconfirmed terminal cleanup"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1fworktree\x1frm' \
+    "Orca abort removed the worktree while its terminal could still be live"
+  assert_present "$state/$id.spawn-endpoint.json" \
+    "unconfirmed Orca terminal cleanup lost its endpoint receipt"
+  assert_present "$state/$id.spawn-orca-operation/failure.json" \
+    "unconfirmed Orca terminal cleanup lost its exact operation journal"
+  assert_absent "$state/$id.meta" \
+    "unconfirmed Orca terminal cleanup published task metadata"
+  pass "fm-spawn.sh --backend orca: preserves resources until terminal absence is confirmed"
 }
 
 test_spawn_removes_orca_worktree_when_terminal_create_fails() {
@@ -1890,6 +1927,12 @@ if [ "${FM_TEST_ONLY:-}" = abort-cleanup-journal ]; then
   echo "ALL TESTS PASSED"
   exit 0
 fi
+if [ "${FM_TEST_ONLY:-}" = abort-compensation-recovery ]; then
+  test_spawn_preserves_orca_worktree_when_terminal_close_is_unconfirmed
+  test_spawn_retries_orca_journal_retirement_before_receipt_cleanup
+  echo "ALL TESTS PASSED"
+  exit 0
+fi
 
 test_capture_reads_terminal_tail_json
 test_capture_falls_back_to_text_fields
@@ -1935,6 +1978,7 @@ test_spawn_retries_orca_journal_retirement_before_receipt_cleanup
 test_spawn_refuses_orca_secondmate_before_home_mutation
 test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
+test_spawn_preserves_orca_worktree_when_terminal_close_is_unconfirmed
 test_spawn_removes_orca_worktree_when_terminal_create_fails
 test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
 test_spawn_refuses_unsafe_metadata_path_before_orca_creation

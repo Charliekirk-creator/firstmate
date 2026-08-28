@@ -393,6 +393,33 @@ test_non_tmux_submission_operation_survives_caller_interruption() {
   pass "non-tmux submission survives interruption through backend-owned evidence"
 }
 
+test_non_tmux_submission_distinguishes_dead_presend_operation() {
+  local evidence="$TMP_ROOT/non-tmux-dead-presend" dead_pid out
+  (exit 0) &
+  dead_pid=$!
+  wait "$dead_pid" 2>/dev/null || true
+  printf '%s:%s\n' "$dead_pid" durable-presend > "${evidence}.operation-owner"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_send_text_submit() { fail "dead pre-send operation invoked the backend"; }
+    fm_backend_send_text_submit_journaled "$evidence" durable-presend \
+      zellij target brief 1 0 0 label
+  ) || fail "dead pre-send submission was not recoverable"
+  [ "$out" = unsent ] || fail "dead pre-send submission recovered as '$out' instead of unsent"
+  printf '%s\n' durable-presend > "${evidence}.operation-started"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_send_text_submit() { fail "ambiguous dead operation invoked the backend"; }
+    fm_backend_send_text_submit_journaled "$evidence" durable-presend \
+      zellij target brief 1 0 0 label
+  ) || fail "dead started submission evidence was not recoverable"
+  [ "$out" = pending-unproven ] \
+    || fail "dead started submission recovered as '$out' instead of pending-unproven"
+  pass "non-tmux submission distinguishes definitely unsent from started operations"
+}
+
 test_kimi_presend_crash_retries_without_wedging_identity() {
   local id rec sub out rc=0 lines
   id="kimi-submit-presend-p5-$$"
@@ -892,6 +919,7 @@ test_kimi_bordered_prompt_needs_no_override() {
 if [ "${FM_TEST_ONLY:-}" = non-tmux-submit-recovery ]; then
   test_non_tmux_definitive_submit_failure_is_retryable
   test_non_tmux_submission_operation_survives_caller_interruption
+  test_non_tmux_submission_distinguishes_dead_presend_operation
   exit 0
 fi
 
@@ -900,6 +928,7 @@ test_kimi_secondmate_commits_identity_only_after_delivery
 test_kimi_interrupted_submit_never_retypes_ambiguous_input
 test_non_tmux_definitive_submit_failure_is_retryable
 test_non_tmux_submission_operation_survives_caller_interruption
+test_non_tmux_submission_distinguishes_dead_presend_operation
 test_kimi_presend_crash_retries_without_wedging_identity
 test_kimi_hook_remove_preserves_owned_newline_boundary
 test_kimi_hook_fails_closed_on_missing_malformed_or_partial_config

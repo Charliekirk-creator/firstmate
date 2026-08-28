@@ -1567,7 +1567,7 @@ spawn_metadata_transaction_published() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? orca_cleanup_compensated=0
+  local status=$? orca_cleanup_compensated=0 orca_resource_cleanup_ok=1
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && spawn_metadata_transaction_published; then
@@ -1610,20 +1610,25 @@ spawn_abort_cleanup() {
   fi
   if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
     ORCA_ABORT_CLEANUP=0
-    if [ -n "${ORCA_TERMINAL:-}" ]; then
-      fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
+    if [ -n "${ORCA_TERMINAL:-}" ] \
+      && ! fm_backend_orca_terminal_close_exact "$ORCA_TERMINAL" --absent-ok >/dev/null 2>&1; then
+      orca_resource_cleanup_ok=0
+      echo "warning: Orca terminal cleanup could not be confirmed; preserving the exact endpoint receipt and operation journal for recovery" >&2
     fi
-    if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-      if fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
-        orca_cleanup_compensated=1
-      else
-        echo "warning: Orca cleanup failed; preserving the exact endpoint receipt and operation journal for recovery" >&2
-      fi
+    if [ "$orca_resource_cleanup_ok" = 1 ] && [ -n "${ORCA_WORKTREE_ID:-}" ] \
+      && ! fm_backend_orca_remove_worktree "$ORCA_WORKTREE_ID" --absent-ok >/dev/null 2>&1; then
+      orca_resource_cleanup_ok=0
+      echo "warning: Orca worktree cleanup could not be confirmed; preserving the exact endpoint receipt and operation journal for recovery" >&2
     fi
+    [ "$orca_resource_cleanup_ok" -ne 1 ] || orca_cleanup_compensated=1
   fi
   if [ "$orca_cleanup_compensated" = 1 ]; then
-    spawn_orca_operation_retire 2>/dev/null || true
-    [ -z "$SPAWN_ENDPOINT_RECEIPT" ] || rm -f -- "$SPAWN_ENDPOINT_RECEIPT" 2>/dev/null || true
+    if ! spawn_orca_operation_retire 2>/dev/null; then
+      echo "warning: compensated Orca operation journal could not be retired; preserving its endpoint receipt for recovery" >&2
+    elif [ -n "$SPAWN_ENDPOINT_RECEIPT" ] \
+      && ! rm -f -- "$SPAWN_ENDPOINT_RECEIPT" 2>/dev/null; then
+      echo "warning: compensated Orca endpoint receipt could not be retired; work identity dispatch requires reconciliation" >&2
+    fi
   fi
   if [ "$SPAWN_DISPATCH_PENDING" = 1 ]; then
     local dispatch_abort_rc=0
@@ -3936,7 +3941,7 @@ kimi_spawn_fail() {  # <detail>
 }
 
 kimi_submission_state() {
-  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted entering result operation_owner operation_result
+  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted entering result operation_owner operation_started operation_result
   local value links pid token verdict
   owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner"
   go="$SPAWN_LAUNCH_REQUEST/kimi-submit-go"
@@ -3944,6 +3949,7 @@ kimi_submission_state() {
   entering="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering"
   result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
   operation_owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-owner"
+  operation_started="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-started"
   operation_result="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-result"
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'absent'; return 0; fi
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
@@ -3984,7 +3990,14 @@ kimi_submission_state() {
     token=${value#*:}
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
-    if kill -0 "$pid" 2>/dev/null; then printf 'submitting'; else printf 'ambiguous'; fi
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'submitting'
+    elif [ ! -e "$operation_started" ] && [ ! -L "$operation_started" ]; then
+      printf 'unsent'
+    else
+      spawn_launch_request_file_matches "$operation_started" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+      printf 'ambiguous'
+    fi
     return 0
   fi
   if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then
@@ -4028,6 +4041,7 @@ kimi_submission_reset_unsent() {
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-owner" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-started" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-result" \
     "$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
   do

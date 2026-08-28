@@ -93,6 +93,10 @@ ACTIVE_BACKLOG_LOCK=
 ACTIVE_TARGET_BACKLOG_LOCK=
 ACTIVE_REGISTRY_LOCK=
 HANDOFF_PLAN_DIR=
+ACTIVE_OUTBOX_PATH=
+ACTIVE_OUTBOX_PARENT_INODE=
+ACTIVE_OUTBOX_FILE_INODE=
+ACTIVE_OUTBOX_HASH=
 release_remote_locks() {
   if [ -n "$HANDOFF_PLAN_DIR" ]; then
     rm -rf -- "$HANDOFF_PLAN_DIR" 2>/dev/null || true
@@ -416,7 +420,7 @@ seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
   )
 }
 
-remove_owned_backlog_scaffold() { # <path> <parent-inode> <file-inode> <sha256>
+remove_owned_backlog_file() { # <path> <parent-inode> <file-inode> <sha256>
   local target=$1 expected_dir_inode=$2 expected_file_inode=$3 expected_hash=$4 dir base state
   dir=$(dirname "$target")
   base=$(basename "$target")
@@ -427,6 +431,58 @@ remove_owned_backlog_scaffold() { # <path> <parent-inode> <file-inode> <sha256>
     *) return 1 ;;
   esac
   python3 "$FS_OWNER" remove "$dir" "$expected_dir_inode" "$base" "$state" "$expected_hash"
+}
+
+remove_owned_backlog_scaffold() {
+  remove_owned_backlog_file "$@"
+}
+
+anchor_existing_handoff_dir() {
+  local home_real data_parent data_parent_real data_base data_expected data_info data_real data_inode
+  if [ ! -e "$DATA" ] && [ ! -L "$DATA" ]; then return 2; fi
+  [ -d "$DATA" ] && [ ! -L "$DATA" ] || return 1
+  home_real=$(cd -P "$FM_HOME" && pwd -P) || return 1
+  data_parent=$(dirname "$DATA")
+  data_base=$(basename "$DATA")
+  case "$data_base" in ''|.|..|*/*) return 1 ;; esac
+  data_parent_real=$(cd -P "$data_parent" && pwd -P) || return 1
+  data_expected="$data_parent_real/$data_base"
+  data_info=$(cd -P "$DATA" && printf '%s\t%s\n' "$(pwd -P)" "$(backlog_file_inode .)") || return 1
+  data_real=${data_info%%$'\t'*}
+  data_inode=${data_info#*$'\t'}
+  [ "$data_real" = "$data_expected" ] || return 1
+  case "$data_real" in "$home_real"/*) ;; *) return 1 ;; esac
+  if [ ! -e "$data_real/handoff" ] && [ ! -L "$data_real/handoff" ]; then return 2; fi
+  [ -d "$data_real/handoff" ] && [ ! -L "$data_real/handoff" ] || return 1
+  (
+    cd -P "$data_real" || exit 1
+    [ "$(backlog_file_inode .)" = "$data_inode" ] || exit 1
+    [ -d handoff ] && [ ! -L handoff ] || exit 1
+    cd -P handoff || exit 1
+    [ "$(backlog_file_inode ..)" = "$data_inode" ] || exit 1
+    printf '%s\t%s\n' "$(pwd -P)" "$(backlog_file_inode .)"
+  )
+}
+
+prepare_outbox_retirement() { # <outbox-path> <parent-inode>
+  local outbox=$1 parent_inode=$2 dir base details links inode hash
+  dir=$(dirname "$outbox")
+  base=$(basename "$outbox")
+  case "$base" in ''|.|..|*/*) return 1 ;; esac
+  details=$(
+    cd -P "$dir" || exit 1
+    [ "$(backlog_file_inode .)" = "$parent_inode" ] || exit 1
+    [ -f "$base" ] && [ ! -L "$base" ] || exit 1
+    links=$(backlog_file_link_count "$base") || exit 1
+    [ "$links" = 1 ] || exit 1
+    inode=$(backlog_file_inode "$base") || exit 1
+    hash=$(sha256_file "$base") || exit 1
+    printf '%s\t%s\n' "$inode" "$hash"
+  ) || return 1
+  ACTIVE_OUTBOX_PATH=$outbox
+  ACTIVE_OUTBOX_PARENT_INODE=$parent_inode
+  ACTIVE_OUTBOX_FILE_INODE=${details%%$'\t'*}
+  ACTIVE_OUTBOX_HASH=${details#*$'\t'}
 }
 
 # A public commitment made through the relay binds its work by home AND id, so an
@@ -1185,6 +1241,11 @@ complete_source_handoff_identities() {
 
 remote_deliver_outbox() { # <secondmate-id> <outbox-path>
   local id=$1 outbox=$2 remote_rel receive_out snapshot bytes hash generation counter counter_tmp current
+  [ "$ACTIVE_OUTBOX_PATH" = "$outbox" ] \
+    && prepare_outbox_retirement "$outbox" "$ACTIVE_OUTBOX_PARENT_INODE" || {
+    echo "error: pending outbox identity changed before delivery: $outbox" >&2
+    return 1
+  }
   [ -f "$outbox" ] && [ ! -L "$outbox" ] || {
     echo "error: pending outbox is unavailable or unsafe: $outbox" >&2
     return 1
@@ -1251,8 +1312,10 @@ finish_remote_handoff() { # <secondmate-id> <outbox-path>
     echo "error: remote backlog and identity are durable at $id; outbox preserved at $outbox for wake retry" >&2
     return 1
   fi
-  rm -f -- "$outbox" || {
-    echo "error: remote receipt, identity commit, and receiver wake were confirmed but local outbox cleanup failed: $outbox" >&2
+  [ "$ACTIVE_OUTBOX_PATH" = "$outbox" ] \
+    && remove_owned_backlog_file "$outbox" "$ACTIVE_OUTBOX_PARENT_INODE" \
+      "$ACTIVE_OUTBOX_FILE_INODE" "$ACTIVE_OUTBOX_HASH" || {
+    echo "error: remote receipt, identity commit, and receiver wake were confirmed but local outbox cleanup failed safely: $outbox" >&2
     return 1
   }
   rm -f -- "$marker" || {
@@ -1499,6 +1562,10 @@ remote_handoff() { # <secondmate-id> <keys...>
   # persist. The outbox is already authoritative in that state, so converge by
   # deleting only duplicates that tasks-axi itself confirms are dependency-safe.
   remove_interrupted_source_duplicates "$outbox" "${delivery_keys[@]}" || return 1
+  prepare_outbox_retirement "$outbox" "$handoff_inode" || {
+    echo "error: pending outbox became unsafe before delivery: $outbox" >&2
+    return 1
+  }
   remote_deliver_outbox "$id" "$outbox" || return 1
   finish_remote_handoff "$id" "$outbox" || return 1
   echo "handed off ${#requested[@]} item(s) to remote secondmate $id: ${requested[*]}"
@@ -1526,11 +1593,11 @@ with_remote_route_locks() { # <secondmate-id> <function> <args...>
   return "$rc"
 }
 
-resume_remote_outbox() { # <secondmate-id> <outbox-path>
-  local id=$1 outbox=$2 target_home key
+resume_remote_outbox() { # <secondmate-id> <outbox-path> <handoff-dir-inode>
+  local id=$1 outbox=$2 handoff_inode=$3 target_home key
   local -a keys
   [ -e "$outbox" ] || [ -L "$outbox" ] || return 0
-  if [ ! -f "$outbox" ] || [ -L "$outbox" ]; then
+  if ! prepare_outbox_retirement "$outbox" "$handoff_inode"; then
     echo "error: unsafe pending handoff outbox: $outbox" >&2
     return 1
   fi
@@ -1560,18 +1627,33 @@ resume_remote_outbox() { # <secondmate-id> <outbox-path>
     echo "error: pending exact backlog staging failed; outbox preserved at $outbox" >&2
     return 1
   }
+  remove_interrupted_source_duplicates "$outbox" "${keys[@]}" || return 1
+  prepare_outbox_retirement "$outbox" "$handoff_inode" || {
+    echo "error: pending outbox became unsafe before resumed delivery: $outbox" >&2
+    return 1
+  }
   remote_deliver_outbox "$id" "$outbox" || return 1
   finish_remote_handoff "$id" "$outbox"
 }
 
 resume_pending_outboxes() {
-  local outbox id failed=0
-  [ -d "$DATA/handoff" ] || return 0
-  for outbox in "$DATA/handoff"/*.outbox.md; do
+  local outbox id failed=0 handoff_info handoff_dir handoff_inode rc
+  set +e
+  handoff_info=$(anchor_existing_handoff_dir)
+  rc=$?
+  set -e
+  case "$rc" in
+    0) ;;
+    2) return 0 ;;
+    *) echo "error: pending handoff directory is unsafe: $DATA/handoff" >&2; return 1 ;;
+  esac
+  handoff_dir=${handoff_info%%$'\t'*}
+  handoff_inode=${handoff_info#*$'\t'}
+  for outbox in "$handoff_dir"/*.outbox.md; do
     [ -e "$outbox" ] || [ -L "$outbox" ] || continue
     id=$(basename "$outbox" .outbox.md)
     case "$id" in ''|*[!A-Za-z0-9._-]*) echo "error: unsafe pending handoff id: $id" >&2; failed=1; continue ;; esac
-    with_remote_route_locks "$id" resume_remote_outbox "$id" "$outbox" || failed=1
+    with_remote_route_locks "$id" resume_remote_outbox "$id" "$outbox" "$handoff_inode" || failed=1
   done
   return "$failed"
 }
