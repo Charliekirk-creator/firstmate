@@ -354,13 +354,13 @@ safe_child_dir() { # <anchor-dir> <anchor-inode> <child-name>
   )
 }
 
-seed_backlog_scaffold() { # <path> <parent-inode>
+seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
   local target=$1 expected_dir_inode=$2 dir base
   dir=$(dirname "$target")
   base=$(basename "$target")
   case "$base" in ''|.|..|*/*) return 1 ;; esac
   (
-    local staging tmp target_links staging_links target_inode staging_inode rc=0
+    local staging tmp target_links staging_links target_inode staging_inode rc=0 report=${3:-}
     cd -P "$dir" || exit 1
     [ "$(backlog_file_inode .)" = "$expected_dir_inode" ] || exit 1
     target=$base
@@ -408,8 +408,27 @@ seed_backlog_scaffold() { # <path> <parent-inode>
       fi
       exit "$rc"
     fi
+    target_inode=$(backlog_file_inode "$target") || exit 1
     rm -f -- "$staging" || exit 1
-    validate_backlog_file "backlog scaffold target" "$target"
+    validate_backlog_file "backlog scaffold target" "$target" || exit 1
+    [ -z "$report" ] || printf '%s\n' "$target_inode"
+  )
+}
+
+remove_owned_backlog_scaffold() { # <path> <parent-inode> <file-inode> <sha256>
+  local target=$1 expected_dir_inode=$2 expected_file_inode=$3 expected_hash=$4 dir base
+  dir=$(dirname "$target")
+  base=$(basename "$target")
+  case "$base" in ''|.|..|*/*) return 1 ;; esac
+  (
+    cd -P "$dir" || exit 1
+    [ "$(backlog_file_inode .)" = "$expected_dir_inode" ] || exit 1
+    [ -f "$base" ] && [ ! -L "$base" ] || exit 1
+    [ "$(backlog_file_link_count "$base")" = 1 ] || exit 1
+    [ "$(backlog_file_inode "$base")" = "$expected_file_inode" ] || exit 1
+    [ "$(sha256_file "$base")" = "$expected_hash" ] || exit 1
+    rm -f -- "$base" || exit 1
+    [ ! -e "$base" ] && [ ! -L "$base" ]
   )
 }
 
@@ -1739,11 +1758,8 @@ receiver_wake_mark_prepared "$ID" "$REQUESTED_BATCH" || {
 # does not exist yet, so the moved item lands under the right section. (Left to
 # create the file itself, tasks-axi mv writes its own `# Backlog` title format,
 # which is not firstmate's home-backlog convention.)
-SUB_CREATED=0
-if [ ! -e "$SUB_BACKLOG" ] && [ ! -L "$SUB_BACKLOG" ]; then
-  SUB_CREATED=1
-fi
-if ! seed_backlog_scaffold "$SUB_BACKLOG" "$SUB_DATA_INODE"; then
+SUB_CREATED_INODE=
+if ! SUB_CREATED_INODE=$(seed_backlog_scaffold "$SUB_BACKLOG" "$SUB_DATA_INODE" report-created); then
   abort_local_handoff_identities "$SUB_HOME" || true
   echo "error: destination backlog scaffold could not be published safely; nothing was moved." >&2
   exit 1
@@ -1761,8 +1777,9 @@ if ! MV_OUT=$(tasks-axi mv "${RESOLVED_MOVE_KEYS[@]}" --file "$MAIN_BACKLOG" --t
   for key in "${RESOLVED_MOVE_KEYS[@]}"; do
     backlog_key_section "$SUB_BACKLOG" "$key" >/dev/null 2>&1 && PERSISTED=1
   done
-  if [ "$SUB_CREATED" -eq 1 ] && [ "$PERSISTED" -eq 0 ]; then
-    rm -f "$SUB_BACKLOG"
+  if [ -n "$SUB_CREATED_INODE" ] && [ "$PERSISTED" -eq 0 ]; then
+    remove_owned_backlog_scaffold "$SUB_BACKLOG" "$SUB_DATA_INODE" \
+      "$SUB_CREATED_INODE" "$MOVE_PLAN_TARGET_HASH" || true
   fi
   receiver_wake_discard_prepared "$ID" || {
     echo "error: tasks-axi mv failed and receiver wake state could not be cleared" >&2

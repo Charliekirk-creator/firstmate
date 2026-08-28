@@ -221,6 +221,13 @@ def recover_replace(directory_fd, name):
         previous_state = raw_entry_state(directory_fd, previous)
         if candidate_state is None:
             fail(f"owned replacement journal is incomplete for {name}")
+        if previous_state == "absent" and stage_state == "absent" \
+                and state_matches(target_state, candidate_state):
+            os.close(journal_fd)
+            journal_fd = None
+            remove(directory_fd, journal)
+            os.fsync(directory_fd)
+            return
         if previous_state != "absent" and not state_matches(previous_state, expected_state):
             if target_state == "absent":
                 atomic_rename(directory_fd, previous, name, False)
@@ -431,11 +438,9 @@ def lock_try(directory_fd, name, pid, token, stale_after):
     lock_info, owner_pid, owner_token, owner_start, entries = details
     if owner_pid == pid and owner_token == token:
         return
-    current_start = process_start_identity(owner_pid) if owner_pid is not None and pid_alive(owner_pid) else None
-    if owner_start is not None and current_start == owner_start:
-        raise SystemExit(2)
-    if owner_start is None and current_start is not None \
-            and time.time() - lock_info.st_mtime < stale_after:
+    owner_alive = owner_pid is not None and pid_alive(owner_pid)
+    current_start = process_start_identity(owner_pid) if owner_alive else None
+    if owner_alive and (owner_start is None or current_start is None or current_start == owner_start):
         raise SystemExit(2)
     if owner_pid is None and entries:
         raise SystemExit(2)

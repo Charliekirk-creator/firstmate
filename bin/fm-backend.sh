@@ -739,9 +739,10 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 }
 
 fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
-  local evidence=$1 token=$2
+  local evidence=$1 token=$2 backend=${3:-} entering=$1
   shift 2
-  FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE= \
+  [ "$backend" != tmux ] || entering=
+  FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE=$entering \
     FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
     FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
     fm_backend_send_text_submit "$@"
