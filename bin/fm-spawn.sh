@@ -3973,10 +3973,11 @@ kimi_spawn_fail() {  # <detail>
 }
 
 kimi_submission_state() {
-  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted result value links pid token verdict
+  local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted entering result value links pid token verdict
   owner="$SPAWN_LAUNCH_REQUEST/kimi-submit-owner"
   go="$SPAWN_LAUNCH_REQUEST/kimi-submit-go"
   attempted="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted"
+  entering="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering"
   result="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'absent'; return 0; fi
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
@@ -4018,6 +4019,9 @@ kimi_submission_state() {
     else
       if [ -e "$attempted" ] || [ -L "$attempted" ]; then
         spawn_launch_request_file_matches "$attempted" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+        printf 'ambiguous'
+      elif [ -e "$entering" ] || [ -L "$entering" ]; then
+        spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
         printf 'ambiguous'
       else
         printf 'prepared'
@@ -4207,6 +4211,28 @@ kimi_deliver_launch_brief() {
         kimi_spawn_fail "kimi launch brief submission remains ambiguous"
         return 1
       }
+      if [ "$KIMI_SUBMIT_VERDICT" = unsent ]; then
+        kimi_submission_reset_unsent || {
+          kimi_spawn_fail "kimi unsent launch brief submission could not be retired"
+          return 1
+        }
+        kimi_submission_start || {
+          kimi_spawn_fail "kimi launch brief submission owner could not be restarted"
+          return 1
+        }
+        KIMI_SUBMIT_VERDICT=$(kimi_submission_wait) || {
+          kimi_spawn_fail "kimi launch brief submission remains ambiguous"
+          return 1
+        }
+        if [ "$KIMI_SUBMIT_VERDICT" = unsent ]; then
+          kimi_submission_reset_unsent || {
+            kimi_spawn_fail "kimi unsent launch brief submission could not be retired"
+            return 1
+          }
+          kimi_spawn_fail "kimi launch brief could not be submitted"
+          return 1
+        fi
+      fi
     else
       KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
         "$BACKEND" "$T" "$KIMI_INPUT" "$KIMI_SUBMIT_RETRIES" \
@@ -4215,7 +4241,14 @@ kimi_deliver_launch_brief() {
         return 1
       }
     fi
-    if [ "$KIMI_SUBMIT_VERDICT" = pending ]; then submission_state=pending; else submission_state=accepted; fi
+    case "$KIMI_SUBMIT_VERDICT" in
+      pending) submission_state=pending ;;
+      accepted|empty) submission_state=accepted ;;
+      *)
+        kimi_spawn_fail "kimi launch brief submission remains ambiguous"
+        return 1
+        ;;
+    esac
     if [ "$journal" -eq 1 ]; then
       kimi_submission_publish "$submission_state" || {
         kimi_spawn_fail "kimi launch brief submission could not be journaled"

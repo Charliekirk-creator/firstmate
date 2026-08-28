@@ -418,14 +418,24 @@ recover_owned_replacement() {  # <target> <label>
     || die "cannot recover $label publication: $target"
 }
 
-owned_remove() {  # <target> <label>
-  local target=$1 label=$2 parent expected base destination_state
+owned_removal_expectation() {  # <target> <label>
+  local target=$1 label=$2 parent expected base
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
-  destination_state=$(python3 "$FS_OWNER" describe "$parent" "$expected" "$base") \
+  python3 "$FS_OWNER" describe-digest "$parent" "$expected" "$base" \
     || die "$label destination is unsafe: $target"
-  python3 "$FS_OWNER" remove "$parent" "$expected" "$base" "$destination_state" \
+}
+
+owned_remove() {  # <target> <label> <validated-state> <validated-digest>
+  local target=$1 label=$2 destination_state=$3 destination_digest=$4 parent expected base
+  [ -n "$destination_state" ] && [ -n "$destination_digest" ] \
+    || die "$label has no validated removal identity"
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
+  python3 "$FS_OWNER" remove "$parent" "$expected" "$base" \
+    "$destination_state" "$destination_digest" \
     || die "cannot remove $label: $target"
 }
 
@@ -1061,6 +1071,7 @@ identity_lock_acquire() {  # <task-id>
     recover_owned_replacement "$TARGET_HANDOFF" "target handoff state"
     recover_owned_replacement "$DISPATCH_STATE" "dispatch state"
     recover_owned_replacement "$DISPATCH_PRIOR" "retained dispatch instructions"
+    recover_owned_replacement "$UNLINKED_RESERVATION" "unlinked reservation"
   fi
   if [ "${#task}" -le 220 ]; then
     recover_owned_replacement "$STATE_REAL/$task.launch-brief.md" "dispatch instructions"
@@ -1171,6 +1182,9 @@ handoff_state_json() {  # <source|target> <prepared|completed> <transfer>
 
 read_handoff_state() {  # <path> <source|target> <task-id>; sets HANDOFF_STATE/HANDOFF_TRANSFER
   local path=$1 role=$2 task=$3 wrapper transfer
+  IFS=$'\t' read -r HANDOFF_STATE_ENTRY_STATE HANDOFF_STATE_ENTRY_DIGEST \
+    < <(owned_removal_expectation "$path" "work identity handoff state") \
+    || die "cannot bind validated work identity handoff state"
   safe_regular_file "$path" "work identity handoff state" "$HANDOFF_MAX_BYTES"
   wrapper=$(jq -e -S -c -s --arg schema "$HANDOFF_STATE_SCHEMA" --arg role "$role" '
     def exact_keys($ks): (keys | sort) == ($ks | sort);
@@ -1272,6 +1286,9 @@ write_unlinked_guard() {  # <task-id> <reason>
 read_unlinked_reservation() {  # <task-id>
   local task=$1 wrapper
   ensure_home_identity
+  IFS=$'\t' read -r UNLINKED_RESERVATION_ENTRY_STATE UNLINKED_RESERVATION_ENTRY_DIGEST \
+    < <(owned_removal_expectation "$UNLINKED_RESERVATION" "work identity unlinked reservation") \
+    || die "cannot bind validated work identity unlinked reservation"
   safe_regular_file "$UNLINKED_RESERVATION" "work identity unlinked reservation" "$HANDOFF_MAX_BYTES"
   wrapper=$(jq -e -S -c -s \
     --arg schema "$UNLINKED_RESERVATION_SCHEMA" --arg home "$FM_HOME_REAL" \
@@ -1327,6 +1344,9 @@ write_unlinked_reservation() {  # <task-id> <reason> <transaction>
 
 read_dispatch_state() {  # <task-id>
   local task=$1 wrapper
+  IFS=$'\t' read -r DISPATCH_STATE_ENTRY_STATE DISPATCH_STATE_ENTRY_DIGEST \
+    < <(owned_removal_expectation "$DISPATCH_STATE" "work identity dispatch state") \
+    || die "cannot bind validated work identity dispatch state"
   safe_regular_file "$DISPATCH_STATE" "work identity dispatch state" "$HANDOFF_MAX_BYTES"
   wrapper=$(jq -e -S -c -s --arg schema "$DISPATCH_STATE_SCHEMA" --arg contract "$SCHEMA" --arg task "$task" '
     def exact_keys($ks): (keys | sort) == ($ks | sort);
@@ -1409,6 +1429,9 @@ validate_dispatch_prior_locked() {
   if [ ! -e "$DISPATCH_PRIOR" ] && [ ! -L "$DISPATCH_PRIOR" ]; then return 0; fi
   [ "$DISPATCH_REPLACEMENT" = true ] \
     || die "non-replacement dispatch has retained prior instructions"
+  IFS=$'\t' read -r DISPATCH_PRIOR_ENTRY_STATE DISPATCH_PRIOR_ENTRY_DIGEST \
+    < <(owned_removal_expectation "$DISPATCH_PRIOR" "retained prior dispatch instructions") \
+    || die "cannot bind validated retained prior dispatch instructions"
   safe_regular_file "$DISPATCH_PRIOR" "retained prior dispatch instructions"
   current_hash=$(sha256_file "$DISPATCH_PRIOR") \
     || die "SHA-256 is unavailable for retained prior instructions"
@@ -1419,7 +1442,8 @@ validate_dispatch_prior_locked() {
 retire_dispatch_prior_locked() {
   validate_dispatch_prior_locked
   if [ -e "$DISPATCH_PRIOR" ] || [ -L "$DISPATCH_PRIOR" ]; then
-    owned_remove "$DISPATCH_PRIOR" "retained prior dispatch instructions"
+    owned_remove "$DISPATCH_PRIOR" "retained prior dispatch instructions" \
+      "$DISPATCH_PRIOR_ENTRY_STATE" "$DISPATCH_PRIOR_ENTRY_DIGEST"
   fi
 }
 
@@ -1916,7 +1940,8 @@ handoff_abort() {  # <task-id> <transfer-path>; 4 means target is already commit
     write_handoff_state "$TARGET_HANDOFF" target completed "$requested"
     return 4
   fi
-  owned_remove "$TARGET_HANDOFF" "handoff target state"
+  owned_remove "$TARGET_HANDOFF" "handoff target state" \
+    "$HANDOFF_STATE_ENTRY_STATE" "$HANDOFF_STATE_ENTRY_DIGEST"
 }
 
 handoff_backlog_state() {  # <task-id> <transfer-path>
@@ -1997,7 +2022,8 @@ handoff_cancel() {  # <task-id> <transfer-path>; 4 means source is already compl
   read_handoff_state "$SOURCE_HANDOFF" source "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different source handoff"
   [ "$HANDOFF_STATE" != completed ] || return 4
-  owned_remove "$SOURCE_HANDOFF" "handoff source state"
+  owned_remove "$SOURCE_HANDOFF" "handoff source state" \
+    "$HANDOFF_STATE_ENTRY_STATE" "$HANDOFF_STATE_ENTRY_DIGEST"
 }
 
 render_identity_projection_locked() {  # <task-id> [brief] [meta] [meta-brief-path]
@@ -2147,7 +2173,8 @@ unlinked_prepare() {  # <task-id> <reason> <transaction>
       read_unlinked_reservation "$task"
       [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
         || die "task $task prepared a different unlinked reservation"
-      owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation"
+      owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation" \
+        "$UNLINKED_RESERVATION_ENTRY_STATE" "$UNLINKED_RESERVATION_ENTRY_DIGEST"
     fi
     emit_unlinked_projection_locked "$task"
     return 0
@@ -2180,7 +2207,8 @@ unlinked_commit() {  # <task-id> <transaction>
     read_unlinked_guard "$task"
   fi
   if [ -e "$UNLINKED_RESERVATION" ] || [ -L "$UNLINKED_RESERVATION" ]; then
-    owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation"
+    owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation" \
+      "$UNLINKED_RESERVATION_ENTRY_STATE" "$UNLINKED_RESERVATION_ENTRY_DIGEST"
   fi
   emit_unlinked_projection_locked "$task"
 }
@@ -2195,7 +2223,8 @@ unlinked_abort() {  # <task-id> <transaction>; 4 means committed
       read_unlinked_reservation "$task"
       [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
         || die "task $task prepared a different unlinked reservation"
-      owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation"
+      owned_remove "$UNLINKED_RESERVATION" "committed unlinked reservation" \
+        "$UNLINKED_RESERVATION_ENTRY_STATE" "$UNLINKED_RESERVATION_ENTRY_DIGEST"
     fi
     return 4
   fi
@@ -2205,7 +2234,8 @@ unlinked_abort() {  # <task-id> <transaction>; 4 means committed
   read_unlinked_reservation "$task"
   [ "$UNLINKED_RESERVATION_TRANSACTION" = "$transaction" ] \
     || die "task $task prepared a different unlinked reservation"
-  owned_remove "$UNLINKED_RESERVATION" "unlinked reservation"
+  owned_remove "$UNLINKED_RESERVATION" "unlinked reservation" \
+    "$UNLINKED_RESERVATION_ENTRY_STATE" "$UNLINKED_RESERVATION_ENTRY_DIGEST"
 }
 
 brief_publish() {  # <task-id> <draft>
@@ -2533,6 +2563,7 @@ dispatch_commit() {  # <task-id> <brief> <meta> <transaction>
 
 dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means published metadata requires reconciliation
   local task=$1 transaction=$2 meta="$STATE_REAL/$1.meta" recorded_hash= rc=0 current_hash
+  local removal_state removal_digest
   identity_mutation_lock_acquire "$task"
   if [ ! -e "$DISPATCH_STATE" ] && [ ! -L "$DISPATCH_STATE" ]; then return 0; fi
   read_dispatch_state "$task"
@@ -2549,6 +2580,9 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
     [ "$DISPATCH_REPLACEMENT" = true ] || return 5
   fi
   if [ "$DISPATCH_REPLACEMENT" = true ]; then
+    IFS=$'\t' read -r removal_state removal_digest \
+      < <(owned_removal_expectation "$DISPATCH_PRIOR" "retained prior dispatch instructions") \
+      || die "cannot bind validated retained prior dispatch instructions"
     safe_regular_file "$DISPATCH_PRIOR" "retained prior dispatch instructions"
     current_hash=$(sha256_file "$DISPATCH_PRIOR") || die "SHA-256 is unavailable for retained prior instructions"
     [ "$current_hash" = "$DISPATCH_PREVIOUS_SHA" ] \
@@ -2559,16 +2593,22 @@ dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means publis
     chmod 400 "$TMP" || die "cannot protect restored dispatch instructions"
     owned_atomic_replace "$TMP" "$DISPATCH_INSTRUCTIONS" "restored dispatch instructions"
     TMP=
-    owned_remove "$DISPATCH_PRIOR" "retained prior dispatch instructions"
+    owned_remove "$DISPATCH_PRIOR" "retained prior dispatch instructions" \
+      "$removal_state" "$removal_digest"
   elif [ -e "$DISPATCH_INSTRUCTIONS" ] || [ -L "$DISPATCH_INSTRUCTIONS" ]; then
+    IFS=$'\t' read -r removal_state removal_digest \
+      < <(owned_removal_expectation "$DISPATCH_INSTRUCTIONS" "prepared dispatch instructions") \
+      || die "cannot bind validated prepared dispatch instructions"
     safe_regular_file "$DISPATCH_INSTRUCTIONS" "prepared dispatch instructions"
     current_hash=$(sha256_file "$DISPATCH_INSTRUCTIONS") \
       || die "SHA-256 is unavailable for prepared dispatch instructions"
     [ "$current_hash" = "$DISPATCH_INSTRUCTIONS_SHA" ] \
       || die "prepared dispatch instructions changed before abort"
-    owned_remove "$DISPATCH_INSTRUCTIONS" "prepared dispatch instructions"
+    owned_remove "$DISPATCH_INSTRUCTIONS" "prepared dispatch instructions" \
+      "$removal_state" "$removal_digest"
   fi
-  owned_remove "$DISPATCH_STATE" "work identity dispatch"
+  owned_remove "$DISPATCH_STATE" "work identity dispatch" \
+    "$DISPATCH_STATE_ENTRY_STATE" "$DISPATCH_STATE_ENTRY_DIGEST"
 }
 
 dispatch_retire_preflight() {  # <task-id>
@@ -2598,7 +2638,8 @@ dispatch_retire() {  # <task-id>
   [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
     || die "task $task dispatch instructions path is mismatched"
   retire_dispatch_prior_locked
-  owned_remove "$DISPATCH_STATE" "work identity dispatch"
+  owned_remove "$DISPATCH_STATE" "work identity dispatch" \
+    "$DISPATCH_STATE_ENTRY_STATE" "$DISPATCH_STATE_ENTRY_DIGEST"
 }
 
 publication_preflight_locked() {
@@ -2633,7 +2674,12 @@ publication_preflight_locked() {
       "$task_dir/.work-identity-handoff-source.json.replace-journal" \
       "$task_dir/.work-identity-handoff-target.json.replace-journal" \
       "$task_dir/.work-identity-dispatch.json.replace-journal" \
-      "$task_dir/.work-identity-dispatch-prior.md.replace-journal"
+      "$task_dir/.work-identity-dispatch-prior.md.replace-journal" \
+      "$task_dir/.work-identity-handoff-source.json.remove-journal" \
+      "$task_dir/.work-identity-handoff-target.json.remove-journal" \
+      "$task_dir/.work-identity-dispatch.json.remove-journal" \
+      "$task_dir/.work-identity-dispatch-prior.md.remove-journal" \
+      "$task_dir/.work-identity-unlinked-reservation.json.remove-journal"
     do
       if [ -e "$guarded_path" ] || [ -L "$guarded_path" ]; then guarded=1; fi
     done

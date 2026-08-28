@@ -146,6 +146,115 @@ def conditional_remove(directory_fd, name, expected_state, expected_digest=None,
     os.fsync(directory_fd)
 
 
+def read_remove_journal(directory_fd, journal, name):
+    try:
+        fd = os.open(
+            journal,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 2048:
+        os.close(fd)
+        fail(f"owned removal journal is unsafe: {journal}")
+    try:
+        payload = os.read(fd, 2049).decode("ascii", "strict")
+    except UnicodeError:
+        fail(f"owned removal journal is malformed: {journal}")
+    finally:
+        os.close(fd)
+    lines = payload.splitlines()
+    retired_prefix = f".{name}.remove-retired."
+    if len(lines) != 3 or lines[0] != "v1" or not valid_name(lines[1]) \
+            or not lines[1].startswith(retired_prefix) \
+            or len(lines[1]) <= len(retired_prefix):
+        fail(f"owned removal journal is malformed: {journal}")
+    commitment = lines[2].split("\t")
+    if len(commitment) != 2:
+        fail(f"owned removal journal is malformed: {journal}")
+    expected_state, expected_digest = commitment
+    state_fields = expected_state.split(":")
+    retired_token = lines[1][len(retired_prefix):]
+    if len(state_fields) != 8 or state_fields[0] != "regular" \
+            or any(not field.isdigit() for field in state_fields[1:]) \
+            or len(retired_token) != 32 \
+            or any(char not in "0123456789abcdef" for char in retired_token):
+        fail(f"owned removal journal is malformed: {journal}")
+    if len(expected_digest) != 64 or any(char not in "0123456789abcdef" for char in expected_digest):
+        fail(f"owned removal journal is malformed: {journal}")
+    return lines[1], expected_state, expected_digest
+
+
+def publish_remove_journal(directory_fd, journal, retired, expected_state, expected_digest):
+    temporary = f".{journal}.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+    published = False
+    try:
+        payload = f"v1\n{retired}\n{expected_state}\t{expected_digest}\n".encode("ascii")
+        if os.write(fd, payload) != len(payload):
+            raise OSError(errno.EIO, "short removal journal write")
+        os.fsync(fd)
+        atomic_rename(directory_fd, temporary, journal, False)
+        published = True
+        os.fsync(directory_fd)
+    finally:
+        os.close(fd)
+        if not published:
+            remove(directory_fd, temporary)
+
+
+def retired_entry_matches(directory_fd, retired, expected_state, expected_digest):
+    return state_matches(raw_entry_state(directory_fd, retired), expected_state) \
+        and file_digest(directory_fd, retired) == expected_digest
+
+
+def recover_remove(directory_fd, name):
+    journal = f".{name}.remove-journal"
+    loaded = read_remove_journal(directory_fd, journal, name)
+    if loaded is None:
+        return
+    retired, expected_state, expected_digest = loaded
+    target_state = raw_entry_state(directory_fd, name)
+    retired_state = raw_entry_state(directory_fd, retired)
+    if retired_state == "absent":
+        if target_state != "absent" and target_state != expected_state:
+            fail(f"owned destination changed during removal: {name}")
+        remove(directory_fd, journal)
+        os.fsync(directory_fd)
+        return
+    if target_state != "absent":
+        fail(f"owned destination changed during removal: {name}")
+    if retired_entry_matches(directory_fd, retired, expected_state, expected_digest):
+        remove(directory_fd, retired)
+        remove(directory_fd, journal)
+        os.fsync(directory_fd)
+        return
+    atomic_rename(directory_fd, retired, name, False)
+    remove(directory_fd, journal)
+    os.fsync(directory_fd)
+    fail(f"owned destination changed before removal: {name}")
+
+
+def remove_entry(directory_fd, name, expected_state, expected_digest):
+    recover_remove(directory_fd, name)
+    if entry_state(directory_fd, name) != expected_state:
+        fail(f"owned destination changed before removal: {name}")
+    if expected_state == "absent":
+        return
+    if file_digest(directory_fd, name) != expected_digest:
+        fail(f"owned destination content changed before removal: {name}")
+    retired = f".{name}.remove-retired.{secrets.token_hex(8)}"
+    journal = f".{name}.remove-journal"
+    publish_remove_journal(directory_fd, journal, retired, expected_state, expected_digest)
+    atomic_rename(directory_fd, name, retired, False)
+    os.fsync(directory_fd)
+    recover_remove(directory_fd, name)
+
+
 def operation_lock(directory_fd, name):
     del name
     fd = os.dup(directory_fd)
@@ -541,14 +650,20 @@ def main():
             probe = f".{name}.{os.getpid()}.{secrets.token_hex(8)}"
             os.mkdir(probe, 0o700, dir_fd=directory_fd)
             os.rmdir(probe, dir_fd=directory_fd)
-        elif command in ("describe", "describe-raw"):
+        elif command in ("describe", "describe-raw", "describe-digest"):
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_replace(directory_fd, name)
+                recover_remove(directory_fd, name)
                 if command == "describe":
                     print(entry_state(directory_fd, name))
-                else:
+                elif command == "describe-raw":
                     print(raw_entry_state(directory_fd, name))
+                else:
+                    state = entry_state(directory_fd, name)
+                    if state == "absent":
+                        fail(f"owned destination is absent: {name}")
+                    print(f"{state}\t{file_digest(directory_fd, name)}")
             finally:
                 os.close(mutex_fd)
         elif command in ("remove", "remove-staging"):
@@ -563,13 +678,18 @@ def main():
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_replace(directory_fd, name)
-                conditional_remove(
-                    directory_fd,
-                    name,
-                    expected_state,
-                    expected_digest,
-                    allow_hardlink=command == "remove-staging",
-                )
+                if command == "remove-staging":
+                    conditional_remove(
+                        directory_fd,
+                        name,
+                        expected_state,
+                        expected_digest,
+                        allow_hardlink=True,
+                    )
+                else:
+                    if expected_digest is None:
+                        fail("owned removal requires a validated SHA-256")
+                    remove_entry(directory_fd, name, expected_state, expected_digest)
             finally:
                 os.close(mutex_fd)
         elif command == "replace":
@@ -578,6 +698,7 @@ def main():
             source, expected_state = sys.argv[5:7]
             mutex_fd = operation_lock(directory_fd, name)
             try:
+                recover_remove(directory_fd, name)
                 replace_entry(directory_fd, name, source, expected_state)
             finally:
                 os.close(mutex_fd)
@@ -590,6 +711,7 @@ def main():
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_replace(directory_fd, name)
+                recover_remove(directory_fd, name)
                 try:
                     os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                     raise SystemExit(2)
