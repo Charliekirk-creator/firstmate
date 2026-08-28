@@ -1010,6 +1010,33 @@ test_dispatch_retire_run_authorizes_task_set() {
   pass "dispatch retirement authorizes complete task sets without nested locks"
 }
 
+test_dispatch_retire_run_accepts_whole_home_removal() {
+  local home task launch transaction binding hash
+  home=$(make_home dispatch-retire-whole-home)
+  task=dispatch-retire-whole-home
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold whole-home dispatch retirement fixture"
+  launch="$home/state/$task.launch-brief.md"
+  transaction=retire-whole-home
+  binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$transaction") || fail "could not prepare whole-home dispatch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+    --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+    || fail "could not commit whole-home dispatch"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" --whole-home -- \
+    rm -rf -- "$home" || fail "authorized whole-home retirement failed after removing its owner home"
+  assert_absent "$home" "authorized whole-home retirement retained its removed owner home"
+  pass "dispatch retirement accepts exact authorized whole-home removal"
+}
+
 test_spawn_recovers_exact_created_endpoint() {
   local home task project wt fakebin manifest original_origin out rc=0 creates
   home=$(make_home endpoint-recovery)
@@ -2690,6 +2717,7 @@ case "${FM_TEST_ONLY:-}" in
     ;;
   dispatch-retirement)
     test_dispatch_transaction_excludes_backlog_handoff
+    test_dispatch_retire_run_accepts_whole_home_removal
     exit 0
     ;;
   no-clobber-recovery)
@@ -2719,6 +2747,7 @@ test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
 test_dispatch_retire_run_authorizes_task_set
+test_dispatch_retire_run_accepts_whole_home_removal
 test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect
 test_spawn_resumes_unsent_worktree_request

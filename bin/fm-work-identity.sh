@@ -2750,13 +2750,17 @@ dispatch_retire_preflight() {  # <task-id>
   validate_dispatch_retirement_locked "$task"
 }
 
-dispatch_retire_run() {  # <task-id> [task-id...] -- <command> [args...]
-  local task rc meta launch authorization authorizations=
+dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [args...]
+  local task rc meta launch authorization authorizations= whole_home=0 owner_pid=${BASHPID:-$$}
   local -a tasks=("$1")
   shift
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
-    fm_pr_task_id_valid "$1" || die "invalid task id"
-    tasks+=("$1")
+    if [ "$1" = --whole-home ]; then
+      whole_home=1
+    else
+      fm_pr_task_id_valid "$1" || die "invalid task id"
+      tasks+=("$1")
+    fi
     shift
   done
   [ "$#" -gt 1 ] && [ "$1" = -- ] || die "dispatch-retire-run requires -- and a command"
@@ -2769,7 +2773,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] -- <command> [args...]
     authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$STATE_REAL" "$STATE_DIR_ID" "$task" \
       "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
-      "$ACTIVE_PUBLICATION_LOCK" "${BASHPID:-$$}" "$ACTIVE_PUBLICATION_LOCK_TOKEN")
+      "$ACTIVE_PUBLICATION_LOCK" "$owner_pid" "$ACTIVE_PUBLICATION_LOCK_TOKEN")
     if [ -n "$authorizations" ]; then
       authorizations="$authorizations"$'\n'"$authorization"
     else
@@ -2784,6 +2788,10 @@ dispatch_retire_run() {  # <task-id> [task-id...] -- <command> [args...]
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || return "$rc"
+  if [ "$whole_home" -eq 1 ] \
+     && [ ! -e "$FM_HOME_REAL" ] && [ ! -L "$FM_HOME_REAL" ]; then
+    return 0
+  fi
   for task in "${tasks[@]}"; do
     meta="$STATE_REAL/$task.meta"
     launch="$STATE_REAL/$task.launch-brief.md"

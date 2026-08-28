@@ -739,40 +739,7 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 }
 
 fm_backend_dead_entering_verdict() {  # <backend> <target> <expected-label> <entering> <token>
-  local backend=$1 target=$2 expected_label=${3:-} entering=${4:-} token=${5:-}
-  local state baseline_path baseline_token baseline current i=0 polls
-  if [ "$backend" = herdr ]; then
-    baseline_path="${entering}.baseline"
-    if [ -e "$baseline_path" ] || [ -L "$baseline_path" ]; then
-      [ -f "$baseline_path" ] && [ ! -L "$baseline_path" ] || return 1
-      IFS=$'\t' read -r baseline_token baseline < "$baseline_path" || return 1
-      [ "$baseline_token" = "$token" ] || return 1
-      case "$baseline" in ''|*[!0-9]*) return 1 ;; esac
-      fm_backend_source herdr || return 1
-      polls=${FM_BACKEND_HERDR_SUBMIT_RECOVERY_POLLS:-20}
-      case "$polls" in ''|*[!0-9]*) polls=20 ;; esac
-      [ "$polls" -gt 0 ] || polls=1
-      while [ "$i" -lt "$polls" ]; do
-        current=$(fm_backend_herdr_pane_revision "$target" 2>/dev/null) || current=
-        case "$current" in ''|*[!0-9]*) printf 'ambiguous'; return 0 ;; esac
-        [ "$current" = "$baseline" ] || break
-        i=$((i + 1))
-        [ "$i" -ge "$polls" ] || sleep 0.05
-      done
-      if [ "$current" = "$baseline" ]; then
-        printf 'unsent'
-        return 0
-      fi
-    fi
-    state=$(fm_backend_composer_state "$backend" "$target" "$expected_label" 2>/dev/null) \
-      || state=unknown
-    case "$state" in
-      pending|pending-unproven) printf 'pending-unproven' ;;
-      *) printf 'ambiguous' ;;
-    esac
-  else
-    printf 'ambiguous'
-  fi
+  printf 'ambiguous'
 }
 
 fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]

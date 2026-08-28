@@ -2555,41 +2555,15 @@ fm_backend_herdr_send_literal() {  # <target> <text>
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-text "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
 }
 
-fm_backend_herdr_pane_revision() {  # <target>
-  fm_backend_herdr_parse_target "$1" || return 1
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -er '.result.pane.revision | select(type == "number" and . >= 0) | floor' 2>/dev/null
-}
-
-fm_backend_herdr_submit_entering_evidence() {  # <target>
-  local target=$1 path=${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}
-  local token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-} baseline baseline_path tmp
-  [ -n "$path" ] || return 0
-  [ -n "$token" ] || return 1
-  baseline=$(fm_backend_herdr_pane_revision "$target") || return 1
-  baseline_path="${path}.baseline"
-  if [ -e "$baseline_path" ] || [ -L "$baseline_path" ]; then
-    [ -f "$baseline_path" ] && [ ! -L "$baseline_path" ] || return 1
-    printf '%s\t%s\n' "$token" "$baseline" | cmp -s "$baseline_path" - || return 1
-  else
-    tmp="${baseline_path}.tmp.${BASHPID:-$$}"
-    (umask 077; printf '%s\t%s\n' "$token" "$baseline" > "$tmp") \
-      && chmod 600 "$tmp" && mv -- "$tmp" "$baseline_path" || return 1
-  fi
-  fm_backend_submit_entering_evidence
-}
-
-fm_backend_herdr_submit_typed_evidence() {
-  local entering=${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}
-  fm_backend_submit_typed_evidence || return 1
-  [ -z "$entering" ] || rm -f -- "${entering}.baseline"
-}
-
-fm_backend_herdr_submit_unsent_verdict() {
-  local entering=${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-} verdict
-  verdict=$(fm_backend_submit_unsent_verdict)
-  [ "$verdict" != unsent ] || [ -z "$entering" ] || rm -f -- "${entering}.baseline"
-  printf '%s' "$verdict"
+fm_backend_herdr_submit_journaled_prompt() {  # <target> <text>
+  local target=$1 text=$2
+  fm_backend_herdr_target_ready "$target" || { fm_backend_submit_unsent_verdict; return 0; }
+  fm_backend_submit_entering_evidence || { printf 'pending-unproven'; return 0; }
+  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent prompt \
+    "$FM_BACKEND_HERDR_PANE" "$text" >/dev/null 2>&1 \
+    || { printf 'pending-unproven'; return 0; }
+  fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
+  printf 'empty'
 }
 
 # fm_backend_herdr_normalize_key: map firstmate's key vocabulary (Enter,
@@ -2827,11 +2801,15 @@ fm_backend_herdr_queued_enter_busy() {  # <target> <allow-rendered>
 fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
   local raw_status footer_baseline='' allow_rendered=0 enter_sent=0
-  fm_backend_herdr_parse_target "$target" || { fm_backend_herdr_submit_unsent_verdict; return 0; }
-  fm_backend_herdr_submit_entering_evidence "$target" || { printf 'pending-unproven'; return 0; }
+  fm_backend_herdr_parse_target "$target" || { fm_backend_submit_unsent_verdict; return 0; }
+  if [ -n "${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE:-}" ]; then
+    fm_backend_herdr_submit_journaled_prompt "$target" "$text"
+    return
+  fi
+  fm_backend_submit_entering_evidence || { printf 'pending-unproven'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" \
-    || { fm_backend_herdr_submit_unsent_verdict; return 0; }
-  fm_backend_herdr_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
+    || { fm_backend_submit_unsent_verdict; return 0; }
+  fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
   sleep "$settle"
   raw_status=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
   baseline=$(fm_backend_herdr_classify_submit_agent_status "$raw_status")

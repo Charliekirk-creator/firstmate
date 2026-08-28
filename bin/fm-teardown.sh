@@ -2215,8 +2215,28 @@ preflight_firstmate_home_process_event_tree() {
   preflight_firstmate_home_process_events "$home" "$label"
 }
 
+collect_firstmate_home_dispatch_ids() {
+  local home=$1 data="$1/data" task_dir task receipt
+  [ -e "$data" ] || [ -L "$data" ] || return 0
+  if [ -L "$data" ] || [ ! -d "$data" ]; then
+    echo "REFUSED: secondmate home $home has an unsafe identity data path at $data; forced teardown changed nothing" >&2
+    return 1
+  fi
+  for task_dir in "$data"/*; do
+    [ -e "$task_dir" ] || [ -L "$task_dir" ] || continue
+    task=$(basename -- "$task_dir")
+    receipt="$task_dir/work-identity-dispatch.json"
+    [ -e "$receipt" ] || [ -L "$receipt" ] || continue
+    if ! fm_task_id_path_safe "$task" || [ -L "$task_dir" ] || [ ! -d "$task_dir" ]; then
+      echo "REFUSED: secondmate home $home has an unsafe dispatch receipt owner at $task_dir; forced teardown changed nothing" >&2
+      return 1
+    fi
+    printf '%s\n' "$task"
+  done
+}
+
 collect_descendant_task_locks() {
-  local home=$1 sub_state child_meta child_id child_kind child_wt child_home task_set_lock
+  local home=$1 sub_state child_meta child_id child_kind child_wt child_home task_set_lock dispatch_ids
   local -a child_ids
   sub_state="$home/state"
   if [ -L "$sub_state" ]; then
@@ -2255,16 +2275,24 @@ collect_descendant_task_locks() {
     [ -e "$child_meta" ] || continue
     child_ids+=("$(basename "$child_meta" .meta)")
   done
+  dispatch_ids=$(collect_firstmate_home_dispatch_ids "$home") || return 1
+  while IFS= read -r child_id; do
+    [ -z "$child_id" ] || child_ids+=("$child_id")
+  done <<< "$dispatch_ids"
   [ "${#child_ids[@]}" -gt 0 ] || return 0
   while IFS= read -r child_id; do
     child_meta="$sub_state/$child_id.meta"
-    child_kind=$(meta_value "$child_meta" kind)
-    [ -n "$child_kind" ] || child_kind=ship
     child_home=
-    if [ "$child_kind" = secondmate ]; then
-      child_wt=$(meta_value "$child_meta" worktree)
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
+    if [ -e "$child_meta" ] || [ -L "$child_meta" ]; then
+      child_kind=$(meta_value "$child_meta" kind)
+      [ -n "$child_kind" ] || child_kind=ship
+      if [ "$child_kind" = secondmate ]; then
+        child_wt=$(meta_value "$child_meta" worktree)
+        child_home=$(meta_value "$child_meta" home)
+        [ -n "$child_home" ] || child_home=$child_wt
+      fi
+    else
+      child_kind=receipt-only
     fi
     DESCENDANT_TASK_STATES+=("$sub_state")
     DESCENDANT_TASK_IDS+=("$child_id")
@@ -2273,11 +2301,11 @@ collect_descendant_task_locks() {
     [ "$child_kind" != secondmate ] \
       || collect_descendant_task_locks "$child_home" \
       || return 1
-  done < <(printf '%s\n' "${child_ids[@]}" | LC_ALL=C sort)
+  done < <(printf '%s\n' "${child_ids[@]}" | LC_ALL=C sort -u)
 }
 
 preflight_descendant_task_locks() {
-  local home=$1 i state task_id meta control_lock meta_lock kind child_wt child_home
+  local home=$1 i state task_id meta receipt control_lock meta_lock kind child_wt child_home
   DESCENDANT_TASK_STATES=()
   DESCENDANT_TASK_IDS=()
   DESCENDANT_TASK_KINDS=()
@@ -2309,6 +2337,16 @@ preflight_descendant_task_locks() {
       return 1
     fi
     DESCENDANT_LOCK_PATHS+=("$meta_lock")
+    if [ "${DESCENDANT_TASK_KINDS[$i]}" = receipt-only ]; then
+      receipt="${state%/state}/data/$task_id/work-identity-dispatch.json"
+      [ ! -e "$meta" ] && [ ! -L "$meta" ] \
+        && { [ -e "$receipt" ] || [ -L "$receipt" ]; } \
+        && teardown_dispatch_authorized "$state" "$task_id" || {
+          echo "REFUSED: receipt-only descendant task $task_id changed while forced teardown acquired its locks; forced teardown changed nothing" >&2
+          return 1
+        }
+      continue
+    fi
     [ -f "$meta" ] || {
       echo "REFUSED: descendant task $task_id changed while forced teardown acquired its locks; forced teardown changed nothing" >&2
       return 1
@@ -2342,23 +2380,22 @@ teardown_dispatch_retire_preflight() {
 }
 
 authorize_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_kind child_wt child_home receipt
+  local home=$1 sub_state child_meta child_id child_kind child_wt child_home dispatch_ids
   local -a pending_ids=()
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
-  for child_meta in "$sub_state"/*.meta; do
-    [ -e "$child_meta" ] || continue
-    child_id=$(basename "$child_meta" .meta)
-    receipt="$home/data/$child_id/work-identity-dispatch.json"
-    if { [ -e "$receipt" ] || [ -L "$receipt" ]; } \
-       && ! teardown_dispatch_authorized "$sub_state" "$child_id"; then
+  dispatch_ids=$(collect_firstmate_home_dispatch_ids "$home") || return 1
+  while IFS= read -r child_id; do
+    [ -n "$child_id" ] || continue
+    if ! teardown_dispatch_authorized "$sub_state" "$child_id"; then
       pending_ids+=("$child_id")
     fi
-  done
+  done <<< "$dispatch_ids"
   if [ "${#pending_ids[@]}" -gt 0 ]; then
+    teardown_release_locks || return 1
     exec env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$sub_state" \
       FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
-      dispatch-retire-run "${pending_ids[@]}" -- env \
+      dispatch-retire-run "${pending_ids[@]}" --whole-home -- env \
       FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
       FM_CONFIG_OVERRIDE="$CONFIG" FM_ROOT_OVERRIDE="$FM_ROOT" \
       "$0" "${TEARDOWN_ORIGINAL_ARGS[@]}"
@@ -2377,9 +2414,14 @@ authorize_firstmate_home_children() {
 }
 
 validate_firstmate_home_children_removal() {
-  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
+  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id dispatch_ids
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
+  dispatch_ids=$(collect_firstmate_home_dispatch_ids "$home") || return 1
+  while IFS= read -r child_id; do
+    [ -n "$child_id" ] || continue
+    teardown_dispatch_retire_preflight "$home" "$home/data" "$sub_state" "$child_id" || return 1
+  done <<< "$dispatch_ids"
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)

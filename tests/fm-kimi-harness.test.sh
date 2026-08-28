@@ -483,38 +483,32 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     fm_backend_send_text_submit_journaled "$evidence" durable-presend \
       herdr target brief 1 0 0 label
   ) || fail "accepted Herdr submission was not recoverable"
-  [ "$out" = pending-unproven ] \
-    || fail "accepted Herdr submission recovered as '$out' instead of pending-unproven"
-  printf '%s\t%s\n' durable-presend 41 > "${evidence}.entering.baseline"
+  [ "$out" = ambiguous ] \
+    || fail "unreceipted Herdr submission recovered as '$out' instead of ambiguous"
+  rm -f -- "$evidence" "${evidence}.entering" "${evidence}.operation-owner" \
+    "${evidence}.operation-started" "${evidence}.operation-result"
   out=$(
     # shellcheck source=bin/fm-backend.sh disable=SC1091
     . "$ROOT/bin/fm-backend.sh"
     fm_backend_source herdr || exit 1
-    fm_backend_source() { return 0; }
-    fm_backend_herdr_pane_revision() { printf '41'; }
-    fm_backend_send_text_submit() { fail "revision-proven pre-send operation invoked the backend"; }
-    fm_backend_composer_state() { fail "revision-proven pre-send operation probed the composer"; }
-    FM_BACKEND_HERDR_SUBMIT_RECOVERY_POLLS=1 \
-      fm_backend_send_text_submit_journaled "$evidence" durable-presend \
-      herdr target brief 1 0 0 label
-  ) || fail "revision-proven Herdr pre-send submission was not recoverable"
-  [ "$out" = unsent ] \
-    || fail "revision-proven Herdr pre-send submission recovered as '$out' instead of unsent"
-  out=$(
-    # shellcheck source=bin/fm-backend.sh disable=SC1091
-    . "$ROOT/bin/fm-backend.sh"
-    fm_backend_source herdr || exit 1
-    fm_backend_source() { return 0; }
-    fm_backend_herdr_pane_revision() { printf '42'; }
-    fm_backend_send_text_submit() { fail "revision-proven accepted operation invoked the backend"; }
-    fm_backend_composer_state() { printf 'pending'; }
-    FM_BACKEND_HERDR_SUBMIT_RECOVERY_POLLS=1 \
-      fm_backend_send_text_submit_journaled "$evidence" durable-presend \
-      herdr target brief 1 0 0 label
-  ) || fail "revision-proven Herdr accepted submission was not recoverable"
-  [ "$out" = pending-unproven ] \
-    || fail "revision-proven Herdr accepted submission recovered as '$out' instead of pending-unproven"
-  pass "non-tmux submission reconciles pre-send and accepted input without retyping"
+    fm_backend_herdr_parse_target() {
+      FM_BACKEND_HERDR_SESSION=session-a
+      FM_BACKEND_HERDR_PANE=pane-a
+    }
+    fm_backend_herdr_target_ready() { return 0; }
+    fm_backend_herdr_cli() { printf '%s\n' "$*" >> "$TMP_ROOT/herdr-prompt.log"; }
+    FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${evidence}.entering" \
+      FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE="$evidence" \
+      FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=durable-presend \
+      fm_backend_herdr_send_text_submit target brief 1 0 0 label
+  ) || fail "Herdr atomic prompt submission was not accepted"
+  [ "$out" = empty ] || fail "Herdr atomic prompt returned '$out' instead of empty"
+  [ "$(tr -d '\n' < "$evidence")" = durable-presend ] \
+    || fail "Herdr atomic prompt did not publish transaction-scoped acceptance"
+  assert_absent "${evidence}.entering" "Herdr accepted prompt retained pre-acceptance evidence"
+  assert_grep "session-a agent prompt pane-a brief" "$TMP_ROOT/herdr-prompt.log" \
+    "Herdr journaled submission did not use the atomic agent prompt boundary"
+  pass "non-tmux submission uses backend-owned Herdr prompt acceptance"
 }
 
 test_kimi_presend_crash_retries_without_wedging_identity() {

@@ -1735,6 +1735,67 @@ configure_secondmate_with_tmux_children() {  # <case-dir>
   done
 }
 
+configure_secondmate_with_receipt_only_child() {  # <case-dir> <prepared|completed>
+  local case_dir=$1 receipt_state=$2 home="$1/secondmate-home" child=receipt-only-child
+  local launch transaction binding hash
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  home=$(cd "$home" && pwd -P)
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$child" firstmate --mode no-mistakes >/dev/null \
+    || fail "receipt-only fixture could not create a child brief"
+  launch="$home/state/$child.launch-brief.md"
+  transaction=receipt-only-transaction
+  binding=$(FM_HOME="$home" "$ROOT/bin/fm-work-identity.sh" dispatch-prepare "$child" \
+    --brief "$home/data/$child/brief.md" --instructions-path "$launch" \
+    --transaction "$transaction") || fail "receipt-only fixture could not prepare dispatch"
+  [ "$receipt_state" = completed ] || return 0
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$child.meta" \
+    "window=firstmate:fm-$child" "endpoint_task_id=$child" \
+    "worktree=$case_dir/receipt-only-wt" "project=$case_dir/project" \
+    "launch_brief=$launch" "launch_brief_sha256=$hash" \
+    "work_identity_dispatch_transaction=$transaction" "harness=codex" \
+    "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" "$ROOT/bin/fm-work-identity.sh" dispatch-commit "$child" \
+    --brief "$launch" --meta "$home/state/$child.meta" --transaction "$transaction" \
+    || fail "receipt-only fixture could not commit dispatch"
+  rm -f -- "$home/state/$child.meta" "$launch"
+}
+
+test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt() {
+  local case_dir home rc=0
+  case_dir=$(make_case receipt-only-prepared)
+  write_meta "$case_dir" local-only secondmate
+  configure_secondmate_with_receipt_only_child "$case_dir" prepared
+  home="$case_dir/secondmate-home"
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "receipt-only prepared dispatch was deleted by forced teardown"
+  assert_grep "incomplete work identity dispatch" "$case_dir/stderr" \
+    "receipt-only prepared dispatch refusal did not come from the identity owner"
+  assert_present "$home/data/receipt-only-child/work-identity-dispatch.json" \
+    "forced teardown deleted a prepared receipt without metadata"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "receipt-only prepared dispatch refusal postdated parent mutation"
+  [ -d "$home" ] || fail "receipt-only prepared dispatch refusal removed the secondmate home"
+  pass "forced teardown refuses receipt-only prepared identity dispatches"
+}
+
+test_forced_secondmate_teardown_accepts_completed_receipt_only_home() {
+  local case_dir home rc=0
+  case_dir=$(make_case receipt-only-completed)
+  write_meta "$case_dir" local-only secondmate
+  configure_secondmate_with_receipt_only_child "$case_dir" completed
+  home="$case_dir/secondmate-home"
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "completed receipt-only forced teardown should retire the whole home: $(cat "$case_dir/stderr")"
+  assert_absent "$home" "completed receipt-only forced teardown retained the secondmate home"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "completed receipt-only forced teardown failed after destructive home removal"
+  pass "forced teardown retires completed receipt-only homes exactly"
+}
+
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks() {
   local case_dir home lock ready release holder_pid rc waited=0 child
   case_dir=$(make_case descendant-locks)
@@ -2648,6 +2709,8 @@ case "${FM_TEST_ONLY:-}" in
   review-fixes)
     test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
     test_forced_secondmate_herdr_child_preflight_refuses_before_changes
+    test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt
+    test_forced_secondmate_teardown_accepts_completed_receipt_only_home
     exit 0
     ;;
 esac
@@ -2667,6 +2730,8 @@ test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes
 test_forced_secondmate_herdr_child_preflight_refuses_before_changes
+test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt
+test_forced_secondmate_teardown_accepts_completed_receipt_only_home
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
 test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconfirmed
