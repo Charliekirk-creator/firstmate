@@ -129,17 +129,49 @@ fm_backend_submit_entering_evidence() {
 
 fm_backend_submit_typed_evidence() {
   local path=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE:-}
+  local entering=${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}
   local token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-} tmp
   [ -n "$path" ] || return 0
   [ -n "$token" ] || return 1
   if [ -e "$path" ] || [ -L "$path" ]; then
     [ -f "$path" ] && [ ! -L "$path" ] || return 1
-    printf '%s\n' "$token" | cmp -s "$path" -
-    return
+    printf '%s\n' "$token" | cmp -s "$path" - || return 1
+  else
+    tmp="${path}.tmp.${BASHPID:-$$}"
+    (umask 077; printf '%s\n' "$token" > "$tmp") \
+      && chmod 600 "$tmp" && mv -- "$tmp" "$path" || return 1
   fi
-  tmp="${path}.tmp.${BASHPID:-$$}"
-  (umask 077; printf '%s\n' "$token" > "$tmp") \
-    && chmod 600 "$tmp" && mv -- "$tmp" "$path"
+  if [ -n "$entering" ] && [ "$entering" != "$path" ]; then
+    [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
+    printf '%s\n' "$token" | cmp -s "$entering" - || return 1
+    rm -f -- "$entering" || return 1
+  fi
+}
+
+fm_backend_submit_unsent_verdict() {
+  local path=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE:-}
+  local entering=${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}
+  local token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-}
+  if [ -z "$path" ]; then
+    printf 'send-failed'
+    return 0
+  fi
+  [ -n "$entering" ] && [ "$entering" != "$path" ] && [ -n "$token" ] || {
+    printf 'pending-unproven'
+    return 0
+  }
+  if [ -e "$entering" ] || [ -L "$entering" ]; then
+    [ -f "$entering" ] && [ ! -L "$entering" ] \
+      && printf '%s\n' "$token" | cmp -s "$entering" - || {
+        printf 'pending-unproven'
+        return 0
+      }
+    rm -f -- "$entering" || {
+      printf 'pending-unproven'
+      return 0
+    }
+  fi
+  printf 'unsent'
 }
 
 fm_composer_strip_ansi() {

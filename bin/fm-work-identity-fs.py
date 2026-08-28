@@ -2,6 +2,7 @@
 import ctypes
 import errno
 import fcntl
+import hashlib
 import os
 import secrets
 import stat
@@ -106,6 +107,43 @@ def entry_state(directory_fd, name):
     if state.startswith("unsafe:"):
         fail(f"owned destination entry is unsafe: {name}")
     return state
+
+
+def file_digest(directory_fd, name):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            fail(f"owned destination entry is unsafe: {name}")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 131072)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def conditional_remove(directory_fd, name, expected_state, expected_digest=None, allow_hardlink=False):
+    actual = raw_entry_state(directory_fd, name) if allow_hardlink else entry_state(directory_fd, name)
+    if actual != expected_state:
+        fail(f"owned destination changed before removal: {name}")
+    if actual == "absent":
+        return
+    if allow_hardlink:
+        fields = actual.split(":")
+        if fields[0] not in ("regular", "unsafe") or not stat.S_ISREG(int(fields[3])):
+            fail(f"owned removal staging entry is unsafe: {name}")
+    elif expected_digest is not None and file_digest(directory_fd, name) != expected_digest:
+        fail(f"owned destination content changed before removal: {name}")
+    current = raw_entry_state(directory_fd, name) if allow_hardlink else entry_state(directory_fd, name)
+    if current != expected_state:
+        fail(f"owned destination changed before removal: {name}")
+    os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
 
 
 def operation_lock(directory_fd, name):
@@ -503,19 +541,35 @@ def main():
             probe = f".{name}.{os.getpid()}.{secrets.token_hex(8)}"
             os.mkdir(probe, 0o700, dir_fd=directory_fd)
             os.rmdir(probe, dir_fd=directory_fd)
-        elif command == "describe":
+        elif command in ("describe", "describe-raw"):
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_replace(directory_fd, name)
-                print(entry_state(directory_fd, name))
+                if command == "describe":
+                    print(entry_state(directory_fd, name))
+                else:
+                    print(raw_entry_state(directory_fd, name))
             finally:
                 os.close(mutex_fd)
-        elif command == "remove":
+        elif command in ("remove", "remove-staging"):
+            if len(sys.argv) not in (6, 7):
+                fail(f"{command} requires expected destination state and optional SHA-256")
+            expected_state = sys.argv[5]
+            expected_digest = sys.argv[6] if len(sys.argv) == 7 else None
+            if expected_digest is not None and (
+                    len(expected_digest) != 64
+                    or any(char not in "0123456789abcdef" for char in expected_digest)):
+                fail("owned removal SHA-256 is malformed")
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_replace(directory_fd, name)
-                remove(directory_fd, name)
-                os.fsync(directory_fd)
+                conditional_remove(
+                    directory_fd,
+                    name,
+                    expected_state,
+                    expected_digest,
+                    allow_hardlink=command == "remove-staging",
+                )
             finally:
                 os.close(mutex_fd)
         elif command == "replace":

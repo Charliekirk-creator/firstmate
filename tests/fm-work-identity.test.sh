@@ -564,7 +564,7 @@ SH
 }
 
 test_owned_replace_refuses_changed_unsafe_destination() {
-  local home parent inode source target sink expected out rc=0
+  local home parent inode source target sink expected digest out rc=0
   home=$(make_home replace-destination-race)
   parent="$home/state"
   source="$home/replacement"
@@ -585,7 +585,39 @@ test_owned_replace_refuses_changed_unsafe_destination() {
   [ "$(cat "$source")" = replacement ] || fail "refused replace changed its publication source"
   assert_contains "$out" "destination entry is unsafe" \
     "replace refusal did not identify the changed unsafe destination"
-  pass "owned replacement refuses a changed unsafe destination without publication"
+
+  rm -f "$target"
+  printf 'original\n' > "$target"
+  expected=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe "$parent" "$inode" authoritative) \
+    || fail "could not capture owned removal destination state"
+  digest=$(sha256_file_for_test "$target")
+  rm -f "$target"
+  ln -s "$sink" "$target"
+  rc=0
+  out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" remove \
+    "$parent" "$inode" authoritative "$expected" "$digest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "changed symlink destination was removed"
+  [ -L "$target" ] || fail "refused removal changed the raced destination"
+  [ "$(cat "$sink")" = unchanged ] || fail "removal followed a changed destination symlink"
+  assert_contains "$out" "destination entry is unsafe" \
+    "remove refusal did not identify the changed unsafe destination"
+
+  rm -f "$target"
+  printf 'original\n' > "$target"
+  expected=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe "$parent" "$inode" authoritative) \
+    || fail "could not recapture owned removal destination state"
+  digest=$(sha256_file_for_test "$target")
+  rm -f "$target"
+  printf 'concurrent replacement\n' > "$target"
+  rc=0
+  out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" remove \
+    "$parent" "$inode" authoritative "$expected" "$digest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "stale regular destination was removed"
+  [ "$(cat "$target")" = "concurrent replacement" ] \
+    || fail "refused removal changed the concurrent destination"
+  assert_contains "$out" "changed before removal" \
+    "remove refusal did not identify the stale destination"
+  pass "owned replacement and removal refuse changed destinations"
 }
 
 test_identity_lock_refuses_replaced_storage_parent() {
@@ -2489,6 +2521,11 @@ EOF
   ' >/dev/null || fail "Bearings trusted a parent decision or hid a nested cap: $bearings"
   pass "Bearings excludes parent decisions and discloses nested surface caps"
 }
+
+if [ "${FM_TEST_ONLY:-}" = owned-removal ]; then
+  test_owned_replace_refuses_changed_unsafe_destination
+  exit 0
+fi
 
 test_intake_through_fleet_projection
 test_spawn_delivers_validated_brief_snapshot

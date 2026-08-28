@@ -74,6 +74,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 REG="$DATA/secondmates.md"
 MAIN_BACKLOG="$DATA/backlog.md"
+FS_OWNER="$SCRIPT_DIR/fm-work-identity-fs.py"
 # shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
@@ -416,20 +417,16 @@ seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
 }
 
 remove_owned_backlog_scaffold() { # <path> <parent-inode> <file-inode> <sha256>
-  local target=$1 expected_dir_inode=$2 expected_file_inode=$3 expected_hash=$4 dir base
+  local target=$1 expected_dir_inode=$2 expected_file_inode=$3 expected_hash=$4 dir base state
   dir=$(dirname "$target")
   base=$(basename "$target")
   case "$base" in ''|.|..|*/*) return 1 ;; esac
-  (
-    cd -P "$dir" || exit 1
-    [ "$(backlog_file_inode .)" = "$expected_dir_inode" ] || exit 1
-    [ -f "$base" ] && [ ! -L "$base" ] || exit 1
-    [ "$(backlog_file_link_count "$base")" = 1 ] || exit 1
-    [ "$(backlog_file_inode "$base")" = "$expected_file_inode" ] || exit 1
-    [ "$(sha256_file "$base")" = "$expected_hash" ] || exit 1
-    rm -f -- "$base" || exit 1
-    [ ! -e "$base" ] && [ ! -L "$base" ]
-  )
+  state=$(python3 "$FS_OWNER" describe "$dir" "$expected_dir_inode" "$base") || return 1
+  case "$state" in
+    "regular:$expected_file_inode:"*) ;;
+    *) return 1 ;;
+  esac
+  python3 "$FS_OWNER" remove "$dir" "$expected_dir_inode" "$base" "$state" "$expected_hash"
 }
 
 # A public commitment made through the relay binds its work by home AND id, so an

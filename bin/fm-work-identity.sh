@@ -357,7 +357,7 @@ recover_no_clobber_target() {  # <target> <label>
   if [ ! -e "$target" ] && [ ! -L "$target" ]; then
     [ "$staging_links" = 1 ] \
       || die "$label publication staging path is unexpectedly hardlinked: $staging"
-    owned_remove "$staging" "$label publication staging path"
+    owned_remove_staging "$staging" "$label publication staging path"
     return 0
   fi
   [ ! -L "$target" ] || die "$label is symlinked: $target"
@@ -370,7 +370,7 @@ recover_no_clobber_target() {  # <target> <label>
     || die "cannot inspect $label publication staging inode: $staging"
   [ "$target_inode" = "$staging_inode" ] \
     || die "$label publication staging path does not own the authoritative record: $staging"
-  owned_remove "$staging" "$label publication staging path"
+  owned_remove_staging "$staging" "$label publication staging path"
   target_links=$(file_link_count "$target") || die "cannot reinspect $label link count: $target"
   [ "$target_links" = 1 ] || die "$label publication recovery did not restore one link: $target"
 }
@@ -419,11 +419,24 @@ recover_owned_replacement() {  # <target> <label>
 }
 
 owned_remove() {  # <target> <label>
-  local target=$1 label=$2 parent expected base
+  local target=$1 label=$2 parent expected base destination_state
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
-  python3 "$FS_OWNER" remove "$parent" "$expected" "$base" \
+  destination_state=$(python3 "$FS_OWNER" describe "$parent" "$expected" "$base") \
+    || die "$label destination is unsafe: $target"
+  python3 "$FS_OWNER" remove "$parent" "$expected" "$base" "$destination_state" \
+    || die "cannot remove $label: $target"
+}
+
+owned_remove_staging() {  # <target> <label>
+  local target=$1 label=$2 parent expected base destination_state
+  IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
+    || die "$label target parent is not owned: $target"
+  base=$(basename -- "$target") || die "cannot resolve $label target name"
+  destination_state=$(python3 "$FS_OWNER" describe-raw "$parent" "$expected" "$base") \
+    || die "$label destination is unsafe: $target"
+  python3 "$FS_OWNER" remove-staging "$parent" "$expected" "$base" "$destination_state" \
     || die "cannot remove $label: $target"
 }
 

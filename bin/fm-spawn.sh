@@ -3990,7 +3990,7 @@ kimi_submission_state() {
     IFS=$'\t' read -r token verdict < "$result" || return 1
     [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
     case "$verdict" in
-      accepted|pending|ambiguous) printf '%s' "$verdict" ;;
+      accepted|pending|ambiguous|unsent) printf '%s' "$verdict" ;;
       send-failed) printf 'ambiguous' ;;
       *) return 1 ;;
     esac
@@ -4026,6 +4026,23 @@ kimi_submission_state() {
   fi
 }
 
+kimi_submission_reset_unsent() {
+  local path
+  for path in \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-go" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
+  do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      [ -f "$path" ] && [ ! -L "$path" ] \
+        && [ "$(spawn_file_link_count "$path")" = 1 ] || return 1
+      rm -f -- "$path" || return 1
+    fi
+  done
+}
+
 kimi_submission_publish() {  # <prepared|pending|accepted>
   local value=$1 tmp="$SPAWN_LAUNCH_REQUEST/.kimi-submission.tmp"
   case "$value" in prepared|pending|accepted) ;; *) return 1 ;; esac
@@ -4055,6 +4072,7 @@ kimi_submission_helper() {
   case "$verdict" in
     empty|accepted) verdict=accepted ;;
     pending|pending-unproven) verdict=pending ;;
+    unsent) verdict=unsent ;;
     send-failed)
       verdict=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || verdict=unknown
       case "$verdict" in pending|pending-unproven) verdict=pending ;; *) verdict=ambiguous ;; esac
@@ -4105,7 +4123,7 @@ kimi_submission_wait() {
   local state i=0 max=${FM_KIMI_SUBMISSION_POLLS:-100} interval=${FM_KIMI_SUBMISSION_INTERVAL:-0.1}
   while [ "$i" -lt "$max" ]; do
     state=$(kimi_submission_state) || return 1
-    case "$state" in accepted|pending) printf '%s' "$state"; return 0 ;; ambiguous) return 2 ;; esac
+    case "$state" in accepted|pending|unsent) printf '%s' "$state"; return 0 ;; ambiguous) return 2 ;; esac
     i=$((i + 1))
     [ "$i" -ge "$max" ] || sleep "$interval"
   done
@@ -4129,7 +4147,15 @@ kimi_deliver_launch_brief() {
       kimi_spawn_fail "kimi launch brief submission remains ambiguous"
       return 1
     }
-  elif [ "$submission_state" = prepared ] \
+  fi
+  if [ "$submission_state" = unsent ]; then
+    kimi_submission_reset_unsent || {
+      kimi_spawn_fail "kimi unsent launch brief submission could not be retired"
+      return 1
+    }
+    submission_state=prepared
+  fi
+  if [ "$submission_state" = prepared ] \
     && { [ -e "$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" ] \
       || [ -L "$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" ]; }; then
     composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) || composer_state=unknown

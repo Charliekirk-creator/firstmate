@@ -334,6 +334,24 @@ test_kimi_interrupted_submit_never_retypes_ambiguous_input() {
   pass "Kimi recovery never retypes accepted or ambiguous launch input"
 }
 
+test_non_tmux_definitive_submit_failure_is_retryable() {
+  local evidence="$TMP_ROOT/non-tmux-submit-attempted" verdict
+  (
+    # shellcheck source=bin/backends/zellij.sh disable=SC1091
+    . "$ROOT/bin/backends/zellij.sh"
+    fm_backend_zellij_composer_content() { printf 'before'; }
+    fm_backend_zellij_send_literal() { return 1; }
+    export FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${evidence}.entering"
+    export FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE="$evidence"
+    export FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=non-tmux-retry
+    verdict=$(fm_backend_zellij_send_text_submit target brief 1 0 0 label)
+    [ "$verdict" = unsent ] || fail "definitive non-tmux send failure was not retryable: $verdict"
+    assert_absent "$evidence" "definitive non-tmux send failure published accepted evidence"
+    assert_absent "${evidence}.entering" "definitive non-tmux send failure retained pre-send evidence"
+  )
+  pass "non-tmux definitive send failures remain retryable"
+}
+
 test_kimi_presend_crash_retries_without_wedging_identity() {
   local id rec sub out rc=0 lines
   id="kimi-submit-presend-p5-$$"
@@ -830,9 +848,15 @@ test_kimi_bordered_prompt_needs_no_override() {
   pass "composer classifier: kimi's existing bordered > shape is already safe without an override"
 }
 
+if [ "${FM_TEST_ONLY:-}" = non-tmux-submit-recovery ]; then
+  test_non_tmux_definitive_submit_failure_is_retryable
+  exit 0
+fi
+
 test_kimi_hook_install_is_surgical_idempotent_and_removable
 test_kimi_secondmate_commits_identity_only_after_delivery
 test_kimi_interrupted_submit_never_retypes_ambiguous_input
+test_non_tmux_definitive_submit_failure_is_retryable
 test_kimi_presend_crash_retries_without_wedging_identity
 test_kimi_hook_remove_preserves_owned_newline_boundary
 test_kimi_hook_fails_closed_on_missing_malformed_or_partial_config
