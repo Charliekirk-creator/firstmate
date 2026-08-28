@@ -8,6 +8,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -123,6 +124,49 @@ def file_digest(directory_fd, name):
                 break
             digest.update(chunk)
         return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def state_from_info(info):
+    kind = "regular" if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 else "unsafe"
+    return ":".join([
+        kind,
+        str(info.st_dev),
+        str(info.st_ino),
+        str(info.st_mode),
+        str(info.st_nlink),
+        str(info.st_size),
+        str(info.st_mtime_ns),
+        str(info.st_ctime_ns),
+    ])
+
+
+def read_exact(directory_fd, name, expected_state, expected_digest):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        before = state_from_info(os.fstat(fd))
+        if before != expected_state or not before.startswith("regular:"):
+            fail(f"owned source changed before snapshot: {name}")
+        digest = hashlib.sha256()
+        with tempfile.SpooledTemporaryFile(max_size=1048576) as payload:
+            while True:
+                chunk = os.read(fd, 131072)
+                if not chunk:
+                    break
+                payload.write(chunk)
+                digest.update(chunk)
+            if digest.hexdigest() != expected_digest:
+                fail(f"owned source content changed before snapshot: {name}")
+            if state_from_info(os.fstat(fd)) != expected_state:
+                fail(f"owned source changed during snapshot: {name}")
+            payload.seek(0)
+            while True:
+                chunk = payload.read(131072)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
     finally:
         os.close(fd)
 
@@ -664,6 +708,20 @@ def main():
                     if state == "absent":
                         fail(f"owned destination is absent: {name}")
                     print(f"{state}\t{file_digest(directory_fd, name)}")
+            finally:
+                os.close(mutex_fd)
+        elif command == "snapshot":
+            if len(sys.argv) != 7:
+                fail("snapshot requires expected source state and SHA-256")
+            expected_state, expected_digest = sys.argv[5:7]
+            if len(expected_digest) != 64 \
+                    or any(char not in "0123456789abcdef" for char in expected_digest):
+                fail("owned snapshot SHA-256 is malformed")
+            mutex_fd = operation_lock(directory_fd, name)
+            try:
+                recover_replace(directory_fd, name)
+                recover_remove(directory_fd, name)
+                read_exact(directory_fd, name, expected_state, expected_digest)
             finally:
                 os.close(mutex_fd)
         elif command in ("remove", "remove-staging"):

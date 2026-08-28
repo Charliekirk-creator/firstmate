@@ -740,8 +740,8 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 
 fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local evidence=$1 token=$2 backend=${3:-} entering="${1}.entering"
-  local owner="${1}.operation-owner" started="${1}.operation-started" result="${1}.operation-result"
-  local tmp worker_pid owner_value owner_pid result_token started_token verdict
+  local owner="${1}.operation-owner" result="${1}.operation-result"
+  local tmp worker_pid owner_value owner_pid result_token evidence_token verdict
   shift 2
   if [ "$backend" = tmux ]; then
     FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE= \
@@ -764,14 +764,19 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
     [ "${owner_value#*:}" = "$token" ] || return 1
     case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
     if ! kill -0 "$owner_pid" 2>/dev/null; then
-      if [ ! -e "$started" ] && [ ! -L "$started" ]; then
+      if [ -e "$evidence" ] || [ -L "$evidence" ]; then
+        [ -f "$evidence" ] && [ ! -L "$evidence" ] || return 1
+        evidence_token=$(tr -d '\n' < "$evidence") || return 1
+        [ "$evidence_token" = "$token" ] || return 1
+        printf 'pending-unproven'
+      elif [ -e "$entering" ] || [ -L "$entering" ]; then
+        [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
+        evidence_token=$(tr -d '\n' < "$entering") || return 1
+        [ "$evidence_token" = "$token" ] || return 1
+        printf 'pending-unproven'
+      else
         printf 'unsent'
-        return 0
       fi
-      [ -f "$started" ] && [ ! -L "$started" ] || return 1
-      started_token=$(tr -d '\n' < "$started") || return 1
-      [ "$started_token" = "$token" ] || return 1
-      printf 'pending-unproven'
       return 0
     fi
   else
@@ -782,9 +787,6 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
       tmp="${owner}.tmp.${BASHPID:-$$}"
       printf '%s:%s\n' "${BASHPID:-$$}" "$token" > "$tmp" \
         && chmod 600 "$tmp" && mv -- "$tmp" "$owner" || exit 1
-      tmp="${started}.tmp.${BASHPID:-$$}"
-      printf '%s\n' "$token" > "$tmp" \
-        && chmod 600 "$tmp" && mv -- "$tmp" "$started" || exit 1
       verdict=$(FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE=$entering \
         FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
         FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
@@ -809,14 +811,19 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
       [ "${owner_value#*:}" = "$token" ] || return 1
       case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
       if ! kill -0 "$owner_pid" 2>/dev/null; then
-        if [ ! -e "$started" ] && [ ! -L "$started" ]; then
+        if [ -e "$evidence" ] || [ -L "$evidence" ]; then
+          [ -f "$evidence" ] && [ ! -L "$evidence" ] || return 1
+          evidence_token=$(tr -d '\n' < "$evidence") || return 1
+          [ "$evidence_token" = "$token" ] || return 1
+          printf 'pending-unproven'
+        elif [ -e "$entering" ] || [ -L "$entering" ]; then
+          [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
+          evidence_token=$(tr -d '\n' < "$entering") || return 1
+          [ "$evidence_token" = "$token" ] || return 1
+          printf 'pending-unproven'
+        else
           printf 'unsent'
-          return 0
         fi
-        [ -f "$started" ] && [ ! -L "$started" ] || return 1
-        started_token=$(tr -d '\n' < "$started") || return 1
-        [ "$started_token" = "$token" ] || return 1
-        printf 'pending-unproven'
         return 0
       fi
     else

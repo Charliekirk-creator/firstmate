@@ -976,9 +976,13 @@ spawn_launch_request_cleanup() {
   spawn_launch_request_paths || return 1
   if [ ! -e "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ]; then return 0; fi
   [ -d "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ] || return 1
+  if [ -e "$SPAWN_LAUNCH_REQUEST/kimi-submission" ] \
+    || [ -L "$SPAWN_LAUNCH_REQUEST/kimi-submission" ]; then
+    kimi_submission_cleanup_preflight || return 1
+  fi
   for entry in "$SPAWN_LAUNCH_REQUEST"/* "$SPAWN_LAUNCH_REQUEST"/.[!.]* "$SPAWN_LAUNCH_REQUEST"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
-    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-go|kimi-submit-attempted|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-go.tmp|.kimi-submit-attempted.tmp|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
+    case "${entry##*/}" in owner|attempted|accepted|failed|executed|outcome|kimi-submission|kimi-submit-owner|kimi-submit-go|kimi-submit-attempted|kimi-submit-attempted.entering|kimi-submit-attempted.operation-owner|kimi-submit-attempted.operation-started|kimi-submit-attempted.operation-result|kimi-submit-result|.owner.tmp|.attempted.tmp|.accepted.tmp|.failed.tmp|.executed.tmp|.outcome.tmp|.kimi-submission.tmp|.kimi-submit-owner.tmp|.kimi-submit-go.tmp|.kimi-submit-attempted.tmp|.kimi-submit-attempted.entering.tmp.*|.kimi-submit-attempted.operation-owner.tmp.*|.kimi-submit-attempted.operation-started.tmp.*|.kimi-submit-attempted.operation-result.tmp.*|.kimi-submit-result.tmp) ;; *) return 1 ;; esac
     [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
     [ "$(spawn_file_link_count "$entry")" = 1 ] || return 1
     rm -f -- "$entry" || return 1
@@ -1026,18 +1030,15 @@ spawn_launch_request_start() {  # <command>
 }
 
 spawn_launch_request_wait() {
-  local state agent_state composer_state i=0 max=${FM_SPAWN_LAUNCH_POLLS:-100} interval=${FM_SPAWN_LAUNCH_INTERVAL:-0.1}
+  local state agent_state guard_state i=0 max=${FM_SPAWN_LAUNCH_POLLS:-100} interval=${FM_SPAWN_LAUNCH_INTERVAL:-0.1}
   while [ "$i" -lt "$max" ]; do
     state=$(spawn_launch_request_state) || return 1
     case "$state" in
       accepted|executed|attempted-live)
+        guard_state=$(spawn_launch_guard_state) || return 1
+        [ "$guard_state" != running ] || return 0
         agent_state=$(fm_backend_agent_state "$BACKEND" "$T")
         [ "$agent_state" != alive ] || return 0
-        if [ "$agent_state" = unverified ]; then
-          composer_state=$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null) \
-            || composer_state=unknown
-          case "$composer_state" in empty|pending|pending-unproven) return 0 ;; esac
-        fi
         ;;
       failed|attempted-dead|launch-exited) return 2 ;;
     esac
@@ -3940,6 +3941,51 @@ kimi_spawn_fail() {  # <detail>
   echo "error: $1; inspect window $T" >&2
 }
 
+kimi_submission_cleanup_preflight() {
+  local path value pid token verdict
+  path="$SPAWN_LAUNCH_REQUEST/kimi-submission"
+  [ -f "$path" ] && [ ! -L "$path" ] \
+    && [ "$(spawn_file_link_count "$path")" = 1 ] || return 1
+  value=$(tr -d '\n' < "$path") || return 1
+  case "$value" in accepted|pending) ;; *) return 1 ;; esac
+  for path in \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-owner" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-owner"; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    [ -f "$path" ] && [ ! -L "$path" ] \
+      && [ "$(spawn_file_link_count "$path")" = 1 ] || return 1
+    value=$(tr -d '\n' < "$path") || return 1
+    pid=${value%%:*}
+    token=${value#*:}
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
+  done
+  for path in \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-go" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.entering" \
+    "$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-started"; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    spawn_launch_request_file_matches "$path" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+  done
+  path="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted.operation-result"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] \
+      && [ "$(spawn_file_link_count "$path")" = 1 ] || return 1
+    IFS=$'\t' read -r token verdict < "$path" || return 1
+    [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
+    case "$verdict" in empty|accepted|pending|pending-unproven|unsent|send-failed|ambiguous|unknown) ;; *) return 1 ;; esac
+  fi
+  path="$SPAWN_LAUNCH_REQUEST/kimi-submit-result"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] \
+      && [ "$(spawn_file_link_count "$path")" = 1 ] || return 1
+    IFS=$'\t' read -r token verdict < "$path" || return 1
+    [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
+    case "$verdict" in accepted|pending) ;; *) return 1 ;; esac
+  fi
+}
+
 kimi_submission_state() {
   local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted entering result operation_owner operation_started operation_result
   local value links pid token verdict
@@ -3992,11 +4038,17 @@ kimi_submission_state() {
     [ "$token" = "$SPAWN_LAUNCH_REQUEST_TOKEN" ] || return 1
     if kill -0 "$pid" 2>/dev/null; then
       printf 'submitting'
-    elif [ ! -e "$operation_started" ] && [ ! -L "$operation_started" ]; then
-      printf 'unsent'
-    else
-      spawn_launch_request_file_matches "$operation_started" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+    elif [ -e "$attempted" ] || [ -L "$attempted" ]; then
+      spawn_launch_request_file_matches "$attempted" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
       printf 'ambiguous'
+    elif [ -e "$entering" ] || [ -L "$entering" ]; then
+      spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+      printf 'ambiguous'
+    else
+      if [ -e "$operation_started" ] || [ -L "$operation_started" ]; then
+        spawn_launch_request_file_matches "$operation_started" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
+      fi
+      printf 'unsent'
     fi
     return 0
   fi

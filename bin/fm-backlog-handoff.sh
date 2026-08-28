@@ -96,6 +96,7 @@ HANDOFF_PLAN_DIR=
 ACTIVE_OUTBOX_PATH=
 ACTIVE_OUTBOX_PARENT_INODE=
 ACTIVE_OUTBOX_FILE_INODE=
+ACTIVE_OUTBOX_STATE=
 ACTIVE_OUTBOX_HASH=
 release_remote_locks() {
   if [ -n "$HANDOFF_PLAN_DIR" ]; then
@@ -465,24 +466,21 @@ anchor_existing_handoff_dir() {
 }
 
 prepare_outbox_retirement() { # <outbox-path> <parent-inode>
-  local outbox=$1 parent_inode=$2 dir base details links inode hash
+  local outbox=$1 parent_inode=$2 dir base details state hash kind dev inode rest
   dir=$(dirname "$outbox")
   base=$(basename "$outbox")
   case "$base" in ''|.|..|*/*) return 1 ;; esac
-  details=$(
-    cd -P "$dir" || exit 1
-    [ "$(backlog_file_inode .)" = "$parent_inode" ] || exit 1
-    [ -f "$base" ] && [ ! -L "$base" ] || exit 1
-    links=$(backlog_file_link_count "$base") || exit 1
-    [ "$links" = 1 ] || exit 1
-    inode=$(backlog_file_inode "$base") || exit 1
-    hash=$(sha256_file "$base") || exit 1
-    printf '%s\t%s\n' "$inode" "$hash"
-  ) || return 1
+  details=$(python3 "$FS_OWNER" describe-digest "$dir" "$parent_inode" "$base") || return 1
+  state=${details%%$'\t'*}
+  hash=${details#*$'\t'}
+  [ "$state" != "$details" ] || return 1
+  IFS=: read -r kind dev inode rest <<< "$state"
+  [ "$kind" = regular ] && [ -n "$dev" ] && [ -n "$inode" ] || return 1
   ACTIVE_OUTBOX_PATH=$outbox
   ACTIVE_OUTBOX_PARENT_INODE=$parent_inode
-  ACTIVE_OUTBOX_FILE_INODE=${details%%$'\t'*}
-  ACTIVE_OUTBOX_HASH=${details#*$'\t'}
+  ACTIVE_OUTBOX_FILE_INODE=$dev:$inode
+  ACTIVE_OUTBOX_STATE=$state
+  ACTIVE_OUTBOX_HASH=$hash
 }
 
 # A public commitment made through the relay binds its work by home AND id, so an
@@ -1241,8 +1239,8 @@ complete_source_handoff_identities() {
 
 remote_deliver_outbox() { # <secondmate-id> <outbox-path>
   local id=$1 outbox=$2 remote_rel receive_out snapshot bytes hash generation counter counter_tmp current
-  [ "$ACTIVE_OUTBOX_PATH" = "$outbox" ] \
-    && prepare_outbox_retirement "$outbox" "$ACTIVE_OUTBOX_PARENT_INODE" || {
+  local i task prepared_hash
+  [ "$ACTIVE_OUTBOX_PATH" = "$outbox" ] || {
     echo "error: pending outbox identity changed before delivery: $outbox" >&2
     return 1
   }
@@ -1251,12 +1249,32 @@ remote_deliver_outbox() { # <secondmate-id> <outbox-path>
     return 1
   }
   snapshot=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-handoff-payload.XXXXXX") || return 1
-  if ! cp -p -- "$outbox" "$snapshot"; then
+  if ! python3 "$FS_OWNER" snapshot "$(dirname "$outbox")" \
+    "$ACTIVE_OUTBOX_PARENT_INODE" "$(basename "$outbox")" \
+    "$ACTIVE_OUTBOX_STATE" "$ACTIVE_OUTBOX_HASH" > "$snapshot"; then
     rm -f -- "$snapshot"
     return 1
   fi
   bytes=$(LC_ALL=C wc -c < "$snapshot" | tr -d ' ')
   hash=$(sha256_file "$snapshot") || { rm -f -- "$snapshot"; return 1; }
+  [ "$hash" = "$ACTIVE_OUTBOX_HASH" ] || { rm -f -- "$snapshot"; return 1; }
+  load_tasks_axi_queued_ids "$snapshot" \
+    && task_sets_match HANDOFF_IDENTITY_TASKS TASKS_AXI_BACKLOG_IDS || {
+    rm -f -- "$snapshot"
+    echo "error: pending outbox snapshot does not match its prepared identity set: $outbox" >&2
+    return 1
+  }
+  i=0
+  while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
+    task=${HANDOFF_IDENTITY_TASKS[$i]}
+    prepared_hash=${HANDOFF_IDENTITY_BACKLOG_HASHES[$i]}
+    [ "$(backlog_task_sha256 "$snapshot" "$task")" = "$prepared_hash" ] || {
+      rm -f -- "$snapshot"
+      echo "error: pending outbox snapshot changed after identity preparation for $task" >&2
+      return 1
+    }
+    i=$((i + 1))
+  done
   counter="$STATE/.remote-handoff-$id.generation"
   current=0
   if [ -e "$counter" ] || [ -L "$counter" ]; then
@@ -1326,36 +1344,80 @@ finish_remote_handoff() { # <secondmate-id> <outbox-path>
 
 remove_interrupted_source_duplicates() { # <outbox> <keys...>
   local outbox=$1 key progress remaining pass=0 source_hash target_hash
+  local source_dir source_base source_inode source_details source_state source_digest candidate
+  local -a duplicates
   shift
+  duplicates=()
+  for key in "$@"; do
+    backlog_key_section "$outbox" "$key" >/dev/null 2>&1 || continue
+    if backlog_key_section "$MAIN_BACKLOG" "$key" >/dev/null 2>&1; then
+      source_hash=$(backlog_task_sha256 "$MAIN_BACKLOG" "$key") || {
+        echo "error: refusing interrupted source removal for $key: source row is not Queued" >&2
+        return 1
+      }
+      target_hash=$(backlog_task_sha256 "$outbox" "$key") || return 1
+      [ "$source_hash" = "$target_hash" ] || {
+        echo "error: refusing interrupted source removal for $key: source and destination content differ" >&2
+        return 1
+      }
+      duplicates+=("$key")
+    fi
+  done
+  [ "${#duplicates[@]}" -gt 0 ] || return 0
+  source_dir=$(dirname "$MAIN_BACKLOG")
+  source_base=$(basename "$MAIN_BACKLOG")
+  source_inode=$(backlog_file_inode "$source_dir") || return 1
+  source_details=$(python3 "$FS_OWNER" describe-digest \
+    "$source_dir" "$source_inode" "$source_base") || return 1
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  [ "$source_state" != "$source_details" ] || return 1
+  candidate=$(umask 077; mktemp "$STATE/.backlog-source-reconcile.XXXXXX") || return 1
+  if ! python3 "$FS_OWNER" snapshot "$source_dir" "$source_inode" "$source_base" \
+    "$source_state" "$source_digest" > "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  for key in "${duplicates[@]}"; do
+    source_hash=$(backlog_task_sha256 "$candidate" "$key") || {
+      rm -f -- "$candidate"
+      echo "error: refusing interrupted source removal for $key: captured source row is not Queued" >&2
+      return 1
+    }
+    target_hash=$(backlog_task_sha256 "$outbox" "$key") || { rm -f -- "$candidate"; return 1; }
+    [ "$source_hash" = "$target_hash" ] || {
+      rm -f -- "$candidate"
+      echo "error: refusing interrupted source removal for $key: captured source and destination content differ" >&2
+      return 1
+    }
+  done
   while :; do
     remaining=0
     progress=0
-    for key in "$@"; do
-      backlog_key_section "$outbox" "$key" >/dev/null 2>&1 || continue
-      if backlog_key_section "$MAIN_BACKLOG" "$key" >/dev/null 2>&1; then
-        source_hash=$(backlog_task_sha256 "$MAIN_BACKLOG" "$key") || {
-          echo "error: refusing interrupted source removal for $key: source row is not Queued" >&2
-          return 1
-        }
-        target_hash=$(backlog_task_sha256 "$outbox" "$key") || return 1
-        [ "$source_hash" = "$target_hash" ] || {
-          echo "error: refusing interrupted source removal for $key: source and destination content differ" >&2
-          return 1
-        }
+    for key in "${duplicates[@]}"; do
+      if backlog_key_section "$candidate" "$key" >/dev/null 2>&1; then
         remaining=$((remaining + 1))
-        if tasks-axi rm "$key" --file "$MAIN_BACKLOG" >/dev/null 2>&1; then
+        if tasks-axi rm "$key" --file "$candidate" >/dev/null 2>&1; then
           progress=$((progress + 1))
         fi
       fi
     done
-    [ "$remaining" -gt 0 ] || return 0
+    [ "$remaining" -gt 0 ] || break
     [ "$progress" -gt 0 ] || {
+      rm -f -- "$candidate"
       echo "error: could not complete interrupted source removal; handoff destination remains authoritative at $outbox" >&2
       return 1
     }
     pass=$((pass + 1))
-    [ "$pass" -le "$#" ] || return 1
+    [ "$pass" -le "${#duplicates[@]}" ] || { rm -f -- "$candidate"; return 1; }
   done
+  if ! python3 "$FS_OWNER" replace "$source_dir" "$source_inode" "$source_base" \
+    "$candidate" "$source_state"; then
+    rm -f -- "$candidate"
+    echo "error: source backlog changed during interrupted handoff reconciliation; no changed row was removed" >&2
+    return 1
+  fi
+  rm -f -- "$candidate"
 }
 
 remote_handoff() { # <secondmate-id> <keys...>

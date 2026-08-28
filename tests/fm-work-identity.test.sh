@@ -620,6 +620,33 @@ test_owned_replace_refuses_changed_unsafe_destination() {
   pass "owned replacement and removal refuse changed destinations"
 }
 
+test_owned_snapshot_binds_validated_entry() {
+  local home parent inode target details state digest output out rc=0
+  home=$(make_home owned-snapshot)
+  parent="$home/state"
+  target="$parent/authoritative"
+  output="$home/snapshot"
+  printf 'prepared payload\n' > "$target"
+  inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$parent")
+  details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-digest \
+    "$parent" "$inode" authoritative) || fail "could not capture owned snapshot state"
+  state=${details%%$'\t'*}
+  digest=${details#*$'\t'}
+  python3 "$ROOT/bin/fm-work-identity-fs.py" snapshot \
+    "$parent" "$inode" authoritative "$state" "$digest" > "$output" \
+    || fail "could not snapshot the exact owned entry"
+  [ "$(cat "$output")" = "prepared payload" ] || fail "owned snapshot changed the prepared payload"
+  printf 'concurrent payload\n' > "$target"
+  rc=0
+  out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" snapshot \
+    "$parent" "$inode" authoritative "$state" "$digest" 2>&1 > "$output") || rc=$?
+  [ "$rc" -ne 0 ] || fail "owned snapshot accepted a changed entry"
+  [ ! -s "$output" ] || fail "owned snapshot emitted changed content before refusal"
+  assert_contains "$out" "changed before snapshot" \
+    "owned snapshot refusal did not identify the changed entry"
+  pass "owned snapshots bind the validated directory entry and digest"
+}
+
 test_identity_lock_refuses_replaced_storage_parent() {
   local home sink fakebin real_python out rc=0
   home=$(make_home identity-lock-parent-race)
@@ -2522,10 +2549,16 @@ EOF
   pass "Bearings excludes parent decisions and discloses nested surface caps"
 }
 
-if [ "${FM_TEST_ONLY:-}" = owned-removal ]; then
-  test_owned_replace_refuses_changed_unsafe_destination
-  exit 0
-fi
+case "${FM_TEST_ONLY:-}" in
+  owned-removal)
+    test_owned_replace_refuses_changed_unsafe_destination
+    exit 0
+    ;;
+  owned-snapshot)
+    test_owned_snapshot_binds_validated_entry
+    exit 0
+    ;;
+esac
 
 test_intake_through_fleet_projection
 test_spawn_delivers_validated_brief_snapshot
@@ -2536,6 +2569,7 @@ test_secondmate_unlinked_reservation_is_transactional
 test_no_clobber_publications_recover_after_interruption
 test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
+test_owned_snapshot_binds_validated_entry
 test_identity_lock_refuses_replaced_storage_parent
 test_identity_lock_refuses_unsafe_lock_entry_without_waiting
 test_identity_lock_reclaims_reused_pid_owner
