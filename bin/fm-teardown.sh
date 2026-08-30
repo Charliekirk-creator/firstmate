@@ -288,17 +288,19 @@ teardown_validate_dispatch_authorizations() {
       || { echo "error: dispatch receipt quarantine changed before teardown; nothing was changed" >&2; return 1; }
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
 }
-teardown_mark_dispatch_authorizations_complete() {
-  local auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
+teardown_mark_dispatch_authorizations_complete() {  # <state-dir> <task-id>
+  local wanted_state wanted_task=$2 auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
   local auth_lock auth_pid auth_token auth_receipt_parent auth_receipt_parent_inode
   local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 0
+  wanted_state=$(cd -- "$1" 2>/dev/null && pwd -P) || return 1
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
     auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
     auth_receipt_state auth_receipt_digest auth_transaction extra; do
     [ -z "$extra" ] && [ -n "$auth_transaction" ] \
       || { echo "error: malformed dispatch retirement authorization" >&2; return 1; }
+    [ "$auth_state" = "$wanted_state" ] && [ "$auth_task" = "$wanted_task" ] || continue
     if [ ! -e "$auth_receipt_parent" ] && [ ! -L "$auth_receipt_parent" ]; then
       continue
     fi
@@ -803,6 +805,7 @@ remote_secondmate_teardown() {
   mv -f -- "$tmp" "$SECONDMATE_REG"
   status_retire_presentation_task "$STATE" "$ID" || return 1
   fm_backlog_atomic_transition remove "$STATE/$ID.meta" "task record" "$STATE" || return 1
+  teardown_mark_dispatch_authorizations_complete "$STATE" "$ID" || return 1
   rm -f -- "$STATE/$ID.turn-ended"
   printf 'teardown %s complete (remote %s:%s)\n' "$ID" "$remote_host" "$remote_home"
   return 0
@@ -3127,7 +3130,7 @@ else
     exit 1
   fi
 fi
-teardown_mark_dispatch_authorizations_complete || exit 1
+teardown_mark_dispatch_authorizations_complete "$STATE" "$ID" || exit 1
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then

@@ -2588,27 +2588,16 @@ fm_backend_herdr_send_literal() {  # <target> <text>
 }
 
 fm_backend_herdr_prompt_receipt_state() {  # <target> <token>
-  local target=$1 token=$2 out marker
-  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
-  marker="FM_SUBMIT:$token"
-  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent read \
-    "$FM_BACKEND_HERDR_PANE" --source recent-unwrapped --lines 400 2>/dev/null) \
-    || { printf 'unknown'; return 0; }
-  if printf '%s\n' "$out" | grep -Fxq -- "$marker"; then
-    printf 'accepted'
-  else
-    printf 'unknown'
-  fi
+  printf 'unknown'
 }
 
 fm_backend_herdr_submit_journaled_prompt() {  # <target> <text>
-  local target=$1 text=$2 token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-} receipt_state prompt
+  local target=$1 text=$2 token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-} receipt_state
   [ -n "$token" ] || { printf 'pending-unproven'; return 0; }
   fm_backend_herdr_target_ready "$target" || { fm_backend_submit_unsent_verdict; return 0; }
   fm_backend_submit_entering_evidence || { printf 'pending-unproven'; return 0; }
-  prompt=$(printf '%s\n\nFM_SUBMIT:%s' "$text" "$token") || { printf 'pending-unproven'; return 0; }
   if ! fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent prompt \
-    "$FM_BACKEND_HERDR_PANE" "$prompt" >/dev/null 2>&1; then
+    "$FM_BACKEND_HERDR_PANE" "$text" >/dev/null 2>&1; then
     receipt_state=$(fm_backend_herdr_prompt_receipt_state "$target" "$token")
     case "$receipt_state" in
       accepted) printf 'empty' ;;

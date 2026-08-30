@@ -491,11 +491,11 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     # shellcheck source=bin/fm-backend.sh disable=SC1091
     . "$ROOT/bin/fm-backend.sh"
     fm_backend_source herdr || exit 1
-    fm_backend_herdr_cli() { printf '%s\n' 'recent output without the transaction marker'; }
+    fm_backend_herdr_cli() { printf '%s\n' 'FM_SUBMIT:durable-presend'; }
     fm_backend_herdr_prompt_receipt_state session-a:pane-a durable-presend
-  ) || fail "Herdr missing-marker recovery could not be inspected"
+  ) || fail "Herdr interrupted-prompt recovery could not be inspected"
   [ "$out" = unknown ] \
-    || fail "missing durable Herdr receipt was classified as '$out' instead of unknown"
+    || fail "terminal output was accepted as a durable Herdr receipt: $out"
   rm -f -- "$evidence" "${evidence}.entering" "${evidence}.operation-owner" \
     "${evidence}.operation-started" "${evidence}.operation-result"
   out=$(
@@ -519,9 +519,9 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
   assert_absent "${evidence}.entering" "Herdr accepted prompt retained pre-acceptance evidence"
   assert_grep "session-a agent prompt pane-a brief" "$TMP_ROOT/herdr-prompt.log" \
     "Herdr journaled submission did not use the atomic agent prompt boundary"
-  assert_grep "FM_SUBMIT:durable-presend" "$TMP_ROOT/herdr-prompt.log" \
-    "Herdr journaled submission omitted its transaction-scoped recovery receipt"
-  pass "non-tmux submission uses backend-owned Herdr prompt acceptance"
+  assert_not_contains "$(cat "$TMP_ROOT/herdr-prompt.log")" "FM_SUBMIT:" \
+    "Herdr submission exposed a terminal-output marker as acceptance authority"
+  pass "Herdr submission fails closed without durable server acceptance"
 }
 
 test_kimi_presend_crash_retries_without_wedging_identity() {

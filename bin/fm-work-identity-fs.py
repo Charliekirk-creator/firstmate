@@ -374,8 +374,17 @@ def remove_entry(directory_fd, name, expected_state, expected_digest, allow_hard
     recover_remove(directory_fd, name)
 
 
+def valid_regular_commitment(expected_state, expected_digest):
+    fields = expected_state.split(":")
+    return len(fields) == 8 and fields[0] == "regular" \
+        and all(field.isdigit() for field in fields[1:]) \
+        and int(fields[4]) == 1 and len(expected_digest) == 64 \
+        and all(char in "0123456789abcdef" for char in expected_digest)
+
+
 def parse_teardown_journal_payload(payload, journal, quarantine):
     lines = payload.splitlines()
+    records = None
     if len(lines) == 3 and lines[0] == "v1" and lines[1] == quarantine:
         phase = "quarantined"
         transaction = "legacy"
@@ -391,22 +400,43 @@ def parse_teardown_journal_payload(payload, journal, quarantine):
         commitment = lines[2].split("\t")
         transaction = lines[3]
         version = "v2"
+    elif len(lines) == 10 and lines[0] in ("v3\tQ", "v3\tC", "v3\tF") \
+            and lines[1] == quarantine:
+        phase = {
+            "v3\tQ": "quarantined",
+            "v3\tC": "command-completed",
+            "v3\tF": "finalizing",
+        }[lines[0]]
+        commitment = lines[2].split("\t")
+        transaction = lines[3]
+        metadata_commitment = lines[7].split("\t")
+        launch_commitment = lines[9].split("\t")
+        try:
+            state_path = os.fsdecode(bytes.fromhex(lines[4]))
+        except ValueError:
+            fail(f"owned teardown journal is malformed: {journal}")
+        if os.fsencode(state_path).hex() != lines[4] \
+                or not valid_name(lines[6]) or not valid_name(lines[8]) \
+                or len(metadata_commitment) != 2 or len(launch_commitment) != 2 \
+                or not valid_regular_commitment(*metadata_commitment) \
+                or not valid_regular_commitment(*launch_commitment):
+            fail(f"owned teardown journal is malformed: {journal}")
+        records = (
+            state_path, lines[5], lines[6], *metadata_commitment,
+            lines[8], *launch_commitment,
+        )
+        version = "v3"
     else:
         fail(f"owned teardown journal is malformed: {journal}")
     if len(commitment) != 2:
         fail(f"owned teardown journal is malformed: {journal}")
     expected_state, expected_digest = commitment
-    fields = expected_state.split(":")
-    if len(fields) != 8 or fields[0] != "regular" \
-            or any(not field.isdigit() for field in fields[1:]) \
-            or int(fields[4]) != 1 \
-            or len(expected_digest) != 64 \
-            or any(char not in "0123456789abcdef" for char in expected_digest) \
+    if not valid_regular_commitment(expected_state, expected_digest) \
             or not valid_token(transaction):
         fail(f"owned teardown journal is malformed: {journal}")
     return (
         journal, quarantine, expected_state, expected_digest,
-        phase, transaction, version,
+        phase, transaction, version, records,
     )
 
 
@@ -437,7 +467,7 @@ def read_teardown_journal(directory_fd, name):
 
 
 def publish_teardown_journal(
-        directory_fd, name, expected_state, expected_digest, transaction
+        directory_fd, name, expected_state, expected_digest, transaction, records
 ):
     journal = f".{name}.teardown-journal"
     quarantine = f".{name}.teardown-quarantine"
@@ -447,9 +477,13 @@ def publish_teardown_journal(
     fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
     published = False
     try:
+        state_path, state_id, metadata_name, metadata_state, metadata_digest, \
+            launch_name, launch_state, launch_digest = records
         payload = (
-            f"v2\tQ\n{quarantine}\n{expected_state}\t{expected_digest}\n"
-            f"{transaction}\n"
+            f"v3\tQ\n{quarantine}\n{expected_state}\t{expected_digest}\n"
+            f"{transaction}\n{os.fsencode(state_path).hex()}\n{state_id}\n{metadata_name}\n"
+            f"{metadata_state}\t{metadata_digest}\n{launch_name}\n"
+            f"{launch_state}\t{launch_digest}\n"
         ).encode("ascii")
         if os.write(fd, payload) != len(payload):
             raise OSError(errno.EIO, "short teardown journal write")
@@ -463,7 +497,7 @@ def publish_teardown_journal(
             remove(directory_fd, temporary)
     return (
         journal, quarantine, expected_state, expected_digest,
-        "quarantined", transaction, "v2",
+        "quarantined", transaction, "v3", records,
     )
 
 
@@ -471,8 +505,8 @@ def set_teardown_phase(directory_fd, name, expected_phase, phase, transaction):
     loaded = read_teardown_journal(directory_fd, name)
     if loaded is None:
         fail(f"owned teardown authorization is absent: {name}")
-    journal, _, _, _, current_phase, journal_transaction, version = loaded
-    if version != "v2" or journal_transaction != transaction \
+    journal, _, _, _, current_phase, journal_transaction, version, _ = loaded
+    if version not in ("v2", "v3") or journal_transaction != transaction \
             or current_phase != expected_phase:
         fail(f"owned teardown phase changed before transition: {journal}")
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -506,7 +540,7 @@ def set_teardown_phase(directory_fd, name, expected_phase, phase, transaction):
 
 
 def teardown_quarantine(
-        directory_fd, name, expected_state, expected_digest, transaction
+        directory_fd, name, expected_state, expected_digest, transaction, records
 ):
     loaded = read_teardown_journal(directory_fd, name)
     if loaded is None:
@@ -517,11 +551,12 @@ def teardown_quarantine(
         if raw_entry_state(directory_fd, quarantine) != "absent":
             fail(f"owned teardown quarantine conflicts: {quarantine}")
         loaded = publish_teardown_journal(
-            directory_fd, name, expected_state, expected_digest, transaction
+            directory_fd, name, expected_state, expected_digest, transaction, records
         )
-    journal, quarantine, journal_state, journal_digest, phase, journal_transaction, _ = loaded
+    journal, quarantine, journal_state, journal_digest, phase, journal_transaction, _, journal_records = loaded
     if journal_state != expected_state or journal_digest != expected_digest \
-            or journal_transaction != transaction or phase != "quarantined":
+            or journal_transaction != transaction or phase != "quarantined" \
+            or journal_records != records:
         fail(f"owned teardown receipt does not match retained authorization: {name}")
     target_state = raw_entry_state(directory_fd, name)
     quarantine_state = raw_entry_state(directory_fd, quarantine)
@@ -550,29 +585,47 @@ def teardown_state(directory_fd, name, transaction):
     return loaded[4]
 
 
+def teardown_remove_records(loaded):
+    records = loaded[7]
+    if records is None:
+        return
+    state_path, state_id, metadata_name, metadata_state, metadata_digest, \
+        launch_name, launch_state, launch_digest = records
+    state_fd = open_owned_dir(state_path, state_id)
+    try:
+        if raw_entry_state(state_fd, metadata_name) != "absent":
+            remove_entry(state_fd, metadata_name, metadata_state, metadata_digest)
+        if raw_entry_state(state_fd, launch_name) != "absent":
+            remove_entry(state_fd, launch_name, launch_state, launch_digest)
+    finally:
+        os.close(state_fd)
+
+
 def teardown_command_complete(directory_fd, name, transaction):
     loaded = read_teardown_journal(directory_fd, name)
     if loaded is None or loaded[5] != transaction:
         fail(f"owned teardown authorization is absent or mismatched: {name}")
-    _, quarantine, expected_state, expected_digest, phase, _, _ = loaded
+    _, quarantine, expected_state, expected_digest, phase, _, _, _ = loaded
     if raw_entry_state(directory_fd, name) != "absent":
         fail(f"owned teardown receipt was recreated before command completion: {name}")
     if phase in ("command-completed", "finalizing"):
+        teardown_remove_records(loaded)
         return
     if phase != "quarantined" or not retired_entry_matches(
             directory_fd, quarantine, expected_state, expected_digest
     ):
         fail(f"owned teardown quarantine changed before command completion: {quarantine}")
-    set_teardown_phase(
+    loaded = set_teardown_phase(
         directory_fd, name, "quarantined", "command-completed", transaction
     )
+    teardown_remove_records(loaded)
 
 
 def teardown_restore(directory_fd, name):
     loaded = read_teardown_journal(directory_fd, name)
     if loaded is None:
         return
-    journal, quarantine, expected_state, expected_digest, phase, _, _ = loaded
+    journal, quarantine, expected_state, expected_digest, phase, _, _, _ = loaded
     if phase != "quarantined":
         fail(f"owned completed teardown cannot be restored: {name}")
     recover_remove(directory_fd, quarantine)
@@ -599,7 +652,9 @@ def teardown_finalize(directory_fd, name):
     loaded = read_teardown_journal(directory_fd, name)
     if loaded is None:
         fail(f"owned teardown authorization is absent: {name}")
-    journal, quarantine, expected_state, expected_digest, phase, transaction, _ = loaded
+    journal, quarantine, expected_state, expected_digest, phase, transaction, _, _ = loaded
+    if phase in ("command-completed", "finalizing"):
+        teardown_remove_records(loaded)
     recover_remove(directory_fd, quarantine)
     if raw_entry_state(directory_fd, name) != "absent":
         fail(f"owned teardown receipt was recreated before commit: {name}")
@@ -1554,17 +1609,24 @@ def main():
             finally:
                 os.close(mutex_fd)
         elif command == "teardown-quarantine":
-            if len(sys.argv) != 8:
-                fail("teardown-quarantine requires expected receipt state, SHA-256, and transaction")
+            if len(sys.argv) != 16:
+                fail("teardown-quarantine requires receipt and final-record commitments")
             expected_state, expected_digest, transaction = sys.argv[5:8]
+            records = tuple(sys.argv[8:16])
             if len(expected_digest) != 64 \
                     or any(char not in "0123456789abcdef" for char in expected_digest) \
-                    or not valid_token(transaction):
+                    or not valid_token(transaction) \
+                    or not valid_name(records[2]) or not valid_name(records[5]) \
+                    or not valid_regular_commitment(records[3], records[4]) \
+                    or not valid_regular_commitment(records[6], records[7]):
                 fail("teardown receipt commitment is malformed")
+            state_fd = open_owned_dir(records[0], records[1])
+            os.close(state_fd)
             mutex_fd = operation_lock(directory_fd, name)
             try:
-                _, quarantine, _, _, _, _, _ = teardown_quarantine(
-                    directory_fd, name, expected_state, expected_digest, transaction
+                _, quarantine, _, _, _, _, _, _ = teardown_quarantine(
+                    directory_fd, name, expected_state, expected_digest,
+                    transaction, records
                 )
                 print(
                     f"{entry_state(directory_fd, quarantine)}"

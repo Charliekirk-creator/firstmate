@@ -2756,10 +2756,10 @@ dispatch_teardown_restore_locked() {
     || die "cannot restore work identity dispatch after interrupted teardown: $DISPATCH_STATE"
 }
 
-dispatch_teardown_quarantine_locked() {  # <validated-state> <validated-digest> <transaction>
+dispatch_teardown_quarantine_locked() {  # <validated-state> <validated-digest> <transaction> <state-dir> <state-id> <meta-name> <meta-state> <meta-digest> <launch-name> <launch-state> <launch-digest>
   local receipt_name=${DISPATCH_STATE##*/} details
   details=$(python3 "$FS_OWNER" teardown-quarantine \
-    "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$1" "$2" "$3") \
+    "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$@") \
     || return 1
   DISPATCH_TEARDOWN_QUARANTINE_STATE=${details%%$'\t'*}
   DISPATCH_TEARDOWN_QUARANTINE_DIGEST=${details#*$'\t'}
@@ -2788,10 +2788,12 @@ dispatch_teardown_finalize_locked() {
 dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [args...]
   local task rc meta launch authorization authorizations= whole_home=0 owner_pid=${BASHPID:-$$}
   local receipt_parent receipt_parent_id receipt_name quarantine_name receipt_state receipt_digest index rollback
+  local metadata_state metadata_digest launch_state launch_digest
   local batch_token seen_tasks=" $1 " recovery_state any_completed=0
   local -a tasks=("$1") command_argv=() recovery_states=()
   local -a receipt_parents=() receipt_parent_ids=() receipt_names=()
   local -a quarantine_names=() receipt_states=() receipt_digests=() receipt_present=() quarantined=()
+  local -a metadata_states=() metadata_digests=() launch_states=() launch_digests=()
   shift
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
     if [ "$1" = --whole-home ]; then
@@ -2844,13 +2846,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     for index in "${!tasks[@]}"; do
       [ "${recovery_states[$index]}" != absent ] || continue
       task=${tasks[$index]}
-      meta="$STATE_REAL/$task.meta"
-      launch="$STATE_REAL/$task.launch-brief.md"
       identity_lock_acquire "$task"
-      [ ! -e "$meta" ] && [ ! -L "$meta" ] \
-        || die "task $task still has dispatch metadata"
-      [ ! -e "$launch" ] && [ ! -L "$launch" ] \
-        || die "task $task still has launch instructions"
       dispatch_teardown_finalize_locked
       identity_lock_release
     done
@@ -2870,6 +2866,18 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     DISPATCH_STATE_ENTRY_STATE=
     DISPATCH_STATE_ENTRY_DIGEST=
     validate_dispatch_retirement_locked "$task"
+    metadata_state=
+    metadata_digest=
+    launch_state=
+    launch_digest=
+    if [ -n "$DISPATCH_STATE_ENTRY_STATE" ]; then
+      IFS=$'\t' read -r metadata_state metadata_digest \
+        < <(owned_removal_expectation "$STATE_REAL/$task.meta" "task dispatch metadata") \
+        || die "cannot bind task dispatch metadata retirement"
+      IFS=$'\t' read -r launch_state launch_digest \
+        < <(owned_removal_expectation "$STATE_REAL/$task.launch-brief.md" "task dispatch instructions") \
+        || die "cannot bind task dispatch instructions retirement"
+    fi
     receipt_parent=$TASK_DIR
     receipt_parent_id=$TASK_DIR_ID
     receipt_state=${DISPATCH_STATE_ENTRY_STATE:-absent}
@@ -2880,6 +2888,10 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     quarantine_names+=("$quarantine_name")
     receipt_states+=("$receipt_state")
     receipt_digests+=("$receipt_digest")
+    metadata_states+=("$metadata_state")
+    metadata_digests+=("$metadata_digest")
+    launch_states+=("$launch_state")
+    launch_digests+=("$launch_digest")
     if [ "$receipt_state" = absent ]; then
       receipt_present+=(0)
     else
@@ -2892,7 +2904,10 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     task=${tasks[$index]}
     identity_lock_acquire "$task"
     if ! dispatch_teardown_quarantine_locked \
-      "${receipt_states[$index]}" "${receipt_digests[$index]}" "$batch_token"; then
+      "${receipt_states[$index]}" "${receipt_digests[$index]}" "$batch_token" \
+      "$STATE_REAL" "$STATE_DIR_ID" "$task.meta" \
+      "${metadata_states[$index]}" "${metadata_digests[$index]}" \
+      "$task.launch-brief.md" "${launch_states[$index]}" "${launch_digests[$index]}"; then
       identity_lock_release
       for rollback in "${quarantined[@]}" "$index"; do
         task=${tasks[$rollback]}
@@ -2984,13 +2999,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
   for index in "${!tasks[@]}"; do
     [ "${receipt_present[$index]}" = 1 ] || continue
     task=${tasks[$index]}
-    meta="$STATE_REAL/$task.meta"
-    launch="$STATE_REAL/$task.launch-brief.md"
     identity_lock_acquire "$task"
-    [ ! -e "$meta" ] && [ ! -L "$meta" ] \
-      || die "task $task still has dispatch metadata"
-    [ ! -e "$launch" ] && [ ! -L "$launch" ] \
-      || die "task $task still has launch instructions"
     python3 "$FS_OWNER" snapshot \
       "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
       "${quarantine_names[$index]}" "${receipt_states[$index]}" \

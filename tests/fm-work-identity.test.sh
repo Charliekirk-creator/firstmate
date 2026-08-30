@@ -1125,7 +1125,7 @@ test_dispatch_retire_run_recovers_completed_command() {
   owner="$home/data/$task"
   journal="$owner/.work-identity-dispatch.json.teardown-journal"
   owner_id=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$owner")
-  command='rm -- "$1" "$2"; token=$(tail -n 1 "$3"); python3 "$4" teardown-command-complete "$5" "$6" work-identity-dispatch.json "$token"; printf "run\n" >> "$7"; kill -KILL "$PPID"'
+  command='token=$(sed -n "4p" "$3"); python3 "$4" teardown-command-complete "$5" "$6" work-identity-dispatch.json "$token"; [ ! -e "$1" ] && [ ! -e "$2" ] || exit 8; printf "run\n" >> "$7"; kill -KILL "$PPID"'
   set +e
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
     sh -c "$command" sh "$home/state/$task.meta" "$launch" "$journal" \
