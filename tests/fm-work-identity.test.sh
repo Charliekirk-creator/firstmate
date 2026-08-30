@@ -1056,9 +1056,10 @@ test_dispatch_retire_run_refuses_invalid_set_without_quarantine() {
 }
 
 test_dispatch_retire_run_accepts_whole_home_removal() {
-  local home task launch transaction binding hash rc=0
+  local home task launch transaction binding hash marker rc=0
   home=$(make_home dispatch-retire-whole-home)
   task=dispatch-retire-whole-home
+  marker="$TMP_ROOT/whole-home-command-ran"
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
     || fail "could not scaffold whole-home dispatch retirement fixture"
   launch="$home/state/$task.launch-brief.md"
@@ -1089,14 +1090,72 @@ test_dispatch_retire_run_accepts_whole_home_removal() {
   assert_present "$home/data/$task/.work-identity-dispatch.json.teardown-journal" \
     "interrupted whole-home retirement lost its recovery journal"
   rm -- "$home/data/$task/.work-identity-dispatch.json.teardown-quarantine"
-  set +e
+  rc=0
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" --whole-home -- \
-    sh -c 'rm -rf -- "$1"; exit 23' sh "$home"
+    sh -c 'touch "$1"' sh "$marker" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "journal-only retirement bypassed exact receipt proof"
+  assert_absent "$marker" "journal-only retirement ran its destructive command"
+  assert_present "$home/data/$task/.work-identity-dispatch.json.teardown-journal" \
+    "journal-only retirement discarded its only recovery evidence"
+  pass "dispatch retirement refuses journal-only state without finalization proof"
+}
+
+test_dispatch_retire_run_recovers_completed_command() {
+  local home task launch transaction binding hash owner owner_id journal marker command rc=0
+  home=$(make_home dispatch-retire-completed-command)
+  task=dispatch-retire-completed-command
+  marker="$home/command-runs"
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold completed-command retirement fixture"
+  launch="$home/state/$task.launch-brief.md"
+  transaction=retire-completed-command
+  binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$transaction") || fail "could not prepare completed-command dispatch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+    --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+    || fail "could not commit completed-command dispatch"
+  owner="$home/data/$task"
+  journal="$owner/.work-identity-dispatch.json.teardown-journal"
+  owner_id=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$owner")
+  command='rm -- "$1" "$2"; token=$(tail -n 1 "$3"); python3 "$4" teardown-command-complete "$5" "$6" work-identity-dispatch.json "$token"; printf "run\n" >> "$7"; kill -KILL "$PPID"'
+  set +e
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
+    sh -c "$command" sh "$home/state/$task.meta" "$launch" "$journal" \
+      "$ROOT/bin/fm-work-identity-fs.py" "$owner" "$owner_id" "$marker"
   rc=$?
   set -e
-  [ "$rc" -eq 23 ] || fail "whole-home retirement hid wrapped command status $rc"
-  assert_absent "$home" "journal-only retirement recovery did not resume wrapped teardown"
-  pass "dispatch retirement recovers finalization and preserves command failure"
+  [ "$rc" -ne 0 ] || fail "completed-command interruption unexpectedly returned success"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
+    sh -c "$command" sh "$home/state/$task.meta" "$launch" "$journal" \
+      "$ROOT/bin/fm-work-identity-fs.py" "$owner" "$owner_id" "$marker" \
+    || fail "completed teardown command was not recovered"
+  [ "$(wc -l < "$marker" | tr -d ' ')" -eq 1 ] \
+    || fail "completed teardown command ran more than once"
+  assert_absent "$owner/work-identity-dispatch.json" \
+    "completed teardown recovery retained the dispatch receipt"
+  assert_absent "$journal" "completed teardown recovery retained its journal"
+  pass "dispatch retirement finalizes a durably completed command once"
+}
+
+test_dispatch_retire_run_rejects_duplicate_tasks() {
+  local home marker out rc=0
+  home=$(make_home dispatch-retire-duplicate)
+  marker="$home/duplicate-command-ran"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run \
+    duplicate-retirement duplicate-retirement -- sh -c 'touch "$1"' sh "$marker" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "duplicate dispatch retirement tasks were accepted"
+  assert_absent "$marker" "duplicate dispatch retirement tasks ran their command"
+  assert_contains "$out" "duplicate dispatch retirement task id" \
+    "duplicate dispatch retirement refusal was not explicit"
+  pass "dispatch retirement rejects duplicate task IDs before mutation"
 }
 
 test_spawn_recovers_exact_created_endpoint() {
@@ -2782,6 +2841,8 @@ case "${FM_TEST_ONLY:-}" in
     test_dispatch_retire_run_authorizes_task_set
     test_dispatch_retire_run_refuses_invalid_set_without_quarantine
     test_dispatch_retire_run_accepts_whole_home_removal
+    test_dispatch_retire_run_recovers_completed_command
+    test_dispatch_retire_run_rejects_duplicate_tasks
     exit 0
     ;;
   no-clobber-recovery)
@@ -2813,6 +2874,8 @@ test_dispatch_transaction_excludes_backlog_handoff
 test_dispatch_retire_run_authorizes_task_set
 test_dispatch_retire_run_refuses_invalid_set_without_quarantine
 test_dispatch_retire_run_accepts_whole_home_removal
+test_dispatch_retire_run_recovers_completed_command
+test_dispatch_retire_run_rejects_duplicate_tasks
 test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect
 test_spawn_resumes_unsent_worktree_request

@@ -2756,15 +2756,27 @@ dispatch_teardown_restore_locked() {
     || die "cannot restore work identity dispatch after interrupted teardown: $DISPATCH_STATE"
 }
 
-dispatch_teardown_quarantine_locked() {  # <validated-state> <validated-digest>
+dispatch_teardown_quarantine_locked() {  # <validated-state> <validated-digest> <transaction>
   local receipt_name=${DISPATCH_STATE##*/} details
   details=$(python3 "$FS_OWNER" teardown-quarantine \
-    "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$1" "$2") \
+    "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$1" "$2" "$3") \
     || return 1
   DISPATCH_TEARDOWN_QUARANTINE_STATE=${details%%$'\t'*}
   DISPATCH_TEARDOWN_QUARANTINE_DIGEST=${details#*$'\t'}
   [ "$DISPATCH_TEARDOWN_QUARANTINE_STATE" != "$details" ] \
     && [ -n "$DISPATCH_TEARDOWN_QUARANTINE_DIGEST" ]
+}
+
+dispatch_teardown_state_locked() {  # <transaction>
+  local receipt_name=${DISPATCH_STATE##*/}
+  python3 "$FS_OWNER" teardown-state "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$1"
+}
+
+dispatch_teardown_complete_locked() {  # <transaction>
+  local receipt_name=${DISPATCH_STATE##*/}
+  python3 "$FS_OWNER" teardown-command-complete \
+    "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$1" \
+    || die "cannot record completed work identity dispatch teardown: $DISPATCH_STATE"
 }
 
 dispatch_teardown_finalize_locked() {
@@ -2776,7 +2788,9 @@ dispatch_teardown_finalize_locked() {
 dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [args...]
   local task rc meta launch authorization authorizations= whole_home=0 owner_pid=${BASHPID:-$$}
   local receipt_parent receipt_parent_id receipt_name quarantine_name receipt_state receipt_digest index rollback
-  local -a tasks=("$1") receipt_parents=() receipt_parent_ids=() receipt_names=()
+  local batch_token seen_tasks=" $1 " recovery_state any_completed=0
+  local -a tasks=("$1") command_argv=() recovery_states=()
+  local -a receipt_parents=() receipt_parent_ids=() receipt_names=()
   local -a quarantine_names=() receipt_states=() receipt_digests=() receipt_present=() quarantined=()
   shift
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
@@ -2784,22 +2798,69 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
       whole_home=1
     else
       fm_pr_task_id_valid "$1" || die "invalid task id"
+      case "$seen_tasks" in
+        *" $1 "*) die "duplicate dispatch retirement task id: $1" ;;
+      esac
       tasks+=("$1")
+      seen_tasks="$seen_tasks$1 "
     fi
     shift
   done
   [ "$#" -gt 1 ] && [ "$1" = -- ] || die "dispatch-retire-run requires -- and a command"
   shift
+  command_argv=("$@")
+  batch_token=$(
+    {
+      printf 'dispatch-retire-run-v2\0%s\0' "$whole_home"
+      printf '%s\0' "${tasks[@]}"
+      printf '%s\0' --
+      printf '%s\0' "${command_argv[@]}"
+    } | sha256_stream
+  ) || die "SHA-256 is unavailable for dispatch retirement"
   publication_lock_acquire
   for task in "${tasks[@]}"; do
     identity_lock_acquire "$task"
-    receipt_name=work-identity-dispatch.json
-    quarantine_name=.$receipt_name.teardown-quarantine
-    if { [ -e "$TASK_DIR/$quarantine_name" ] || [ -L "$TASK_DIR/$quarantine_name" ] \
-         || [ -e "$TASK_DIR/.$receipt_name.teardown-journal" ] \
-         || [ -L "$TASK_DIR/.$receipt_name.teardown-journal" ]; }; then
-      dispatch_teardown_restore_locked
-    fi
+    recovery_state=$(dispatch_teardown_state_locked "$batch_token") \
+      || die "cannot inspect interrupted work identity dispatch teardown"
+    recovery_states+=("$recovery_state")
+    case "$recovery_state" in
+      command-completed|finalizing) any_completed=1 ;;
+      absent|quarantined|legacy-quarantined) ;;
+      *) die "work identity dispatch teardown state is malformed" ;;
+    esac
+    identity_lock_release
+  done
+  if [ "$any_completed" -eq 1 ]; then
+    for index in "${!tasks[@]}"; do
+      task=${tasks[$index]}
+      identity_lock_acquire "$task"
+      case "${recovery_states[$index]}" in
+        quarantined) dispatch_teardown_complete_locked "$batch_token" ;;
+        command-completed|finalizing|absent) ;;
+        *) die "interrupted dispatch retirement has a mismatched legacy transaction" ;;
+      esac
+      identity_lock_release
+    done
+    for index in "${!tasks[@]}"; do
+      [ "${recovery_states[$index]}" != absent ] || continue
+      task=${tasks[$index]}
+      meta="$STATE_REAL/$task.meta"
+      launch="$STATE_REAL/$task.launch-brief.md"
+      identity_lock_acquire "$task"
+      [ ! -e "$meta" ] && [ ! -L "$meta" ] \
+        || die "task $task still has dispatch metadata"
+      [ ! -e "$launch" ] && [ ! -L "$launch" ] \
+        || die "task $task still has launch instructions"
+      dispatch_teardown_finalize_locked
+      identity_lock_release
+    done
+    return 0
+  fi
+  for index in "${!tasks[@]}"; do
+    [ "${recovery_states[$index]}" != absent ] || continue
+    task=${tasks[$index]}
+    identity_lock_acquire "$task"
+    dispatch_teardown_restore_locked
     identity_lock_release
   done
   for task in "${tasks[@]}"; do
@@ -2831,7 +2892,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     task=${tasks[$index]}
     identity_lock_acquire "$task"
     if ! dispatch_teardown_quarantine_locked \
-      "${receipt_states[$index]}" "${receipt_digests[$index]}"; then
+      "${receipt_states[$index]}" "${receipt_digests[$index]}" "$batch_token"; then
       identity_lock_release
       for rollback in "${quarantined[@]}" "$index"; do
         task=${tasks[$rollback]}
@@ -2847,13 +2908,13 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     receipt_digests[$index]=$receipt_digest
     quarantined+=("$index")
     identity_lock_release
-    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$STATE_REAL" "$STATE_DIR_ID" "$task" \
       "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
       "$ACTIVE_PUBLICATION_LOCK" "$owner_pid" "$ACTIVE_PUBLICATION_LOCK_TOKEN" \
       "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
       "${receipt_names[$index]}" "${quarantine_names[$index]}" \
-      "$receipt_state" "$receipt_digest")
+      "$receipt_state" "$receipt_digest" "$batch_token")
     if [ -n "$authorizations" ]; then
       authorizations="$authorizations"$'\n'"$authorization"
     else
@@ -2864,14 +2925,42 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     authorizations="${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS}"$'\n'"$authorizations"
   fi
   set +e
-  FM_TEARDOWN_DISPATCH_AUTHORIZATIONS=$authorizations "$@"
+  FM_TEARDOWN_DISPATCH_AUTHORIZATIONS=$authorizations "${command_argv[@]}"
   rc=$?
   set -e
   if [ "$whole_home" -eq 1 ] \
      && [ ! -e "$FM_HOME_REAL" ] && [ ! -L "$FM_HOME_REAL" ]; then
     return "$rc"
   fi
-  if [ "$rc" -ne 0 ]; then
+  any_completed=0
+  for index in "${!tasks[@]}"; do
+    [ "${receipt_present[$index]}" = 1 ] || continue
+    task=${tasks[$index]}
+    identity_lock_acquire "$task"
+    recovery_state=$(dispatch_teardown_state_locked "$batch_token") \
+      || die "cannot inspect completed work identity dispatch teardown"
+    if [ "$rc" -eq 0 ] && [ "$recovery_state" = quarantined ]; then
+      meta="$STATE_REAL/$task.meta"
+      launch="$STATE_REAL/$task.launch-brief.md"
+      [ ! -e "$meta" ] && [ ! -L "$meta" ] \
+        || die "task $task still has dispatch metadata"
+      [ ! -e "$launch" ] && [ ! -L "$launch" ] \
+        || die "task $task still has launch instructions"
+      python3 "$FS_OWNER" snapshot \
+        "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
+        "${quarantine_names[$index]}" "${receipt_states[$index]}" \
+        "${receipt_digests[$index]}" >/dev/null \
+        || die "task $task dispatch quarantine changed during teardown"
+      dispatch_teardown_complete_locked "$batch_token"
+      recovery_state=command-completed
+    fi
+    case "$recovery_state" in
+      command-completed|finalizing) any_completed=1 ;;
+    esac
+    recovery_states[$index]=$recovery_state
+    identity_lock_release
+  done
+  if [ "$rc" -ne 0 ] && [ "$any_completed" -eq 0 ]; then
     for index in "${!tasks[@]}"; do
       [ "${receipt_present[$index]}" = 1 ] || continue
       task=${tasks[$index]}
@@ -2880,6 +2969,17 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
       identity_lock_release
     done
     return "$rc"
+  fi
+  if [ "$any_completed" -eq 1 ]; then
+    for index in "${!tasks[@]}"; do
+      [ "${receipt_present[$index]}" = 1 ] || continue
+      [ "${recovery_states[$index]}" = quarantined ] || continue
+      task=${tasks[$index]}
+      identity_lock_acquire "$task"
+      dispatch_teardown_complete_locked "$batch_token"
+      recovery_states[$index]=command-completed
+      identity_lock_release
+    done
   fi
   for index in "${!tasks[@]}"; do
     [ "${receipt_present[$index]}" = 1 ] || continue
@@ -2899,6 +2999,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     dispatch_teardown_finalize_locked
     identity_lock_release
   done
+  return "$rc"
 }
 
 dispatch_retire() {  # <task-id>

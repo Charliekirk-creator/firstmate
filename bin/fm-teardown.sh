@@ -231,7 +231,7 @@ teardown_dispatch_authorized() {
   local state=$1 task=$2 state_real state_inode auth_state auth_inode auth_task
   local auth_lock_parent auth_lock_parent_inode auth_lock auth_pid auth_token
   local auth_receipt_parent auth_receipt_parent_inode auth_receipt_name
-  local auth_quarantine_name auth_receipt_state auth_receipt_digest live_state extra
+  local auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction live_state extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 1
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   state_real=$(cd -- "$state" 2>/dev/null && pwd -P) || return 1
@@ -239,8 +239,8 @@ teardown_dispatch_authorized() {
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
     auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
-    auth_receipt_state auth_receipt_digest extra; do
-    [ -z "$extra" ] || continue
+    auth_receipt_state auth_receipt_digest auth_transaction extra; do
+    [ -z "$extra" ] && [ -n "$auth_transaction" ] || continue
     [ "$auth_state" = "$state_real" ] && [ "$auth_inode" = "$state_inode" ] \
       && [ "$auth_task" = "$task" ] || continue
     teardown_pid_is_ancestor "$auth_pid" || continue
@@ -262,13 +262,14 @@ teardown_dispatch_authorized() {
 teardown_validate_dispatch_authorizations() {
   local auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
   local auth_lock auth_pid auth_token auth_receipt_parent auth_receipt_parent_inode
-  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest live_state extra
+  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction live_state extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 0
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
     auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
-    auth_receipt_state auth_receipt_digest extra; do
-    [ -z "$extra" ] || { echo "error: malformed dispatch retirement authorization" >&2; return 1; }
+    auth_receipt_state auth_receipt_digest auth_transaction extra; do
+    [ -z "$extra" ] && [ -n "$auth_transaction" ] \
+      || { echo "error: malformed dispatch retirement authorization" >&2; return 1; }
     teardown_pid_is_ancestor "$auth_pid" \
       || { echo "error: dispatch retirement authorization owner is not active" >&2; return 1; }
     python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-held \
@@ -285,6 +286,26 @@ teardown_validate_dispatch_authorizations() {
       "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_quarantine_name" \
       "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 \
       || { echo "error: dispatch receipt quarantine changed before teardown; nothing was changed" >&2; return 1; }
+  done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
+}
+teardown_mark_dispatch_authorizations_complete() {
+  local auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
+  local auth_lock auth_pid auth_token auth_receipt_parent auth_receipt_parent_inode
+  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction extra
+  [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 0
+  while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
+    auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
+    auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
+    auth_receipt_state auth_receipt_digest auth_transaction extra; do
+    [ -z "$extra" ] && [ -n "$auth_transaction" ] \
+      || { echo "error: malformed dispatch retirement authorization" >&2; return 1; }
+    if [ ! -e "$auth_receipt_parent" ] && [ ! -L "$auth_receipt_parent" ]; then
+      continue
+    fi
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" teardown-command-complete \
+      "$auth_receipt_parent" "$auth_receipt_parent_inode" \
+      "$auth_receipt_name" "$auth_transaction" >/dev/null \
+      || { echo "error: cannot record completed dispatch teardown" >&2; return 1; }
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
 }
 if teardown_dispatch_evidence_exists "$DATA" "$ID" \
@@ -3106,6 +3127,7 @@ else
     exit 1
   fi
 fi
+teardown_mark_dispatch_authorizations_complete || exit 1
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
