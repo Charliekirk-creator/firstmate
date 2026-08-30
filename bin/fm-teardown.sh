@@ -804,8 +804,11 @@ remote_secondmate_teardown() {
   grep -vE "^- $ID( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv -f -- "$tmp" "$SECONDMATE_REG"
   status_retire_presentation_task "$STATE" "$ID" || return 1
-  fm_backlog_atomic_transition remove "$STATE/$ID.meta" "task record" "$STATE" || return 1
-  teardown_mark_dispatch_authorizations_complete "$STATE" "$ID" || return 1
+  if teardown_dispatch_authorized "$STATE" "$ID"; then
+    teardown_mark_dispatch_authorizations_complete "$STATE" "$ID" || return 1
+  else
+    fm_backlog_atomic_transition remove "$STATE/$ID.meta" "task record" "$STATE" || return 1
+  fi
   rm -f -- "$STATE/$ID.turn-ended"
   printf 'teardown %s complete (remote %s:%s)\n' "$ID" "$remote_host" "$remote_home"
   return 0
@@ -3087,30 +3090,44 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
+
 rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
   "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-session" \
-  "$STATE/$ID.launch-brief.md" "$STATE/$ID.spawn-endpoint.json" \
+  "$STATE/$ID.spawn-endpoint.json" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged"
+if ! teardown_dispatch_authorized "$STATE" "$ID"; then
+  rm -f -- "$STATE/$ID.launch-brief.md"
+fi
 rmdir -- "$STATE/.$ID.worktree-request."* 2>/dev/null || true
 # The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.
 rm -rf "$STATE/$ID.inbox"
-if teardown_dispatch_evidence_exists "$DATA" "$ID" \
-   && ! teardown_dispatch_authorized "$STATE" "$ID"; then
+TEARDOWN_DISPATCH_AUTHORIZED=0
+if teardown_dispatch_authorized "$STATE" "$ID"; then
+  TEARDOWN_DISPATCH_AUTHORIZED=1
+elif teardown_dispatch_evidence_exists "$DATA" "$ID"; then
   echo "error: work identity dispatch retirement was not authorized before teardown" >&2
   exit 1
 fi
-# The record is gone, so the backlog must not still show this task in flight
-# when teardown reports success. Still under this task's meta lock, so a steer
-# racing the same id stays serialized exactly as it was before.
+# The backlog must not still show this task in flight when teardown reports
+# success. An authorized dispatch retirement keeps metadata and launch bytes for
+# the identity owner's atomic finalization after this command succeeds.
 if [ "$BACKLOG_CLOSED" = 1 ]; then
   BACKLOG_CLOSE_MARKER=$(fm_backlog_close_marker_path "$STATE" "$ID") || exit 1
-  if ! fm_backlog_atomic_transition close "$STATE/$ID.meta" "$BACKLOG_CLOSE_MARKER" \
+  if [ "$TEARDOWN_DISPATCH_AUTHORIZED" = 1 ]; then
+    if ! fm_backlog_done "$DATA" "$ID" "${BACKLOG_DONE_ARGS[@]+"${BACKLOG_DONE_ARGS[@]}"}" \
+       || ! fm_backlog_record_remove "$BACKLOG_CLOSE_MARKER" "pending-close record" "$STATE"; then
+      fm_lock_release "$META_LOCK"
+      META_LOCK_HELD=0
+      echo "error: $ID's endpoint and local copy are cleaned up, but its backlog item could not be closed ($FM_BACKLOG_TRANSITION_ERROR); the pending close is recorded and the next session start retries it" >&2
+      exit 1
+    fi
+  elif ! fm_backlog_atomic_transition close "$STATE/$ID.meta" "$BACKLOG_CLOSE_MARKER" \
       "$DATA" "$ID" "$STATE" "${BACKLOG_DONE_ARGS[@]+"${BACKLOG_DONE_ARGS[@]}"}"; then
     fm_lock_release "$META_LOCK"
     META_LOCK_HELD=0
@@ -3122,7 +3139,7 @@ elif [ "$KIND" = secondmate ] && [ ! -e "$STATE" ] && [ ! -L "$STATE" ]; then
   # removed. remove_firstmate_home above already performed that physical
   # deletion; do not turn its confirmed absence into a false cleanup failure.
   :
-else
+elif [ "$TEARDOWN_DISPATCH_AUTHORIZED" != 1 ]; then
   if ! fm_backlog_atomic_transition remove "$STATE/$ID.meta" "task record" "$STATE"; then
     fm_lock_release "$META_LOCK"
     META_LOCK_HELD=0

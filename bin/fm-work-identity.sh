@@ -2955,12 +2955,6 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     recovery_state=$(dispatch_teardown_state_locked "$batch_token") \
       || die "cannot inspect completed work identity dispatch teardown"
     if [ "$rc" -eq 0 ] && [ "$recovery_state" = quarantined ]; then
-      meta="$STATE_REAL/$task.meta"
-      launch="$STATE_REAL/$task.launch-brief.md"
-      [ ! -e "$meta" ] && [ ! -L "$meta" ] \
-        || die "task $task still has dispatch metadata"
-      [ ! -e "$launch" ] && [ ! -L "$launch" ] \
-        || die "task $task still has launch instructions"
       python3 "$FS_OWNER" snapshot \
         "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
         "${quarantine_names[$index]}" "${receipt_states[$index]}" \

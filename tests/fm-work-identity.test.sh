@@ -964,8 +964,7 @@ test_dispatch_transaction_excludes_backlog_handoff() {
   assert_contains "$out" "has no exact owner receipt" \
     "missing dispatch receipt refusal did not identify the orphan metadata transaction"
   mv "$home/dispatch.valid" "$home/data/$task/work-identity-dispatch.json"
-  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
-    sh -c 'rm -- "$1" "$2"' sh "$home/state/$task.meta" "$launch" \
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- true \
     || fail "completed dispatch receipt could not authorize lifecycle cleanup"
   assert_absent "$home/data/$task/work-identity-dispatch.json" \
     "completed dispatch receipt remained after lifecycle cleanup"
@@ -1000,8 +999,7 @@ test_dispatch_retire_run_authorizes_task_set() {
     cleanup_paths+=("$home/state/$task.meta" "$launch")
   done
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run \
-    dispatch-retire-set-a dispatch-retire-set-b -- \
-    sh -c 'rm -- "$@"' sh "${cleanup_paths[@]}" \
+    dispatch-retire-set-a dispatch-retire-set-b -- true \
     || fail "one owner could not retire a complete task set"
   for task in dispatch-retire-set-a dispatch-retire-set-b; do
     assert_absent "$home/data/$task/work-identity-dispatch.json" \
@@ -1125,7 +1123,7 @@ test_dispatch_retire_run_recovers_completed_command() {
   owner="$home/data/$task"
   journal="$owner/.work-identity-dispatch.json.teardown-journal"
   owner_id=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$owner")
-  command='token=$(sed -n "4p" "$3"); python3 "$4" teardown-command-complete "$5" "$6" work-identity-dispatch.json "$token"; [ ! -e "$1" ] && [ ! -e "$2" ] || exit 8; printf "run\n" >> "$7"; kill -KILL "$PPID"'
+  command='token=$(sed -n "4p" "$3"); python3 "$4" teardown-command-complete "$5" "$6" work-identity-dispatch.json "$token"; [ -e "$1" ] && [ -e "$2" ] || exit 8; printf "run\n" >> "$7"; kill -KILL "$PPID"'
   set +e
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
     sh -c "$command" sh "$home/state/$task.meta" "$launch" "$journal" \
@@ -1143,6 +1141,41 @@ test_dispatch_retire_run_recovers_completed_command() {
     "completed teardown recovery retained the dispatch receipt"
   assert_absent "$journal" "completed teardown recovery retained its journal"
   pass "dispatch retirement finalizes a durably completed command once"
+}
+
+test_dispatch_retire_run_refuses_changed_record_without_partial_retirement() {
+  local home task launch transaction binding hash marker out rc=0
+  home=$(make_home dispatch-retire-record-change)
+  task=dispatch-retire-record-change
+  marker="$home/command-ran"
+  FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+    || fail "could not scaffold changed-record retirement fixture"
+  launch="$home/state/$task.launch-brief.md"
+  transaction=retire-record-change
+  binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+    --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+    --transaction "$transaction") || fail "could not prepare changed-record dispatch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+    "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+    "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+    --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+    || fail "could not commit changed-record dispatch"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
+    sh -c 'cp "$1" "$1.changed"; chmod u+w "$1.changed"; printf "changed\n" >> "$1.changed"; mv "$1.changed" "$1"; touch "$2"' \
+      sh "$launch" "$marker" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "changed launch record was retired"
+  assert_present "$marker" "changed-record retirement did not run its wrapped command"
+  assert_present "$home/state/$task.meta" \
+    "changed launch record caused partial metadata retirement"
+  assert_present "$launch" "changed launch record was removed"
+  assert_contains "$out" "record changed before retirement" \
+    "changed record refusal did not identify the retirement conflict"
+  pass "dispatch retirement validates all final records before retiring any"
 }
 
 test_dispatch_retire_run_rejects_duplicate_tasks() {
@@ -2842,6 +2875,7 @@ case "${FM_TEST_ONLY:-}" in
     test_dispatch_retire_run_refuses_invalid_set_without_quarantine
     test_dispatch_retire_run_accepts_whole_home_removal
     test_dispatch_retire_run_recovers_completed_command
+    test_dispatch_retire_run_refuses_changed_record_without_partial_retirement
     test_dispatch_retire_run_rejects_duplicate_tasks
     exit 0
     ;;
@@ -2875,6 +2909,7 @@ test_dispatch_retire_run_authorizes_task_set
 test_dispatch_retire_run_refuses_invalid_set_without_quarantine
 test_dispatch_retire_run_accepts_whole_home_removal
 test_dispatch_retire_run_recovers_completed_command
+test_dispatch_retire_run_refuses_changed_record_without_partial_retirement
 test_dispatch_retire_run_rejects_duplicate_tasks
 test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect

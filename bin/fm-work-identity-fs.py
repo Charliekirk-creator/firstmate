@@ -12,6 +12,9 @@ import tempfile
 import time
 
 
+TEARDOWN_JOURNAL_MAX = 65536
+
+
 def fail(message):
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -454,11 +457,12 @@ def read_teardown_journal(directory_fd, name):
             fail(f"owned teardown quarantine has no journal: {quarantine}")
         return None
     info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 2048:
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 \
+            or info.st_size > TEARDOWN_JOURNAL_MAX:
         os.close(fd)
         fail(f"owned teardown journal is unsafe: {journal}")
     try:
-        payload = os.read(fd, 2049).decode("ascii", "strict")
+        payload = os.read(fd, TEARDOWN_JOURNAL_MAX + 1).decode("ascii", "strict")
     except UnicodeError:
         fail(f"owned teardown journal is malformed: {journal}")
     finally:
@@ -485,6 +489,8 @@ def publish_teardown_journal(
             f"{metadata_state}\t{metadata_digest}\n{launch_name}\n"
             f"{launch_state}\t{launch_digest}\n"
         ).encode("ascii")
+        if len(payload) > TEARDOWN_JOURNAL_MAX:
+            fail("owned teardown journal payload is too large")
         if os.write(fd, payload) != len(payload):
             raise OSError(errno.EIO, "short teardown journal write")
         os.fsync(fd)
@@ -515,7 +521,7 @@ def set_teardown_phase(directory_fd, name, expected_phase, phase, transaction):
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             fail(f"owned teardown journal is unsafe: {journal}")
-        payload = os.read(fd, 2049).decode("ascii", "strict")
+        payload = os.read(fd, TEARDOWN_JOURNAL_MAX + 1).decode("ascii", "strict")
         if parse_teardown_journal_payload(
                 payload, journal, f".{name}.teardown-quarantine"
         ) != loaded:
@@ -585,19 +591,77 @@ def teardown_state(directory_fd, name, transaction):
     return loaded[4]
 
 
-def teardown_remove_records(loaded):
+def teardown_record_commitments(loaded):
     records = loaded[7]
     if records is None:
-        return
+        return None, ()
     state_path, state_id, metadata_name, metadata_state, metadata_digest, \
         launch_name, launch_state, launch_digest = records
-    state_fd = open_owned_dir(state_path, state_id)
+    return (state_path, state_id), (
+        (metadata_name, metadata_state, metadata_digest),
+        (launch_name, launch_state, launch_digest),
+    )
+
+
+def teardown_quarantine_records(loaded):
+    state_owner, commitments = teardown_record_commitments(loaded)
+    if state_owner is None:
+        return
+    state_fd = open_owned_dir(*state_owner)
+    mutex_fd = operation_lock(state_fd, "teardown-records")
     try:
-        if raw_entry_state(state_fd, metadata_name) != "absent":
-            remove_entry(state_fd, metadata_name, metadata_state, metadata_digest)
-        if raw_entry_state(state_fd, launch_name) != "absent":
-            remove_entry(state_fd, launch_name, launch_state, launch_digest)
+        positions = []
+        for record_name, record_state, record_digest in commitments:
+            quarantine = f".{record_name}.teardown-quarantine"
+            live_state = raw_entry_state(state_fd, record_name)
+            quarantine_state = raw_entry_state(state_fd, quarantine)
+            if retired_entry_matches(
+                    state_fd, record_name, record_state, record_digest
+            ) and quarantine_state == "absent":
+                positions.append((record_name, quarantine, record_state, record_digest, True))
+            elif live_state == "absent" and retired_entry_matches(
+                    state_fd, quarantine, record_state, record_digest
+            ):
+                positions.append((record_name, quarantine, record_state, record_digest, False))
+            else:
+                fail(f"owned teardown record changed before retirement: {record_name}")
+        for record_name, quarantine, _, _, live in positions:
+            if live:
+                atomic_rename(state_fd, record_name, quarantine, False)
+        os.fsync(state_fd)
+        for record_name, quarantine, record_state, record_digest, _ in positions:
+            if raw_entry_state(state_fd, record_name) != "absent" \
+                    or not retired_entry_matches(
+                        state_fd, quarantine, record_state, record_digest
+                    ):
+                fail(f"owned teardown record quarantine changed: {record_name}")
     finally:
+        os.close(mutex_fd)
+        os.close(state_fd)
+
+
+def teardown_finalize_records(loaded):
+    state_owner, commitments = teardown_record_commitments(loaded)
+    if state_owner is None:
+        return
+    state_fd = open_owned_dir(*state_owner)
+    mutex_fd = operation_lock(state_fd, "teardown-records")
+    try:
+        for record_name, record_state, record_digest in commitments:
+            quarantine = f".{record_name}.teardown-quarantine"
+            if raw_entry_state(state_fd, record_name) != "absent":
+                fail(f"owned teardown record was recreated before commit: {record_name}")
+            quarantine_state = raw_entry_state(state_fd, quarantine)
+            if quarantine_state == "absent":
+                continue
+            if not retired_entry_matches(
+                    state_fd, quarantine, record_state, record_digest
+            ):
+                fail(f"owned teardown record quarantine changed: {quarantine}")
+            remove_entry(state_fd, quarantine, quarantine_state, record_digest)
+        os.fsync(state_fd)
+    finally:
+        os.close(mutex_fd)
         os.close(state_fd)
 
 
@@ -609,16 +673,14 @@ def teardown_command_complete(directory_fd, name, transaction):
     if raw_entry_state(directory_fd, name) != "absent":
         fail(f"owned teardown receipt was recreated before command completion: {name}")
     if phase in ("command-completed", "finalizing"):
-        teardown_remove_records(loaded)
         return
     if phase != "quarantined" or not retired_entry_matches(
             directory_fd, quarantine, expected_state, expected_digest
     ):
         fail(f"owned teardown quarantine changed before command completion: {quarantine}")
-    loaded = set_teardown_phase(
+    set_teardown_phase(
         directory_fd, name, "quarantined", "command-completed", transaction
     )
-    teardown_remove_records(loaded)
 
 
 def teardown_restore(directory_fd, name):
@@ -653,8 +715,6 @@ def teardown_finalize(directory_fd, name):
     if loaded is None:
         fail(f"owned teardown authorization is absent: {name}")
     journal, quarantine, expected_state, expected_digest, phase, transaction, _, _ = loaded
-    if phase in ("command-completed", "finalizing"):
-        teardown_remove_records(loaded)
     recover_remove(directory_fd, quarantine)
     if raw_entry_state(directory_fd, name) != "absent":
         fail(f"owned teardown receipt was recreated before commit: {name}")
@@ -664,12 +724,14 @@ def teardown_finalize(directory_fd, name):
                 directory_fd, quarantine, expected_state, expected_digest
         ):
             fail(f"owned teardown quarantine changed before finalization: {quarantine}")
-        set_teardown_phase(
+        teardown_quarantine_records(loaded)
+        loaded = set_teardown_phase(
             directory_fd, name, "command-completed", "finalizing", transaction
         )
         phase = "finalizing"
     if phase != "finalizing":
         fail(f"owned teardown command has not completed: {name}")
+    teardown_finalize_records(loaded)
     quarantine_state = raw_entry_state(directory_fd, quarantine)
     if quarantine_state != "absent":
         if not retired_entry_matches(
