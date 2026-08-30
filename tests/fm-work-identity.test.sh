@@ -1010,6 +1010,51 @@ test_dispatch_retire_run_authorizes_task_set() {
   pass "dispatch retirement authorizes complete task sets without nested locks"
 }
 
+test_dispatch_retire_run_refuses_invalid_set_without_quarantine() {
+  local home task launch transaction binding hash marker out rc=0
+  local -a cleanup_paths=()
+  home=$(make_home dispatch-retire-invalid-set)
+  marker="$home/command-ran"
+  for task in dispatch-retire-valid dispatch-retire-invalid; do
+    FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+      || fail "could not scaffold $task invalid-set retirement fixture"
+    launch="$home/state/$task.launch-brief.md"
+    transaction="retire-$task"
+    binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+      --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+      --transaction "$transaction") || fail "could not prepare $task dispatch"
+    hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+    fm_write_meta "$home/state/$task.meta" \
+      "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+      "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+      "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+      "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+      "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+    FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+      --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+      || fail "could not commit $task dispatch"
+    cleanup_paths+=("$home/state/$task.meta" "$launch")
+  done
+  rm -- "$home/data/dispatch-retire-invalid/work-identity-dispatch.json"
+  ln -s "$home/outside-receipt" \
+    "$home/data/dispatch-retire-invalid/work-identity-dispatch.json"
+  out=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run \
+    dispatch-retire-valid dispatch-retire-invalid -- \
+    sh -c 'marker=$1; shift; touch "$marker"; rm -- "$@"' sh \
+      "$marker" "${cleanup_paths[@]}" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "invalid dispatch set was authorized"
+  assert_absent "$marker" "invalid dispatch set ran its destructive command"
+  assert_present "$home/data/dispatch-retire-valid/work-identity-dispatch.json" \
+    "invalid dispatch set moved an earlier valid receipt"
+  assert_absent "$home/data/dispatch-retire-valid/.work-identity-dispatch.json.teardown-quarantine" \
+    "invalid dispatch set retained an earlier valid quarantine"
+  assert_absent "$home/data/dispatch-retire-valid/.work-identity-dispatch.json.teardown-journal" \
+    "invalid dispatch set retained an earlier valid teardown journal"
+  assert_contains "$out" "unsafe" \
+    "invalid dispatch set refusal did not identify its unsafe receipt"
+  pass "dispatch retirement validates a complete set before quarantine"
+}
+
 test_dispatch_retire_run_accepts_whole_home_removal() {
   local home task launch transaction binding hash rc=0
   home=$(make_home dispatch-retire-whole-home)
@@ -1043,10 +1088,15 @@ test_dispatch_retire_run_accepts_whole_home_removal() {
     "interrupted whole-home retirement lost its exact quarantined receipt"
   assert_present "$home/data/$task/.work-identity-dispatch.json.teardown-journal" \
     "interrupted whole-home retirement lost its recovery journal"
+  rm -- "$home/data/$task/.work-identity-dispatch.json.teardown-quarantine"
+  set +e
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" --whole-home -- \
-    rm -rf -- "$home" || fail "authorized whole-home retirement failed after removing its owner home"
-  assert_absent "$home" "authorized whole-home retirement retained its removed owner home"
-  pass "dispatch retirement accepts exact authorized whole-home removal"
+    sh -c 'rm -rf -- "$1"; exit 23' sh "$home"
+  rc=$?
+  set -e
+  [ "$rc" -eq 23 ] || fail "whole-home retirement hid wrapped command status $rc"
+  assert_absent "$home" "journal-only retirement recovery did not resume wrapped teardown"
+  pass "dispatch retirement recovers finalization and preserves command failure"
 }
 
 test_spawn_recovers_exact_created_endpoint() {
@@ -2729,6 +2779,8 @@ case "${FM_TEST_ONLY:-}" in
     ;;
   dispatch-retirement)
     test_dispatch_transaction_excludes_backlog_handoff
+    test_dispatch_retire_run_authorizes_task_set
+    test_dispatch_retire_run_refuses_invalid_set_without_quarantine
     test_dispatch_retire_run_accepts_whole_home_removal
     exit 0
     ;;
@@ -2759,6 +2811,7 @@ test_projection_serializes_identity_ownership
 test_handoff_receipts_require_owning_task
 test_dispatch_transaction_excludes_backlog_handoff
 test_dispatch_retire_run_authorizes_task_set
+test_dispatch_retire_run_refuses_invalid_set_without_quarantine
 test_dispatch_retire_run_accepts_whole_home_removal
 test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect

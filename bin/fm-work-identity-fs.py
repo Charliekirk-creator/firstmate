@@ -471,8 +471,13 @@ def teardown_restore(directory_fd, name):
     if loaded is None:
         return
     journal, quarantine, expected_state, expected_digest = loaded
+    recover_remove(directory_fd, quarantine)
     target_state = raw_entry_state(directory_fd, name)
     quarantine_state = raw_entry_state(directory_fd, quarantine)
+    if target_state == "absent" and quarantine_state == "absent":
+        remove(directory_fd, journal)
+        os.fsync(directory_fd)
+        return
     if target_state == "absent":
         if not retired_entry_matches(
                 directory_fd, quarantine, expected_state, expected_digest
@@ -493,6 +498,7 @@ def teardown_finalize(directory_fd, name):
     if loaded is None:
         fail(f"owned teardown authorization is absent: {name}")
     journal, quarantine, expected_state, expected_digest = loaded
+    recover_remove(directory_fd, quarantine)
     if raw_entry_state(directory_fd, name) != "absent":
         fail(f"owned teardown receipt was recreated before commit: {name}")
     quarantine_state = raw_entry_state(directory_fd, quarantine)
