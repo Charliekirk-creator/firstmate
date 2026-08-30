@@ -1011,7 +1011,7 @@ test_dispatch_retire_run_authorizes_task_set() {
 }
 
 test_dispatch_retire_run_accepts_whole_home_removal() {
-  local home task launch transaction binding hash
+  local home task launch transaction binding hash rc=0
   home=$(make_home dispatch-retire-whole-home)
   task=dispatch-retire-whole-home
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
@@ -1031,6 +1031,18 @@ test_dispatch_retire_run_accepts_whole_home_removal() {
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
     --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
     || fail "could not commit whole-home dispatch"
+  set +e
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" --whole-home -- \
+    sh -c 'kill -KILL "$PPID"; sleep 1'
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "interrupted whole-home retirement unexpectedly succeeded"
+  assert_absent "$home/data/$task/work-identity-dispatch.json" \
+    "interrupted whole-home retirement left its receipt at the mutable live path"
+  assert_present "$home/data/$task/.work-identity-dispatch.json.teardown-quarantine" \
+    "interrupted whole-home retirement lost its exact quarantined receipt"
+  assert_present "$home/data/$task/.work-identity-dispatch.json.teardown-journal" \
+    "interrupted whole-home retirement lost its recovery journal"
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" --whole-home -- \
     rm -rf -- "$home" || fail "authorized whole-home retirement failed after removing its owner home"
   assert_absent "$home" "authorized whole-home retirement retained its removed owner home"

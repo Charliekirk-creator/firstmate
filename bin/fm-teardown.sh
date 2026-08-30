@@ -219,18 +219,27 @@ teardown_directory_identity() {
     stat -c '%d:%i' "$1" 2>/dev/null
   fi
 }
+teardown_dispatch_evidence_exists() {
+  local data=$1 task=$2 owner="$1/$2" name=work-identity-dispatch.json
+  [ -e "$owner/$name" ] || [ -L "$owner/$name" ] \
+    || [ -e "$owner/.$name.teardown-quarantine" ] \
+    || [ -L "$owner/.$name.teardown-quarantine" ] \
+    || [ -e "$owner/.$name.teardown-journal" ] \
+    || [ -L "$owner/.$name.teardown-journal" ]
+}
 teardown_dispatch_authorized() {
   local state=$1 task=$2 state_real state_inode auth_state auth_inode auth_task
   local auth_lock_parent auth_lock_parent_inode auth_lock auth_pid auth_token
   local auth_receipt_parent auth_receipt_parent_inode auth_receipt_name
-  local auth_receipt_state auth_receipt_digest extra
+  local auth_quarantine_name auth_receipt_state auth_receipt_digest live_state extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 1
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   state_real=$(cd -- "$state" 2>/dev/null && pwd -P) || return 1
   state_inode=$(teardown_directory_identity "$state_real") || return 1
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
-    auth_receipt_parent_inode auth_receipt_name auth_receipt_state auth_receipt_digest extra; do
+    auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
+    auth_receipt_state auth_receipt_digest extra; do
     [ -z "$extra" ] || continue
     [ "$auth_state" = "$state_real" ] && [ "$auth_inode" = "$state_inode" ] \
       && [ "$auth_task" = "$task" ] || continue
@@ -238,8 +247,12 @@ teardown_dispatch_authorized() {
     python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-held \
       "$auth_lock_parent" "$auth_lock_parent_inode" "$auth_lock" "$auth_pid" "$auth_token" \
       >/dev/null 2>&1 || continue
-    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+    live_state=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-raw \
       "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_receipt_name" \
+      2>/dev/null) || continue
+    [ "$live_state" = absent ] || continue
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+      "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_quarantine_name" \
       "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 || continue
     TEARDOWN_DISPATCH_AUTH_PID=$auth_pid
     return 0
@@ -249,11 +262,12 @@ teardown_dispatch_authorized() {
 teardown_validate_dispatch_authorizations() {
   local auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
   local auth_lock auth_pid auth_token auth_receipt_parent auth_receipt_parent_inode
-  local auth_receipt_name auth_receipt_state auth_receipt_digest extra
+  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest live_state extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 0
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
-    auth_receipt_parent_inode auth_receipt_name auth_receipt_state auth_receipt_digest extra; do
+    auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
+    auth_receipt_state auth_receipt_digest extra; do
     [ -z "$extra" ] || { echo "error: malformed dispatch retirement authorization" >&2; return 1; }
     teardown_pid_is_ancestor "$auth_pid" \
       || { echo "error: dispatch retirement authorization owner is not active" >&2; return 1; }
@@ -261,14 +275,19 @@ teardown_validate_dispatch_authorizations() {
       "$auth_lock_parent" "$auth_lock_parent_inode" "$auth_lock" "$auth_pid" "$auth_token" \
       >/dev/null 2>&1 \
       || { echo "error: dispatch retirement authorization lock is not held" >&2; return 1; }
-    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+    live_state=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-raw \
       "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_receipt_name" \
+      2>/dev/null) \
+      || { echo "error: dispatch receipt path changed before teardown; nothing was changed" >&2; return 1; }
+    [ "$live_state" = absent ] \
+      || { echo "error: dispatch receipt was recreated before teardown; nothing was changed" >&2; return 1; }
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+      "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_quarantine_name" \
       "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 \
-      || { echo "error: dispatch receipt changed before teardown; nothing was changed" >&2; return 1; }
+      || { echo "error: dispatch receipt quarantine changed before teardown; nothing was changed" >&2; return 1; }
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
 }
-if { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
-     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; } \
+if teardown_dispatch_evidence_exists "$DATA" "$ID" \
    && ! teardown_dispatch_authorized "$STATE" "$ID"; then
   if [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ]; then
     echo "error: dispatch receipt changed before teardown; nothing was changed" >&2
@@ -2258,7 +2277,7 @@ collect_firstmate_home_dispatch_ids() {
     [ -e "$task_dir" ] || [ -L "$task_dir" ] || continue
     task=$(basename -- "$task_dir")
     receipt="$task_dir/work-identity-dispatch.json"
-    [ -e "$receipt" ] || [ -L "$receipt" ] || continue
+    teardown_dispatch_evidence_exists "$data" "$task" || continue
     if ! fm_task_id_path_safe "$task" || [ -L "$task_dir" ] || [ ! -d "$task_dir" ]; then
       echo "REFUSED: secondmate home $home has an unsafe dispatch receipt owner at $task_dir; forced teardown changed nothing" >&2
       return 1
@@ -2372,7 +2391,7 @@ preflight_descendant_task_locks() {
     if [ "${DESCENDANT_TASK_KINDS[$i]}" = receipt-only ]; then
       receipt="${state%/state}/data/$task_id/work-identity-dispatch.json"
       [ ! -e "$meta" ] && [ ! -L "$meta" ] \
-        && { [ -e "$receipt" ] || [ -L "$receipt" ]; } \
+        && teardown_dispatch_evidence_exists "${state%/state}/data" "$task_id" \
         && teardown_dispatch_authorized "$state" "$task_id" || {
           echo "REFUSED: receipt-only descendant task $task_id changed while forced teardown acquired its locks; forced teardown changed nothing" >&2
           return 1
@@ -2403,7 +2422,7 @@ preflight_descendant_task_locks() {
 
 teardown_dispatch_retire_preflight() {
   local home=$1 data=$2 state=$3 task=$4 receipt="$2/$4/work-identity-dispatch.json"
-  if [ -e "$receipt" ] || [ -L "$receipt" ]; then
+  if teardown_dispatch_evidence_exists "$data" "$task"; then
     if ! teardown_dispatch_authorized "$state" "$task"; then
       echo "REFUSED: descendant task $task has no owner-held dispatch retirement authorization; forced teardown changed nothing" >&2
       return 1
@@ -3057,8 +3076,7 @@ rmdir -- "$STATE/.$ID.worktree-request."* 2>/dev/null || true
 # retired endpoint; teardown only runs after landing is confirmed, so any
 # leftover unhandled steer here is moot rather than unlanded work.
 rm -rf "$STATE/$ID.inbox"
-if { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
-     || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; } \
+if teardown_dispatch_evidence_exists "$DATA" "$ID" \
    && ! teardown_dispatch_authorized "$STATE" "$ID"; then
   echo "error: work identity dispatch retirement was not authorized before teardown" >&2
   exit 1
@@ -3091,8 +3109,7 @@ fi
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
-  if { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
-       || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; } \
+  if teardown_dispatch_evidence_exists "$DATA" "$ID" \
      && teardown_dispatch_authorized "$STATE" "$ID"; then
     (
       trap '' HUP INT TERM

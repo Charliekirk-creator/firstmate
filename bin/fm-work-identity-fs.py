@@ -374,6 +374,141 @@ def remove_entry(directory_fd, name, expected_state, expected_digest, allow_hard
     recover_remove(directory_fd, name)
 
 
+def read_teardown_journal(directory_fd, name):
+    journal = f".{name}.teardown-journal"
+    quarantine = f".{name}.teardown-quarantine"
+    try:
+        fd = os.open(
+            journal,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 2048:
+        os.close(fd)
+        fail(f"owned teardown journal is unsafe: {journal}")
+    try:
+        payload = os.read(fd, 2049).decode("ascii", "strict")
+    except UnicodeError:
+        fail(f"owned teardown journal is malformed: {journal}")
+    finally:
+        os.close(fd)
+    lines = payload.splitlines()
+    if len(lines) != 3 or lines[0] != "v1" or lines[1] != quarantine:
+        fail(f"owned teardown journal is malformed: {journal}")
+    commitment = lines[2].split("\t")
+    if len(commitment) != 2:
+        fail(f"owned teardown journal is malformed: {journal}")
+    expected_state, expected_digest = commitment
+    fields = expected_state.split(":")
+    if len(fields) != 8 or fields[0] != "regular" \
+            or any(not field.isdigit() for field in fields[1:]) \
+            or int(fields[4]) != 1 \
+            or len(expected_digest) != 64 \
+            or any(char not in "0123456789abcdef" for char in expected_digest):
+        fail(f"owned teardown journal is malformed: {journal}")
+    return journal, quarantine, expected_state, expected_digest
+
+
+def publish_teardown_journal(directory_fd, name, expected_state, expected_digest):
+    journal = f".{name}.teardown-journal"
+    quarantine = f".{name}.teardown-quarantine"
+    temporary = f".{journal}.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+    published = False
+    try:
+        payload = f"v1\n{quarantine}\n{expected_state}\t{expected_digest}\n".encode("ascii")
+        if os.write(fd, payload) != len(payload):
+            raise OSError(errno.EIO, "short teardown journal write")
+        os.fsync(fd)
+        atomic_rename(directory_fd, temporary, journal, False)
+        published = True
+        os.fsync(directory_fd)
+    finally:
+        os.close(fd)
+        if not published:
+            remove(directory_fd, temporary)
+    return journal, quarantine, expected_state, expected_digest
+
+
+def teardown_quarantine(directory_fd, name, expected_state, expected_digest):
+    loaded = read_teardown_journal(directory_fd, name)
+    if loaded is None:
+        if entry_state(directory_fd, name) != expected_state \
+                or file_digest(directory_fd, name) != expected_digest:
+            fail(f"owned teardown receipt changed before quarantine: {name}")
+        quarantine = f".{name}.teardown-quarantine"
+        if raw_entry_state(directory_fd, quarantine) != "absent":
+            fail(f"owned teardown quarantine conflicts: {quarantine}")
+        loaded = publish_teardown_journal(
+            directory_fd, name, expected_state, expected_digest
+        )
+    journal, quarantine, journal_state, journal_digest = loaded
+    if journal_state != expected_state or journal_digest != expected_digest:
+        fail(f"owned teardown receipt does not match retained authorization: {name}")
+    target_state = raw_entry_state(directory_fd, name)
+    quarantine_state = raw_entry_state(directory_fd, quarantine)
+    if target_state != "absent":
+        if not retired_entry_matches(
+                directory_fd, name, expected_state, expected_digest
+        ) or quarantine_state != "absent":
+            fail(f"owned teardown receipt changed during quarantine: {name}")
+        atomic_rename(directory_fd, name, quarantine, False)
+        os.fsync(directory_fd)
+    elif not retired_entry_matches(
+            directory_fd, quarantine, expected_state, expected_digest
+    ):
+        fail(f"owned teardown quarantine changed: {quarantine}")
+    return journal, quarantine, expected_state, expected_digest
+
+
+def teardown_restore(directory_fd, name):
+    loaded = read_teardown_journal(directory_fd, name)
+    if loaded is None:
+        return
+    journal, quarantine, expected_state, expected_digest = loaded
+    target_state = raw_entry_state(directory_fd, name)
+    quarantine_state = raw_entry_state(directory_fd, quarantine)
+    if target_state == "absent":
+        if not retired_entry_matches(
+                directory_fd, quarantine, expected_state, expected_digest
+        ):
+            fail(f"owned teardown quarantine changed before restore: {quarantine}")
+        atomic_rename(directory_fd, quarantine, name, False)
+        os.fsync(directory_fd)
+    elif not retired_entry_matches(
+            directory_fd, name, expected_state, expected_digest
+    ) or quarantine_state != "absent":
+        fail(f"owned teardown receipt changed before restore: {name}")
+    remove(directory_fd, journal)
+    os.fsync(directory_fd)
+
+
+def teardown_finalize(directory_fd, name):
+    loaded = read_teardown_journal(directory_fd, name)
+    if loaded is None:
+        fail(f"owned teardown authorization is absent: {name}")
+    journal, quarantine, expected_state, expected_digest = loaded
+    if raw_entry_state(directory_fd, name) != "absent":
+        fail(f"owned teardown receipt was recreated before commit: {name}")
+    quarantine_state = raw_entry_state(directory_fd, quarantine)
+    if quarantine_state != "absent":
+        if not retired_entry_matches(
+                directory_fd, quarantine, expected_state, expected_digest
+        ):
+            fail(f"owned teardown quarantine changed before commit: {quarantine}")
+        quarantine_current = entry_state(directory_fd, quarantine)
+        conditional_remove(
+            directory_fd, quarantine, quarantine_current, expected_digest
+        )
+    remove(directory_fd, journal)
+    os.fsync(directory_fd)
+
+
 def operation_lock(directory_fd, name):
     del name
     fd = os.dup(directory_fd)
@@ -1296,6 +1431,35 @@ def main():
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 lock_try(directory_fd, name, int(pid_text), token, stale_after)
+            finally:
+                os.close(mutex_fd)
+        elif command == "teardown-quarantine":
+            if len(sys.argv) != 7:
+                fail("teardown-quarantine requires expected receipt state and SHA-256")
+            expected_state, expected_digest = sys.argv[5:7]
+            if len(expected_digest) != 64 \
+                    or any(char not in "0123456789abcdef" for char in expected_digest):
+                fail("teardown receipt SHA-256 is malformed")
+            mutex_fd = operation_lock(directory_fd, name)
+            try:
+                _, quarantine, _, _ = teardown_quarantine(
+                    directory_fd, name, expected_state, expected_digest
+                )
+                print(
+                    f"{entry_state(directory_fd, quarantine)}"
+                    f"\t{file_digest(directory_fd, quarantine)}"
+                )
+            finally:
+                os.close(mutex_fd)
+        elif command in ("teardown-restore", "teardown-finalize"):
+            if len(sys.argv) != 5:
+                fail(f"{command} accepts no additional arguments")
+            mutex_fd = operation_lock(directory_fd, name)
+            try:
+                if command == "teardown-restore":
+                    teardown_restore(directory_fd, name)
+                else:
+                    teardown_finalize(directory_fd, name)
             finally:
                 os.close(mutex_fd)
         elif command in ("lock-held", "lock-release"):

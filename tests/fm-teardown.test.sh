@@ -648,14 +648,16 @@ SH
 }
 
 test_dispatch_receipt_commits_only_after_successful_teardown() {
-  local case_dir receipt rc=0
+  local case_dir receipt quarantine rc=0
   case_dir=$(make_case dispatch-retirement-commit)
   configure_completed_dispatch "$case_dir"
   receipt="$case_dir/data/task-x1/work-identity-dispatch.json"
+  quarantine="$case_dir/data/task-x1/.work-identity-dispatch.json.teardown-quarantine"
   cat > "$case_dir/fakebin/treehouse" <<SH
 #!/usr/bin/env bash
-[ -f "$receipt" ] || exit 9
-printf '%s\n' receipt-present >> "$case_dir/treehouse.log"
+[ ! -e "$receipt" ] || exit 8
+[ -f "$quarantine" ] || exit 9
+printf '%s\n' receipt-quarantined >> "$case_dir/treehouse.log"
 exit 1
 SH
   chmod +x "$case_dir/fakebin/treehouse"
@@ -664,9 +666,11 @@ SH
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   [ "$rc" -ne 0 ] || fail "failed treehouse return unexpectedly completed teardown"
   assert_present "$case_dir/treehouse.log" \
-    "destructive teardown started after its dispatch receipt was retired"
+    "destructive teardown started without quarantining its exact dispatch receipt"
   assert_present "$receipt" \
-    "failed teardown permanently retired its dispatch receipt"
+    "failed teardown did not restore its quarantined dispatch receipt"
+  assert_absent "$quarantine" \
+    "failed teardown retained its quarantine after restoring the dispatch receipt"
   assert_present "$case_dir/state/task-x1.meta" \
     "failed teardown removed task metadata"
   assert_present "$case_dir/state/task-x1.launch-brief.md" \
