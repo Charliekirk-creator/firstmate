@@ -2752,8 +2752,9 @@ dispatch_retire_preflight() {  # <task-id>
 
 dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [args...]
   local task rc meta launch authorization authorizations= whole_home=0 owner_pid=${BASHPID:-$$}
-  local receipt_parent receipt_parent_id receipt_name receipt_state receipt_digest
-  local -a tasks=("$1")
+  local receipt_parent receipt_parent_id receipt_name receipt_state receipt_digest index
+  local -a tasks=("$1") receipt_parents=() receipt_parent_ids=() receipt_names=()
+  local -a receipt_states=() receipt_digests=()
   shift
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
     if [ "$1" = --whole-home ]; then
@@ -2777,6 +2778,11 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     receipt_name=${DISPATCH_STATE##*/}
     receipt_state=${DISPATCH_STATE_ENTRY_STATE:-absent}
     receipt_digest=${DISPATCH_STATE_ENTRY_DIGEST:--}
+    receipt_parents+=("$receipt_parent")
+    receipt_parent_ids+=("$receipt_parent_id")
+    receipt_names+=("$receipt_name")
+    receipt_states+=("$receipt_state")
+    receipt_digests+=("$receipt_digest")
     identity_lock_release
     authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$STATE_REAL" "$STATE_DIR_ID" "$task" \
@@ -2801,7 +2807,8 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
      && [ ! -e "$FM_HOME_REAL" ] && [ ! -L "$FM_HOME_REAL" ]; then
     return 0
   fi
-  for task in "${tasks[@]}"; do
+  for index in "${!tasks[@]}"; do
+    task=${tasks[$index]}
     meta="$STATE_REAL/$task.meta"
     launch="$STATE_REAL/$task.launch-brief.md"
     identity_lock_acquire "$task"
@@ -2809,15 +2816,26 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
       || die "task $task still has dispatch metadata"
     [ ! -e "$launch" ] && [ ! -L "$launch" ] \
       || die "task $task still has launch instructions"
-    if [ -e "$DISPATCH_STATE" ] || [ -L "$DISPATCH_STATE" ]; then
+    if [ "${receipt_states[$index]}" != absent ]; then
+      python3 "$FS_OWNER" snapshot \
+        "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
+        "${receipt_names[$index]}" "${receipt_states[$index]}" \
+        "${receipt_digests[$index]}" >/dev/null \
+        || die "task $task dispatch changed during teardown"
       read_dispatch_state "$task"
       [ "$DISPATCH_STATUS" = completed ] || die "task $task dispatch changed during teardown"
       [ "$DISPATCH_INSTRUCTIONS" = "$launch" ] \
         || die "task $task dispatch instructions path changed during teardown"
       retire_dispatch_prior_locked
-      owned_remove "$DISPATCH_STATE" "work identity dispatch" \
-        "$DISPATCH_STATE_ENTRY_STATE" "$DISPATCH_STATE_ENTRY_DIGEST"
     fi
+    identity_lock_release
+  done
+  for index in "${!tasks[@]}"; do
+    [ "${receipt_states[$index]}" != absent ] || continue
+    task=${tasks[$index]}
+    identity_lock_acquire "$task"
+    owned_remove "$DISPATCH_STATE" "work identity dispatch" \
+      "${receipt_states[$index]}" "${receipt_digests[$index]}"
     identity_lock_release
   done
 }

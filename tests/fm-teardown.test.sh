@@ -188,6 +188,33 @@ write_meta() {
     "spawn_gen=teardown-test-task-x1"
 }
 
+configure_completed_dispatch() {
+  local case_dir task=task-x1 launch transaction binding hash
+  case_dir=$(cd "$1" && pwd -P)
+  FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-brief.sh" "$task" firstmate --mode local-only >/dev/null \
+    || fail "dispatch fixture could not create a task brief"
+  launch="$case_dir/state/$task.launch-brief.md"
+  transaction=teardown-dispatch-transaction
+  binding=$(FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-work-identity.sh" dispatch-prepare "$task" \
+      --brief "$case_dir/data/$task/brief.md" --instructions-path "$launch" \
+      --transaction "$transaction") || fail "dispatch fixture could not prepare dispatch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$case_dir/state/$task.meta" \
+    "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+    "worktree=$case_dir/wt" "project=$case_dir/project" \
+    "launch_brief=$launch" "launch_brief_sha256=$hash" \
+    "work_identity_dispatch_transaction=$transaction" "harness=codex" \
+    "kind=ship" "mode=local-only" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-work-identity.sh" dispatch-commit "$task" \
+      --brief "$launch" --meta "$case_dir/state/$task.meta" \
+      --transaction "$transaction" \
+    || fail "dispatch fixture could not commit dispatch"
+}
+
 # Commit something on the worktree's task branch. Args: case_dir [message]
 wt_commit() {
   local case_dir=$1 msg=${2:-wt work}
@@ -618,6 +645,45 @@ SH
   assert_absent "$case_dir/treehouse.log" \
     "malformed dispatch receipt allowed worktree return before refusal"
   pass "teardown preflights dispatch ownership before destructive cleanup"
+}
+
+test_dispatch_receipt_commits_only_after_successful_teardown() {
+  local case_dir receipt rc=0
+  case_dir=$(make_case dispatch-retirement-commit)
+  configure_completed_dispatch "$case_dir"
+  receipt="$case_dir/data/task-x1/work-identity-dispatch.json"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+[ -f "$receipt" ] || exit 9
+printf '%s\n' receipt-present >> "$case_dir/treehouse.log"
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  FM_HOME="$case_dir" FM_DATA_OVERRIDE="$case_dir/data" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "failed treehouse return unexpectedly completed teardown"
+  assert_present "$case_dir/treehouse.log" \
+    "destructive teardown started after its dispatch receipt was retired"
+  assert_present "$receipt" \
+    "failed teardown permanently retired its dispatch receipt"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "failed teardown removed task metadata"
+  assert_present "$case_dir/state/task-x1.launch-brief.md" \
+    "failed teardown removed launch instructions"
+
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  rc=0
+  FM_HOME="$case_dir" FM_DATA_OVERRIDE="$case_dir/data" \
+    run_teardown "$case_dir" >> "$case_dir/stdout" 2>> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "successful retry should complete dispatch retirement"
+  assert_absent "$receipt" \
+    "successful teardown retained its completed dispatch receipt"
+  pass "dispatch receipts commit retirement only after successful teardown"
 }
 
 test_teardown_closes_the_backlog_item_itself() {
@@ -2732,6 +2798,7 @@ EOF
 case "${FM_TEST_ONLY:-}" in
   dispatch-retirement)
     test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+    test_dispatch_receipt_commits_only_after_successful_teardown
     exit 0
     ;;
   review-fixes)
@@ -2746,6 +2813,7 @@ esac
 
 test_local_only_fork_remote_allows
 test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+test_dispatch_receipt_commits_only_after_successful_teardown
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses

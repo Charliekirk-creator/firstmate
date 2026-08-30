@@ -201,7 +201,6 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 }
 TEARDOWN_ORIGINAL_ARGS=("$@")
 TEARDOWN_DISPATCH_AUTH_PID=
-TEARDOWN_DISPATCH_AUTHORIZATIONS_CONSUMED=0
 teardown_pid_is_ancestor() {
   local wanted=$1 current=$$ parent
   case "$wanted" in ''|*[!0-9]*) return 1 ;; esac
@@ -247,11 +246,10 @@ teardown_dispatch_authorized() {
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
   return 1
 }
-teardown_consume_dispatch_authorizations() {
+teardown_validate_dispatch_authorizations() {
   local auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
   local auth_lock auth_pid auth_token auth_receipt_parent auth_receipt_parent_inode
   local auth_receipt_name auth_receipt_state auth_receipt_digest extra
-  [ "$TEARDOWN_DISPATCH_AUTHORIZATIONS_CONSUMED" -eq 0 ] || return 0
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 0
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
@@ -268,16 +266,6 @@ teardown_consume_dispatch_authorizations() {
       "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 \
       || { echo "error: dispatch receipt changed before teardown; nothing was changed" >&2; return 1; }
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
-  while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
-    auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
-    auth_receipt_parent_inode auth_receipt_name auth_receipt_state auth_receipt_digest extra; do
-    [ "$auth_receipt_state" = absent ] && continue
-    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" remove \
-      "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_receipt_name" \
-      "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 \
-      || { echo "error: dispatch receipt changed before teardown; nothing was changed" >&2; return 1; }
-  done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
-  TEARDOWN_DISPATCH_AUTHORIZATIONS_CONSUMED=1
 }
 if { [ -e "$DATA/$ID/work-identity-dispatch.json" ] \
      || [ -L "$DATA/$ID/work-identity-dispatch.json" ]; } \
@@ -2872,7 +2860,7 @@ if [ "$BACKEND" = herdr ]; then
   TEARDOWN_HERDR_PANE=$FM_BACKEND_HERDR_PANE
 fi
 
-teardown_consume_dispatch_authorizations || exit 1
+teardown_validate_dispatch_authorizations || exit 1
 
 BACKLOG_CLOSED=0
 BACKLOG_SKIP_REASON=
