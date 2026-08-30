@@ -507,7 +507,26 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
       FM_BACKEND_HERDR_PANE=pane-a
     }
     fm_backend_herdr_target_ready() { return 0; }
-    fm_backend_herdr_cli() { printf '%s\n' "$*" >> "$TMP_ROOT/herdr-prompt.log"; }
+    fm_backend_herdr_cli() {
+      local arg previous= token_value=
+      printf '%s\n' "$*" >> "$TMP_ROOT/herdr-prompt.log"
+      case "$*" in
+        *" agent get "*)
+          printf '{"result":{"agent":{"agent_status":"idle","state_change_seq":%s,"tokens":{"fm_kimi_submit":"%s"}}}}\n' \
+            "$(cat "$TMP_ROOT/herdr-sequence")" "$(cat "$TMP_ROOT/herdr-token" 2>/dev/null || true)"
+          ;;
+        *" pane report-metadata "*" --token "*)
+          for arg in "$@"; do
+            [ "$previous" != --token ] || token_value=${arg#fm_kimi_submit=}
+            previous=$arg
+          done
+          printf '%s\n' "$token_value" > "$TMP_ROOT/herdr-token"
+          ;;
+        *" pane report-metadata "*" --clear-token "*) rm -f -- "$TMP_ROOT/herdr-token" ;;
+        *" agent prompt "*) printf '8\n' > "$TMP_ROOT/herdr-sequence" ;;
+      esac
+    }
+    printf '7\n' > "$TMP_ROOT/herdr-sequence"
     FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${evidence}.entering" \
       FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE="$evidence" \
       FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=durable-presend \
@@ -517,10 +536,47 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
   [ "$(tr -d '\n' < "$evidence")" = durable-presend ] \
     || fail "Herdr atomic prompt did not publish transaction-scoped acceptance"
   assert_absent "${evidence}.entering" "Herdr accepted prompt retained pre-acceptance evidence"
-  assert_grep "session-a agent prompt pane-a brief" "$TMP_ROOT/herdr-prompt.log" \
-    "Herdr journaled submission did not use the atomic agent prompt boundary"
+  assert_grep "session-a agent prompt pane-a brief --wait --until working" "$TMP_ROOT/herdr-prompt.log" \
+    "Herdr journaled submission did not use the state-sequenced agent prompt boundary"
   assert_not_contains "$(cat "$TMP_ROOT/herdr-prompt.log")" "FM_SUBMIT:" \
     "Herdr submission exposed a terminal-output marker as acceptance authority"
+  printf 'durable-presend\t7\n' > "${evidence}.entering.baseline"
+  printf 'durable-presend:7\n' > "$TMP_ROOT/herdr-token"
+  printf '8\n' > "$TMP_ROOT/herdr-sequence"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 1
+    fm_backend_herdr_target_ready() {
+      FM_BACKEND_HERDR_SESSION=session-a
+      FM_BACKEND_HERDR_PANE=pane-a
+    }
+    fm_backend_herdr_cli() {
+      printf '{"result":{"agent":{"state_change_seq":%s,"tokens":{"fm_kimi_submit":"%s"}}}}\n' \
+        "$(cat "$TMP_ROOT/herdr-sequence")" "$(cat "$TMP_ROOT/herdr-token")"
+    }
+    FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${evidence}.entering" \
+      fm_backend_herdr_prompt_receipt_state session-a:pane-a durable-presend
+  ) || fail "Herdr accepted prompt sequence could not be reconciled"
+  [ "$out" = accepted ] \
+    || fail "Herdr accepted prompt sequence recovered as '$out'"
+  printf '7\n' > "$TMP_ROOT/herdr-sequence"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 1
+    fm_backend_herdr_target_ready() {
+      FM_BACKEND_HERDR_SESSION=session-a
+      FM_BACKEND_HERDR_PANE=pane-a
+    }
+    fm_backend_herdr_cli() {
+      printf '{"result":{"agent":{"state_change_seq":7,"tokens":{"fm_kimi_submit":"durable-presend:7"}}}}\n'
+    }
+    FM_BACKEND_HERDR_RECEIPT_POLLS=1 \
+      FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${evidence}.entering" \
+      fm_backend_herdr_prompt_receipt_state session-a:pane-a durable-presend
+  ) || fail "Herdr pre-send prompt sequence could not be reconciled"
+  [ "$out" = unsent ] || fail "Herdr pre-send prompt sequence recovered as '$out'"
   pass "Herdr submission fails closed without durable server acceptance"
 }
 

@@ -2772,6 +2772,12 @@ dispatch_teardown_state_locked() {  # <transaction>
   python3 "$FS_OWNER" teardown-state "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$1"
 }
 
+dispatch_teardown_records_quarantine_locked() {  # <transaction>
+  local receipt_name=${DISPATCH_STATE##*/}
+  python3 "$FS_OWNER" teardown-records-quarantine \
+    "$TASK_DIR" "$TASK_DIR_ID" "$receipt_name" "$1"
+}
+
 dispatch_teardown_complete_locked() {  # <transaction>
   local receipt_name=${DISPATCH_STATE##*/}
   python3 "$FS_OWNER" teardown-command-complete \
@@ -2923,18 +2929,36 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     receipt_digests[$index]=$receipt_digest
     quarantined+=("$index")
     identity_lock_release
-    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$STATE_REAL" "$STATE_DIR_ID" "$task" \
       "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
       "$ACTIVE_PUBLICATION_LOCK" "$owner_pid" "$ACTIVE_PUBLICATION_LOCK_TOKEN" \
       "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
       "${receipt_names[$index]}" "${quarantine_names[$index]}" \
-      "$receipt_state" "$receipt_digest" "$batch_token")
+      "$receipt_state" "$receipt_digest" "$batch_token" \
+      "$task.meta" "${metadata_states[$index]}" "${metadata_digests[$index]}" \
+      "$task.launch-brief.md" "${launch_states[$index]}" "${launch_digests[$index]}")
     if [ -n "$authorizations" ]; then
       authorizations="$authorizations"$'\n'"$authorization"
     else
       authorizations=$authorization
     fi
+  done
+  for index in "${!tasks[@]}"; do
+    [ "${receipt_present[$index]}" = 1 ] || continue
+    task=${tasks[$index]}
+    identity_lock_acquire "$task"
+    if ! dispatch_teardown_records_quarantine_locked "$batch_token"; then
+      identity_lock_release
+      for rollback in "${quarantined[@]}"; do
+        task=${tasks[$rollback]}
+        identity_lock_acquire "$task"
+        dispatch_teardown_restore_locked
+        identity_lock_release
+      done
+      die "cannot quarantine complete work identity dispatch record set for teardown"
+    fi
+    identity_lock_release
   done
   if [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ]; then
     authorizations="${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS}"$'\n'"$authorizations"

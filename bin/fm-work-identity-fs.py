@@ -640,6 +640,38 @@ def teardown_quarantine_records(loaded):
         os.close(state_fd)
 
 
+def teardown_restore_records(loaded):
+    state_owner, commitments = teardown_record_commitments(loaded)
+    if state_owner is None:
+        return
+    state_fd = open_owned_dir(*state_owner)
+    mutex_fd = operation_lock(state_fd, "teardown-records")
+    try:
+        positions = []
+        for record_name, record_state, record_digest in commitments:
+            quarantine = f".{record_name}.teardown-quarantine"
+            recover_remove(state_fd, quarantine)
+            live_state = raw_entry_state(state_fd, record_name)
+            quarantine_state = raw_entry_state(state_fd, quarantine)
+            if retired_entry_matches(
+                    state_fd, record_name, record_state, record_digest
+            ) and quarantine_state == "absent":
+                positions.append((record_name, quarantine, False))
+            elif live_state == "absent" and retired_entry_matches(
+                    state_fd, quarantine, record_state, record_digest
+            ):
+                positions.append((record_name, quarantine, True))
+            else:
+                fail(f"owned teardown record changed before restore: {record_name}")
+        for record_name, quarantine, quarantined in positions:
+            if quarantined:
+                atomic_rename(state_fd, quarantine, record_name, False)
+        os.fsync(state_fd)
+    finally:
+        os.close(mutex_fd)
+        os.close(state_fd)
+
+
 def teardown_finalize_records(loaded):
     state_owner, commitments = teardown_record_commitments(loaded)
     if state_owner is None:
@@ -649,6 +681,7 @@ def teardown_finalize_records(loaded):
     try:
         for record_name, record_state, record_digest in commitments:
             quarantine = f".{record_name}.teardown-quarantine"
+            recover_remove(state_fd, quarantine)
             if raw_entry_state(state_fd, record_name) != "absent":
                 fail(f"owned teardown record was recreated before commit: {record_name}")
             quarantine_state = raw_entry_state(state_fd, quarantine)
@@ -690,6 +723,7 @@ def teardown_restore(directory_fd, name):
     journal, quarantine, expected_state, expected_digest, phase, _, _, _ = loaded
     if phase != "quarantined":
         fail(f"owned completed teardown cannot be restored: {name}")
+    teardown_restore_records(loaded)
     recover_remove(directory_fd, quarantine)
     target_state = raw_entry_state(directory_fd, name)
     quarantine_state = raw_entry_state(directory_fd, quarantine)
@@ -1696,7 +1730,9 @@ def main():
                 )
             finally:
                 os.close(mutex_fd)
-        elif command in ("teardown-state", "teardown-command-complete"):
+        elif command in (
+                "teardown-state", "teardown-records-quarantine",
+                "teardown-command-complete"):
             if len(sys.argv) != 6 or not valid_token(sys.argv[5]):
                 fail(f"{command} requires a transaction")
             transaction = sys.argv[5]
@@ -1704,6 +1740,12 @@ def main():
             try:
                 if command == "teardown-state":
                     print(teardown_state(directory_fd, name, transaction))
+                elif command == "teardown-records-quarantine":
+                    loaded = read_teardown_journal(directory_fd, name)
+                    if loaded is None or loaded[4] != "quarantined" \
+                            or loaded[5] != transaction:
+                        fail(f"owned teardown authorization is absent or mismatched: {name}")
+                    teardown_quarantine_records(loaded)
                 else:
                     teardown_command_complete(directory_fd, name, transaction)
             finally:

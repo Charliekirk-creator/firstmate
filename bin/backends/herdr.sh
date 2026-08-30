@@ -2587,21 +2587,99 @@ fm_backend_herdr_send_literal() {  # <target> <text>
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane send-text "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
 }
 
+fm_backend_herdr_prompt_snapshot() {  # <target>
+  local out
+  fm_backend_herdr_target_ready "$1" || return 1
+  out=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent get \
+    "$FM_BACKEND_HERDR_PANE" 2>/dev/null) || return 1
+  printf '%s' "$out" | jq -er '
+    [.result.agent.state_change_seq, (.result.agent.agent_status // "")]
+    | select((.[0] | type) == "number" and .[0] >= 0)
+    | @tsv
+  ' 2>/dev/null
+}
+
 fm_backend_herdr_prompt_receipt_state() {  # <target> <token>
-  printf 'unknown'
+  local target=$1 token=$2 baseline_file=${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}.baseline
+  local recorded_token baseline raw current server_token extra observed=0
+  local i=0 max=${FM_BACKEND_HERDR_RECEIPT_POLLS:-20}
+  [ -n "${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}" ] \
+    && [ -f "$baseline_file" ] && [ ! -L "$baseline_file" ] || { printf 'unknown'; return 0; }
+  IFS=$'\t' read -r recorded_token baseline extra < "$baseline_file" || { printf 'unknown'; return 0; }
+  [ -z "$extra" ] && [ "$recorded_token" = "$token" ] || { printf 'unknown'; return 0; }
+  case "$baseline" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  while [ "$i" -lt "$max" ]; do
+    raw=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent get \
+      "$FM_BACKEND_HERDR_PANE" 2>/dev/null) || raw=
+    if [ -n "$raw" ]; then
+      IFS=$'\t' read -r current server_token extra <<EOF
+$(printf '%s' "$raw" | jq -r '
+  [.result.agent.state_change_seq, (.result.agent.tokens.fm_kimi_submit // ""), ""]
+  | @tsv
+' 2>/dev/null)
+EOF
+      [ -z "$extra" ] || { printf 'unknown'; return 0; }
+      case "$current" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+      [ "$server_token" = "$token:$baseline" ] || { printf 'unknown'; return 0; }
+      observed=1
+      if [ "$current" -gt "$baseline" ]; then printf 'accepted'; return 0; fi
+      [ "$current" -eq "$baseline" ] || { printf 'unknown'; return 0; }
+    fi
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "${FM_BACKEND_HERDR_RECEIPT_INTERVAL:-0.05}"
+  done
+  [ "$observed" -eq 1 ] && printf 'unsent' || printf 'unknown'
+}
+
+fm_backend_herdr_prompt_baseline_publish() {  # <target> <token>
+  local target=$1 token=$2 snapshot sequence status baseline_file tmp
+  baseline_file=${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}.baseline
+  [ -n "${FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE:-}" ] || return 1
+  snapshot=$(fm_backend_herdr_prompt_snapshot "$target") || return 1
+  IFS=$'\t' read -r sequence status <<EOF
+$snapshot
+EOF
+  case "$sequence" in ''|*[!0-9]*) return 1 ;; esac
+  case "$status" in idle|done|blocked) ;; *) return 1 ;; esac
+  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane report-metadata \
+    "$FM_BACKEND_HERDR_PANE" --source firstmate-kimi-submit \
+    --token "fm_kimi_submit=$token:$sequence" >/dev/null 2>&1 || return 1
+  tmp="${baseline_file}.tmp.${BASHPID:-$$}"
+  (umask 077; printf '%s\t%s\n' "$token" "$sequence" > "$tmp") \
+    && chmod 600 "$tmp" && mv -- "$tmp" "$baseline_file" || {
+      rm -f -- "$tmp"
+      return 1
+    }
+}
+
+fm_backend_herdr_prompt_receipt_clear() {  # <target>
+  fm_backend_herdr_parse_target "$1" || return 1
+  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane report-metadata \
+    "$FM_BACKEND_HERDR_PANE" --source firstmate-kimi-submit \
+    --clear-token fm_kimi_submit >/dev/null 2>&1
 }
 
 fm_backend_herdr_submit_journaled_prompt() {  # <target> <text>
   local target=$1 text=$2 token=${FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN:-} receipt_state
   [ -n "$token" ] || { printf 'pending-unproven'; return 0; }
-  fm_backend_herdr_target_ready "$target" || { fm_backend_submit_unsent_verdict; return 0; }
+  fm_backend_herdr_prompt_baseline_publish "$target" "$token" \
+    || { fm_backend_submit_unsent_verdict; return 0; }
   fm_backend_submit_entering_evidence || { printf 'pending-unproven'; return 0; }
   if ! fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" agent prompt \
-    "$FM_BACKEND_HERDR_PANE" "$text" >/dev/null 2>&1; then
+    "$FM_BACKEND_HERDR_PANE" "$text" --wait --until working \
+    --timeout "${FM_BACKEND_HERDR_PROMPT_TIMEOUT_MS:-5000}" >/dev/null 2>&1; then
     receipt_state=$(fm_backend_herdr_prompt_receipt_state "$target" "$token")
     case "$receipt_state" in
-      accepted) printf 'empty' ;;
-      unsent) fm_backend_submit_unsent_verdict ;;
+      accepted)
+        fm_backend_submit_typed_evidence || { printf 'pending-unproven'; return 0; }
+        fm_backend_herdr_prompt_receipt_clear "$target" || true
+        printf 'empty'
+        ;;
+      unsent)
+        fm_backend_herdr_prompt_receipt_clear "$target" || true
+        fm_backend_submit_unsent_verdict
+        ;;
       *) printf 'pending-unproven' ;;
     esac
     return 0
@@ -2611,6 +2689,7 @@ fm_backend_herdr_submit_journaled_prompt() {  # <target> <text>
     [ "$receipt_state" = accepted ] && printf 'empty' || printf 'pending-unproven'
     return 0
   }
+  fm_backend_herdr_prompt_receipt_clear "$target" || true
   printf 'empty'
 }
 

@@ -789,8 +789,11 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
         [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
         evidence_token=$(tr -d '\n' < "$entering") || return 1
         [ "$evidence_token" = "$token" ] || return 1
-        fm_backend_dead_entering_verdict "$backend" "$target" "$expected_label" \
-          "$entering" "$token" || return 1
+        FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE=$entering \
+          FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
+          FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
+          fm_backend_dead_entering_verdict "$backend" "$target" "$expected_label" \
+            "$entering" "$token" || return 1
       else
         printf 'unsent'
       fi
@@ -837,8 +840,11 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
           [ -f "$entering" ] && [ ! -L "$entering" ] || return 1
           evidence_token=$(tr -d '\n' < "$entering") || return 1
           [ "$evidence_token" = "$token" ] || return 1
-          fm_backend_dead_entering_verdict "$backend" "$target" "$expected_label" \
-            "$entering" "$token" || return 1
+          FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE=$entering \
+            FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
+            FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
+            fm_backend_dead_entering_verdict "$backend" "$target" "$expected_label" \
+              "$entering" "$token" || return 1
         else
           printf 'unsent'
         fi

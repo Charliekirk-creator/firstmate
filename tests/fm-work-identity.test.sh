@@ -998,6 +998,18 @@ test_dispatch_retire_run_authorizes_task_set() {
       || fail "could not commit $task dispatch"
     cleanup_paths+=("$home/state/$task.meta" "$launch")
   done
+  if FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run \
+    dispatch-retire-set-a dispatch-retire-set-b -- false; then
+    fail "failed task-set teardown unexpectedly committed retirement"
+  fi
+  for task in dispatch-retire-set-a dispatch-retire-set-b; do
+    assert_present "$home/data/$task/work-identity-dispatch.json" \
+      "$task dispatch receipt was not restored after failed task-set teardown"
+    assert_present "$home/state/$task.meta" \
+      "$task metadata was not restored after failed task-set teardown"
+    assert_present "$home/state/$task.launch-brief.md" \
+      "$task launch instructions were not restored after failed task-set teardown"
+  done
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run \
     dispatch-retire-set-a dispatch-retire-set-b -- true \
     || fail "one owner could not retire a complete task set"
@@ -1087,6 +1099,10 @@ test_dispatch_retire_run_accepts_whole_home_removal() {
     "interrupted whole-home retirement lost its exact quarantined receipt"
   assert_present "$home/data/$task/.work-identity-dispatch.json.teardown-journal" \
     "interrupted whole-home retirement lost its recovery journal"
+  assert_present "$home/state/.$task.meta.teardown-quarantine" \
+    "interrupted whole-home retirement lost its metadata quarantine"
+  assert_present "$home/state/.$task.launch-brief.md.teardown-quarantine" \
+    "interrupted whole-home retirement lost its launch quarantine"
   rm -- "$home/data/$task/.work-identity-dispatch.json.teardown-quarantine"
   rc=0
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" --whole-home -- \
@@ -1100,6 +1116,7 @@ test_dispatch_retire_run_accepts_whole_home_removal() {
 
 test_dispatch_retire_run_recovers_completed_command() {
   local home task launch transaction binding hash owner owner_id journal marker command rc=0
+  local quarantine quarantine_name retired remove_journal quarantine_state quarantine_digest
   home=$(make_home dispatch-retire-completed-command)
   task=dispatch-retire-completed-command
   marker="$home/command-runs"
@@ -1126,13 +1143,35 @@ test_dispatch_retire_run_recovers_completed_command() {
   command='token=$(sed -n "4p" "$3"); python3 "$4" teardown-command-complete "$5" "$6" work-identity-dispatch.json "$token"; [ -e "$1" ] && [ -e "$2" ] || exit 8; printf "run\n" >> "$7"; kill -KILL "$PPID"'
   set +e
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
-    sh -c "$command" sh "$home/state/$task.meta" "$launch" "$journal" \
+    sh -c "$command" sh "$home/state/.$task.meta.teardown-quarantine" \
+      "$home/state/.$task.launch-brief.md.teardown-quarantine" "$journal" \
       "$ROOT/bin/fm-work-identity-fs.py" "$owner" "$owner_id" "$marker"
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "completed-command interruption unexpectedly returned success"
+  python3 - "$journal" <<'PY' || fail "could not record interrupted teardown finalization phase"
+import os
+import sys
+with open(sys.argv[1], "r+b", buffering=0) as stream:
+    stream.seek(3)
+    stream.write(b"F")
+    os.fsync(stream.fileno())
+PY
+  quarantine="$home/state/.$task.meta.teardown-quarantine"
+  quarantine_name=${quarantine##*/}
+  IFS=$'\t' read -r quarantine_state quarantine_digest \
+    < <(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-digest \
+      "$home/state" "$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$home/state")" \
+      "$quarantine_name") \
+    || fail "could not inspect completed teardown metadata quarantine"
+  retired=".$quarantine_name.remove-retired.0123456789abcdef0123456789abcdef"
+  remove_journal="$home/state/.$quarantine_name.remove-journal"
+  mv -- "$quarantine" "$home/state/$retired"
+  printf 'v1\n%s\n%s\t%s\n' "$retired" "$quarantine_state" "$quarantine_digest" \
+    > "$remove_journal"
   FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run "$task" -- \
-    sh -c "$command" sh "$home/state/$task.meta" "$launch" "$journal" \
+    sh -c "$command" sh "$home/state/.$task.meta.teardown-quarantine" \
+      "$home/state/.$task.launch-brief.md.teardown-quarantine" "$journal" \
       "$ROOT/bin/fm-work-identity-fs.py" "$owner" "$owner_id" "$marker" \
     || fail "completed teardown command was not recovered"
   [ "$(wc -l < "$marker" | tr -d ' ')" -eq 1 ] \
@@ -1140,6 +1179,10 @@ test_dispatch_retire_run_recovers_completed_command() {
   assert_absent "$owner/work-identity-dispatch.json" \
     "completed teardown recovery retained the dispatch receipt"
   assert_absent "$journal" "completed teardown recovery retained its journal"
+  assert_absent "$home/state/$retired" \
+    "completed teardown recovery retained a hidden metadata record"
+  assert_absent "$remove_journal" \
+    "completed teardown recovery retained a metadata removal journal"
   pass "dispatch retirement finalizes a durably completed command once"
 }
 
@@ -1170,10 +1213,14 @@ test_dispatch_retire_run_refuses_changed_record_without_partial_retirement() {
       sh "$launch" "$marker" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "changed launch record was retired"
   assert_present "$marker" "changed-record retirement did not run its wrapped command"
-  assert_present "$home/state/$task.meta" \
-    "changed launch record caused partial metadata retirement"
+  assert_absent "$home/state/$task.meta" \
+    "changed launch record escaped the authorized metadata quarantine"
+  assert_present "$home/state/.$task.meta.teardown-quarantine" \
+    "changed launch record caused partial metadata finalization"
   assert_present "$launch" "changed launch record was removed"
-  assert_contains "$out" "record changed before retirement" \
+  assert_present "$home/state/.$task.launch-brief.md.teardown-quarantine" \
+    "changed launch record caused partial launch finalization"
+  assert_contains "$out" "changed before retirement" \
     "changed record refusal did not identify the retirement conflict"
   pass "dispatch retirement validates all final records before retiring any"
 }

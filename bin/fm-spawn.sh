@@ -4045,6 +4045,16 @@ kimi_submission_cleanup_preflight() {
   fi
 }
 
+kimi_submission_entering_recovery() {  # <entering-path>
+  local entering=$1 verdict
+  verdict=$(FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE=$entering \
+    FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE="$SPAWN_LAUNCH_REQUEST/kimi-submit-attempted" \
+    FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$SPAWN_LAUNCH_REQUEST_TOKEN \
+    fm_backend_dead_entering_verdict "$BACKEND" "$T" "$W" \
+      "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN") || return 1
+  case "$verdict" in accepted|unsent|ambiguous) printf '%s' "$verdict" ;; *) return 1 ;; esac
+}
+
 kimi_submission_state() {
   local path="$SPAWN_LAUNCH_REQUEST/kimi-submission" owner go attempted entering result operation_owner operation_started operation_result
   local value links pid token verdict
@@ -4102,7 +4112,7 @@ kimi_submission_state() {
       printf 'ambiguous'
     elif [ -e "$entering" ] || [ -L "$entering" ]; then
       spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-      printf 'ambiguous'
+      kimi_submission_entering_recovery "$entering"
     else
       if [ -e "$operation_started" ] || [ -L "$operation_started" ]; then
         spawn_launch_request_file_matches "$operation_started" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
@@ -4136,7 +4146,7 @@ kimi_submission_state() {
         printf 'ambiguous'
       elif [ -e "$entering" ] || [ -L "$entering" ]; then
         spawn_launch_request_file_matches "$entering" "$SPAWN_LAUNCH_REQUEST_TOKEN" || return 1
-        printf 'ambiguous'
+        kimi_submission_entering_recovery "$entering"
       else
         printf 'prepared'
       fi

@@ -2,7 +2,7 @@
 
 Herdr is an experimental agent-native terminal backend with native per-pane agent state and push events.
 Firstmate requires Herdr protocol 14 or newer; broad backend verification covers versions 0.7.1, 0.7.3, 0.7.4, 0.7.5, and 0.8.0, while protocol-16 features remain gated by availability.
-Persistent Kimi delivery requires Herdr 0.7.5 or newer (protocol 17) for atomic `agent prompt` submission. Herdr exposes no durable transaction-scoped prompt receipt, so an interrupted prompt with no local acceptance record is contained as ambiguous and requires operator reconciliation rather than risking duplicate delivery.
+Persistent Kimi delivery requires Herdr 0.7.5 or newer (protocol 17) for atomic `agent prompt` submission. Firstmate binds each submission token to Herdr's durable pane metadata and pre-submit agent-state sequence; recovery resends only when that exact token retains the unchanged sequence, and treats an advanced sequence as accepted without retyping the brief.
 Default-on presentation spaces have a higher floor of Herdr 0.8.0 for the reason given under [Presentation spaces](#presentation-spaces).
 Herdr provides the terminal session while Treehouse continues to provide task worktrees.
 [`configuration.md`](configuration.md#runtime-backend-configbackend--fm_backend) owns shared backend selection and metadata semantics.

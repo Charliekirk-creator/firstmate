@@ -201,6 +201,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 }
 TEARDOWN_ORIGINAL_ARGS=("$@")
 TEARDOWN_DISPATCH_AUTH_PID=
+TEARDOWN_DISPATCH_META_PATH=
+TEARDOWN_DISPATCH_LAUNCH_PATH=
 teardown_pid_is_ancestor() {
   local wanted=$1 current=$$ parent
   case "$wanted" in ''|*[!0-9]*) return 1 ;; esac
@@ -231,7 +233,8 @@ teardown_dispatch_authorized() {
   local state=$1 task=$2 state_real state_inode auth_state auth_inode auth_task
   local auth_lock_parent auth_lock_parent_inode auth_lock auth_pid auth_token
   local auth_receipt_parent auth_receipt_parent_inode auth_receipt_name
-  local auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction live_state extra
+  local auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction live_state
+  local auth_meta_name auth_meta_state auth_meta_digest auth_launch_name auth_launch_state auth_launch_digest extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 1
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   state_real=$(cd -- "$state" 2>/dev/null && pwd -P) || return 1
@@ -239,8 +242,10 @@ teardown_dispatch_authorized() {
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
     auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
-    auth_receipt_state auth_receipt_digest auth_transaction extra; do
-    [ -z "$extra" ] && [ -n "$auth_transaction" ] || continue
+    auth_receipt_state auth_receipt_digest auth_transaction \
+    auth_meta_name auth_meta_state auth_meta_digest \
+    auth_launch_name auth_launch_state auth_launch_digest extra; do
+    [ -z "$extra" ] && [ -n "$auth_launch_digest" ] || continue
     [ "$auth_state" = "$state_real" ] && [ "$auth_inode" = "$state_inode" ] \
       && [ "$auth_task" = "$task" ] || continue
     teardown_pid_is_ancestor "$auth_pid" || continue
@@ -254,7 +259,15 @@ teardown_dispatch_authorized() {
     python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
       "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_quarantine_name" \
       "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 || continue
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+      "$auth_state" "$auth_inode" ".$auth_meta_name.teardown-quarantine" \
+      "$auth_meta_state" "$auth_meta_digest" >/dev/null 2>&1 || continue
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+      "$auth_state" "$auth_inode" ".$auth_launch_name.teardown-quarantine" \
+      "$auth_launch_state" "$auth_launch_digest" >/dev/null 2>&1 || continue
     TEARDOWN_DISPATCH_AUTH_PID=$auth_pid
+    TEARDOWN_DISPATCH_META_PATH="$auth_state/.$auth_meta_name.teardown-quarantine"
+    TEARDOWN_DISPATCH_LAUNCH_PATH="$auth_state/.$auth_launch_name.teardown-quarantine"
     return 0
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
   return 1
@@ -262,13 +275,16 @@ teardown_dispatch_authorized() {
 teardown_validate_dispatch_authorizations() {
   local auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
   local auth_lock auth_pid auth_token auth_receipt_parent auth_receipt_parent_inode
-  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction live_state extra
+  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction live_state
+  local auth_meta_name auth_meta_state auth_meta_digest auth_launch_name auth_launch_state auth_launch_digest extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 0
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
     auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
-    auth_receipt_state auth_receipt_digest auth_transaction extra; do
-    [ -z "$extra" ] && [ -n "$auth_transaction" ] \
+    auth_receipt_state auth_receipt_digest auth_transaction \
+    auth_meta_name auth_meta_state auth_meta_digest \
+    auth_launch_name auth_launch_state auth_launch_digest extra; do
+    [ -z "$extra" ] && [ -n "$auth_launch_digest" ] \
       || { echo "error: malformed dispatch retirement authorization" >&2; return 1; }
     teardown_pid_is_ancestor "$auth_pid" \
       || { echo "error: dispatch retirement authorization owner is not active" >&2; return 1; }
@@ -286,19 +302,30 @@ teardown_validate_dispatch_authorizations() {
       "$auth_receipt_parent" "$auth_receipt_parent_inode" "$auth_quarantine_name" \
       "$auth_receipt_state" "$auth_receipt_digest" >/dev/null 2>&1 \
       || { echo "error: dispatch receipt quarantine changed before teardown; nothing was changed" >&2; return 1; }
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+      "$auth_state" "$auth_inode" ".$auth_meta_name.teardown-quarantine" \
+      "$auth_meta_state" "$auth_meta_digest" >/dev/null 2>&1 \
+      || { echo "error: dispatch metadata quarantine changed before teardown; nothing was changed" >&2; return 1; }
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+      "$auth_state" "$auth_inode" ".$auth_launch_name.teardown-quarantine" \
+      "$auth_launch_state" "$auth_launch_digest" >/dev/null 2>&1 \
+      || { echo "error: dispatch launch quarantine changed before teardown; nothing was changed" >&2; return 1; }
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
 }
 teardown_mark_dispatch_authorizations_complete() {  # <state-dir> <task-id>
   local wanted_state wanted_task=$2 auth_state auth_inode auth_task auth_lock_parent auth_lock_parent_inode
   local auth_lock auth_pid auth_token auth_receipt_parent auth_receipt_parent_inode
-  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction extra
+  local auth_receipt_name auth_quarantine_name auth_receipt_state auth_receipt_digest auth_transaction
+  local auth_meta_name auth_meta_state auth_meta_digest auth_launch_name auth_launch_state auth_launch_digest extra
   [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ] || return 0
   wanted_state=$(cd -- "$1" 2>/dev/null && pwd -P) || return 1
   while IFS=$'\t' read -r auth_state auth_inode auth_task auth_lock_parent \
     auth_lock_parent_inode auth_lock auth_pid auth_token auth_receipt_parent \
     auth_receipt_parent_inode auth_receipt_name auth_quarantine_name \
-    auth_receipt_state auth_receipt_digest auth_transaction extra; do
-    [ -z "$extra" ] && [ -n "$auth_transaction" ] \
+    auth_receipt_state auth_receipt_digest auth_transaction \
+    auth_meta_name auth_meta_state auth_meta_digest \
+    auth_launch_name auth_launch_state auth_launch_digest extra; do
+    [ -z "$extra" ] && [ -n "$auth_launch_digest" ] \
       || { echo "error: malformed dispatch retirement authorization" >&2; return 1; }
     [ "$auth_state" = "$wanted_state" ] && [ "$auth_task" = "$wanted_task" ] || continue
     if [ ! -e "$auth_receipt_parent" ] && [ ! -L "$auth_receipt_parent" ]; then
@@ -388,12 +415,13 @@ CONTROL_LOCK_HELD=1
 fm_refuse_if_gate_agent
 FM_LOCK_LOG_PREFIX=teardown
 
-META="$STATE/$ID.meta"
+META_LIVE="$STATE/$ID.meta"
+META=${TEARDOWN_DISPATCH_META_PATH:-$META_LIVE}
 fm_backlog_record_present "$META" "task record" "$STATE" || {
   echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 }
-META_LOCK=$(fm_meta_lock_path "$META") || exit 1
+META_LOCK=$(fm_meta_lock_path "$META_LIVE") || exit 1
 fm_lock_acquire_wait "$META_LOCK"
 META_LOCK_HELD=1
 fm_backlog_record_present "$META" "task record" "$STATE" || {
