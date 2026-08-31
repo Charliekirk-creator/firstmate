@@ -19,6 +19,24 @@ Untracked files and directories whose names begin with `scratchpad` are also git
 The producing PR and Relay helpers own the fields they append, `bin/fm-classify-lib.sh` owns status-event vocabulary, and `bin/fm-crew-state.sh` owns current-state reconciliation.
 Wake, watcher, away-mode, and Relay-specific state mechanics remain with their named scripts and reference sections rather than being duplicated into one exhaustive state tree here.
 
+### Workstack Compass private snapshot
+
+Workstack Compass stays on its sanitized demonstration input until an operator supplies one upstream-owned snapshot.
+Generate and validate the local snapshot with the Firstmate producer, binding only the registered project roots whose local evidence should be observed:
+
+```sh
+FM_HOME=/path/to/firstmate /path/to/firstmate/bin/fm-workstack-compass-snapshot.py \
+  --workstack-root /path/to/workstack-compass \
+  --project-root data-team-management=/path/to/data-team-management \
+  --project-root gl-data-team-tickets=/path/to/gl-data-team-tickets
+```
+
+The command defaults to the gitignored, captain-private `$FM_HOME/data/workstack-compass/snapshot.json`, validates the complete observation against the supplied application's executable model, replaces the file atomically at mode `0600`, and prints the exact `./bin/workstack-compass --snapshot ...` launch command without running it.
+It is local-only and network-free, does not discover project roots, and never launches or controls a worker, acknowledges fleet activity, changes a source, opens a remote connection, or publishes data.
+Pass another `--project-root NAME=PATH` only when `NAME` is already an exact entry in this home's `data/projects.md`; omit a root to keep that project's upstream detail visibly unavailable rather than allowing a path or repository guess.
+Use `--output` only for another path inside an owner-private subdirectory below this home's `data/` directory.
+The producer's header and `--help` own exact bounds, validation, path-safety, and replacement mechanics, while [architecture.md](architecture.md#workstack-compass-upstream-projection) owns the stable evidence boundary.
+
 `bin/fm-session-start.sh`'s header is the single owner of session-start ordering, composed commands, digest contents, and the digest's startup mechanism.
 `bin/fm-startup-network.sh`'s header owns the deferred network stage that keeps every external-network call off that digest's blocking path, including its state files and the safety argument for running them later.
 `docs/sessionstart-nudge.md` owns the native session-open adapter tiers that run or nudge the digest command, and the source routing between them.
