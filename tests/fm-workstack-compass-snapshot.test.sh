@@ -59,11 +59,9 @@ make_world() {
   chmod 0700 "$world/home/data/workstack-compass"
   cat > "$world/home/bin/fm-crew-state.sh" <<'SH'
 #!/usr/bin/env bash
-case "${1:-}" in
-  task-a) printf '%s\n' 'state: working · source: pane · STATUS_READER_DETAIL_SECRET' ;;
-  task-z) printf '%s\n' 'state: blocked · source: status-log · STATUS_READER_DETAIL_SECRET' ;;
-  *) printf '%s\n' 'state: unknown · source: none · STATUS_READER_DETAIL_SECRET' ;;
-esac
+printf '%s\n' invoked > "${FM_HOME:?}/state/crew-state-invoked"
+printf '%s\n' 'state: working · source: pane · STATUS_READER_DETAIL_SECRET'
+exit 9
 SH
   chmod 0755 "$world/home/bin/fm-crew-state.sh"
   write_fake_model "$world/app"
@@ -174,8 +172,13 @@ test_successful_truthful_projection() {
     '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:task-a") | .project_identity) == "firstmate-project:alpha"' \
     "exact task-to-registry project relation was not preserved"
   json_assert "$snapshot" \
-    '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:task-a") | .status) == "working" and (.worker_incarnations[] | select(.worker_identity == "firstmate-worker:task-z") | .status) == "blocked"' \
-    "authoritative bounded current states were not projected"
+    'all(.worker_incarnations[]; .status == "unavailable")' \
+    "unbounded worker current states were not kept unavailable"
+  json_assert "$snapshot" \
+    '(.sources[] | select(.source_identity == "source:firstmate-task-identities") | .completeness) == "partial"' \
+    "unavailable current-state evidence was reported as complete"
+  [ ! -e "$world/home/state/crew-state-invoked" ] \
+    || fail "producer invoked the general live-state reader"
   json_assert "$snapshot" \
     'all(.worker_incarnations[]; .liveness == "unavailable" and .context_percent == null and .duration_seconds == null)' \
     "missing worker telemetry was fabricated"
@@ -317,6 +320,33 @@ PY
   pass "malformed and oversized source or output data are bounded safely"
 }
 
+test_optional_source_appearance_during_observation_refuses() {
+  local world snapshot before fakebin registry
+  world=$(make_world optional-source-race)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  run_world "$world" >/dev/null || fail "optional-source race baseline failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  registry="$world/home/data/projects.md"
+  rm "$registry"
+  fakebin="$world/fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/tasks-axi" <<SH
+#!/usr/bin/env bash
+printf '%s\n' '# appeared during observation' > '$registry'
+printf '%s\n' 'count: 0'
+printf '%s\n' 'tasks[0]{id,state,kind,repo,title}:'
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$fakebin/tasks-axi"
+  run_failure "source changed during observation" env \
+    PATH="$fakebin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
+    --workstack-root "$world/app" \
+    --output "$snapshot"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "optional-source race changed the prior complete snapshot"
+  pass "an optional source appearing mid-observation prevents publication"
+}
+
 test_source_change_during_observation_refuses() {
   local world fakebin registry
   world=$(make_world source-race)
@@ -357,7 +387,7 @@ test_private_application_model_integration() {
     --project-root "alpha=$world/alpha" \
     --output "$snapshot" >/dev/null \
     || fail "private Workstack executable model rejected sanitized live-source fixtures"
-  PYTHONPATH="$app/src" python3 - "$snapshot" <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$app/src" python3 -B - "$snapshot" <<'PY'
 from pathlib import Path
 import sys
 from workstack_compass.model import JsonFileSnapshotProvider
@@ -374,5 +404,6 @@ test_duplicate_and_broken_identities_refuse
 test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
 test_malformed_and_oversized_inputs_and_output_refuse
+test_optional_source_appearance_during_observation_refuses
 test_source_change_during_observation_refuses
 test_private_application_model_integration

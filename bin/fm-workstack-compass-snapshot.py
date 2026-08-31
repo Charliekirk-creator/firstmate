@@ -40,7 +40,6 @@ Workstack Compass launch command.  It never prints snapshot contents.
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import csv
 import hashlib
 import json
@@ -58,6 +57,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+sys.dont_write_bytecode = True
+
 MAX_REGISTRY_BYTES = 128 * 1024
 MAX_BACKLOG_BYTES = 512 * 1024
 MAX_META_BYTES = 64 * 1024
@@ -68,9 +69,7 @@ MAX_PROJECT_SOURCE_BYTES = 512 * 1024
 MAX_MODEL_BYTES = 512 * 1024
 MAX_READER_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_TASK_RECORDS = 10_000
-MAX_STATUS_READS = 256
 TASKS_AXI_TIMEOUT_SECONDS = 10
-STATUS_READER_TIMEOUT_SECONDS = 4
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 REGISTRY_LINE_RE = re.compile(
     r"^- ([A-Za-z0-9._-]{1,160})(?: \[[^\]\r\n]+\])? - \S.*$"
@@ -120,6 +119,7 @@ class Observation:
 
     def __init__(self) -> None:
         self._observed: dict[Path, Fingerprint] = {}
+        self._absent: set[Path] = set()
         self._inventories: dict[tuple[Path, str], tuple[str, ...]] = {}
 
     @staticmethod
@@ -159,6 +159,7 @@ class Observation:
             before = os.stat(path, follow_symlinks=False)
         except FileNotFoundError:
             if missing_ok:
+                self._absent.add(path)
                 return None
             raise ProducerError("required source file is unavailable")
         except OSError as exc:
@@ -218,12 +219,22 @@ class Observation:
         return payload
 
     def _remember(self, path: Path, fingerprint: Fingerprint) -> None:
+        if path in self._absent:
+            raise SourceChanged("source changed during observation")
         prior = self._observed.get(path)
         if prior is not None and prior != fingerprint:
             raise SourceChanged("source changed during observation")
         self._observed[path] = fingerprint
 
     def prove_unchanged(self) -> None:
+        for path in self._absent:
+            try:
+                os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise SourceChanged("source changed during observation") from exc
+            raise SourceChanged("source changed during observation")
         for path, expected in self._observed.items():
             try:
                 current = os.stat(path, follow_symlinks=False)
@@ -634,48 +645,6 @@ def project_identity(name: str) -> str:
     return f"firstmate-project:{name}"
 
 
-def worker_status_from_reader(
-    reader: Path, home: Path, identity: str, path: str
-) -> str:
-    environment = {
-        "PATH": path,
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "NO_COLOR": "1",
-        "HOME": os.fspath(home),
-        "FM_HOME": os.fspath(home),
-        "FM_ROOT_OVERRIDE": os.fspath(home),
-        "FM_STATE_OVERRIDE": os.fspath(home / "state"),
-        "FM_CREW_STATE_NM_TIMEOUT": "2",
-    }
-    try:
-        payload = run_bounded(
-            (os.fspath(reader), identity),
-            environment,
-            timeout=STATUS_READER_TIMEOUT_SECONDS,
-            cap=16 * 1024,
-        )
-        line = decode_utf8(payload, "Firstmate current-state reader output").splitlines()[0]
-    except (ProducerError, IndexError):
-        return "unavailable"
-    match = re.fullmatch(
-        r"state: (working|parked|done|blocked|paused|failed|unknown)"
-        r" · source: [A-Za-z0-9._-]+(?: · .*)?",
-        line,
-    )
-    if match is None:
-        return "unavailable"
-    return {
-        "working": "working",
-        "parked": "waiting",
-        "done": "finished/stopped",
-        "blocked": "blocked",
-        "paused": "waiting",
-        "failed": "failed",
-        "unknown": "unavailable",
-    }[match.group(1)]
-
-
 def collect_workers(
     home: Path,
     observation: Observation,
@@ -687,15 +656,8 @@ def collect_workers(
         raise ProducerError("task metadata inventory exceeds its record bound")
     tasks = {record.identity: record for record in backlog_tasks}
     workers: list[dict[str, Any]] = []
-    status_candidates: list[tuple[str, dict[str, Any]]] = []
     total_bytes = 0
     omitted = 0
-    reader: Path | None = None
-    reader_path = home / "bin" / "fm-crew-state.sh"
-    if os.path.lexists(reader_path):
-        observation.read_under(reader_path, home, MAX_PROJECT_SOURCE_BYTES)
-        if os.access(reader_path, os.X_OK):
-            reader = reader_path.resolve(strict=True)
     for path in paths:
         identity = path.name[:-5]
         if not IDENTITY_RE.fullmatch(identity):
@@ -739,29 +701,7 @@ def collect_workers(
             "source_identity": "source:firstmate-task-identities",
         }
         workers.append(row)
-        if reader is not None and not meta.get("remote_host"):
-            status_candidates.append((identity, row))
-        elif meta.get("remote_host"):
-            omitted += 1
-    if reader is None:
-        omitted += len(workers)
-    if len(status_candidates) > MAX_STATUS_READS:
-        omitted += len(status_candidates) - MAX_STATUS_READS
-        status_candidates = status_candidates[:MAX_STATUS_READS]
-    if reader is not None and status_candidates:
-        active_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, len(status_candidates)),
-            thread_name_prefix="workstack-current-state",
-        ) as executor:
-            statuses = executor.map(
-                lambda item: worker_status_from_reader(
-                    reader, home, item[0], active_path
-                ),
-                status_candidates,
-            )
-            for (_identity, row), status in zip(status_candidates, statuses):
-                row["status"] = status
+        omitted += 1
     workers.sort(key=lambda row: row["worker_incarnation_identity"])
     return workers, bool(paths), omitted
 
@@ -902,7 +842,7 @@ def build_document(
     registry_present: bool,
     backlog_present: bool,
     meta_present: bool,
-    omitted_meta: int,
+    omitted_task_evidence: int,
     project_sources: list[dict[str, Any]],
     project_source_by_name: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -917,11 +857,11 @@ def build_document(
         ),
     }
     if backlog_present and meta_present:
-        task_completeness = "partial" if omitted_meta else "complete"
+        task_completeness = "partial" if omitted_task_evidence else "complete"
         task_detail = (
-            "Exact task and worker-incarnation identities were observed; some legacy identities or bounded current-state reads were omitted, and untyped telemetry remains unavailable."
-            if omitted_meta
-            else "Exact task and worker-incarnation identities and bounded local current states were observed; liveness, context, duration, and untyped work relations remain unavailable."
+            "Exact task and worker-incarnation identities were observed; worker current state is unavailable, records without exact incarnation identity are omitted, and untyped telemetry remains unavailable."
+            if omitted_task_evidence
+            else "Exact task and worker-incarnation identities were observed; no worker current-state evidence was available, and untyped telemetry remains unavailable."
         )
     elif backlog_present or meta_present:
         task_completeness = "partial"
@@ -958,12 +898,7 @@ def build_document(
         else "Exact project and work hierarchy identities are unavailable."
     )
     worker_status = "partial" if workers else "unavailable"
-    current_status_available = any(
-        worker["status"] != "unavailable" for worker in workers
-    )
-    if current_status_available:
-        worker_detail = "Exact worker incarnations and bounded local current states are available; liveness, context, duration, and typed work-unit relations are unavailable."
-    elif workers:
+    if workers:
         worker_detail = "Exact worker incarnations are available; current status, liveness, context, duration, and typed work-unit relations are unavailable."
     else:
         worker_detail = "No exact worker incarnation with an authoritative generation identity is available."
@@ -1026,11 +961,13 @@ def publish_snapshot(
     parent_descriptor: int,
     payload: bytes,
     max_snapshot_bytes: int,
+    observation: Observation,
 ) -> None:
     if len(payload) > max_snapshot_bytes:
         raise ProducerError("validated snapshot exceeds the application model size bound")
     temp_name = write_private_temp(parent_descriptor, "workstack-snapshot", payload)
     try:
+        observation.prove_unchanged()
         try:
             existing = os.stat(output.name, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
@@ -1126,7 +1063,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         backlog_tasks = read_backlog_tasks(
             backlog_payload, parent_descriptor, output.parent
         )
-        workers, meta_present, omitted_meta = collect_workers(
+        workers, meta_present, omitted_task_evidence = collect_workers(
             home, observation, backlog_tasks, set(registered)
         )
         document = build_document(
@@ -1136,7 +1073,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             registry_payload is not None,
             backlog_payload is not None,
             meta_present,
-            omitted_meta,
+            omitted_task_evidence,
             project_sources,
             project_source_by_name,
         )
@@ -1151,7 +1088,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = (
             json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
         ).encode("utf-8")
-        publish_snapshot(output, parent_descriptor, payload, model.MAX_SNAPSHOT_BYTES)
+        publish_snapshot(
+            output,
+            parent_descriptor,
+            payload,
+            model.MAX_SNAPSHOT_BYTES,
+            observation,
+        )
         launch = (
             f"cd {shlex.quote(os.fspath(workstack_root))} && "
             f"./bin/workstack-compass --snapshot {shlex.quote(os.fspath(output))} "
