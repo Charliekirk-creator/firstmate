@@ -1,0 +1,22 @@
+FIRSTMATE MIXED-CLONE ALLOCATION — END-USER CLI EVIDENCE
+requested_project_common_dir=/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-common-dir-evidence.ktA9fI/requested-project/.git
+allocated_worktree_common_dir=/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-common-dir-evidence.ktA9fI/foreign-clone/.git
+spawn_exit=1
+--- fm-spawn response ---
+error: Git common-directory mismatch after treehouse get: requested project '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-common-dir-evidence.ktA9fI/requested-project' uses '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-common-dir-evidence.ktA9fI/requested-project/.git', but allocated worktree '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-common-dir-evidence.ktA9fI/allocated-slot' uses '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-common-dir-evidence.ktA9fI/foreign-clone/.git'. Refusing before worker launch. No supported non-cleaning allocation return or quarantine operation is available, so the allocated local copy and any existing endpoint are preserved in place. Inspect firstmate:fm-mixed-family-evidence-z1 and reconcile the mixed clone-family pool or provider through its guarded ownership path before retrying; do not force-return, clean, reset, or remove this allocation
+--- preserved allocation state ---
+branch=fm/evidence
+head=4690e0b102a16c17fb864b1072cbcfd65e6cd52d
+before_snapshot_hash=ebfeb07c36a45a72c217d9ff230996fad707f08c
+after_snapshot_hash=ebfeb07c36a45a72c217d9ff230996fad707f08c
+branch_head_index_files_refs_and_worktree_state_unchanged=yes
+--- allocated slot status (including untracked and ignored) ---
+## fm/evidence
+M  tracked-staged.txt
+ M tracked-unstaged.txt
+?? untracked-preserve.txt
+!! ignored-preserve.txt
+treehouse_allocation_exercised=yes
+treehouse_return_attempted=no
+worker_launch_sent=no
+task_metadata_published=no
