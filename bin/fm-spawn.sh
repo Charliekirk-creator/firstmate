@@ -141,7 +141,13 @@
 #   default-branch commit when safe: directly for a local home, or through the
 #   configured host for a remote home. Skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   git worktree root distinct from the primary project checkout and its
+#   absolute Git common directory matches the requested project's absolute Git
+#   common directory. A common-directory mismatch is refused before worker
+#   launch and preserved in place because neither Treehouse nor Orca exposes a
+#   supported non-cleaning quarantine or return operation; the error identifies
+#   the project family, allocated family, local copy, and endpoint for guarded
+#   reconciliation.
 #   Before a fresh ship or scout worker starts, its clean task worktree fetches
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   An unreachable origin, unresolved default branch, or non-clean worktree
@@ -1917,8 +1923,29 @@ real_path_or_raw() {  # <path>
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
+resolve_absolute_git_common_dir() {  # <repository>
+  local repository=$1 common
+  common=$(git -C "$repository" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  case "$common" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  CDPATH='' cd -- "$common" 2>/dev/null && pwd -P
+}
+
+preserve_common_dir_mismatch_allocation() {
+  # Orca's only removal primitive is forced, and Treehouse documents no
+  # non-cleaning quarantine or return operation. Herdr presentation abort and
+  # Orca abort cleanup would otherwise remove the endpoint or allocated local
+  # copy on EXIT, so disable only those cleanup paths for this safety refusal.
+  # The ordinary tmux, flat-Herdr, Zellij, and cmux abort paths already retain
+  # their endpoint and Treehouse allocation in place.
+  HERDR_PROJECTION_ABORT_CLEANUP=0
+  ORCA_ABORT_CLEANUP=0
+}
+
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real proj_common wt_common
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -1931,6 +1958,21 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+  if ! proj_common=$(resolve_absolute_git_common_dir "$proj_real"); then
+    preserve_common_dir_mismatch_allocation
+    echo "error: $source allocated '$wt_real', but the requested project's absolute Git common directory could not be resolved from '$proj_real'; refusing before worker launch. No supported non-cleaning allocation return or quarantine operation is available, so the allocated local copy and endpoint are preserved in place. Inspect $inspect_target and reconcile the pool or provider through its guarded ownership path before retrying" >&2
+    exit 1
+  fi
+  if ! wt_common=$(resolve_absolute_git_common_dir "$wt_real"); then
+    preserve_common_dir_mismatch_allocation
+    echo "error: $source allocated '$wt_real', but its absolute Git common directory could not be resolved; the requested project '$proj_real' uses '$proj_common'. Refusing before worker launch. No supported non-cleaning allocation return or quarantine operation is available, so the allocated local copy and endpoint are preserved in place. Inspect $inspect_target and reconcile the pool or provider through its guarded ownership path before retrying" >&2
+    exit 1
+  fi
+  if [ "$wt_common" != "$proj_common" ]; then
+    preserve_common_dir_mismatch_allocation
+    echo "error: Git common-directory mismatch after $source: requested project '$proj_real' uses '$proj_common', but allocated worktree '$wt_real' uses '$wt_common'. Refusing before worker launch. No supported non-cleaning allocation return or quarantine operation is available, so the allocated local copy and endpoint are preserved in place. Inspect $inspect_target and reconcile the mixed clone-family pool or provider through its guarded ownership path before retrying; do not force-return, clean, reset, or remove this allocation" >&2
     exit 1
   fi
 }
@@ -2374,7 +2416,9 @@ EOF
       echo "error: orca did not return a worktree id/path for $W" >&2
       exit 1
     fi
-    validate_spawn_worktree "orca worktree create" "$W"
+    ORCA_INSPECT_TARGET="task '$W', Orca worktree id '$ORCA_WORKTREE_ID'"
+    [ -z "$ORCA_TERMINAL" ] || ORCA_INSPECT_TARGET="$ORCA_INSPECT_TARGET, terminal '$ORCA_TERMINAL'"
+    validate_spawn_worktree "orca worktree create" "$ORCA_INSPECT_TARGET"
     if [ -z "$ORCA_TERMINAL" ]; then
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
     fi
