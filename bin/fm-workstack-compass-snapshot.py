@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
+import fnmatch
 import hashlib
 import json
 import os
@@ -76,7 +78,7 @@ REGISTRY_LINE_RE = re.compile(
     r"^- ([A-Za-z0-9._-]{1,160})(?: \[[^\]\r\n]+\])? - \S.*$"
 )
 META_KEY_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
-SPAWN_GEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+SPAWN_GEN_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]+$")
 DTM_NODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,180}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -110,18 +112,28 @@ class BacklogTask:
 
 
 @dataclass(frozen=True)
+class AnchoredDirectory:
+    path: Path
+    descriptor: int
+    fingerprint: Fingerprint
+
+
+@dataclass(frozen=True)
 class ProjectBinding:
     name: str
-    root: Path
+    root: AnchoredDirectory
 
 
 class Observation:
-    """Capture bounded source bytes and prove every capture stayed unchanged."""
+    """Capture bounded source bytes beneath retained directory authorities."""
 
     def __init__(self) -> None:
-        self._observed: dict[Path, Fingerprint] = {}
-        self._absent: set[Path] = set()
-        self._inventories: dict[tuple[Path, str], tuple[str, ...]] = {}
+        self._anchors: list[AnchoredDirectory] = []
+        self._observed: dict[tuple[int, tuple[str, ...]], Fingerprint] = {}
+        self._absent: set[tuple[int, tuple[str, ...]]] = set()
+        self._inventories: dict[
+            tuple[int, tuple[str, ...], str], tuple[str, ...]
+        ] = {}
 
     @staticmethod
     def _fingerprint(info: os.stat_result) -> Fingerprint:
@@ -135,49 +147,187 @@ class Observation:
             info.st_nlink,
         )
 
-    def observe_directory(self, path: Path) -> Path:
+    @staticmethod
+    def _parts(
+        anchor: AnchoredDirectory, relative: str | Path | Sequence[str]
+    ) -> tuple[str, ...]:
+        if isinstance(relative, Sequence) and not isinstance(relative, (str, Path)):
+            parts = tuple(relative)
+        else:
+            candidate = Path(relative)
+            if candidate.is_absolute():
+                try:
+                    candidate = candidate.relative_to(anchor.path)
+                except ValueError as exc:
+                    raise ProducerError("source path escapes its approved root") from exc
+            parts = candidate.parts
+        if not parts or any(
+            part in {"", ".", ".."} or "/" in part for part in parts
+        ):
+            raise ProducerError("source path escapes its approved root")
+        for part in parts:
+            reject_control_path(Path(part))
+        return parts
+
+    @staticmethod
+    def _directory_flags() -> int:
+        return (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+
+    def _open_directory(
+        self, anchor: AnchoredDirectory, parts: Sequence[str]
+    ) -> int:
+        descriptor = os.dup(anchor.descriptor)
+        try:
+            for part in parts:
+                child = os.open(
+                    part,
+                    self._directory_flags(),
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except OSError:
+            os.close(descriptor)
+            raise
+
+    def _open_entry(
+        self,
+        anchor: AnchoredDirectory,
+        parts: Sequence[str],
+        *,
+        directory: bool = False,
+    ) -> int:
+        parent = self._open_directory(anchor, parts[:-1])
+        flags = self._directory_flags() if directory else (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            return os.open(parts[-1], flags, dir_fd=parent)
+        finally:
+            os.close(parent)
+
+    def observe_directory(self, path: Path) -> AnchoredDirectory:
         reject_control_path(path)
         try:
             before = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                raise ProducerError(
+                    "required source directory is not an ordinary directory"
+                )
+            descriptor = os.open(path, self._directory_flags())
+        except ProducerError:
+            raise
         except OSError as exc:
             raise ProducerError("required source directory is unavailable") from exc
-        if not stat.S_ISDIR(before.st_mode):
-            raise ProducerError("required source directory is not an ordinary directory")
-        resolved = resolve_existing_directory(path)
-        self._remember(resolved, self._fingerprint(before))
-        return resolved
-
-    def observe_inventory(self, directory: Path, pattern: str) -> list[Path]:
-        root = resolve_existing_directory(directory)
-        paths = sorted(root.glob(pattern), key=lambda item: item.name)
-        names = tuple(path.name for path in paths)
-        self._inventories[(root, pattern)] = names
-        return paths
-
-    def read_file(self, path: Path, cap: int, *, missing_ok: bool = False) -> bytes | None:
-        reject_control_path(path)
-        try:
-            before = os.stat(path, follow_symlinks=False)
-        except FileNotFoundError:
-            if missing_ok:
-                self._absent.add(path)
-                return None
-            raise ProducerError("required source file is unavailable")
-        except OSError as exc:
-            raise ProducerError("required source file is unavailable") from exc
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise ProducerError("source input is not a single ordinary file")
-        if before.st_size > cap:
-            raise ProducerError("source input exceeds its bounded size")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags)
-        except OSError as exc:
-            raise ProducerError("source input could not be opened safely") from exc
         try:
             opened = os.fstat(descriptor)
             if self._fingerprint(opened) != self._fingerprint(before):
                 raise SourceChanged("source changed during observation")
+            resolved = path.resolve(strict=True)
+            resolved_info = os.stat(resolved, follow_symlinks=False)
+            if self._fingerprint(resolved_info) != self._fingerprint(opened):
+                raise SourceChanged("source changed during observation")
+        except Exception:
+            os.close(descriptor)
+            raise
+        anchor = AnchoredDirectory(resolved, descriptor, self._fingerprint(opened))
+        self._anchors.append(anchor)
+        return anchor
+
+    def observe_subdirectory(
+        self, anchor: AnchoredDirectory, relative: str | Path | Sequence[str]
+    ) -> AnchoredDirectory:
+        parts = self._parts(anchor, relative)
+        try:
+            descriptor = self._open_directory(anchor, parts)
+            info = os.fstat(descriptor)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ProducerError("source path contains a symlink or unsafe component") from exc
+            raise ProducerError("required source directory is unavailable") from exc
+        fingerprint = self._fingerprint(info)
+        child = AnchoredDirectory(anchor.path.joinpath(*parts), descriptor, fingerprint)
+        self._anchors.append(child)
+        return child
+
+    def observe_entry(
+        self, anchor: AnchoredDirectory, relative: str | Path | Sequence[str]
+    ) -> os.stat_result:
+        parts = self._parts(anchor, relative)
+        try:
+            descriptor = self._open_entry(anchor, parts)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ProducerError("source path contains a symlink or unsafe component") from exc
+            raise ProducerError("required source path is unavailable") from exc
+        try:
+            info = os.fstat(descriptor)
+            self._remember(anchor, parts, self._fingerprint(info))
+            return info
+        finally:
+            os.close(descriptor)
+
+    def observe_inventory(
+        self,
+        anchor: AnchoredDirectory,
+        relative: str | Path | Sequence[str],
+        pattern: str,
+    ) -> list[str]:
+        parts = self._parts(anchor, relative)
+        try:
+            descriptor = self._open_directory(anchor, parts)
+            info = os.fstat(descriptor)
+            names = tuple(
+                sorted(
+                    name
+                    for name in os.listdir(descriptor)
+                    if fnmatch.fnmatchcase(name, pattern)
+                )
+            )
+        except OSError as exc:
+            raise ProducerError("required source directory is unavailable") from exc
+        finally:
+            if "descriptor" in locals():
+                os.close(descriptor)
+        self._remember(anchor, parts, self._fingerprint(info))
+        self._inventories[(anchor.descriptor, parts, pattern)] = names
+        return list(names)
+
+    def read_under(
+        self,
+        anchor: AnchoredDirectory,
+        relative: str | Path | Sequence[str],
+        cap: int,
+        *,
+        missing_ok: bool = False,
+    ) -> bytes | None:
+        parts = self._parts(anchor, relative)
+        key = (anchor.descriptor, parts)
+        try:
+            descriptor = self._open_entry(anchor, parts)
+        except FileNotFoundError:
+            if missing_ok:
+                self._absent.add(key)
+                return None
+            raise ProducerError("required source file is unavailable")
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ProducerError("source path contains a symlink or unsafe component") from exc
+            raise ProducerError("source input could not be opened safely") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise ProducerError("source input is not a single ordinary file")
+            if opened.st_size > cap:
+                raise ProducerError("source input exceeds its bounded size")
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -193,80 +343,96 @@ class Observation:
                 raise SourceChanged("source changed during observation")
         finally:
             os.close(descriptor)
-        resolved = path.resolve(strict=True)
-        self._remember(resolved, self._fingerprint(after))
+        self._remember(anchor, parts, self._fingerprint(after))
         return b"".join(chunks)
 
-    def read_under(self, path: Path, root: Path, cap: int) -> bytes:
-        try:
-            relative = path.relative_to(root)
-        except ValueError as exc:
-            raise ProducerError("source path escapes its approved root") from exc
-        current = root
-        for part in relative.parts:
-            current = current / part
-            try:
-                info = os.stat(current, follow_symlinks=False)
-            except OSError as exc:
-                raise ProducerError("required source path is unavailable") from exc
-            if stat.S_ISLNK(info.st_mode):
-                raise ProducerError("source path contains a symlink")
-        try:
-            path.resolve(strict=True).relative_to(root.resolve(strict=True))
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise ProducerError("source path escapes its approved root") from exc
-        payload = self.read_file(path, cap)
-        assert payload is not None
-        return payload
-
-    def _remember(self, path: Path, fingerprint: Fingerprint) -> None:
-        if path in self._absent:
+    def _remember(
+        self,
+        anchor: AnchoredDirectory,
+        parts: tuple[str, ...],
+        fingerprint: Fingerprint,
+    ) -> None:
+        key = (anchor.descriptor, parts)
+        if key in self._absent:
             raise SourceChanged("source changed during observation")
-        prior = self._observed.get(path)
+        prior = self._observed.get(key)
         if prior is not None and prior != fingerprint:
             raise SourceChanged("source changed during observation")
-        self._observed[path] = fingerprint
+        self._observed[key] = fingerprint
 
     def prove_unchanged(self) -> None:
-        for path in self._absent:
+        anchors = {anchor.descriptor: anchor for anchor in self._anchors}
+        for anchor in self._anchors:
             try:
-                os.stat(path, follow_symlinks=False)
+                retained = os.fstat(anchor.descriptor)
+                current = os.stat(anchor.path, follow_symlinks=False)
+            except OSError as exc:
+                raise SourceChanged("source changed during observation") from exc
+            if any(
+                info.st_dev != anchor.fingerprint.device
+                or info.st_ino != anchor.fingerprint.inode
+                or stat.S_IFMT(info.st_mode) != anchor.fingerprint.mode_type
+                for info in (retained, current)
+            ):
+                raise SourceChanged("source changed during observation")
+        for descriptor, parts in self._absent:
+            anchor = anchors[descriptor]
+            try:
+                present = self._open_entry(anchor, parts)
             except FileNotFoundError:
                 continue
             except OSError as exc:
                 raise SourceChanged("source changed during observation") from exc
-            raise SourceChanged("source changed during observation")
-        for path, expected in self._observed.items():
+            else:
+                os.close(present)
+                raise SourceChanged("source changed during observation")
+        for (descriptor, parts), expected in self._observed.items():
+            anchor = anchors[descriptor]
             try:
-                current = os.stat(path, follow_symlinks=False)
+                current_descriptor = self._open_entry(
+                    anchor, parts, directory=stat.S_ISDIR(expected.mode_type)
+                )
+                current = os.fstat(current_descriptor)
             except OSError as exc:
                 raise SourceChanged("source changed during observation") from exc
+            finally:
+                if "current_descriptor" in locals():
+                    os.close(current_descriptor)
+                    del current_descriptor
             if self._fingerprint(current) != expected:
                 raise SourceChanged("source changed during observation")
-        for (directory, pattern), expected in self._inventories.items():
-            current = tuple(
-                path.name
-                for path in sorted(directory.glob(pattern), key=lambda item: item.name)
-            )
+        for (descriptor, parts, pattern), expected in self._inventories.items():
+            anchor = anchors[descriptor]
+            try:
+                directory = self._open_directory(anchor, parts)
+                current = tuple(
+                    sorted(
+                        name
+                        for name in os.listdir(directory)
+                        if fnmatch.fnmatchcase(name, pattern)
+                    )
+                )
+            except OSError as exc:
+                raise SourceChanged("source inventory changed during observation") from exc
+            finally:
+                if "directory" in locals():
+                    os.close(directory)
+                    del directory
             if current != expected:
                 raise SourceChanged("source inventory changed during observation")
+
+    def close(self) -> None:
+        while self._anchors:
+            anchor = self._anchors.pop()
+            try:
+                os.close(anchor.descriptor)
+            except OSError:
+                pass
 
 
 def reject_control_path(path: Path) -> None:
     if CONTROL_RE.search(os.fspath(path)):
         raise ProducerError("a supplied path contains a control character")
-
-
-def resolve_existing_directory(path: Path) -> Path:
-    reject_control_path(path)
-    try:
-        unresolved = os.stat(path, follow_symlinks=False)
-        resolved = path.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ProducerError("required directory is unavailable") from exc
-    if not stat.S_ISDIR(unresolved.st_mode) or path.is_symlink() or not resolved.is_dir():
-        raise ProducerError("required directory is unsafe")
-    return resolved
 
 
 def decode_utf8(payload: bytes, label: str) -> str:
@@ -286,18 +452,16 @@ def load_json(payload: bytes, label: str) -> Mapping[str, Any]:
     return value
 
 
-def active_home(script_root: Path) -> Path:
+def active_home(
+    script_root: Path, observation: Observation
+) -> AnchoredDirectory:
     configured = os.environ.get("FM_HOME")
     candidate = Path(configured).expanduser() if configured else script_root
-    home = resolve_existing_directory(candidate)
+    home = observation.observe_directory(candidate)
     for child in ("data", "state"):
-        path = home / child
-        try:
-            info = os.stat(path, follow_symlinks=False)
-        except OSError as exc:
-            raise ProducerError("active Firstmate home is incomplete") from exc
-        if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
-            raise ProducerError("active Firstmate home is unsafe")
+        directory = observation.observe_subdirectory(home, child)
+        if not stat.S_ISDIR(os.fstat(directory.descriptor).st_mode):
+            raise ProducerError("active Firstmate home is incomplete")
     return home
 
 
@@ -332,13 +496,14 @@ def parse_project_root(argument: str) -> tuple[str, Path]:
     return name, Path(raw_path).expanduser()
 
 
-def validate_git_marker(root: Path) -> None:
-    marker = root / ".git"
+def validate_git_marker(
+    root: AnchoredDirectory, observation: Observation
+) -> None:
     try:
-        info = os.stat(marker, follow_symlinks=False)
-    except OSError as exc:
+        info = observation.observe_entry(root, ".git")
+    except ProducerError as exc:
         raise ProducerError("explicit project root is not a repository") from exc
-    if marker.is_symlink() or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
         raise ProducerError("explicit project repository marker is unsafe")
 
 
@@ -350,92 +515,110 @@ def bind_project_roots(
     for value in values:
         name, requested = parse_project_root(value)
         if name not in registered:
-            raise ProducerError("explicit project root is not present in the Firstmate registry")
+            raise ProducerError(
+                "explicit project root is not present in the Firstmate registry"
+            )
         if name in bindings:
             raise ProducerError("duplicate explicit project-root identity")
         root = observation.observe_directory(requested)
-        validate_git_marker(root)
-        if root in roots_seen:
-            raise ProducerError("one project root cannot represent multiple exact project identities")
-        roots_seen.add(root)
+        validate_git_marker(root, observation)
+        if root.path in roots_seen:
+            raise ProducerError(
+                "one project root cannot represent multiple exact project identities"
+            )
+        roots_seen.add(root.path)
         bindings[name] = ProjectBinding(name, root)
     return bindings
 
 
 def prepare_output(
-    home: Path,
+    home: AnchoredDirectory,
     requested: str | None,
-    source_roots: Iterable[Path],
+    source_roots: Iterable[AnchoredDirectory],
+    observation: Observation,
 ) -> tuple[Path, int]:
-    data_root = resolve_existing_directory(home / "data")
-    canonical_data = data_root.resolve(strict=True)
-    default_parent = canonical_data / "workstack-compass"
-    create_default_parent = requested is None and not default_parent.exists()
+    data = observation.observe_subdirectory(home, "data")
+    canonical_data = data.path
     if requested is None:
-        parent = default_parent
-        output = parent / "snapshot.json"
+        parent_parts = ("workstack-compass",)
+        output_name = "snapshot.json"
+        parent = canonical_data.joinpath(*parent_parts)
     else:
-        output = Path(requested).expanduser()
-        reject_control_path(output)
-        if not output.is_absolute():
-            output = Path.cwd() / output
+        requested_output = Path(requested).expanduser()
+        reject_control_path(requested_output)
+        if not requested_output.is_absolute():
+            requested_output = Path.cwd() / requested_output
+        output_name = requested_output.name
         try:
-            parent = output.parent.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
+            parent = requested_output.parent.resolve(strict=True)
+            parent_parts = parent.relative_to(canonical_data).parts
+        except (OSError, RuntimeError, ValueError) as exc:
             raise ProducerError(
                 "snapshot output must stay below the active FM_HOME data directory"
             ) from exc
-        output = parent / output.name
-    try:
-        parent.relative_to(canonical_data)
-    except ValueError as exc:
-        raise ProducerError("snapshot output must stay below the active FM_HOME data directory") from exc
+    if not parent_parts:
+        raise ProducerError(
+            "snapshot output requires a private subdirectory below FM_HOME data"
+        )
+    if output_name in {"", ".", ".."} or "/" in output_name:
+        raise ProducerError("snapshot destination name is unsafe")
+    output = canonical_data.joinpath(*parent_parts, output_name)
+    reject_control_path(output)
     for source_root in source_roots:
         try:
-            output.relative_to(source_root)
+            output.relative_to(source_root.path)
         except ValueError:
             continue
         raise ProducerError("snapshot output must not be inside a source repository")
-    if create_default_parent:
+
+    created_default_parent = False
+    if requested is None:
         try:
-            os.mkdir(default_parent, 0o700)
-            os.chmod(default_parent, 0o700, follow_symlinks=False)
+            os.mkdir(parent_parts[0], 0o700, dir_fd=data.descriptor)
+            created_default_parent = True
+            os.chmod(
+                parent_parts[0],
+                0o700,
+                dir_fd=data.descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            pass
         except OSError as exc:
             raise ProducerError("private snapshot directory could not be created") from exc
-    parent_info = os.stat(parent, follow_symlinks=False)
-    if parent == canonical_data:
-        raise ProducerError("snapshot output requires a private subdirectory below FM_HOME data")
-    if not stat.S_ISDIR(parent_info.st_mode) or parent.is_symlink():
-        raise ProducerError("snapshot output parent is unsafe")
-    current = canonical_data
-    for part in parent.relative_to(canonical_data).parts:
-        current = current / part
-        component = os.stat(current, follow_symlinks=False)
-        if stat.S_ISLNK(component.st_mode) or not stat.S_ISDIR(component.st_mode):
-            raise ProducerError("snapshot output parent contains an unsafe component")
-    if parent_info.st_uid != os.getuid() or stat.S_IMODE(parent_info.st_mode) & 0o077:
-        raise ProducerError("snapshot output parent has unsafe ownership or permissions")
-    output = parent / output.name
-    reject_control_path(output)
-    existing: os.stat_result | None
     try:
-        existing = os.stat(output, follow_symlinks=False)
-    except FileNotFoundError:
-        existing = None
-    except OSError as exc:
-        raise ProducerError("snapshot destination could not be inspected safely") from exc
-    if existing is not None:
+        parent_anchor = observation.observe_subdirectory(data, parent_parts)
+    except ProducerError as exc:
+        raise ProducerError("snapshot output parent contains an unsafe component") from exc
+    parent_descriptor = os.dup(parent_anchor.descriptor)
+    try:
+        parent_info = os.fstat(parent_descriptor)
+        if created_default_parent:
+            os.fchmod(parent_descriptor, 0o700)
+            parent_info = os.fstat(parent_descriptor)
         if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.getuid()
+            or stat.S_IMODE(parent_info.st_mode) & 0o077
+        ):
+            raise ProducerError("snapshot output parent has unsafe ownership or permissions")
+        try:
+            existing = os.stat(
+                output_name, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            existing = None
+        except OSError as exc:
+            raise ProducerError("snapshot destination could not be inspected safely") from exc
+        if existing is not None and (
             not stat.S_ISREG(existing.st_mode)
             or existing.st_nlink != 1
             or stat.S_IMODE(existing.st_mode) != 0o600
         ):
             raise ProducerError("snapshot destination is not one private ordinary file")
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        parent_descriptor = os.open(parent, flags)
-    except OSError as exc:
-        raise ProducerError("snapshot output parent could not be opened safely") from exc
+    except Exception:
+        os.close(parent_descriptor)
+        raise
     return output, parent_descriptor
 
 
@@ -484,6 +667,7 @@ def run_bounded(
     *,
     timeout: int = TASKS_AXI_TIMEOUT_SECONDS,
     cap: int = MAX_READER_OUTPUT_BYTES,
+    pass_descriptors: Sequence[int] = (),
 ) -> bytes:
     try:
         process = subprocess.Popen(
@@ -494,6 +678,7 @@ def run_bounded(
             env=dict(env),
             shell=False,
             start_new_session=True,
+            pass_fds=tuple(pass_descriptors),
         )
     except OSError as exc:
         raise ProducerError("authoritative local reader could not be started") from exc
@@ -610,7 +795,19 @@ def read_backlog_tasks(
     if payload is None:
         return []
     temp_name = write_private_temp(parent_descriptor, "workstack-backlog", payload)
-    temp_path = output_parent / temp_name
+    try:
+        source_descriptor = os.open(
+            temp_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+    except OSError as exc:
+        try:
+            os.unlink(temp_name, dir_fd=parent_descriptor)
+        except OSError:
+            pass
+        raise ProducerError("private captured source could not be reopened") from exc
+    temp_path = Path("/dev/fd") / str(source_descriptor)
     path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     environment = {
         "PATH": path,
@@ -630,9 +827,11 @@ def read_backlog_tasks(
                 str(MAX_TASK_RECORDS),
             ),
             environment,
+            pass_descriptors=(source_descriptor,),
         )
         return parse_tasks_axi(output)
     finally:
+        os.close(source_descriptor)
         try:
             os.unlink(temp_name, dir_fd=parent_descriptor)
         except FileNotFoundError:
@@ -665,23 +864,23 @@ def project_identity(name: str) -> str:
 
 
 def collect_workers(
-    home: Path,
+    home: AnchoredDirectory,
     observation: Observation,
     backlog_tasks: Iterable[BacklogTask],
     registered: set[str],
 ) -> tuple[list[dict[str, Any]], bool, int]:
-    paths = observation.observe_inventory(home / "state", "*.meta")
-    if len(paths) > MAX_META_RECORDS:
+    names = observation.observe_inventory(home, "state", "*.meta")
+    if len(names) > MAX_META_RECORDS:
         raise ProducerError("task metadata inventory exceeds its record bound")
     tasks = {record.identity: record for record in backlog_tasks}
     workers: list[dict[str, Any]] = []
     total_bytes = 0
     omitted = 0
-    for path in paths:
-        identity = path.name[:-5]
+    for name in names:
+        identity = name[:-5]
         if not IDENTITY_RE.fullmatch(identity):
             raise ProducerError("task metadata filename contains a broken exact identity")
-        payload = observation.read_file(path, MAX_META_BYTES)
+        payload = observation.read_under(home, ("state", name), MAX_META_BYTES)
         assert payload is not None
         total_bytes += len(payload)
         if total_bytes > MAX_META_TOTAL_BYTES:
@@ -730,7 +929,7 @@ def collect_workers(
         workers.append(row)
         omitted += 1
     workers.sort(key=lambda row: row["worker_incarnation_identity"])
-    return workers, bool(paths), omitted
+    return workers, bool(names), omitted
 
 
 def inspect_project_sources(
@@ -756,8 +955,8 @@ def inspect_project_sources(
             continue
         if name == "data-team-management":
             payload = observation.read_under(
-                binding.root / "config" / "board.json",
                 binding.root,
+                ("config", "board.json"),
                 MAX_PROJECT_SOURCE_BYTES,
             )
             board = load_json(payload, "Data Team Management board contract")
@@ -787,7 +986,7 @@ def inspect_project_sources(
             project_sources[name] = identity
         elif name == "gl-data-team-tickets":
             payload = observation.read_under(
-                binding.root / "README.md", binding.root, MAX_PROJECT_SOURCE_BYTES
+                binding.root, "README.md", MAX_PROJECT_SOURCE_BYTES
             )
             if not decode_utf8(payload, "Data Team Tickets repository contract").strip():
                 raise ProducerError("Data Team Tickets repository contract is malformed")
@@ -815,13 +1014,17 @@ def inspect_project_sources(
     return sources, project_sources
 
 
-def load_workstack_model(root: Path, observation: Observation) -> tuple[types.ModuleType, Path]:
+def load_workstack_model(
+    root: Path, observation: Observation
+) -> tuple[types.ModuleType, AnchoredDirectory]:
     workstack = observation.observe_directory(root)
-    validate_git_marker(workstack)
-    model_path = workstack / "src" / "workstack_compass" / "model.py"
-    launcher = workstack / "bin" / "workstack-compass"
-    model_payload = observation.read_under(model_path, workstack, MAX_MODEL_BYTES)
-    launcher_payload = observation.read_under(launcher, workstack, MAX_MODEL_BYTES)
+    validate_git_marker(workstack, observation)
+    model_payload = observation.read_under(
+        workstack, ("src", "workstack_compass", "model.py"), MAX_MODEL_BYTES
+    )
+    launcher_payload = observation.read_under(
+        workstack, ("bin", "workstack-compass"), MAX_MODEL_BYTES
+    )
     if not launcher_payload.startswith(b"#!"):
         raise ProducerError("Workstack Compass launcher is malformed")
     source = decode_utf8(model_payload, "Workstack Compass executable model")
@@ -1067,14 +1270,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     script_root = Path(__file__).resolve().parent.parent
     parent_descriptor: int | None = None
+    observation = Observation()
     try:
-        home = active_home(script_root)
-        observation = Observation()
+        home = active_home(script_root, observation)
         model, workstack_root = load_workstack_model(
             Path(arguments.workstack_root).expanduser(), observation
         )
-        registry_payload = observation.read_file(
-            home / "data" / "projects.md", MAX_REGISTRY_BYTES, missing_ok=True
+        registry_payload = observation.read_under(
+            home, ("data", "projects.md"), MAX_REGISTRY_BYTES, missing_ok=True
         )
         registered = parse_registry(registry_payload)
         bindings = bind_project_roots(
@@ -1084,12 +1287,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             home,
             arguments.output,
             [workstack_root, *(binding.root for binding in bindings.values())],
+            observation,
         )
         project_sources, project_source_by_name = inspect_project_sources(
             registered, bindings, observation
         )
-        backlog_payload = observation.read_file(
-            home / "data" / "backlog.md", MAX_BACKLOG_BYTES, missing_ok=True
+        backlog_payload = observation.read_under(
+            home, ("data", "backlog.md"), MAX_BACKLOG_BYTES, missing_ok=True
         )
         backlog_tasks = read_backlog_tasks(
             backlog_payload, parent_descriptor, output.parent
@@ -1127,7 +1331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             observation,
         )
         launch = (
-            f"cd {shlex.quote(os.fspath(workstack_root))} && "
+            f"cd {shlex.quote(os.fspath(workstack_root.path))} && "
             f"./bin/workstack-compass --snapshot {shlex.quote(os.fspath(output))} "
             "--color --reduced-motion"
         )
@@ -1140,6 +1344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if parent_descriptor is not None:
             os.close(parent_descriptor)
+        observation.close()
 
 
 if __name__ == "__main__":

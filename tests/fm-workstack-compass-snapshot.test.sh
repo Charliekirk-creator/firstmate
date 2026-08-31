@@ -29,6 +29,42 @@ write_fake_model() {
 SCHEMA_VERSION = "$schema_version"
 MAX_SNAPSHOT_BYTES = $max_bytes
 
+import os
+
+_real_open = os.open
+_output_raced = False
+
+def _race_open(path, flags, mode=0o777, *, dir_fd=None):
+    global _output_raced
+    source = os.environ.get("FM_TEST_OUTPUT_SWAP_SOURCE")
+    destination = os.environ.get("FM_TEST_OUTPUT_SWAP_DESTINATION")
+    target = os.environ.get("FM_TEST_OUTPUT_OPEN_TARGET")
+    text = os.fspath(path)
+    if source and destination and not _output_raced and (text == target or text == "private"):
+        _output_raced = True
+        os.rename(source, source + ".retained")
+        os.symlink(destination, source)
+    return _real_open(path, flags, mode, dir_fd=dir_fd)
+
+os.open = _race_open
+
+_real_stat = os.stat
+_source_stat_count = 0
+
+def _race_stat(path, *args, **kwargs):
+    global _source_stat_count
+    target = os.environ.get("FM_TEST_SOURCE_STAT_TARGET")
+    source = os.environ.get("FM_TEST_SOURCE_SWAP_SOURCE")
+    destination = os.environ.get("FM_TEST_SOURCE_SWAP_DESTINATION")
+    if target and os.fspath(path) == target:
+        _source_stat_count += 1
+        if _source_stat_count == 2:
+            os.rename(source, source + ".retained")
+            os.symlink(destination, source)
+    return _real_stat(path, *args, **kwargs)
+
+os.stat = _race_stat
+
 class ValidatedSnapshot:
     def integrity_issues(self):
         return ()
@@ -245,6 +281,13 @@ test_duplicate_and_broken_identities_refuse() {
   run_failure "exactly one incarnation identity" run_world "$world"
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "broken task identity failure changed the prior complete snapshot"
+  sed -i.bak '$d' "$world/home/state/task-z.meta"
+  rm -f "$world/home/state/task-z.meta.bak"
+  sed -i.bak 's/^spawn_gen=.*/spawn_gen=.hidden-generation/' "$world/home/state/task-z.meta"
+  rm -f "$world/home/state/task-z.meta.bak"
+  run_failure "broken incarnation identity" run_world "$world"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "leading-dot incarnation failure changed the prior complete snapshot"
   pass "duplicate and broken source identities refuse without partial replacement"
 }
 
@@ -302,6 +345,50 @@ test_unsafe_outputs_and_sources_refuse() {
   ln -s "$world/outside-board.json" "$world/dtm/config/board.json"
   run_failure "symlink" run_world "$world"
   pass "path escapes, symlinks, and unsafe output files are refused"
+}
+
+test_component_swap_cannot_escape_bound_source() {
+  local world outside snapshot
+  world=$(make_world source-component-swap)
+  outside="$world/outside-config"
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  mkdir -p "$outside"
+  cat > "$outside/board.json" <<'JSON'
+{"project":{"id":"PVT_ESCAPE","number":9},"issue_repo":"escape/repository"}
+JSON
+  FM_TEST_SOURCE_STAT_TARGET="$world/dtm/config/board.json" \
+    FM_TEST_SOURCE_SWAP_SOURCE="$world/dtm/config" \
+    FM_TEST_SOURCE_SWAP_DESTINATION="$outside" \
+    FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "data-team-management=$world/dtm" \
+      --output "$snapshot" >/dev/null \
+    || fail "descriptor-anchored source generation failed"
+  json_assert "$snapshot" \
+    'any(.sources[]; .source_identity == "source:data-team-management-board:PVT_TEST_BOARD") and all(.sources[]; .source_identity != "source:data-team-management-board:PVT_ESCAPE")' \
+    "an intermediate component substitution escaped the explicitly bound root"
+  pass "bound source traversal cannot follow a substituted intermediate component"
+}
+
+test_output_parent_substitution_refuses_before_source_write() {
+  local world private destination output
+  world=$(make_world output-component-swap)
+  private="$world/home/data/private"
+  destination="$world/alpha/injected"
+  output="$private/nested/snapshot.json"
+  mkdir -p "$private/nested" "$destination/nested"
+  chmod 0700 "$private" "$private/nested" "$destination" "$destination/nested"
+  run_failure "unsafe component" env \
+    FM_TEST_OUTPUT_SWAP_SOURCE="$private" \
+    FM_TEST_OUTPUT_SWAP_DESTINATION="$destination" \
+    FM_TEST_OUTPUT_OPEN_TARGET="$private/nested" \
+    FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "alpha=$world/alpha" \
+      --output "$output"
+  [ -z "$(find "$destination" -type f -print -quit)" ] \
+    || fail "output-parent substitution wrote into a bound source repository"
+  pass "output traversal rejects ancestor substitution before any source write"
 }
 
 test_repository_containment_refuses_before_output_writes() {
@@ -441,6 +528,8 @@ test_missing_relations_stay_missing
 test_duplicate_and_broken_identities_refuse
 test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
+test_component_swap_cannot_escape_bound_source
+test_output_parent_substitution_refuses_before_source_write
 test_repository_containment_refuses_before_output_writes
 test_malformed_and_oversized_inputs_and_output_refuse
 test_optional_source_appearance_during_observation_refuses
