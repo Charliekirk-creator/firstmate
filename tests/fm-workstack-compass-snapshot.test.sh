@@ -22,10 +22,11 @@ run_failure() {
 
 write_fake_model() {
   local app=$1 max_bytes=${2:-2097152} behavior=${3:-accept}
+  local schema_version=${4:-workstack-compass.snapshot.v1}
   mkdir -p "$app/src/workstack_compass" "$app/bin"
   git -C "$app" init -q
   cat > "$app/src/workstack_compass/model.py" <<PY
-SCHEMA_VERSION = "test.snapshot.v1"
+SCHEMA_VERSION = "$schema_version"
 MAX_SNAPSHOT_BYTES = $max_bytes
 
 class ValidatedSnapshot:
@@ -105,14 +106,16 @@ MD
   cat > "$world/home/state/task-z.meta" <<'META'
 project=/PRIVATE/PATH/SECRET
 kind=ship
-busy_gen=g1700000000.10.20
+busy_gen=transient-busy-z
+spawn_gen=spawn-task-z
 model=PRIVATE_MODEL_SECRET
 harness=PRIVATE_HARNESS_SECRET
 META
   cat > "$world/home/state/task-a.meta" <<'META'
 project=/ANOTHER/PRIVATE/PATH
 kind=scout
-busy_gen=g1700000001.10.20
+busy_gen=transient-busy-a
+spawn_gen=spawn-task-a
 model=PRIVATE_MODEL_SECRET
 META
   printf '%s\n' 'working: STATUS_PROSE_SECRET' > "$world/home/state/task-a.status"
@@ -157,8 +160,8 @@ test_successful_truthful_projection() {
   [ "$(file_mode "$snapshot")" = 600 ] || fail "snapshot mode is not 0600"
   [ "$(find "$world/home/data/workstack-compass" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1 ] \
     || fail "generation left a partial temporary file beside the snapshot"
-  json_assert "$snapshot" '.schema_version == "test.snapshot.v1"' \
-    "producer did not use the executable model's schema version"
+  json_assert "$snapshot" '.schema_version == "workstack-compass.snapshot.v1"' \
+    "producer did not require the authoritative schema version"
   json_assert "$snapshot" \
     '(.observation_identity | startswith("observation:sha256:")) and (.observed_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) and all(.sources[]; (.detail | type) == "string" and (.detail | length) > 0)' \
     "observation time, identity, or source provenance is missing"
@@ -168,6 +171,9 @@ test_successful_truthful_projection() {
   json_assert "$snapshot" \
     '[.worker_incarnations[].worker_identity] == ["firstmate-worker:task-a","firstmate-worker:task-z"]' \
     "worker ordering is not deterministic"
+  json_assert "$snapshot" \
+    '[.worker_incarnations[].worker_incarnation_identity] == ["firstmate-worker-incarnation:task-a:spawn-task-a","firstmate-worker-incarnation:task-z:spawn-task-z"]' \
+    "durable spawn generations did not define worker incarnations"
   json_assert "$snapshot" \
     '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:task-a") | .project_identity) == "firstmate-project:alpha"' \
     "exact task-to-registry project relation was not preserved"
@@ -209,7 +215,7 @@ test_missing_relations_stay_missing() {
   snapshot="$world/home/data/workstack-compass/snapshot.json"
   cat > "$world/home/state/orphan.meta" <<'META'
 kind=ship
-busy_gen=g1700000002.10.20
+spawn_gen=spawn-orphan
 project=/path/must/not/be/a/join
 META
   run_world "$world" >/dev/null || fail "missing-relation projection failed"
@@ -235,8 +241,8 @@ test_duplicate_and_broken_identities_refuse() {
     || fail "duplicate registry failure changed the prior complete snapshot"
   sed -i.bak '$d' "$world/home/data/projects.md"
   rm -f "$world/home/data/projects.md.bak"
-  printf '%s\n' 'busy_gen=not valid!' >> "$world/home/state/task-z.meta"
-  run_failure "broken incarnation identity" run_world "$world"
+  printf '%s\n' 'spawn_gen=duplicate-generation' >> "$world/home/state/task-z.meta"
+  run_failure "exactly one incarnation identity" run_world "$world"
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "broken task identity failure changed the prior complete snapshot"
   pass "duplicate and broken source identities refuse without partial replacement"
@@ -257,6 +263,10 @@ test_atomic_replacement_and_model_rejection() {
   [ "$inode_after" != "$inode_before" ] || fail "snapshot replacement reused the published inode"
   [ "$hash_after" != "$hash_before" ] || fail "source change did not replace the observation"
   jq -e . "$snapshot" >/dev/null || fail "atomically replaced snapshot is not complete JSON"
+  write_fake_model "$world/app" 2097152 accept test.snapshot.v1
+  run_failure "model contract is unsupported" run_world "$world"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$hash_after" ] \
+    || fail "wrong model schema replaced the last complete snapshot"
   write_fake_model "$world/app" 2097152 reject
   run_failure "executable model rejected" run_world "$world"
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$hash_after" ] \
@@ -292,6 +302,34 @@ test_unsafe_outputs_and_sources_refuse() {
   ln -s "$world/outside-board.json" "$world/dtm/config/board.json"
   run_failure "symlink" run_world "$world"
   pass "path escapes, symlinks, and unsafe output files are refused"
+}
+
+test_repository_containment_refuses_before_output_writes() {
+  local world project alias
+  world=$(make_world repository-containment)
+  rmdir "$world/home/data/workstack-compass"
+  write_fake_model "$world/home"
+  run_failure "must not be inside a source repository" env \
+    FM_HOME="$world/home" "$PRODUCER" --workstack-root "$world/home"
+  [ ! -e "$world/home/data/workstack-compass" ] \
+    || fail "Workstack-root containment refusal created an output directory"
+
+  world=$(make_world project-containment)
+  rmdir "$world/home/data/workstack-compass"
+  project="$world/home/data/source-project"
+  init_project "$project"
+  mkdir -m 0700 "$project/private"
+  mkdir -p "$world/aliases"
+  ln -s "$world/home/data" "$world/aliases/data-link"
+  alias="$world/aliases/data-link/source-project"
+  run_failure "must not be inside a source repository" env \
+    FM_HOME="$world/home" "$PRODUCER" \
+    --workstack-root "$world/app" \
+    --project-root "alpha=$alias" \
+    --output "$project/private/snapshot.json"
+  [ -z "$(find "$project/private" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "project-root containment refusal created an output or temporary file"
+  pass "canonical repository containment is refused before output writes"
 }
 
 test_malformed_and_oversized_inputs_and_output_refuse() {
@@ -403,6 +441,7 @@ test_missing_relations_stay_missing
 test_duplicate_and_broken_identities_refuse
 test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
+test_repository_containment_refuses_before_output_writes
 test_malformed_and_oversized_inputs_and_output_refuse
 test_optional_source_appearance_during_observation_refuses
 test_source_change_during_observation_refuses

@@ -70,12 +70,13 @@ MAX_MODEL_BYTES = 512 * 1024
 MAX_READER_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_TASK_RECORDS = 10_000
 TASKS_AXI_TIMEOUT_SECONDS = 10
+REQUIRED_SCHEMA_VERSION = "workstack-compass.snapshot.v1"
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 REGISTRY_LINE_RE = re.compile(
     r"^- ([A-Za-z0-9._-]{1,160})(?: \[[^\]\r\n]+\])? - \S.*$"
 )
 META_KEY_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
-BUSY_GEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+SPAWN_GEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 DTM_NODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,180}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -361,32 +362,50 @@ def bind_project_roots(
     return bindings
 
 
-def prepare_output(home: Path, requested: str | None) -> tuple[Path, int]:
+def prepare_output(
+    home: Path,
+    requested: str | None,
+    source_roots: Iterable[Path],
+) -> tuple[Path, int]:
     data_root = resolve_existing_directory(home / "data")
-    default_parent = data_root / "workstack-compass"
+    canonical_data = data_root.resolve(strict=True)
+    default_parent = canonical_data / "workstack-compass"
+    create_default_parent = requested is None and not default_parent.exists()
     if requested is None:
-        if not default_parent.exists():
-            try:
-                os.mkdir(default_parent, 0o700)
-                os.chmod(default_parent, 0o700, follow_symlinks=False)
-            except OSError as exc:
-                raise ProducerError("private snapshot directory could not be created") from exc
-        output = default_parent / "snapshot.json"
+        parent = default_parent
+        output = parent / "snapshot.json"
     else:
         output = Path(requested).expanduser()
         reject_control_path(output)
         if not output.is_absolute():
             output = Path.cwd() / output
+        try:
+            parent = output.parent.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ProducerError(
+                "snapshot output must stay below the active FM_HOME data directory"
+            ) from exc
+        output = parent / output.name
     try:
-        parent = output.parent.resolve(strict=True)
-        canonical_data = data_root.resolve(strict=True)
         parent.relative_to(canonical_data)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except ValueError as exc:
         raise ProducerError("snapshot output must stay below the active FM_HOME data directory") from exc
+    for source_root in source_roots:
+        try:
+            output.relative_to(source_root)
+        except ValueError:
+            continue
+        raise ProducerError("snapshot output must not be inside a source repository")
+    if create_default_parent:
+        try:
+            os.mkdir(default_parent, 0o700)
+            os.chmod(default_parent, 0o700, follow_symlinks=False)
+        except OSError as exc:
+            raise ProducerError("private snapshot directory could not be created") from exc
     parent_info = os.stat(parent, follow_symlinks=False)
     if parent == canonical_data:
         raise ProducerError("snapshot output requires a private subdirectory below FM_HOME data")
-    if not stat.S_ISDIR(parent_info.st_mode) or output.parent.is_symlink():
+    if not stat.S_ISDIR(parent_info.st_mode) or parent.is_symlink():
         raise ProducerError("snapshot output parent is unsafe")
     current = canonical_data
     for part in parent.relative_to(canonical_data).parts:
@@ -668,11 +687,19 @@ def collect_workers(
         if total_bytes > MAX_META_TOTAL_BYTES:
             raise ProducerError("task metadata inventory exceeds its total byte bound")
         meta = parse_meta(payload)
-        generation = meta.get("busy_gen")
-        if generation is None:
+        spawn_generation_count = sum(
+            1 for line in decode_utf8(payload, "task metadata").splitlines()
+            if line.startswith("spawn_gen=")
+        )
+        if spawn_generation_count == 0:
             omitted += 1
             continue
-        if not BUSY_GEN_RE.fullmatch(generation):
+        if spawn_generation_count != 1:
+            raise ProducerError(
+                "task metadata must contain exactly one incarnation identity"
+            )
+        generation = meta["spawn_gen"]
+        if not SPAWN_GEN_RE.fullmatch(generation):
             raise ProducerError("task metadata contains a broken incarnation identity")
         kind = meta.get("kind", "ship")
         roles = {
@@ -810,7 +837,7 @@ def load_workstack_model(root: Path, observation: Observation) -> tuple[types.Mo
     finally:
         sys.modules.pop(module_name, None)
     if (
-        not isinstance(getattr(module, "SCHEMA_VERSION", None), str)
+        getattr(module, "SCHEMA_VERSION", None) != REQUIRED_SCHEMA_VERSION
         or not callable(getattr(module, "snapshot_from_mapping", None))
         or not isinstance(getattr(module, "MAX_SNAPSHOT_BYTES", None), int)
         or module.MAX_SNAPSHOT_BYTES < 1
@@ -1042,7 +1069,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parent_descriptor: int | None = None
     try:
         home = active_home(script_root)
-        output, parent_descriptor = prepare_output(home, arguments.output)
         observation = Observation()
         model, workstack_root = load_workstack_model(
             Path(arguments.workstack_root).expanduser(), observation
@@ -1053,6 +1079,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         registered = parse_registry(registry_payload)
         bindings = bind_project_roots(
             arguments.project_root, set(registered), observation
+        )
+        output, parent_descriptor = prepare_output(
+            home,
+            arguments.output,
+            [workstack_root, *(binding.root for binding in bindings.values())],
         )
         project_sources, project_source_by_name = inspect_project_sources(
             registered, bindings, observation
