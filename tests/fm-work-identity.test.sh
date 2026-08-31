@@ -1225,6 +1225,52 @@ test_dispatch_retire_run_refuses_changed_record_without_partial_retirement() {
   pass "dispatch retirement validates all final records before retiring any"
 }
 
+test_dispatch_retire_run_preserves_failed_siblings() {
+  local home task launch transaction binding hash owner owner_id journal command rc=0
+  home=$(make_home dispatch-retire-partial-set)
+  for task in dispatch-retire-partial-a dispatch-retire-partial-b; do
+    FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
+      || fail "could not scaffold $task partial retirement fixture"
+    launch="$home/state/$task.launch-brief.md"
+    transaction="retire-$task"
+    binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
+      --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
+      --transaction "$transaction") || fail "could not prepare $task dispatch"
+    hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+    fm_write_meta "$home/state/$task.meta" \
+      "window=firstmate:fm-$task" "endpoint_task_id=$task" \
+      "worktree=$home/worktree" "project=firstmate" "launch_brief=$launch" \
+      "launch_brief_sha256=$hash" "work_identity_dispatch_transaction=$transaction" \
+      "harness=codex" "kind=ship" "mode=no-mistakes" "yolo=off" \
+      "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+    FM_HOME="$home" "$WORK_IDENTITY" dispatch-commit "$task" \
+      --brief "$launch" --meta "$home/state/$task.meta" --transaction "$transaction" \
+      || fail "could not commit $task dispatch"
+  done
+  owner="$home/data/dispatch-retire-partial-a"
+  owner_id=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$owner")
+  journal="$owner/.work-identity-dispatch.json.teardown-journal"
+  command='token=$(sed -n "4p" "$1"); python3 "$2" teardown-command-complete "$3" "$4" work-identity-dispatch.json "$token"; exit 9'
+  FM_HOME="$home" "$WORK_IDENTITY" dispatch-retire-run \
+    dispatch-retire-partial-a dispatch-retire-partial-b -- \
+    sh -c "$command" sh "$journal" "$ROOT/bin/fm-work-identity-fs.py" \
+      "$owner" "$owner_id" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 9 ] || fail "partial retirement returned $rc instead of the wrapped failure"
+  assert_absent "$home/data/dispatch-retire-partial-a/work-identity-dispatch.json" \
+    "completed child dispatch receipt was not finalized"
+  assert_absent "$home/state/dispatch-retire-partial-a.meta" \
+    "completed child metadata was not finalized"
+  assert_absent "$home/state/dispatch-retire-partial-a.launch-brief.md" \
+    "completed child launch instructions were not finalized"
+  assert_present "$home/data/dispatch-retire-partial-b/work-identity-dispatch.json" \
+    "failed sibling dispatch receipt was finalized"
+  assert_present "$home/state/dispatch-retire-partial-b.meta" \
+    "failed sibling metadata was finalized"
+  assert_present "$home/state/dispatch-retire-partial-b.launch-brief.md" \
+    "failed sibling launch instructions were finalized"
+  pass "partial dispatch retirement finalizes only completed children"
+}
+
 test_dispatch_retire_run_rejects_duplicate_tasks() {
   local home marker out rc=0
   home=$(make_home dispatch-retire-duplicate)
@@ -2923,6 +2969,7 @@ case "${FM_TEST_ONLY:-}" in
     test_dispatch_retire_run_accepts_whole_home_removal
     test_dispatch_retire_run_recovers_completed_command
     test_dispatch_retire_run_refuses_changed_record_without_partial_retirement
+    test_dispatch_retire_run_preserves_failed_siblings
     test_dispatch_retire_run_rejects_duplicate_tasks
     exit 0
     ;;
@@ -2957,6 +3004,7 @@ test_dispatch_retire_run_refuses_invalid_set_without_quarantine
 test_dispatch_retire_run_accepts_whole_home_removal
 test_dispatch_retire_run_recovers_completed_command
 test_dispatch_retire_run_refuses_changed_record_without_partial_retirement
+test_dispatch_retire_run_preserves_failed_siblings
 test_dispatch_retire_run_rejects_duplicate_tasks
 test_spawn_recovers_exact_created_endpoint
 test_spawn_recovers_creation_intent_after_endpoint_side_effect

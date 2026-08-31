@@ -49,11 +49,12 @@ harness=kimi
 EOF
 
 run_launch() {
+  local harness=${1:-kimi}
   FM_ROOT_OVERRIDE="$FIXTURE_ROOT" FM_HOME="$HOME_DIR" \
     FM_TEST_STATE="$HOME_DIR/state/parent-route" \
     FM_TEST_DATA="$HOME_DIR/data/.parent-route" FM_TEST_CALLS="$CALLS" \
     "$FIXTURE_ROOT/bin/fm-remote-secondmate-control.sh" \
-      launch remote kimi - - herdr
+      launch remote "$harness" - - herdr
 }
 
 out=$(run_launch) || fail "alive completed route was not reusable"
@@ -62,14 +63,24 @@ assert_contains "$out" 'schema=fm-remote-secondmate-control.v1' \
 assert_absent "$CALLS" "completed route unnecessarily resumed host-local spawn"
 
 : > "$HOME_DIR/state/parent-route/remote.spawn-endpoint.json"
-out=$(run_launch) || fail "alive route with recovery evidence did not resume"
-assert_contains "$out" 'harness=kimi' "resumed launch did not return the Kimi route"
+rc=0
+out=$(run_launch 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "incomplete remote Kimi delivery was resumed without a prompt receipt"
+assert_contains "$out" 'no transaction-scoped prompt receipt' \
+  "remote Kimi refusal did not identify its missing acceptance boundary"
+assert_absent "$CALLS" "remote Kimi refusal invoked host-local spawn"
+
+sed 's/^harness=.*/harness=codex/' \
+  "$HOME_DIR/state/parent-route/remote.meta" > "$HOME_DIR/state/parent-route/remote.meta.next"
+mv -- "$HOME_DIR/state/parent-route/remote.meta.next" "$HOME_DIR/state/parent-route/remote.meta"
+out=$(run_launch codex) || fail "alive Codex route with recovery evidence did not resume"
+assert_contains "$out" 'harness=codex' "resumed launch did not return the Codex route"
 [ "$(wc -l < "$CALLS" | tr -d ' ')" -eq 1 ] \
   || fail "host-local spawn was not resumed exactly once"
-assert_grep '--secondmate --harness kimi --backend herdr' "$CALLS" \
+assert_grep '--secondmate --harness codex --backend herdr' "$CALLS" \
   "host-local recovery did not preserve the launch identity"
 assert_absent "$HOME_DIR/state/parent-route/remote.spawn-endpoint.json" \
   "resumed host-local transaction did not retire its recovery receipt"
 
-pass "remote secondmate launch resumes retained host-local transactions"
+pass "remote secondmate launch refuses Kimi and resumes receiptable routes"
 echo "ALL TESTS PASSED"

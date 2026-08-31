@@ -314,6 +314,19 @@ test_non_tmux_persistent_kimi_refuses_before_identity_reservation() {
   assert_absent "$HOME_DIR/data/$id/work-identity-unlinked-guard.json" \
     "inapplicable Kimi backend permanently classified the task"
   [ ! -s "$CASE_DIR/launch.log" ] || fail "inapplicable Kimi backend launched an agent"
+  rc=0
+  out=$(HOME="$HOME_DIR" FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 FM_SKIP_SECONDMATE_INHERIT=1 FM_REMOTE_SECONDMATE_LAUNCH=1 \
+    PATH="$FAKEBIN_DIR:$BASE_PATH" "$SPAWN" "$id" "$sub" \
+      --harness kimi --secondmate --backend herdr 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "remote Herdr Kimi spawn unexpectedly succeeded"
+  assert_contains "$out" "Herdr does not expose a transaction-scoped prompt receipt" \
+    "remote Herdr Kimi refusal did not identify its missing receipt"
+  assert_absent "$HOME_DIR/data/$id/work-identity-unlinked-reservation.json" \
+    "remote Herdr Kimi refusal published an identity reservation"
+  [ ! -s "$CASE_DIR/launch.log" ] || fail "remote Herdr Kimi refusal launched an agent"
   pass "persistent Kimi rejects backends without atomic submission receipts"
 }
 

@@ -2795,7 +2795,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
   local task rc meta launch authorization authorizations= whole_home=0 owner_pid=${BASHPID:-$$}
   local receipt_parent receipt_parent_id receipt_name quarantine_name receipt_state receipt_digest index rollback
   local metadata_state metadata_digest launch_state launch_digest
-  local batch_token seen_tasks=" $1 " recovery_state any_completed=0
+  local batch_token seen_tasks=" $1 " recovery_state any_completed=0 partial_completion=0
   local -a tasks=("$1") command_argv=() recovery_states=()
   local -a receipt_parents=() receipt_parent_ids=() receipt_names=()
   local -a quarantine_names=() receipt_states=() receipt_digests=() receipt_present=() quarantined=()
@@ -2841,21 +2841,23 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
   if [ "$any_completed" -eq 1 ]; then
     for index in "${!tasks[@]}"; do
       task=${tasks[$index]}
-      identity_lock_acquire "$task"
       case "${recovery_states[$index]}" in
-        quarantined) dispatch_teardown_complete_locked "$batch_token" ;;
-        command-completed|finalizing|absent) ;;
-        *) die "interrupted dispatch retirement has a mismatched legacy transaction" ;;
+        command-completed|finalizing)
+          identity_lock_acquire "$task"
+          dispatch_teardown_finalize_locked
+          identity_lock_release
+          ;;
+        quarantined|legacy-quarantined)
+          identity_lock_acquire "$task"
+          dispatch_teardown_restore_locked
+          identity_lock_release
+          partial_completion=1
+          ;;
+        absent) ;;
+        *) die "interrupted dispatch retirement has a malformed transaction state" ;;
       esac
-      identity_lock_release
     done
-    for index in "${!tasks[@]}"; do
-      [ "${recovery_states[$index]}" != absent ] || continue
-      task=${tasks[$index]}
-      identity_lock_acquire "$task"
-      dispatch_teardown_finalize_locked
-      identity_lock_release
-    done
+    [ "$partial_completion" -eq 0 ] || return 1
     return 0
   fi
   for index in "${!tasks[@]}"; do
@@ -2971,7 +2973,6 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
      && [ ! -e "$FM_HOME_REAL" ] && [ ! -L "$FM_HOME_REAL" ]; then
     return "$rc"
   fi
-  any_completed=0
   for index in "${!tasks[@]}"; do
     [ "${receipt_present[$index]}" = 1 ] || continue
     task=${tasks[$index]}
@@ -2988,32 +2989,35 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
       recovery_state=command-completed
     fi
     case "$recovery_state" in
-      command-completed|finalizing) any_completed=1 ;;
+      command-completed|finalizing|quarantined) ;;
+      *) die "completed dispatch retirement has a malformed transaction state" ;;
     esac
     recovery_states[$index]=$recovery_state
     identity_lock_release
   done
-  if [ "$rc" -ne 0 ] && [ "$any_completed" -eq 0 ]; then
+  if [ "$rc" -ne 0 ]; then
     for index in "${!tasks[@]}"; do
       [ "${receipt_present[$index]}" = 1 ] || continue
       task=${tasks[$index]}
       identity_lock_acquire "$task"
-      dispatch_teardown_restore_locked
+      case "${recovery_states[$index]}" in
+        command-completed|finalizing) dispatch_teardown_finalize_locked ;;
+        quarantined) dispatch_teardown_restore_locked ;;
+        *) die "failed dispatch retirement has a malformed transaction state" ;;
+      esac
       identity_lock_release
     done
     return "$rc"
   fi
-  if [ "$any_completed" -eq 1 ]; then
-    for index in "${!tasks[@]}"; do
-      [ "${receipt_present[$index]}" = 1 ] || continue
-      [ "${recovery_states[$index]}" = quarantined ] || continue
-      task=${tasks[$index]}
-      identity_lock_acquire "$task"
-      dispatch_teardown_complete_locked "$batch_token"
-      recovery_states[$index]=command-completed
-      identity_lock_release
-    done
-  fi
+  for index in "${!tasks[@]}"; do
+    [ "${receipt_present[$index]}" = 1 ] || continue
+    [ "${recovery_states[$index]}" = quarantined ] || continue
+    task=${tasks[$index]}
+    identity_lock_acquire "$task"
+    dispatch_teardown_complete_locked "$batch_token"
+    recovery_states[$index]=command-completed
+    identity_lock_release
+  done
   for index in "${!tasks[@]}"; do
     [ "${receipt_present[$index]}" = 1 ] || continue
     task=${tasks[$index]}

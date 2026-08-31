@@ -162,13 +162,16 @@ cmd_launch() {
           return 0
         fi
         ;;
-      dead)
-        fm_backend_kill "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null \
-          || die "could not remove the confirmed agent-less endpoint"
-        ;;
+      dead) ;;
       missing) ;;
       *) die "remote endpoint state is $current; refusing duplicate launch" ;;
     esac
+  fi
+  [ "$harness" != kimi ] \
+    || die "remote Kimi secondmates cannot be launched or resumed because Herdr has no transaction-scoped prompt receipt"
+  if [ -f "$meta" ] && [ "$current" = dead ]; then
+    fm_backend_kill "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null \
+      || die "could not remove the confirmed agent-less endpoint"
   fi
   ARGS=("$id" "$TARGET_HOME" --secondmate --harness "$harness" --backend "$selected_backend")
   [ "$model" = - ] || ARGS+=(--model "$model")
