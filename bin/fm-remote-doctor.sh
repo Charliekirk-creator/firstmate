@@ -64,8 +64,6 @@ LAUNCH_AGENT_LABEL=dev.firstmate.herdr.fm-remote
 # remains in the separate default session, which this readiness check never
 # requires or changes.
 HERDR_SESSION_NAME=fm-remote
-HERDR_PROMPT_MIN_VERSION=0.7.5
-HERDR_PROMPT_MIN_PROTOCOL=17
 LAUNCH_AGENT_DIR="${HOME:-}/Library/LaunchAgents"
 LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
 LAUNCH_AGENT_LOG_DIR="${HOME:-}/Library/Logs"
@@ -477,9 +475,9 @@ check_herdr() {
   client_protocol=$(printf '%s' "$status" | jq -r '.client.protocol // empty' 2>/dev/null) || client_protocol=
   client_version=$(printf '%s' "$status" | jq -r '.client.version // empty' 2>/dev/null) || client_version=
   case "$client_protocol" in ''|*[!0-9]*) client_protocol=0 ;; esac
-  if [ "$client_protocol" -lt "$HERDR_PROMPT_MIN_PROTOCOL" ]; then
-    record herdr "human: client ${client_version:-unknown} protocol $client_protocol lacks durable agent prompt submission" \
-      "upgrade herdr to $HERDR_PROMPT_MIN_VERSION or newer (protocol $HERDR_PROMPT_MIN_PROTOCOL or newer), then rerun remote doctor"
+  if [ "$client_protocol" -lt "$FM_BACKEND_HERDR_MIN_PROTOCOL" ]; then
+    record herdr "human: client ${client_version:-unknown} protocol $client_protocol is below the verified Herdr backend minimum" \
+      "upgrade herdr to protocol $FM_BACKEND_HERDR_MIN_PROTOCOL or newer, then rerun remote doctor"
     return 0
   fi
   running=$(printf '%s' "$status" | jq -r 'if .server.running == true then "true" elif .server.running == false then "false" else "unknown" end' 2>/dev/null) || running=unknown
@@ -487,9 +485,9 @@ check_herdr() {
     server_protocol=$(printf '%s' "$status" | jq -r '.server.protocol // empty' 2>/dev/null) || server_protocol=
     server_version=$(printf '%s' "$status" | jq -r '.server.version // empty' 2>/dev/null) || server_version=
     case "$server_protocol" in ''|*[!0-9]*) server_protocol=0 ;; esac
-    if [ "$server_protocol" -lt "$HERDR_PROMPT_MIN_PROTOCOL" ]; then
-      record herdr "human: fm-remote server ${server_version:-unknown} protocol $server_protocol lacks durable agent prompt submission" \
-        "upgrade herdr to $HERDR_PROMPT_MIN_VERSION or newer and restart the fm-remote server, then rerun remote doctor"
+    if [ "$server_protocol" -lt "$FM_BACKEND_HERDR_MIN_PROTOCOL" ]; then
+      record herdr "human: fm-remote server ${server_version:-unknown} protocol $server_protocol is below the verified Herdr backend minimum" \
+        "upgrade herdr to protocol $FM_BACKEND_HERDR_MIN_PROTOCOL or newer and restart the fm-remote server, then rerun remote doctor"
       return 0
     fi
   fi

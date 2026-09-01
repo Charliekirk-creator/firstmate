@@ -290,17 +290,33 @@ esac
 SH
 chmod +x "$CASE_BIN/herdr"
 doctor
-expect_code 1 "$DOCTOR_RC" "a remote host without atomic Herdr prompt support was reported ready"
-assert_contains "$DOCTOR_OUT" 'check herdr=human:' "an old Herdr release was not reported as a readiness gap"
-assert_contains "$DOCTOR_OUT" 'protocol 17' "the Herdr readiness gap did not name the prompt protocol floor"
-pass "remote doctor requires Herdr prompt submission support"
+assert_contains "$DOCTOR_OUT" 'check herdr=ok:' \
+  "a supported protocol-16 Herdr route was rejected without an applicable consumer"
+assert_not_contains "$DOCTOR_OUT" 'check herdr=human:' \
+  "a supported protocol-16 Herdr route remained a readiness gap"
+pass "remote doctor accepts the general Herdr backend floor"
+
+new_case Darwin with-herdr gui
+cat > "$CASE_BIN/herdr" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "status --json") printf '%s\n' '{"client":{"version":"0.6.0","protocol":13},"server":{"running":false}}' ;;
+esac
+SH
+chmod +x "$CASE_BIN/herdr"
+doctor
+assert_contains "$DOCTOR_OUT" 'check herdr=human:' \
+  "a Herdr client below the verified backend floor was accepted"
+assert_contains "$DOCTOR_OUT" 'protocol 14' \
+  "the Herdr readiness gap did not name the verified backend floor"
+pass "remote doctor rejects clients below the Herdr backend floor"
 
 new_case Darwin with-herdr gui
 cat > "$CASE_BIN/herdr" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
   "status --json --session fm-remote")
-    printf '%s\n' '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true,"version":"0.7.4","protocol":16}}'
+    printf '%s\n' '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true,"version":"0.6.0","protocol":13}}'
     ;;
   "status --json")
     printf '%s\n' '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true,"version":"0.7.5","protocol":17}}'

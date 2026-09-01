@@ -2771,6 +2771,97 @@ SH
   pass "schema-maximum delegated identities use bounded remote pages"
 }
 
+test_secondmate_deadlines_are_isolated_per_home() {
+  local parent slow healthy task fakebin fake_ssh deadline_marker canonical
+  parent=$(make_home isolated-deadline-parent)
+  slow="$TMP_ROOT/isolated-deadline-slow"
+  healthy="$TMP_ROOT/isolated-deadline-healthy"
+  task=healthy-delegated-child
+  mkdir -p "$slow/data" "$slow/state" "$slow/config" "$slow/projects" \
+    "$healthy/data" "$healthy/state" "$healthy/config" "$healthy/projects"
+  printf 'a-slow\n' > "$slow/.fm-secondmate-home"
+  printf 'z-healthy\n' > "$healthy/.fm-secondmate-home"
+  printf '# Firstmate fixture\n' > "$slow/AGENTS.md"
+  printf '# Firstmate fixture\n' > "$healthy/AGENTS.md"
+  cat > "$slow/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+EOF
+  cat > "$healthy/data/backlog.md" <<EOF
+## In flight
+
+## Queued
+- [ ] $task - Healthy exact projection (repo: firstmate) (kind: ship)
+
+## Done
+EOF
+  cat > "$parent/data/secondmates.md" <<EOF
+- a-slow - slow domain (host: slow-remote; root: $ROOT; home: $slow; scope: slow work; projects: firstmate; added 2026-08-14)
+- z-healthy - healthy domain (host: healthy-remote; root: $ROOT; home: $healthy; scope: healthy work; projects: firstmate; added 2026-08-14)
+EOF
+  fakebin=$(make_fakebin "$parent/fakes")
+  deadline_marker="$parent/first-home-failed"
+  cat > "$fakebin/date" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = +%s ]; then
+  if [ -e "${FM_TEST_DEADLINE_MARKER:?}" ]; then printf '2000\n'; else printf '1000\n'; fi
+  exit 0
+fi
+exec /bin/date "$@"
+SH
+  fake_ssh="$fakebin/fake-ssh"
+  cat > "$fake_ssh" <<'SH'
+#!/usr/bin/env bash
+set -u
+args=("$@")
+n=${#args[@]}
+home_b64=${args[$((n - 2))]}
+argv_b64=${args[$((n - 1))]}
+decode() {
+  if [ "$(uname 2>/dev/null)" = Darwin ]; then
+    printf '%s' "$1" | base64 -D
+  else
+    printf '%s' "$1" | base64 --decode
+  fi
+}
+remote_home=$(decode "$home_b64") || exit 64
+argv_file="${FM_TEST_DEADLINE_TMP:?}/deadline-argv.$$"
+decode "$argv_b64" > "$argv_file" || exit 64
+argv=()
+while IFS= read -r -d '' value; do argv+=("$value"); done < "$argv_file"
+rm -f "$argv_file"
+[ "${#argv[@]}" -gt 0 ] || exit 64
+if [ "$remote_home" = "${FM_TEST_SLOW_HOME:?}" ] \
+  && [ "${argv[1]:-}" = --secondmate-home-summary ]; then
+  : > "${FM_TEST_DEADLINE_MARKER:?}"
+  exit 124
+fi
+env -i PATH="$PATH" HOME="${HOME:-}" FM_HOME="$remote_home" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT:?}" \
+  FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1786708800 \
+  "$FM_TEST_ROOT/bin/${argv[0]}" "${argv[@]:1}"
+SH
+  chmod +x "$fakebin/date" "$fake_ssh"
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SSH_BIN="$fake_ssh" \
+    FM_TEST_ROOT="$ROOT" FM_TEST_SLOW_HOME="$slow" FM_TEST_DEADLINE_TMP="$parent" \
+    FM_TEST_DEADLINE_MARKER="$deadline_marker" FM_SNAPSHOT_SECONDMATE_TIMEOUT=3 \
+    FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1786708800 \
+    "$SNAPSHOT" --json) || fail "isolated secondmate deadline snapshot failed"
+  printf '%s' "$canonical" | jq -e --arg task "$task" '
+    (.secondmate_current.records[] | select(.id == "a-slow")
+      | .current.state == "unknown")
+    and (.secondmate_current.records[] | select(.id == "z-healthy")
+      | .provenance.selected == "structured-home"
+        and ([.queued[] | select(.id == $task and .work_identity_ref == $task)] | length) == 1
+        and ([.work_identities[] | select(.task_id == $task)
+          | .work_identity.status == "unlinked"] | length) == 1)
+  ' >/dev/null || fail "an earlier failed route suppressed a healthy later identity projection: $canonical"
+  pass "secondmate summary and identity deadlines are isolated per home"
+}
+
 test_bearings_preserves_complete_identity_references() {
   local home task manifest wt fakebin bearings hash gen last_unit last_source
   home=$(make_home complete-refs)
@@ -2979,6 +3070,10 @@ case "${FM_TEST_ONLY:-}" in
     test_no_clobber_journal_rejects_unrelated_staging
     exit 0
     ;;
+  secondmate-deadlines)
+    test_secondmate_deadlines_are_isolated_per_home
+    exit 0
+    ;;
 esac
 
 test_intake_through_fleet_projection
@@ -3032,6 +3127,7 @@ test_handoff_rejects_unowned_identical_target_sidecar
 test_unsafe_publication_setup_uses_integrity_exit
 test_delegated_integrity_failure_stops_parent_publication
 test_schema_maximum_delegated_identities_are_streamed_once
+test_secondmate_deadlines_are_isolated_per_home
 test_bearings_preserves_complete_identity_references
 test_display_labels_cannot_spoof_exact_references
 test_secondmate_parent_decisions_and_nested_caps_are_disclosed

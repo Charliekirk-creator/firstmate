@@ -221,11 +221,12 @@ state/home-summary.json is fetched concurrently under one FM_SNAPSHOT_BUDGET
 (default 5 seconds), with a valid prior copy under FM_SNAPSHOT_CACHE_DIR used
 when the live read fails, is invalid, or consumes the budget. A home with neither
 a valid ledger nor a valid cached copy is reported unreadable with the reason;
-collection never computes a summary in that home. Exact identity streams share
-one fleet-wide FM_SNAPSHOT_SECONDMATE_TIMEOUT deadline. Each local per-task
-current-state read is bounded by FM_SNAPSHOT_CREW_STATE_TIMEOUT (default 10
-seconds); a read that hits the bound reports state unknown. Remote secondmate
-endpoint liveness is not probed by this command.
+collection never computes a summary in that home. Exact identity streams get a
+fresh FM_SNAPSHOT_SECONDMATE_TIMEOUT deadline per sampled home, without affecting
+later homes. Each local per-task current-state read is bounded by
+FM_SNAPSHOT_CREW_STATE_TIMEOUT (default 10 seconds); a read that hits the bound
+reports state unknown. Remote secondmate endpoint liveness is not probed by this
+command.
 Terminal contradiction evidence uses
 FM_SNAPSHOT_TERMINAL_LINES, FM_SNAPSHOT_TERMINAL_BYTES, and
 FM_SNAPSHOT_TERMINAL_TIMEOUT and never becomes canonical current state.
@@ -1848,6 +1849,7 @@ secondmate_current_json() {  # <parent-tasks-json>
     summary_observed=$SNAPSHOT_NOW
     summary_freshness=fresh
     if [ -z "$reason" ]; then
+      SECONDMATE_DEADLINE_EPOCH=$(($(date +%s) + FM_SNAPSHOT_SECONDMATE_TIMEOUT))
       if [ "$remote" = true ]; then
         cache_path=$(snapshot_route_cache_path "$id" "$host" "$home" 2>/dev/null || true)
         collection_slot=$(jq -r --arg id "$id" 'select(.id == $id) | .slot' "$SNAPSHOT_COLLECT_DIR/manifest.jsonl" 2>/dev/null | head -1)
@@ -2057,7 +2059,6 @@ if [ "$OUTPUT_MODE" = secondmate-home-identities ] || [ "$OUTPUT_MODE" = secondm
 fi
 
 BACKLOG_JSON=$(backlog_json) || { echo "fm-fleet-snapshot: backlog read failed" >&2; exit 1; }
-SECONDMATE_DEADLINE_EPOCH=$(($(date +%s) + FM_SNAPSHOT_SECONDMATE_TIMEOUT))
 TASKS_RC=0
 TASKS_JSON=$(task_json_lines) || TASKS_RC=$?
 [ "$TASKS_RC" -eq 0 ] || {
