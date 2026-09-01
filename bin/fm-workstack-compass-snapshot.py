@@ -69,6 +69,7 @@ MAX_BACKLOG_BYTES = 512 * 1024
 MAX_META_BYTES = 64 * 1024
 MAX_META_TOTAL_BYTES = 2 * 1024 * 1024
 MAX_META_RECORDS = 10_000
+MAX_STATE_ENTRIES = 10_000
 MAX_REGISTERED_PROJECTS = 1_000
 MAX_PROJECT_SOURCE_BYTES = 512 * 1024
 MAX_MODEL_BYTES = 512 * 1024
@@ -170,7 +171,7 @@ class Observation:
         self._observed: dict[tuple[int, tuple[str, ...]], Fingerprint] = {}
         self._absent: set[tuple[int, tuple[str, ...]]] = set()
         self._inventories: dict[
-            tuple[int, tuple[str, ...], str], tuple[str, ...]
+            tuple[int, tuple[str, ...], str, int], tuple[str, ...]
         ] = {}
         self._aliases: dict[Path, Fingerprint] = {}
 
@@ -341,22 +342,39 @@ class Observation:
         finally:
             os.close(descriptor)
 
+    @staticmethod
+    def _bounded_inventory(
+        descriptor: int,
+        pattern: str,
+        max_entries: int,
+        overflow_message: str,
+    ) -> tuple[str, ...]:
+        names: list[str] = []
+        entries_seen = 0
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                entries_seen += 1
+                if entries_seen > max_entries:
+                    raise ProducerError(overflow_message)
+                if fnmatch.fnmatchcase(entry.name, pattern):
+                    names.append(entry.name)
+        return tuple(sorted(names))
+
     def observe_inventory(
         self,
         anchor: AnchoredDirectory,
         relative: str | Path | Sequence[str],
         pattern: str,
+        *,
+        max_entries: int,
+        overflow_message: str,
     ) -> list[str]:
         parts = self._parts(anchor, relative)
         try:
             descriptor = self._open_directory(anchor, parts)
             info = os.fstat(descriptor)
-            names = tuple(
-                sorted(
-                    name
-                    for name in os.listdir(descriptor)
-                    if fnmatch.fnmatchcase(name, pattern)
-                )
+            names = self._bounded_inventory(
+                descriptor, pattern, max_entries, overflow_message
             )
         except OSError as exc:
             raise ProducerError("required source directory is unavailable") from exc
@@ -364,7 +382,7 @@ class Observation:
             if "descriptor" in locals():
                 os.close(descriptor)
         self._remember(anchor, parts, self._fingerprint(info))
-        self._inventories[(anchor.descriptor, parts, pattern)] = names
+        self._inventories[(anchor.descriptor, parts, pattern, max_entries)] = names
         return list(names)
 
     def capture_tree(self, anchor: AnchoredDirectory) -> tuple[ReaderAsset, ...]:
@@ -375,12 +393,27 @@ class Observation:
         while pending:
             parts = pending.pop()
             if parts:
-                names = self.observe_inventory(anchor, parts, "*")
+                names = self.observe_inventory(
+                    anchor,
+                    parts,
+                    "*",
+                    max_entries=MAX_READER_PACKAGE_ENTRIES,
+                    overflow_message=(
+                        "authoritative local reader package exceeds its entry bound"
+                    ),
+                )
             else:
                 try:
                     descriptor = os.dup(anchor.descriptor)
                     info = os.fstat(descriptor)
-                    names = sorted(os.listdir(descriptor))
+                    names = list(
+                        self._bounded_inventory(
+                            descriptor,
+                            "*",
+                            MAX_READER_PACKAGE_ENTRIES,
+                            "authoritative local reader package exceeds its entry bound",
+                        )
+                    )
                 except OSError as exc:
                     raise ProducerError(
                         "authoritative local reader package is unsafe"
@@ -389,7 +422,9 @@ class Observation:
                     if "descriptor" in locals():
                         os.close(descriptor)
                         del descriptor
-                self._inventories[(anchor.descriptor, (), "*")] = tuple(names)
+                self._inventories[
+                    (anchor.descriptor, (), "*", MAX_READER_PACKAGE_ENTRIES)
+                ] = tuple(names)
                 if self._fingerprint(info) != anchor.fingerprint:
                     raise SourceChanged("source changed during observation")
             for name in names:
@@ -558,18 +593,22 @@ class Observation:
                 raise SourceChanged("source changed during observation") from exc
             if current != expected:
                 raise SourceChanged("source changed during observation")
-        for (descriptor, parts, pattern), expected in self._inventories.items():
+        for (
+            descriptor,
+            parts,
+            pattern,
+            max_entries,
+        ), expected in self._inventories.items():
             anchor = anchors[descriptor]
             try:
                 directory = self._open_directory(anchor, parts)
-                current = tuple(
-                    sorted(
-                        name
-                        for name in os.listdir(directory)
-                        if fnmatch.fnmatchcase(name, pattern)
-                    )
+                current = self._bounded_inventory(
+                    directory,
+                    pattern,
+                    max_entries,
+                    "source inventory exceeds its entry bound",
                 )
-            except OSError as exc:
+            except (OSError, ProducerError) as exc:
                 raise SourceChanged("source inventory changed during observation") from exc
             finally:
                 if "directory" in locals():
@@ -1712,7 +1751,13 @@ def collect_workers(
     backlog_tasks: Iterable[BacklogTask],
     registered: set[str],
 ) -> tuple[list[dict[str, Any]], bool, int]:
-    names = observation.observe_inventory(home, "state", "*.meta")
+    names = observation.observe_inventory(
+        home,
+        "state",
+        "*.meta",
+        max_entries=MAX_STATE_ENTRIES,
+        overflow_message="Firstmate state inventory exceeds its entry bound",
+    )
     if len(names) > MAX_META_RECORDS:
         raise ProducerError("task metadata inventory exceeds its record bound")
     tasks = {record.identity: record for record in backlog_tasks}

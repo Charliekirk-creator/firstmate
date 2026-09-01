@@ -340,6 +340,26 @@ test_duplicate_and_broken_identities_refuse() {
   pass "duplicate and broken source identities refuse without partial replacement"
 }
 
+test_state_inventory_bound_refuses_unrelated_runtime_entries() {
+  local world snapshot before
+  world=$(make_world bounded-state-inventory)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  run_world "$world" >/dev/null || fail "baseline state-inventory generation failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  python3 - "$world/home/state" <<'PY'
+from pathlib import Path
+import sys
+
+state = Path(sys.argv[1])
+for index in range(10_001):
+    (state / f"unrelated-{index}.status").touch()
+PY
+  run_failure "Firstmate state inventory exceeds its entry bound" run_world "$world"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "oversized state inventory replaced the prior complete snapshot"
+  pass "the whole heterogeneous state inventory is bounded before metadata filtering"
+}
+
 test_atomic_replacement_and_model_rejection() {
   local world snapshot inode_before hash_before inode_after hash_after
   world=$(make_world atomic)
@@ -1120,6 +1140,7 @@ PY
 test_successful_truthful_projection
 test_missing_relations_stay_missing
 test_duplicate_and_broken_identities_refuse
+test_state_inventory_bound_refuses_unrelated_runtime_entries
 test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
 test_nonexecutable_launcher_refuses_before_publication
