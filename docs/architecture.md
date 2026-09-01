@@ -99,7 +99,7 @@ Optional Relay integrates with the watcher only after explicit opt-in; [configur
 ## Workstack Compass upstream projection
 
 `bin/fm-workstack-compass-snapshot.py` is an operator-invoked, read-only projection boundary rather than another fleet registry or execution authority.
-The Workstack Compass executable model under the explicitly supplied application root remains the sole snapshot-schema owner and validates every complete projection before publication.
+The Workstack Compass executable model under the explicitly supplied application root remains the sole snapshot-schema owner and validates every complete projection before publication through a bounded subprocess with a sanitized environment, no network or write authority, and a copy-isolated candidate.
 The producer reads one active `FM_HOME`, uses the existing Firstmate project registry and bounded `tasks-axi` reader for exact local identities, and accepts project evidence only through explicit `NAME=PATH` bindings whose names already exist in that registry.
 A supplied path, repository resemblance, title, source prose, or status prose never establishes a relation.
 Firstmate task metadata contributes a worker incarnation only when its existing generation identity is exact, while project membership is added only through the same task identity's exact backlog repository field and registered project identity.

@@ -19,8 +19,9 @@ Mechanics and safety boundaries:
   ``$FM_HOME/data``.  Symlinks, special
   files, hard-linked destinations, unsafe parents, source changes, malformed
   or oversized inputs, and oversized model output are refused.
-* The command is local-only and network-free.  It never retains or emits
-  transcripts or status prose, launches or controls a worker, changes a source,
+* The command is local-only and network-free.  Executable-model validation uses
+  the built-in macOS sandbox and refuses when that boundary is unavailable.  It
+  never retains or emits transcripts or status prose, launches or controls a worker, changes a source,
   acknowledges an event, opens a connection, launches Workstack Compass, or
   publishes data.
 * Firstmate project identity, bounded tasks-axi backlog identity, and task
@@ -52,8 +53,8 @@ import signal
 import stat
 import subprocess
 import sys
+import sysconfig
 import threading
-import types
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,8 @@ MAX_MODEL_BYTES = 512 * 1024
 MAX_READER_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_TASK_RECORDS = 10_000
 TASKS_AXI_TIMEOUT_SECONDS = 10
+MODEL_TIMEOUT_SECONDS = 10
+MAX_MODEL_RESPONSE_BYTES = 64 * 1024
 REQUIRED_SCHEMA_VERSION = "workstack-compass.snapshot.v1"
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 REGISTRY_LINE_RE = re.compile(
@@ -122,6 +125,13 @@ class AnchoredDirectory:
 class ProjectBinding:
     name: str
     root: AnchoredDirectory
+
+
+@dataclass(frozen=True)
+class ModelContract:
+    source: bytes
+    schema_version: str
+    max_snapshot_bytes: int
 
 
 class Observation:
@@ -637,19 +647,16 @@ def prepare_output(
 
     created_default_parent = False
     if requested is None:
+        previous_umask = os.umask(0)
         try:
             os.mkdir(parent_parts[0], 0o700, dir_fd=data.descriptor)
             created_default_parent = True
-            os.chmod(
-                parent_parts[0],
-                0o700,
-                dir_fd=data.descriptor,
-                follow_symlinks=False,
-            )
         except FileExistsError:
             pass
         except OSError as exc:
             raise ProducerError("private snapshot directory could not be created") from exc
+        finally:
+            os.umask(previous_umask)
     try:
         parent_anchor = observation.observe_subdirectory(data, parent_parts)
     except ProducerError as exc:
@@ -687,11 +694,18 @@ def prepare_output(
     return output, parent_descriptor
 
 
-def write_private_temp(parent_descriptor: int, prefix: str, payload: bytes) -> str:
+def write_private_temp(
+    parent_descriptor: int,
+    prefix: str,
+    payload: bytes,
+    source_roots: Iterable[AnchoredDirectory],
+) -> str:
+    retained_source_roots = tuple(source_roots)
     for _ in range(64):
         name = f".{prefix}.{os.getpid()}.{os.urandom(8).hex()}"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         try:
+            reject_source_repository_parent(parent_descriptor, retained_source_roots)
             descriptor = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
         except FileExistsError:
             continue
@@ -733,13 +747,15 @@ def run_bounded(
     timeout: int = TASKS_AXI_TIMEOUT_SECONDS,
     cap: int = MAX_READER_OUTPUT_BYTES,
     pass_descriptors: Sequence[int] = (),
+    input_payload: bytes | None = None,
+    discard_stderr: bool = False,
 ) -> bytes:
     try:
         process = subprocess.Popen(
             list(argv),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if input_payload is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.DEVNULL if discard_stderr else subprocess.STDOUT,
             env=dict(env),
             shell=False,
             start_new_session=True,
@@ -778,20 +794,34 @@ def run_bounded(
                 return
 
     reader = threading.Thread(target=drain, name="workstack-source-reader", daemon=True)
+
+    def supply_input() -> None:
+        if input_payload is None or process.stdin is None:
+            return
+        try:
+            process.stdin.write(input_payload)
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    writer = threading.Thread(target=supply_input, name="workstack-source-input", daemon=True)
     reader.start()
+    writer.start()
     try:
         return_code = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         kill_reader()
         process.wait()
         reader.join(timeout=1)
+        writer.join(timeout=1)
         raise ProducerError("authoritative local reader exceeded its time bound") from exc
     reader.join(timeout=1)
+    writer.join(timeout=1)
     if process.stdout is not None:
         process.stdout.close()
-    if reader.is_alive():
+    if reader.is_alive() or writer.is_alive():
         kill_reader()
-        raise ProducerError("authoritative local reader did not close its output")
+        raise ProducerError("authoritative local reader did not close its bounded streams")
     if oversized:
         raise ProducerError("authoritative local reader exceeded its output bound")
     if return_code != 0:
@@ -854,55 +884,29 @@ def parse_tasks_axi(payload: bytes) -> list[BacklogTask]:
     return rows
 
 
-def read_backlog_tasks(
-    payload: bytes | None, parent_descriptor: int, output_parent: Path
-) -> list[BacklogTask]:
+def read_backlog_tasks(payload: bytes | None) -> list[BacklogTask]:
     if payload is None:
         return []
-    temp_name = write_private_temp(parent_descriptor, "workstack-backlog", payload)
-    try:
-        source_descriptor = os.open(
-            temp_name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_descriptor,
-        )
-    except OSError as exc:
-        try:
-            os.unlink(temp_name, dir_fd=parent_descriptor)
-        except OSError:
-            pass
-        raise ProducerError("private captured source could not be reopened") from exc
-    temp_path = Path("/dev/fd") / str(source_descriptor)
     path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     environment = {
         "PATH": path,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "NO_COLOR": "1",
-        "HOME": os.fspath(output_parent),
     }
-    try:
-        output = run_bounded(
-            (
-                "tasks-axi",
-                "list",
-                "--file",
-                os.fspath(temp_path),
-                "--limit",
-                str(MAX_TASK_RECORDS),
-            ),
-            environment,
-            pass_descriptors=(source_descriptor,),
-        )
-        return parse_tasks_axi(output)
-    finally:
-        os.close(source_descriptor)
-        try:
-            os.unlink(temp_name, dir_fd=parent_descriptor)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise ProducerError("private captured-source cleanup failed") from exc
+    output = run_bounded(
+        (
+            "tasks-axi",
+            "list",
+            "--file",
+            "/dev/fd/0",
+            "--limit",
+            str(MAX_TASK_RECORDS),
+        ),
+        environment,
+        input_payload=payload,
+    )
+    return parse_tasks_axi(output)
 
 
 def parse_meta(payload: bytes) -> dict[str, str]:
@@ -1079,9 +1083,140 @@ def inspect_project_sources(
     return sources, project_sources
 
 
+MODEL_BOUNDARY_PROGRAM = r'''
+import json
+import resource
+import sys
+import types
+
+resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+request = json.loads(sys.stdin.buffer.read())
+source = request["source"]
+module_name = "_fm_workstack_model_boundary"
+module = types.ModuleType(module_name)
+module.__file__ = "<workstack-compass-model>"
+sys.modules[module_name] = module
+try:
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    schema_version = getattr(module, "SCHEMA_VERSION", None)
+    max_snapshot_bytes = getattr(module, "MAX_SNAPSHOT_BYTES", None)
+    validator = getattr(module, "snapshot_from_mapping", None)
+    if (
+        schema_version != "workstack-compass.snapshot.v1"
+        or isinstance(max_snapshot_bytes, bool)
+        or not isinstance(max_snapshot_bytes, int)
+        or max_snapshot_bytes < 1
+        or not callable(validator)
+    ):
+        raise ValueError("unsupported contract")
+    if request["operation"] == "validate":
+        snapshot = validator(request["document"])
+        issues = snapshot.integrity_issues()
+        if not isinstance(issues, tuple) or issues:
+            raise ValueError("integrity failure")
+    response = {
+        "schema_version": schema_version,
+        "max_snapshot_bytes": max_snapshot_bytes,
+        "valid": True,
+    }
+    sys.stdout.write(json.dumps(response, sort_keys=True, separators=(",", ":")))
+finally:
+    sys.modules.pop(module_name, None)
+'''
+
+
+def _sandbox_literal(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def model_boundary_argv() -> list[str]:
+    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+        raise ProducerError(
+            "a supported network-free executable-model sandbox is unavailable"
+        )
+    executable = Path(sys.executable).resolve(strict=True)
+    read_roots = {
+        executable.parent,
+        Path(sys.base_prefix).resolve(strict=True),
+        Path(sysconfig.get_path("stdlib")).resolve(strict=True),
+        Path("/usr/lib"),
+        Path("/System/Library"),
+        Path("/private/var/db/dyld"),
+    }
+    readable_rules: list[str] = ['(literal "/")', '(literal "/dev/null")']
+    ancestors: set[Path] = set()
+    for root in read_roots:
+        readable_rules.append(f'(subpath "{_sandbox_literal(os.fspath(root))}")')
+        ancestors.update(root.parents)
+    for ancestor in sorted(ancestors, key=lambda path: (len(path.parts), os.fspath(path))):
+        readable_rules.append(f'(literal "{_sandbox_literal(os.fspath(ancestor))}")')
+    profile = " ".join(
+        [
+            "(version 1)",
+            "(deny default)",
+            '(import "system.sb")',
+            "(deny network*)",
+            "(deny file-write*)",
+            "(allow process*)",
+            f"(allow file-read* {' '.join(readable_rules)})",
+        ]
+    )
+    return [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        profile,
+        os.fspath(executable),
+        "-I",
+        "-S",
+        "-B",
+        "-c",
+        MODEL_BOUNDARY_PROGRAM,
+    ]
+
+
+def run_model_boundary(
+    source: bytes, operation: str, document: Mapping[str, Any] | None = None
+) -> Mapping[str, Any]:
+    request: dict[str, Any] = {
+        "operation": operation,
+        "source": decode_utf8(source, "Workstack Compass executable model"),
+    }
+    if document is not None:
+        request["document"] = document
+    payload = json.dumps(
+        request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    boundary_argv = model_boundary_argv()
+    try:
+        output = run_bounded(
+            boundary_argv,
+            environment,
+            timeout=MODEL_TIMEOUT_SECONDS,
+            cap=MAX_MODEL_RESPONSE_BYTES,
+            input_payload=payload,
+            discard_stderr=True,
+        )
+        response = json.loads(decode_utf8(output, "executable-model response"))
+    except (ProducerError, json.JSONDecodeError) as exc:
+        raise ProducerError("Workstack Compass executable model boundary failed") from exc
+    if not isinstance(response, Mapping) or set(response) != {
+        "schema_version",
+        "max_snapshot_bytes",
+        "valid",
+    }:
+        raise ProducerError("Workstack Compass executable model returned a malformed result")
+    return response
+
+
 def load_workstack_model(
     root: Path, observation: Observation
-) -> tuple[types.ModuleType, AnchoredDirectory]:
+) -> tuple[ModelContract, AnchoredDirectory]:
     workstack = observation.observe_directory(root)
     validate_git_marker(workstack, observation)
     model_payload = observation.read_under(
@@ -1092,36 +1227,42 @@ def load_workstack_model(
     )
     if not launcher_payload.startswith(b"#!"):
         raise ProducerError("Workstack Compass launcher is malformed")
-    source = decode_utf8(model_payload, "Workstack Compass executable model")
-    module_name = f"_fm_workstack_model_{os.getpid()}_{id(source)}"
-    module = types.ModuleType(module_name)
-    module.__file__ = "<workstack-compass-model>"
-    sys.modules[module_name] = module
     try:
-        code = compile(source, module.__file__, "exec")
-        exec(code, module.__dict__)
-    except Exception as exc:
-        raise ProducerError("Workstack Compass executable model could not be loaded") from exc
-    finally:
-        sys.modules.pop(module_name, None)
+        response = run_model_boundary(model_payload, "contract")
+    except ProducerError as exc:
+        if "sandbox" in str(exc) and "unavailable" in str(exc):
+            raise
+        raise ProducerError(
+            "Workstack Compass executable model contract is unsupported"
+        ) from exc
+    max_snapshot_bytes = response.get("max_snapshot_bytes")
     if (
-        getattr(module, "SCHEMA_VERSION", None) != REQUIRED_SCHEMA_VERSION
-        or not callable(getattr(module, "snapshot_from_mapping", None))
-        or not isinstance(getattr(module, "MAX_SNAPSHOT_BYTES", None), int)
-        or module.MAX_SNAPSHOT_BYTES < 1
+        response.get("schema_version") != REQUIRED_SCHEMA_VERSION
+        or response.get("valid") is not True
+        or isinstance(max_snapshot_bytes, bool)
+        or not isinstance(max_snapshot_bytes, int)
+        or max_snapshot_bytes < 1
     ):
         raise ProducerError("Workstack Compass executable model contract is unsupported")
-    return module, workstack
+    return (
+        ModelContract(model_payload, REQUIRED_SCHEMA_VERSION, max_snapshot_bytes),
+        workstack,
+    )
 
 
-def validate_document(model: types.ModuleType, document: Mapping[str, Any]) -> None:
+def validate_document(model: ModelContract, document: Mapping[str, Any]) -> None:
     try:
-        snapshot = model.snapshot_from_mapping(document)
-        issues = snapshot.integrity_issues()
-    except Exception as exc:
-        raise ProducerError("Workstack Compass executable model rejected the snapshot") from exc
-    if not isinstance(issues, tuple) or issues:
-        raise ProducerError("Workstack Compass executable model reported broken exact relations")
+        response = run_model_boundary(model.source, "validate", document)
+    except ProducerError as exc:
+        raise ProducerError(
+            "Workstack Compass executable model rejected the snapshot"
+        ) from exc
+    if (
+        response.get("schema_version") != model.schema_version
+        or response.get("max_snapshot_bytes") != model.max_snapshot_bytes
+        or response.get("valid") is not True
+    ):
+        raise ProducerError("Workstack Compass executable model rejected the snapshot")
 
 
 def unique_identities(records: Iterable[Mapping[str, Any]], field: str, label: str) -> None:
@@ -1131,7 +1272,7 @@ def unique_identities(records: Iterable[Mapping[str, Any]], field: str, label: s
 
 
 def build_document(
-    model: types.ModuleType,
+    model: ModelContract,
     registered: Sequence[str],
     workers: list[dict[str, Any]],
     registry_present: bool,
@@ -1223,7 +1364,7 @@ def build_document(
         "+00:00", "Z"
     )
     document: dict[str, Any] = {
-        "schema_version": model.SCHEMA_VERSION,
+        "schema_version": model.schema_version,
         "observation_identity": "observation:pending",
         "observed_at": observed_at,
         "data_classification": "authoritative" if projects or workers else "unavailable",
@@ -1256,13 +1397,19 @@ def publish_snapshot(
     parent_descriptor: int,
     payload: bytes,
     max_snapshot_bytes: int,
+    source_roots: Iterable[AnchoredDirectory],
     observation: Observation,
 ) -> None:
     if len(payload) > max_snapshot_bytes:
         raise ProducerError("validated snapshot exceeds the application model size bound")
-    temp_name = write_private_temp(parent_descriptor, "workstack-snapshot", payload)
+    retained_source_roots = tuple(source_roots)
+    observation.prove_unchanged()
+    temp_name = write_private_temp(
+        parent_descriptor, "workstack-snapshot", payload, retained_source_roots
+    )
     try:
         observation.prove_unchanged()
+        reject_source_repository_parent(parent_descriptor, retained_source_roots)
         try:
             existing = os.stat(output.name, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
@@ -1273,6 +1420,7 @@ def publish_snapshot(
             or stat.S_IMODE(existing.st_mode) != 0o600
         ):
             raise ProducerError("snapshot destination became unsafe before replacement")
+        reject_source_repository_parent(parent_descriptor, retained_source_roots)
         os.replace(
             temp_name,
             output.name,
@@ -1360,9 +1508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         backlog_payload = observation.read_under(
             home, ("data", "backlog.md"), MAX_BACKLOG_BYTES, missing_ok=True
         )
-        backlog_tasks = read_backlog_tasks(
-            backlog_payload, parent_descriptor, output.parent
-        )
+        backlog_tasks = read_backlog_tasks(backlog_payload)
         workers, meta_present, omitted_task_evidence = collect_workers(
             home, observation, backlog_tasks, set(registered)
         )
@@ -1392,7 +1538,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             output,
             parent_descriptor,
             payload,
-            model.MAX_SNAPSHOT_BYTES,
+            model.max_snapshot_bytes,
+            [workstack_root, *(binding.root for binding in bindings.values())],
             observation,
         )
         launch = (

@@ -51,48 +51,6 @@ write_fake_model() {
 SCHEMA_VERSION = "$schema_version"
 MAX_SNAPSHOT_BYTES = $max_bytes
 
-import os
-
-_real_open = os.open
-_output_raced = False
-
-def _race_open(path, flags, mode=0o777, *, dir_fd=None):
-    global _output_raced
-    source = os.environ.get("FM_TEST_OUTPUT_SWAP_SOURCE")
-    destination = os.environ.get("FM_TEST_OUTPUT_SWAP_DESTINATION")
-    target = os.environ.get("FM_TEST_OUTPUT_OPEN_TARGET")
-    text = os.fspath(path)
-    move_source = os.environ.get("FM_TEST_OUTPUT_MOVE_SOURCE")
-    move_destination = os.environ.get("FM_TEST_OUTPUT_MOVE_DESTINATION")
-    if move_source and move_destination and not _output_raced and text == target:
-        _output_raced = True
-        os.rename(move_destination, move_destination + ".retained")
-        os.rename(move_source, move_destination)
-    elif source and destination and not _output_raced and (text == target or text == "private"):
-        _output_raced = True
-        os.rename(source, source + ".retained")
-        os.symlink(destination, source)
-    return _real_open(path, flags, mode, dir_fd=dir_fd)
-
-os.open = _race_open
-
-_real_stat = os.stat
-_source_stat_count = 0
-
-def _race_stat(path, *args, **kwargs):
-    global _source_stat_count
-    target = os.environ.get("FM_TEST_SOURCE_STAT_TARGET")
-    source = os.environ.get("FM_TEST_SOURCE_SWAP_SOURCE")
-    destination = os.environ.get("FM_TEST_SOURCE_SWAP_DESTINATION")
-    if target and os.fspath(path) == target:
-        _source_stat_count += 1
-        if _source_stat_count == 2:
-            os.rename(source, source + ".retained")
-            os.symlink(destination, source)
-    return _real_stat(path, *args, **kwargs)
-
-os.stat = _race_stat
-
 class ValidatedSnapshot:
     def integrity_issues(self):
         return ()
@@ -109,6 +67,52 @@ PY
 exit 0
 SH
   chmod 0755 "$app/bin/workstack-compass"
+}
+
+write_hostile_model() {
+  local app=$1 marker=$2
+  python3 - "$app/src/workstack_compass/model.py" "$marker" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+marker = json.dumps(sys.argv[2])
+path.write_text(f'''SCHEMA_VERSION = "workstack-compass.snapshot.v1"
+MAX_SNAPSHOT_BYTES = 2097152
+
+import os
+import socket
+
+try:
+    open({marker}, "w").close()
+except OSError:
+    pass
+else:
+    raise RuntimeError("model filesystem writes were not confined")
+
+probe = socket.socket()
+try:
+    probe.bind(("127.0.0.1", 0))
+except OSError:
+    pass
+else:
+    raise RuntimeError("model network access was not confined")
+finally:
+    probe.close()
+
+if os.environ.get("PRIVATE_ENV_SECRET"):
+    raise RuntimeError("private parent environment reached the model")
+
+class ValidatedSnapshot:
+    def integrity_issues(self):
+        return ()
+
+def snapshot_from_mapping(document):
+    document["projects"][0]["label"] = "MODEL_MUTATION_SECRET"
+    return ValidatedSnapshot()
+''')
+PY
 }
 
 init_project() {
@@ -375,71 +379,57 @@ test_unsafe_outputs_and_sources_refuse() {
   pass "path escapes, symlinks, and unsafe output files are refused"
 }
 
-test_component_swap_cannot_escape_bound_source() {
-  local world outside snapshot
-  world=$(make_world source-component-swap)
-  outside="$world/outside-config"
+test_executable_model_is_confined_and_copy_isolated() {
+  local world snapshot marker
+  world=$(make_world model-confinement)
   snapshot="$world/home/data/workstack-compass/snapshot.json"
-  mkdir -p "$outside"
-  cat > "$outside/board.json" <<'JSON'
-{"project":{"id":"PVT_ESCAPE","number":9},"issue_repo":"escape/repository"}
-JSON
-  FM_TEST_SOURCE_STAT_TARGET="$world/dtm/config/board.json" \
-    FM_TEST_SOURCE_SWAP_SOURCE="$world/dtm/config" \
-    FM_TEST_SOURCE_SWAP_DESTINATION="$outside" \
-    FM_HOME="$world/home" "$PRODUCER" \
-      --workstack-root "$world/app" \
-      --project-root "data-team-management=$world/dtm" \
-      --output "$snapshot" >/dev/null \
-    || fail "descriptor-anchored source generation failed"
-  json_assert "$snapshot" \
-    'any(.sources[]; .source_identity == "source:data-team-management-board:PVT_TEST_BOARD") and all(.sources[]; .source_identity != "source:data-team-management-board:PVT_ESCAPE")' \
-    "an intermediate component substitution escaped the explicitly bound root"
-  pass "bound source traversal cannot follow a substituted intermediate component"
+  marker="$world/model-wrote-outside-sandbox"
+  write_hostile_model "$world/app" "$marker"
+  PRIVATE_ENV_SECRET=must-not-reach-model run_world "$world" >/dev/null \
+    || fail "confined executable model could not validate an isolated candidate"
+  [ ! -e "$marker" ] || fail "executable model wrote outside its read-only boundary"
+  assert_not_contains "$(cat "$snapshot")" MODEL_MUTATION_SECRET \
+    "executable model mutated the candidate serialized by the producer"
+  pass "executable model has no network, write, environment, or mutation authority"
 }
 
-test_output_parent_substitution_refuses_before_source_write() {
-  local world private destination output
-  world=$(make_world output-component-swap)
+test_output_parent_relocation_refuses_without_source_write() {
+  local world private relocated marker fakebin real_tasks producer_pid rc
+  world=$(make_world output-parent-relocation)
   private="$world/home/data/private"
-  destination="$world/alpha/injected"
-  output="$private/nested/snapshot.json"
-  mkdir -p "$private/nested" "$destination/nested"
-  chmod 0700 "$private" "$private/nested" "$destination" "$destination/nested"
-  run_failure "unsafe component" env \
-    FM_TEST_OUTPUT_SWAP_SOURCE="$private" \
-    FM_TEST_OUTPUT_SWAP_DESTINATION="$destination" \
-    FM_TEST_OUTPUT_OPEN_TARGET="$private/nested" \
-    FM_HOME="$world/home" "$PRODUCER" \
-      --workstack-root "$world/app" \
-      --project-root "alpha=$world/alpha" \
-      --output "$output"
-  [ -z "$(find "$destination" -type f -print -quit)" ] \
-    || fail "output-parent substitution wrote into a bound source repository"
-  pass "output traversal rejects ancestor substitution before any source write"
-}
-
-test_project_root_moved_to_output_refuses_before_write() {
-  local world private before after
-  world=$(make_world output-project-move)
-  private="$world/home/data/private"
-  mkdir "$private"
-  chmod 0700 "$private" "$world/alpha"
-  before=$(python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$world/alpha")
-  run_failure "must not be inside a source repository" env \
-    FM_TEST_OUTPUT_MOVE_SOURCE="$world/alpha" \
-    FM_TEST_OUTPUT_MOVE_DESTINATION="$private" \
-    FM_TEST_OUTPUT_OPEN_TARGET=private \
-    FM_HOME="$world/home" "$PRODUCER" \
-      --workstack-root "$world/app" \
-      --project-root "alpha=$world/alpha" \
-      --output "$private/snapshot.json"
-  after=$(python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$private")
-  [ "$after" = "$before" ] \
-    || fail "output preparation created and removed a file in the moved project root"
-  [ -z "$(find "$private" -mindepth 1 -maxdepth 1 -type f -print -quit)" ] \
-    || fail "output preparation left a file in the moved project root"
-  pass "retained output ancestry refuses a moved project before any write"
+  relocated="$world/alpha/relocated-output"
+  marker="$world/tasks-reader-started"
+  fakebin="$world/fakebin"
+  real_tasks=$(command -v tasks-axi)
+  mkdir -m 0700 "$private" "$fakebin"
+  cat > "$fakebin/tasks-axi" <<SH
+#!/usr/bin/env bash
+: > '$marker'
+sleep 1
+exec '$real_tasks' "\$@"
+SH
+  chmod 0755 "$fakebin/tasks-axi"
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
+    --workstack-root "$world/app" \
+    --project-root "alpha=$world/alpha" \
+    --output "$private/snapshot.json" >/dev/null 2>&1 &
+  producer_pid=$!
+  set -e
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "$marker" ] && break
+    sleep 0.1
+  done
+  [ -e "$marker" ] || fail "bounded backlog reader did not reach the relocation point"
+  mv "$private" "$relocated"
+  set +e
+  wait "$producer_pid"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "producer accepted a relocated output authority"
+  [ -z "$(find "$relocated" -mindepth 1 -maxdepth 1 -type f -print -quit)" ] \
+    || fail "relocated output authority wrote into a bound source repository"
+  pass "output authority relocation refuses without modifying a source repository"
 }
 
 test_repository_containment_refuses_before_output_writes() {
@@ -597,9 +587,8 @@ test_missing_relations_stay_missing
 test_duplicate_and_broken_identities_refuse
 test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
-test_component_swap_cannot_escape_bound_source
-test_output_parent_substitution_refuses_before_source_write
-test_project_root_moved_to_output_refuses_before_write
+test_executable_model_is_confined_and_copy_isolated
+test_output_parent_relocation_refuses_without_source_write
 test_repository_containment_refuses_before_output_writes
 test_fifo_source_refuses_without_blocking_or_replacement
 test_malformed_and_oversized_inputs_and_output_refuse
