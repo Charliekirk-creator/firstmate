@@ -635,15 +635,18 @@ PY
 }
 
 test_tasks_axi_reader_is_stdin_only_and_confined() {
-  local world fakebin secret marker network_marker port_file port server_pid snapshot
+  local world fakebin ambient_home secret marker network_marker port_file port server_pid snapshot
   world=$(make_world tasks-reader-confinement)
   fakebin="$world/fakebin"
+  ambient_home="$world/ambient-home"
   secret="$world/private-task-identity"
   marker="$world/tasks-reader-write"
   network_marker="$world/tasks-reader-network"
   port_file="$world/tasks-reader-port"
   snapshot="$world/home/data/workstack-compass/snapshot.json"
-  mkdir -p "$fakebin"
+  mkdir -p "$fakebin" "$ambient_home/.tasks-axi"
+  printf '%s\n' 'markdown.path = "ambient-secret-backlog.md"' \
+    > "$ambient_home/.tasks-axi/config.toml"
   printf '%s\n' 'task-secret' > "$secret"
   python3 - "$port_file" "$network_marker" <<'PY' &
 import pathlib
@@ -671,6 +674,10 @@ PY
   port=$(cat "$port_file")
   cat > "$fakebin/tasks-axi" <<SH
 #!/usr/bin/env bash
+if [ -z "\${HOME:-}" ] || [ "\$PWD" != "\$HOME" ] || \
+   [ -e "\$HOME/.tasks-axi/config.toml" ]; then
+  exit 9
+fi
 identity=
 IFS= read -r identity < '$secret' || identity=
 printf '%s\n' touched > '$marker' 2>/dev/null || :
@@ -690,7 +697,7 @@ SH
 kind=ship
 spawn_gen=spawn-task-secret
 META
-  PATH="$fakebin:$PATH" run_world "$world" >/dev/null \
+  HOME="$ambient_home" PATH="$fakebin:$PATH" run_world "$world" >/dev/null \
     || fail "confined stdin-only backlog reader could not return bounded identities"
   wait "$server_pid" || fail "backlog reader network probe server failed"
   [ ! -e "$marker" ] || fail "backlog reader wrote outside its boundary"
@@ -699,6 +706,59 @@ META
     '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:task-secret") | .project_identity) == null' \
     "backlog reader read a private file outside its executable runtime"
   pass "backlog reader is confined to stdin and its executable runtime"
+}
+
+test_tasks_axi_package_race_refuses() {
+  local world fakebin inject snapshot before
+  world=$(make_world tasks-reader-race)
+  fakebin="$world/fakebin"
+  inject="$world/inject-reader-race"
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  mkdir -p "$fakebin" "$inject"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'count: 0'
+printf '%s\n' 'tasks[0]{id,state,kind,repo,title}:'
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$fakebin/tasks-axi"
+  PATH="$fakebin:$PATH" run_world "$world" >/dev/null \
+    || fail "baseline generation with retained reader authorities failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+import shutil
+import subprocess
+
+reader = os.environ["FM_TEST_TASKS_AXI"]
+real_popen = subprocess.Popen
+replaced = False
+
+
+class GuardedPopen(real_popen):
+    def __init__(self, args, *pargs, **kwargs):
+        global replaced
+        if not replaced and reader in [os.fspath(value) for value in args]:
+            replacement = reader + ".replacement"
+            shutil.copy2(reader, replacement)
+            os.replace(replacement, reader)
+            replaced = True
+        super().__init__(args, *pargs, **kwargs)
+
+
+subprocess.Popen = GuardedPopen
+PY
+  run_failure "source changed during observation" env \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    FM_TEST_TASKS_AXI="$fakebin/tasks-axi" \
+    PATH="$fakebin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "reader authority race replaced the prior complete snapshot"
+  pass "reader package races preserve the prior snapshot"
 }
 
 test_optional_source_appearance_during_observation_refuses() {
@@ -790,6 +850,7 @@ test_repository_containment_refuses_before_output_writes
 test_fifo_source_refuses_without_blocking_or_replacement
 test_malformed_and_oversized_inputs_and_output_refuse
 test_tasks_axi_reader_is_stdin_only_and_confined
+test_tasks_axi_package_race_refuses
 test_optional_source_appearance_during_observation_refuses
 test_source_change_during_observation_refuses
 test_private_application_model_integration

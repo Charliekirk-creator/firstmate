@@ -72,6 +72,8 @@ MAX_REGISTERED_PROJECTS = 1_000
 MAX_PROJECT_SOURCE_BYTES = 512 * 1024
 MAX_MODEL_BYTES = 512 * 1024
 MAX_READER_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_READER_PACKAGE_BYTES = 32 * 1024 * 1024
+MAX_READER_PACKAGE_ENTRIES = 4_000
 MAX_TASK_RECORDS = 10_000
 TASKS_AXI_TIMEOUT_SECONDS = 10
 MODEL_TIMEOUT_SECONDS = 10
@@ -335,6 +337,47 @@ class Observation:
         self._remember(anchor, parts, self._fingerprint(info))
         self._inventories[(anchor.descriptor, parts, pattern)] = names
         return list(names)
+
+    def observe_tree(self, anchor: AnchoredDirectory) -> None:
+        pending: list[tuple[str, ...]] = [()]
+        entries = 0
+        total_bytes = 0
+        while pending:
+            parts = pending.pop()
+            if parts:
+                names = self.observe_inventory(anchor, parts, "*")
+            else:
+                try:
+                    descriptor = os.dup(anchor.descriptor)
+                    info = os.fstat(descriptor)
+                    names = sorted(os.listdir(descriptor))
+                except OSError as exc:
+                    raise ProducerError(
+                        "authoritative local reader package is unsafe"
+                    ) from exc
+                finally:
+                    if "descriptor" in locals():
+                        os.close(descriptor)
+                        del descriptor
+                self._inventories[(anchor.descriptor, (), "*")] = tuple(names)
+                if self._fingerprint(info) != anchor.fingerprint:
+                    raise SourceChanged("source changed during observation")
+            for name in names:
+                child = (*parts, name)
+                entry = self.observe_entry(anchor, child)
+                entries += 1
+                if entries > MAX_READER_PACKAGE_ENTRIES:
+                    raise ProducerError(
+                        "authoritative local reader package exceeds its entry bound"
+                    )
+                if stat.S_ISDIR(entry.st_mode):
+                    pending.append(child)
+                else:
+                    total_bytes += entry.st_size
+                    if total_bytes > MAX_READER_PACKAGE_BYTES:
+                        raise ProducerError(
+                            "authoritative local reader package exceeds its size bound"
+                        )
 
     def read_under(
         self,
@@ -832,36 +875,39 @@ def parse_tasks_axi(payload: bytes) -> list[BacklogTask]:
     return rows
 
 
-def tasks_axi_boundary(path: str) -> tuple[list[str], Path]:
+def tasks_axi_boundary(
+    path: str, observation: Observation
+) -> tuple[list[str], Path]:
     selected = shutil.which("tasks-axi", path=path)
     if selected is None:
         raise ProducerError("authoritative local reader is unavailable")
-    descriptor: int | None = None
     try:
         executable = Path(selected).resolve(strict=True)
-        before = executable.stat()
-        if not stat.S_ISREG(before.st_mode) or not executable_by_current_user(before):
-            raise ProducerError("authoritative local reader is unsafe")
-        descriptor = os.open(
-            executable,
-            os.O_RDONLY
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_dev != before.st_dev
-            or opened.st_ino != before.st_ino
-        ):
-            raise ProducerError("authoritative local reader changed during inspection")
-        shebang = os.read(descriptor, 4096).splitlines(keepends=True)[0]
-    except (OSError, RuntimeError, IndexError) as exc:
+    except (OSError, RuntimeError) as exc:
         raise ProducerError("authoritative local reader is unsafe") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+    source_root = executable.parent
+    for candidate in executable.parents:
+        if candidate.name == "tasks-axi" and candidate.parent.name == "node_modules":
+            source_root = candidate
+            break
+    try:
+        source_anchor = observation.observe_directory(source_root)
+        executable_relative = executable.relative_to(source_root).parts
+        executable_info = observation.observe_entry(
+            source_anchor, executable_relative
+        )
+        executable_payload = observation.read_under(
+            source_anchor, executable_relative, MAX_READER_PACKAGE_BYTES
+        )
+        observation.observe_tree(source_anchor)
+        assert executable_payload is not None
+        shebang = executable_payload[:4096].splitlines(keepends=True)[0]
+    except (OSError, RuntimeError, IndexError, ValueError, ProducerError) as exc:
+        raise ProducerError("authoritative local reader is unsafe") from exc
+    if not stat.S_ISREG(executable_info.st_mode) or not executable_by_current_user(
+        executable_info
+    ):
+        raise ProducerError("authoritative local reader is unsafe")
     if not shebang.startswith(b"#!") or len(shebang) == 4096:
         raise ProducerError("authoritative local reader has an unsupported runtime")
     try:
@@ -882,16 +928,24 @@ def tasks_axi_boundary(path: str) -> tuple[list[str], Path]:
         raise ProducerError("authoritative local reader runtime is unavailable")
     try:
         runtime = Path(runtime_selected).resolve(strict=True)
-        runtime_info = runtime.stat()
-    except (OSError, RuntimeError) as exc:
+        runtime_anchor = observation.observe_directory(runtime.parent)
+        runtime_info = observation.observe_entry(runtime_anchor, runtime.name)
+    except (OSError, RuntimeError, ProducerError) as exc:
         raise ProducerError("authoritative local reader runtime is unsafe") from exc
     if not stat.S_ISREG(runtime_info.st_mode) or not executable_by_current_user(runtime_info):
         raise ProducerError("authoritative local reader runtime is unsafe")
-    source_root = executable.parent
-    for candidate in executable.parents:
-        if candidate.name == "tasks-axi" and candidate.parent.name == "node_modules":
-            source_root = candidate
-            break
+    try:
+        empty_home = Path("/var/empty").resolve(strict=True)
+        empty_info = empty_home.stat()
+        if (
+            not stat.S_ISDIR(empty_info.st_mode)
+            or empty_info.st_uid != 0
+            or stat.S_IMODE(empty_info.st_mode) & 0o022
+            or any(empty_home.iterdir())
+        ):
+            raise ProducerError("authoritative local reader empty home is unsafe")
+    except (OSError, RuntimeError) as exc:
+        raise ProducerError("authoritative local reader empty home is unsafe") from exc
     runtime_paths = [runtime]
     runtime_root = runtime.parent.parent if runtime.parent.name == "bin" else runtime.parent
     if runtime_root != Path("/"):
@@ -903,21 +957,24 @@ def tasks_axi_boundary(path: str) -> tuple[list[str], Path]:
     return (
         sandboxed_command_argv(
             (runtime, executable, "list", "--file", "/dev/fd/0", "--limit", str(MAX_TASK_RECORDS)),
-            read_paths=(source_root, *runtime_paths),
+            read_paths=(source_root, empty_home, *runtime_paths),
             executable=runtime,
         ),
-        source_root,
+        empty_home,
     )
 
 
-def read_backlog_tasks(payload: bytes | None) -> list[BacklogTask]:
+def read_backlog_tasks(
+    payload: bytes | None, observation: Observation
+) -> list[BacklogTask]:
     if payload is None:
         return []
     path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-    argv, cwd = tasks_axi_boundary(path)
+    argv, cwd = tasks_axi_boundary(path, observation)
     output = run_bounded(
         argv,
         {
+            "HOME": os.fspath(cwd),
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "NO_COLOR": "1",
@@ -1759,7 +1816,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         backlog_payload = observation.read_under(
             home, ("data", "backlog.md"), MAX_BACKLOG_BYTES, missing_ok=True
         )
-        backlog_tasks = read_backlog_tasks(backlog_payload)
+        backlog_tasks = read_backlog_tasks(backlog_payload, observation)
         workers, meta_present, omitted_task_evidence = collect_workers(
             home, observation, backlog_tasks, set(registered)
         )
