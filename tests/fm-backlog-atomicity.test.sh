@@ -907,7 +907,7 @@ test_dispatch_refuses_to_commit_without_a_published_record() {
 }
 
 test_dispatch_preserves_an_accepted_launch_when_the_transition_fails() {
-  local case_dir home id out rc=0
+  local case_dir home id out rc=0 accepted_head accepted_busy_gen
   id=atomic-dispatch-b4
   case_dir=$(make_home dispatch-transition-fails "$id")
   home=$(home_of "$case_dir")
@@ -926,6 +926,11 @@ test_dispatch_preserves_an_accepted_launch_when_the_transition_fails() {
     "a failed backlog commit discarded exact launch acceptance"
   [ "$(row_state "$case_dir" "$id")" = queued ] \
     || fail "a failed dispatch left the backlog item in $(row_state "$case_dir" "$id")"
+  accepted_busy_gen=$(sed -n 's/^busy_gen=//p' "$home/state/$id.meta")
+  printf 'accepted worker state\n' > "$case_dir/wt/accepted-worker-state"
+  git -C "$case_dir/wt" add accepted-worker-state
+  git -C "$case_dir/wt" commit -q -m 'accepted worker state'
+  accepted_head=$(git -C "$case_dir/wt" rev-parse HEAD)
 
   restore_tasks_axi "$case_dir"
   restore_launch_delivery "$case_dir" "$id"
@@ -938,7 +943,11 @@ test_dispatch_preserves_an_accepted_launch_when_the_transition_fails() {
     "accepted launch retry retained its completed recovery receipt"
   assert_present "$home/state/$id.meta" \
     "accepted launch retry lost its task metadata"
-  pass "accepted launches preserve metadata until backlog commit recovery"
+  [ "$(git -C "$case_dir/wt" rev-parse HEAD)" = "$accepted_head" ] \
+    || fail "accepted launch recovery reset the running worker's worktree"
+  [ "$(sed -n 's/^busy_gen=//p' "$home/state/$id.meta")" = "$accepted_busy_gen" ] \
+    || fail "accepted launch recovery minted a replacement busy generation"
+  pass "accepted launches preserve their exact incarnation during commit recovery"
 }
 
 test_dispatch_reports_an_incomplete_record_rollback() {
@@ -1048,7 +1057,7 @@ test_exited_launch_is_reconciled_without_replay() {
   pass "exited launches reconcile from execution evidence without replay"
 }
 
-test_failed_exited_launch_is_terminal_and_never_replayed() {
+test_failed_exited_launch_is_compensated_before_a_fresh_retry() {
   local case_dir home id out rc=0
   id=atomic-dispatch-failed-launch-b5
   case_dir=$(make_home dispatch-failed-launch "$id")
@@ -1068,15 +1077,28 @@ test_failed_exited_launch_is_terminal_and_never_replayed() {
 
   rc=0
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
-  [ "$rc" -ne 0 ] || fail "terminal failed launch was reported as spawned on retry"
-  assert_contains "$out" "exited unsuccessfully" \
-    "failed launch retry did not report terminal execution evidence"
+  [ "$rc" -ne 0 ] || fail "terminal failed launch compensation was reported as spawned"
+  assert_contains "$out" "provisional publication was compensated" \
+    "failed launch retry did not report transaction compensation"
   [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
-    || fail "terminal failed launch was replayed"
-  pass "failed exited launches remain terminal without replay"
+    || fail "terminal failed launch was replayed during compensation"
+  assert_absent "$home/state/$id.meta" \
+    "failed launch compensation retained provisional metadata"
+  jq -e '.phase == "worktree-ready"' "$home/state/$id.spawn-endpoint.json" >/dev/null \
+    || fail "failed launch compensation did not restore the exact reusable endpoint"
+
+  fm_fake_exit0 "$case_dir/fakebin" claude
+  rc=0
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -eq 0 ] || fail "fresh launch after terminal compensation did not succeed: $out"
+  [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 2 ] \
+    || fail "fresh retry did not launch exactly once after compensation"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "fresh retry after compensation did not commit the backlog row"
+  pass "failed exited launches compensate before one fresh retry"
 }
 
-test_missing_accepted_endpoint_reconciles_without_losing_its_receipt() {
+test_missing_accepted_endpoint_compensates_before_backlog_commit() {
   local case_dir home id out rc=0
   id=atomic-dispatch-missing-accepted-endpoint-b5
   case_dir=$(make_home dispatch-missing-accepted-endpoint "$id")
@@ -1094,15 +1116,15 @@ test_missing_accepted_endpoint_reconciles_without_losing_its_receipt() {
   rc=0
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
   [ "$rc" -ne 0 ] || fail "missing accepted endpoint was reported as a live spawn"
-  assert_contains "$out" "was reconciled, but its endpoint is gone" \
-    "missing accepted endpoint did not report conservative reconciliation"
-  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
-    || fail "missing accepted endpoint left accepted metadata paired with queued work"
-  assert_present "$home/state/$id.meta" \
-    "missing accepted endpoint reconciliation lost task metadata"
-  assert_present "$home/state/$id.spawn-endpoint.json" \
-    "missing accepted endpoint reconciliation lost its exact receipt"
-  pass "missing accepted endpoints reconcile without discarding exact receipts"
+  assert_contains "$out" "published transaction was compensated" \
+    "missing accepted endpoint did not report transaction compensation"
+  [ "$(row_state "$case_dir" "$id")" = queued ] \
+    || fail "missing accepted endpoint committed nonexistent work In flight"
+  assert_absent "$home/state/$id.meta" \
+    "missing accepted endpoint retained task metadata"
+  assert_absent "$home/state/$id.spawn-endpoint.json" \
+    "missing accepted endpoint retained a stranded receipt"
+  pass "missing accepted endpoints compensate before backlog commit"
 }
 
 test_dispatch_defers_interruption_across_backlog_commit() {
@@ -2466,8 +2488,8 @@ test_dispatch_reports_an_incomplete_record_rollback
 test_dispatch_reports_an_incomplete_busy_rollback
 test_dispatch_rolls_back_before_a_failed_launch_delivery
 test_exited_launch_is_reconciled_without_replay
-test_failed_exited_launch_is_terminal_and_never_replayed
-test_missing_accepted_endpoint_reconciles_without_losing_its_receipt
+test_failed_exited_launch_is_compensated_before_a_fresh_retry
+test_missing_accepted_endpoint_compensates_before_backlog_commit
 test_dispatch_defers_interruption_across_backlog_commit
 test_dispatch_interruption_during_kimi_readiness_fails_before_commit
 test_dispatch_does_not_resurrect_a_row_closed_after_preflight

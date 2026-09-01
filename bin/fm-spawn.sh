@@ -941,6 +941,24 @@ spawn_launch_guard_cleanup_retryable() {
   rmdir -- "$retired"
 }
 
+spawn_launch_guard_cleanup_terminal() {
+  local state entry retired
+  state=$(spawn_launch_guard_state) || return 1
+  case "$state" in absent) return 0 ;; exited|abandoned) ;; *) return 1 ;; esac
+  retired=$(umask 077; mktemp -d "$STATE/.$ID.launch-execution-retired.XXXXXX") || return 1
+  rmdir -- "$retired" || return 1
+  mv -- "$SPAWN_LAUNCH_GUARD" "$retired" || return 1
+  state=$(spawn_launch_guard_state_at "$retired") || return 1
+  case "$state" in exited|abandoned) ;; *) return 1 ;; esac
+  for entry in "$retired"/* "$retired"/.[!.]* "$retired"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    case "${entry##*/}" in owner|child|.owner.tmp|.child.tmp) ;; *) return 1 ;; esac
+    [ -f "$entry" ] && [ ! -L "$entry" ] \
+      && [ "$(spawn_file_link_count "$entry")" = 1 ] || return 1
+  done
+  rm -rf -- "$retired"
+}
+
 spawn_launch_request_file_matches() {  # <path> <value>
   local path=$1 value=$2 links bytes
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
@@ -1105,7 +1123,10 @@ spawn_launch_request_wait() {
         agent_state=$(fm_backend_agent_state "$BACKEND" "$T")
         [ "$agent_state" != alive ] || return 0
         ;;
-      launch-exited) return 0 ;;
+      launch-exited)
+        [ "$KIND" != secondmate ] || return 2
+        return 0
+        ;;
       failed|attempted-dead|launch-abandoned|launch-failed) return 2 ;;
     esac
     i=$((i + 1))
@@ -2741,6 +2762,10 @@ if [ "$KIND" = secondmate ]; then
 fi
 
 if [ "$KIND" = secondmate ]; then
+  SECONDMATE_PREPARATION_RECOVERY=0
+  if [ -e "$STATE/$ID.spawn-endpoint.json" ] || [ -L "$STATE/$ID.spawn-endpoint.json" ]; then
+    SECONDMATE_PREPARATION_RECOVERY=1
+  fi
   [ -n "$FIRSTMATE_HOME" ] || { echo "error: no firstmate home supplied or registered for $ID" >&2; exit 1; }
   PROJ_ABS=$(validate_firstmate_home_for_spawn "$ID" "$FIRSTMATE_HOME")
   if [ -e "$DATA/secondmates.md" ] || [ -L "$DATA/secondmates.md" ]; then
@@ -2761,7 +2786,8 @@ if [ "$KIND" = secondmate ]; then
     echo "error: could not create secondmate state directory for $PROJ_ABS" >&2
     exit 1
   }
-  if [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
+  if [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ] \
+     && [ "$SECONDMATE_PREPARATION_RECOVERY" -eq 0 ]; then
     CONFIG_INHERIT_LOCK=$(fm_config_inherit_lock_path "$PROJ_ABS") || {
       echo "error: could not resolve secondmate inheritance lock for $PROJ_ABS" >&2
       exit 1
@@ -2780,20 +2806,23 @@ if [ "$KIND" = secondmate ]; then
   # repo and already holds the commit. ff-only and guarded; a dirty, diverged, or
   # wrong-branch home is left untouched and launches as-is. The agent re-reads
   # AGENTS.md fresh on launch, so no nudge is needed here.
-  if sm_primary_head=$(primary_head_commit "$FM_ROOT"); then
-    sm_ff_out=$(ff_target "$PROJ_ABS" "secondmate $ID" "$sm_primary_head" yes yes 2>&1 || true)
-    case "$sm_ff_out" in
-      *': skipped:'*)
-        sm_ff_line=$(first_line "$sm_ff_out")
-        sm_ff_prefix="secondmate $ID: skipped: "
-        sm_ff_reason=${sm_ff_line#"$sm_ff_prefix"}
-        echo "warning: secondmate $ID sync skipped before launch: $sm_ff_reason" >&2
-        ;;
-    esac
-  else
-    echo "warning: secondmate $ID sync skipped before launch: primary default-branch commit cannot be resolved" >&2
+  if [ "$SECONDMATE_PREPARATION_RECOVERY" -eq 0 ]; then
+    if sm_primary_head=$(primary_head_commit "$FM_ROOT"); then
+      sm_ff_out=$(ff_target "$PROJ_ABS" "secondmate $ID" "$sm_primary_head" yes yes 2>&1 || true)
+      case "$sm_ff_out" in
+        *': skipped:'*)
+          sm_ff_line=$(first_line "$sm_ff_out")
+          sm_ff_prefix="secondmate $ID: skipped: "
+          sm_ff_reason=${sm_ff_line#"$sm_ff_prefix"}
+          echo "warning: secondmate $ID sync skipped before launch: $sm_ff_reason" >&2
+          ;;
+      esac
+    else
+      echo "warning: secondmate $ID sync skipped before launch: primary default-branch commit cannot be resolved" >&2
+    fi
   fi
-  if [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
+  if [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ] \
+     && [ "$SECONDMATE_PREPARATION_RECOVERY" -eq 0 ]; then
     # Inheritance propagation: push the primary-authoritative live-safe local inheritance
     # surface into this secondmate home (fm-config-inherit-lib.sh).
     FM_CONFIG_INHERIT_LIVE=1 \
@@ -2898,6 +2927,51 @@ fm_operational_input_construct launch-brief "$SPAWN_BRIEF_BODY" SPAWN_BRIEF_INPU
   || { echo "error: could not encode captured launch brief" >&2; exit 1; }
 unset SPAWN_BRIEF_BODY
 W="fm-$ID"
+spawn_terminal_launch_reset() {
+  local busy_gen=
+  if spawn_metadata_transaction_published; then
+    busy_gen=$(fm_meta_get "$STATE/$ID.meta" busy_gen)
+    BUSY_GEN=$busy_gen
+    spawn_fresh_commit_rollback || return 1
+  fi
+  spawn_launch_request_cleanup || return 1
+  spawn_launch_guard_cleanup_terminal || return 1
+  SPAWN_FRESH_COMMIT_PENDING=0
+  spawn_endpoint_receipt_publish worktree-ready "$WT"
+}
+
+spawn_missing_endpoint_compensate() {
+  local busy_gen= guard_state
+  guard_state=$(spawn_launch_guard_state) || return 1
+  case "$guard_state" in absent|exited|abandoned) ;; *) return 1 ;; esac
+  if spawn_metadata_transaction_published; then
+    busy_gen=$(fm_meta_get "$STATE/$ID.meta" busy_gen)
+  fi
+  if [ "$KIND" != secondmate ] && [ -d "$WT" ]; then
+    if [ "$BACKEND" = orca ]; then
+      fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID" --absent-ok >/dev/null 2>&1 \
+        || return 1
+    else
+      (cd "$PROJ_ABS" && treehouse return --force "$WT") >/dev/null 2>&1 || return 1
+    fi
+  fi
+  if [ -n "$busy_gen" ]; then
+    FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+      dispatch-retire-run "$ID" -- "$FM_ROOT/bin/fm-busy-event.sh" \
+        retire "$STATE" "$ID" --gen "$busy_gen" >/dev/null || return 1
+  else
+    FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_STATE_OVERRIDE="$STATE" \
+      FM_ROOT_OVERRIDE="$FM_ROOT" "$SCRIPT_DIR/fm-work-identity.sh" \
+      dispatch-retire-run "$ID" -- true >/dev/null || return 1
+  fi
+  spawn_launch_request_cleanup || return 1
+  spawn_launch_guard_cleanup_terminal || return 1
+  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || return 1
+  SPAWN_DISPATCH_PENDING=0
+  SPAWN_FRESH_COMMIT_PENDING=0
+}
+
 if [ "$RELAUNCH" -eq 0 ] \
    && { [ -e "$SPAWN_ENDPOINT_RECEIPT" ] || [ -L "$SPAWN_ENDPOINT_RECEIPT" ]; }; then
   endpoint_receipt_rc=0
@@ -2914,7 +2988,7 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
     exit 1
   }
   case "$launch_request_state" in
-    accepted|executed|launch-exited)
+    accepted|executed)
       spawn_metadata_transaction_published || {
         echo "error: accepted launch has no exact published metadata for $ID" >&2
         exit 1
@@ -2926,8 +3000,41 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
       }
       SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
       ;;
+    launch-exited)
+      if [ "$KIND" != secondmate ]; then
+        spawn_metadata_transaction_published || {
+          echo "error: accepted launch has no exact published metadata for $ID" >&2
+          exit 1
+        }
+        SPAWN_METADATA_RECOVERY=1
+        spawn_endpoint_receipt_publish launch-submitted "$WT" || {
+          echo "error: accepted launch could not be journaled for $ID" >&2
+          exit 1
+        }
+        SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
+      else
+        if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
+          spawn_missing_endpoint_compensate
+        else
+          spawn_terminal_launch_reset
+        fi || {
+          echo "error: exited secondmate launch for $ID could not be compensated safely" >&2
+          exit 1
+        }
+        echo "error: persistent secondmate launch for $ID exited; its provisional publication was compensated - rerun spawn to retry" >&2
+        exit 1
+      fi
+      ;;
     launch-failed)
-      echo "error: launch command for $ID exited unsuccessfully; terminal execution evidence is preserved" >&2
+      if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
+        spawn_missing_endpoint_compensate
+      else
+        spawn_terminal_launch_reset
+      fi || {
+        echo "error: failed launch for $ID could not be compensated safely" >&2
+        exit 1
+      }
+      echo "error: launch command for $ID exited unsuccessfully; its provisional publication was compensated - rerun spawn to retry" >&2
       exit 1
       ;;
     absent|failed|unattempted-dead|attempted-dead|launch-abandoned)
@@ -2967,18 +3074,39 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -eq 1 ]; then
     echo "error: submitted launch evidence is unsafe for $ID" >&2
     exit 1
   }
-  case "$launch_request_state" in accepted|executed|launch-exited) ;; *)
-    echo "error: submitted launch lacks exact backend acceptance for $ID" >&2
-    exit 1 ;;
+  case "$launch_request_state" in
+    accepted|executed) ;;
+    launch-exited)
+      if [ "$KIND" = secondmate ]; then
+        if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
+          spawn_missing_endpoint_compensate
+        else
+          spawn_terminal_launch_reset
+        fi || {
+          echo "error: exited submitted secondmate launch for $ID could not be compensated safely" >&2
+          exit 1
+        }
+        echo "error: submitted persistent secondmate launch for $ID exited; its provisional publication was compensated - rerun spawn to retry" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "error: submitted launch lacks exact backend acceptance for $ID" >&2
+      exit 1
+      ;;
   esac
-  if [ "$SPAWN_ENDPOINT_MISSING" -ne 1 ]; then
+  if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
+    spawn_missing_endpoint_compensate || {
+      echo "error: missing accepted endpoint for $ID could not be compensated safely; exact receipt is preserved" >&2
+      exit 1
+    }
+    echo "error: accepted launch endpoint for $ID disappeared; its published transaction was compensated - rerun spawn to retry" >&2
+    exit 1
+  else
     spawn_launch_delivery_wait || {
       echo "error: submitted launch has not published exact backend acceptance for $ID" >&2
       exit 1
     }
-  elif [ "$SPAWN_ENDPOINT_WAS_SUBMITTED" -ne 1 ] && [ "$KIND" = secondmate ]; then
-    echo "error: secondmate endpoint disappeared before durable launch acceptance for $ID; exact evidence is preserved" >&2
-    exit 1
   fi
 fi
 
@@ -4670,7 +4798,8 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     esac
   fi
 fi
-if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] \
+   && [ "$SPAWN_METADATA_RECOVERY" -eq 0 ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
 fi
 
@@ -4711,7 +4840,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   RELAUNCH_REPLACEMENT_STATE=$STATE_REAL
   RELAUNCH_REPLACEMENT_WT=$WT
 fi
-if [ "$KIND" != secondmate ]; then
+if [ "$KIND" != secondmate ] && [ "$SPAWN_METADATA_RECOVERY" -eq 0 ]; then
   # Arm the semantic busy-state contract (bin/fm-busy-lib.sh) for every
   # adapter with a verified semantic source. The launch brief sent below IS a
   # submitted turn, so the seed record is busy/fm-spawn. The minted gen is
@@ -5400,10 +5529,6 @@ if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
 fi
 if [ "$RELAUNCH" -eq 0 ]; then
-  if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
-    echo "error: accepted launch for $ID was reconciled, but its endpoint is gone; exact receipt is preserved" >&2
-    exit 1
-  fi
   rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
     echo "error: accepted launch receipt could not be retired for $ID" >&2
     exit 1
