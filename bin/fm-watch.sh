@@ -284,8 +284,18 @@ hash_pane() {
   if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi
 }
 
-pane_marker_hash() {  # <window>, pane bytes on stdin
-  normalize_pane_for_marker_hash "$(window_harness "$1")" | hash_pane
+PANE_MARKER_PI_FORMAT=pi-footer-clock-v1
+
+pane_marker_hash() {  # <harness>, pane bytes on stdin
+  normalize_pane_for_marker_hash "$1" | hash_pane
+}
+
+pane_marker_format_current() {  # <harness> <window-key>
+  local harness=$1 key=$2 format_file="$STATE/.pane-hash-format-$2"
+  case "$harness" in
+    pi|pi-signed) [ "$(cat "$format_file" 2>/dev/null || true)" = "$PANE_MARKER_PI_FORMAT" ] ;;
+    *)            [ ! -e "$format_file" ] && [ ! -L "$format_file" ] ;;
+  esac
 }
 
 # window_is_busy: 0 (busy) iff the task's harness is PROVABLY working, through
@@ -481,11 +491,11 @@ inbox_steer_check() {  # <window> <task>
 # it never runs on the ordinary per-wake path.
 signal_turnend_panes_churned() {  # <file> ...
   [ -e "$CONFIG/turnend-churn-absorb" ] || return 1
-  local f base task meta kind w key backend label terminal prev now since now_s absorb_secs marker age
+  local f base task meta kind w key backend harness label terminal prev now since now_s absorb_secs marker age
   local rec_task task_index i j count hash_file hash_bytes created
   local max_absorb_secs=9223372036854775807
   local -a signal_tasks=() signal_statuses=() snapshot_tasks=() snapshot_kinds=()
-  local -a snapshot_windows=() snapshot_keys=() snapshot_backends=() snapshot_labels=()
+  local -a snapshot_windows=() snapshot_keys=() snapshot_backends=() snapshot_harnesses=() snapshot_labels=()
   local -a signal_indexes=() churn_indexes=() churned_keys=() missing_keys=() created_keys=()
   [ "$#" -gt 0 ] || return 1
   for f in "$@"; do
@@ -513,6 +523,7 @@ signal_turnend_panes_churned() {  # <file> ...
     rec_task=${rec_task%.meta}
     kind=$(fm_meta_get "$meta" kind)
     backend=$(fm_backend_of_meta "$meta")
+    harness=$(fm_meta_get "$meta" harness)
     if [ "$backend" = orca ]; then
       terminal=$(fm_meta_get "$meta" terminal)
       w=${terminal:-$(fm_meta_get "$meta" window)}
@@ -527,6 +538,7 @@ signal_turnend_panes_churned() {  # <file> ...
     snapshot_windows+=("$w")
     snapshot_keys+=("$key")
     snapshot_backends+=("$backend")
+    snapshot_harnesses+=("$harness")
     snapshot_labels+=("$label")
   done
   # These linear lookups deliberately support stock macOS Bash 3.2.57, enforced
@@ -570,8 +582,10 @@ signal_turnend_panes_churned() {  # <file> ...
     w=${snapshot_windows[$task_index]}
     key=${snapshot_keys[$task_index]}
     backend=${snapshot_backends[$task_index]}
+    harness=${snapshot_harnesses[$task_index]}
     label=${snapshot_labels[$task_index]}
     hash_file="$STATE/.hash-$key"
+    pane_marker_format_current "$harness" "$key" || return 1
     hash_bytes=$(LC_ALL=C wc -c 2>/dev/null < "$hash_file") || return 1
     hash_bytes=${hash_bytes//[[:space:]]/}
     [ "$hash_bytes" = 32 ] || return 1
@@ -579,7 +593,7 @@ signal_turnend_panes_churned() {  # <file> ...
     [[ $prev =~ ^[0-9a-f]{32}$ ]] || return 1
     now=$(fm_backend_capture "$backend" "$w" 40 "$label" 2>/dev/null) || return 1
     [ -n "$now" ] || return 1
-    [ "$(printf '%s' "$now" | pane_marker_hash "$w")" != "$prev" ] || return 1
+    [ "$(printf '%s' "$now" | pane_marker_hash "$harness")" != "$prev" ] || return 1
     churned_keys+=("$key")
   done
   # Enforce the deferral bound BEFORE any .stale- state is touched, so a wake that
@@ -1787,15 +1801,31 @@ EOF
     if [ "$kind" = secondmate ] && ! status_is_paused_or_captain_held "$last"; then
       continue
     fi
-    tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
-    h=$(printf '%s' "$tail40" | pane_marker_hash "$w")
+    backend=$(window_backend "$w")
+    harness=$(window_harness "$w")
+    tail40=$(fm_backend_capture "$backend" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
+    h=$(printf '%s' "$tail40" | pane_marker_hash "$harness")
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"
     ssf="$STATE/.stale-since-$key"
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
+    formatf="$STATE/.pane-hash-format-$key"
     prev=$(cat "$hf" 2>/dev/null || true)
+    if ! pane_marker_format_current "$harness" "$key"; then
+      stale_hash=$(cat "$sf" 2>/dev/null || true)
+      printf '%s' "$h" > "$hf" || continue
+      echo 0 > "$cf" || continue
+      if [ -n "$prev" ] && [ "$stale_hash" = "$prev" ]; then
+        printf '%s' "$h" > "$sf" || continue
+      fi
+      case "$harness" in
+        pi|pi-signed) printf '%s' "$PANE_MARKER_PI_FORMAT" > "$formatf" || continue ;;
+        *)            rm -f "$formatf" || continue ;;
+      esac
+      prev=$h
+    fi
     # Busy match: a backend's native semantic state when available (herdr), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified
     # harness renders its busy indicator) so busy-looking strings in displayed
