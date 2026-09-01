@@ -251,7 +251,7 @@ afk_present() { [ -e "$STATE/.afk" ]; }
 # pi-signed, and the clock must sit on the structured context line immediately
 # above Pi's ready/working state line. Other timestamps, harnesses, and every
 # other pane byte remain significant to stale detection.
-normalize_pane_for_stale_hash() {  # <harness>, pane bytes on stdin
+normalize_pane_for_marker_hash() {  # <harness>, pane bytes on stdin
   local harness=$1 pane='' before_state state_line context_line prefix normalized_context
   local state_re='^[[:space:]]*▶▶ agent (ready|working)([[:space:]].*)?$'
   local context_re='^(.*ctx:(\?|[0-9]+%).*\([0-9]+(\.[0-9]+)?[kM]? context\).*  )([0-9][0-9]:[0-9][0-9])(.*)$'
@@ -282,6 +282,10 @@ normalize_pane_for_stale_hash() {  # <harness>, pane bytes on stdin
 
 hash_pane() {
   if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi
+}
+
+pane_marker_hash() {  # <window>, pane bytes on stdin
+  normalize_pane_for_marker_hash "$(window_harness "$1")" | hash_pane
 }
 
 # window_is_busy: 0 (busy) iff the task's harness is PROVABLY working, through
@@ -575,7 +579,7 @@ signal_turnend_panes_churned() {  # <file> ...
     [[ $prev =~ ^[0-9a-f]{32}$ ]] || return 1
     now=$(fm_backend_capture "$backend" "$w" 40 "$label" 2>/dev/null) || return 1
     [ -n "$now" ] || return 1
-    [ "$(printf '%s' "$now" | hash_pane)" != "$prev" ] || return 1
+    [ "$(printf '%s' "$now" | pane_marker_hash "$w")" != "$prev" ] || return 1
     churned_keys+=("$key")
   done
   # Enforce the deferral bound BEFORE any .stale- state is touched, so a wake that
@@ -1784,7 +1788,7 @@ EOF
       continue
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
-    h=$(printf '%s' "$tail40" | normalize_pane_for_stale_hash "$(window_harness "$w")" | hash_pane)
+    h=$(printf '%s' "$tail40" | pane_marker_hash "$w")
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"

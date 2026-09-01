@@ -820,6 +820,83 @@ test_turn_ended_churning_pane_absorbed() {
   pass "a bare turn-end from a pane that churned since the previous poll is absorbed"
 }
 
+test_turn_ended_pi_clock_tick_is_not_churn() {
+  local harness dir state fakebin out capture_file window key pid
+  for harness in pi pi-signed; do
+    dir=$(make_case "turn-ended-${harness}-clock"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"
+    window="test:fm-${harness}-turnend-clock"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    cat > "$capture_file" <<'EOF'
+completed transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:03  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+    printf 'window=%s\nkind=ship\nharness=%s\n' "$window" "$harness" > "$state/${harness}-turnend-clock.meta"
+    export FM_FAKE_CREW_STATE='state: unknown · source: none · idle Pi fixture'
+
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_CONFIG_OVERRIDE="$(churn_config "$dir")" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=0 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 150 \
+      || { reap "$pid"; fail "$harness watcher did not classify its initial idle pane"; }
+    grep -Fx "stale: $window" "$out" >/dev/null \
+      || fail "$harness initial idle pane did not establish a stale marker"
+    ack_stopped_cycle "$state" || fail "$harness initial idle cycle could not be acknowledged"
+
+    cat > "$capture_file" <<'EOF'
+completed transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:04  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+    : > "$state/${harness}-turnend-clock.turn-ended"
+    set_mtime "$(( $(date +%s) - 2 ))" "$state/${harness}-turnend-clock.turn-ended"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_CONFIG_OVERRIDE="$(churn_config "$dir")" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=0 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 100 \
+      || { reap "$pid"; fail "$harness clock-only turn-end was falsely absorbed as pane churn"; }
+    grep -F "signal: $state/${harness}-turnend-clock.turn-ended" "$out" >/dev/null \
+      || fail "$harness clock-only turn-end did not surface: $(cat "$out")"
+    [ ! -e "$state/.churn-since-$key" ] \
+      || fail "$harness clock-only turn-end opened a false churn deferral window"
+    ack_stopped_cycle "$state" || fail "$harness clock-only turn-end cycle could not be acknowledged"
+
+    cat > "$capture_file" <<'EOF'
+completed transcript
+new tool output
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:04  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+    printf 'next\n' > "$state/${harness}-turnend-clock.turn-ended"
+    set_mtime "$(( $(date +%s) - 2 ))" "$state/${harness}-turnend-clock.turn-ended"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_CONFIG_OVERRIDE="$(churn_config "$dir")" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=0 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_absorbed "$state" "$pid" "absorbed benign signal:" \
+      || { reap "$pid"; fail "$harness genuine pane progress was not observed as churn: $(cat "$out")"; }
+    [ -s "$state/.churn-since-$key" ] \
+      || { reap "$pid"; fail "$harness genuine pane progress opened no churn deferral window"; }
+    reap "$pid"
+  done
+  unset FM_FAKE_CREW_STATE
+  pass "Pi clock-only turn-ends are not false churn while genuine pane progress remains observable"
+}
+
 test_turn_ended_churn_resets_prior_stale_classification() {
   local dir state fakebin out capture_file window key old_hash active_hash pid i
   dir=$(make_case turn-ended-churn-resets-stale); state="$dir/state"; fakebin="$dir/fakebin"
@@ -3939,6 +4016,7 @@ test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced
 test_turn_ended_churning_pane_absorbed
+test_turn_ended_pi_clock_tick_is_not_churn
 test_turn_ended_churn_resets_prior_stale_classification
 test_turn_ended_churn_resets_wedge_state_before_stale_poll
 test_turn_ended_still_pane_surfaced
