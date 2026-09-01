@@ -1058,25 +1058,37 @@ test_exited_launch_is_reconciled_without_replay() {
 }
 
 test_failed_exited_launch_is_compensated_before_a_fresh_retry() {
-  local case_dir home id out rc=0
+  local case_dir home id out rc=0 grok_home token auth
   id=atomic-dispatch-failed-launch-b5
   case_dir=$(make_home dispatch-failed-launch "$id")
   home=$(home_of "$case_dir")
+  grok_home="$case_dir/grok-home"
   add_item "$case_dir" "$id"
   execute_launch_then_exit "$case_dir" "$id"
-  make_worker_exit_nonzero "$case_dir"
+  cat > "$case_dir/fakebin/grok" <<'SH'
+#!/usr/bin/env bash
+exit 42
+SH
+  chmod +x "$case_dir/fakebin/grok"
 
-  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  out=$(GROK_HOME="$grok_home" run_spawn "$case_dir" "$id" "$case_dir/project" \
+    --harness grok --mode no-mistakes --yolo off) || rc=$?
   [ "$rc" -ne 0 ] || fail "failed worker launch was reported as spawned"
   [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
     || fail "failed worker launch did not execute exactly once"
   assert_present "$home/state/$id.meta" \
     "failed worker launch lost its terminal execution metadata"
+  token=$(cat "$home/state/$id.grok-turnend-token")
+  auth="$grok_home/hooks/fm-turn-end.d/$token"
+  assert_present "$auth" "failed worker launch did not retain its exact Grok authorization"
+  assert_present "$case_dir/wt/.fm-grok-turnend" \
+    "failed worker launch did not retain its Grok worktree pointer"
   [ "$(row_state "$case_dir" "$id")" = queued ] \
     || fail "failed worker launch moved its backlog row"
 
   rc=0
-  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  out=$(GROK_HOME="$grok_home" run_spawn "$case_dir" "$id" "$case_dir/project" \
+    --harness grok --mode no-mistakes --yolo off) || rc=$?
   [ "$rc" -ne 0 ] || fail "terminal failed launch compensation was reported as spawned"
   assert_contains "$out" "provisional publication was compensated" \
     "failed launch retry did not report transaction compensation"
@@ -1084,18 +1096,24 @@ test_failed_exited_launch_is_compensated_before_a_fresh_retry() {
     || fail "terminal failed launch was replayed during compensation"
   assert_absent "$home/state/$id.meta" \
     "failed launch compensation retained provisional metadata"
+  assert_absent "$auth" "failed launch compensation orphaned its Grok authorization"
+  assert_absent "$home/state/$id.grok-turnend-token" \
+    "failed launch compensation retained its Grok authorization token"
+  assert_absent "$case_dir/wt/.fm-grok-turnend" \
+    "failed launch compensation retained its Grok worktree pointer"
   jq -e '.phase == "worktree-ready"' "$home/state/$id.spawn-endpoint.json" >/dev/null \
     || fail "failed launch compensation did not restore the exact reusable endpoint"
 
-  fm_fake_exit0 "$case_dir/fakebin" claude
+  fm_fake_exit0 "$case_dir/fakebin" grok
   rc=0
-  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  out=$(GROK_HOME="$grok_home" run_spawn "$case_dir" "$id" "$case_dir/project" \
+    --harness grok --mode no-mistakes --yolo off) || rc=$?
   [ "$rc" -eq 0 ] || fail "fresh launch after terminal compensation did not succeed: $out"
   [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 2 ] \
     || fail "fresh retry did not launch exactly once after compensation"
   [ "$(row_state "$case_dir" "$id")" = in_flight ] \
     || fail "fresh retry after compensation did not commit the backlog row"
-  pass "failed exited launches compensate before one fresh retry"
+  pass "failed exited launches retire harness wiring before one fresh retry"
 }
 
 test_missing_accepted_endpoint_compensates_before_backlog_commit() {
