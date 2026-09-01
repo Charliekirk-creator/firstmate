@@ -127,6 +127,10 @@ fm_backend_tmux_send_text_line() {  # <target> <text>
   tmux send-keys -t "$1" "$2" Enter
 }
 
+fm_backend_tmux_send_launch_line() {  # <target> <text>
+  tmux send-keys -t "$1" -l "$2" \; send-keys -t "$1" Enter
+}
+
 # fm_backend_tmux_send_literal: send TEXT as literal bytes with no
 # submission - the caller sends Enter separately (fm-spawn.sh's launch-command
 # send pauses between the literal send and Enter for the harness to settle).

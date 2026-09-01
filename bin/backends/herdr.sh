@@ -2578,6 +2578,10 @@ fm_backend_herdr_send_text_line() {  # <target> <text>
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane run "$FM_BACKEND_HERDR_PANE" "$2" >/dev/null 2>&1
 }
 
+fm_backend_herdr_send_launch_line() {  # <target> <text>
+  fm_backend_herdr_send_text_line "$1" "$2"
+}
+
 # fm_backend_herdr_send_literal: send TEXT as literal, UNSUBMITTED input - the
 # caller sends Enter separately. Mirrors tmux's `send-keys -t T -l text`.
 # Verified: `pane send-text` does NOT auto-submit (contrary to the addendum's

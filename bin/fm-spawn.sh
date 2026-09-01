@@ -1080,6 +1080,28 @@ spawn_launch_request_wait() {
   return 3
 }
 
+spawn_launch_acceptance_wait() {
+  local state i=0 max=${FM_SPAWN_LAUNCH_POLLS:-100} interval=${FM_SPAWN_LAUNCH_INTERVAL:-0.1}
+  while [ "$i" -lt "$max" ]; do
+    state=$(spawn_launch_request_state) || return 1
+    case "$state" in
+      accepted|executed) return 0 ;;
+      failed|attempted-dead|launch-exited) return 2 ;;
+    esac
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "$interval"
+  done
+  return 3
+}
+
+spawn_launch_delivery_wait() {
+  if [ "$KIND" = secondmate ]; then
+    spawn_launch_request_wait
+  else
+    spawn_launch_acceptance_wait
+  fi
+}
+
 spawn_endpoint_receipt_publish() {  # <phase> [worktree]
   local phase=$1 worktree=${2:-} details payload tmp
   case "$phase" in endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-retryable|worktree-acquired|worktree-ready|launch-prepared|launch-submitted) ;; *) return 1 ;; esac
@@ -1180,7 +1202,6 @@ spawn_endpoint_receipt_load() {
              else true end)
         and (if .phase == "worktree-retryable" or .phase == "worktree-acquired" then
                ($backend == "zellij" or $backend == "cmux")
-             elif .phase == "launch-prepared" or .phase == "launch-submitted" then $kind == "secondmate"
              else true end)
       ) | $r
     ' "$receipt" 2>/dev/null) || {
@@ -1601,6 +1622,7 @@ spawn_metadata_transaction_published() {
 
 spawn_abort_cleanup() {
   local status=$? orca_cleanup_compensated=0 orca_resource_cleanup_ok=1
+  local preserve_published_launch=0 launch_abort_state
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && spawn_metadata_transaction_published; then
@@ -1704,7 +1726,19 @@ spawn_abort_cleanup() {
     fm_lock_release "$SPAWN_TASK_LOCK" || true
   fi
   if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ]; then
-    if ! spawn_fresh_commit_rollback; then
+    case "$SPAWN_ENDPOINT_PHASE" in
+      launch-submitted) preserve_published_launch=1 ;;
+      launch-prepared)
+        launch_abort_state=$(spawn_launch_request_state 2>/dev/null || printf ambiguous)
+        case "$launch_abort_state" in
+          accepted|executed|attempted-live|unattempted-live) preserve_published_launch=1 ;;
+        esac
+        ;;
+    esac
+    if [ "$preserve_published_launch" = 1 ]; then
+      SPAWN_FRESH_COMMIT_PENDING=0
+      echo "warning: published task metadata and exact launch evidence for $ID were preserved for retry" >&2
+    elif ! spawn_fresh_commit_rollback; then
       status=1
     fi
   fi
@@ -2835,85 +2869,65 @@ if [ "$RELAUNCH" -eq 0 ] \
   fi
   [ "$endpoint_receipt_rc" -eq 0 ] || exit "$endpoint_receipt_rc"
 fi
-if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ] \
-   && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
+if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
   launch_request_state=$(spawn_launch_request_state) || {
-    echo "error: secondmate launch request evidence is unsafe for $ID" >&2
+    echo "error: launch request evidence is unsafe for $ID" >&2
     exit 1
   }
   case "$launch_request_state" in
     accepted|executed)
+      spawn_metadata_transaction_published || {
+        echo "error: accepted launch has no exact published metadata for $ID" >&2
+        exit 1
+      }
+      SPAWN_METADATA_RECOVERY=1
       spawn_endpoint_receipt_publish launch-submitted "$WT" || {
-        echo "error: accepted secondmate launch could not be journaled for $ID" >&2
+        echo "error: accepted launch could not be journaled for $ID" >&2
         exit 1
       }
       SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
       ;;
-    absent|unattempted-dead)
+    absent|failed|unattempted-dead|attempted-dead|launch-exited)
       spawn_launch_guard_cleanup_retryable || {
-        echo "error: retryable secondmate execution guard could not be retired for $ID" >&2
+        echo "error: retryable execution guard could not be retired for $ID" >&2
         exit 1
       }
       spawn_launch_request_cleanup || {
-        echo "error: retryable secondmate launch evidence could not be retired for $ID" >&2
+        echo "error: retryable launch evidence could not be retired for $ID" >&2
         exit 1
       }
-      SPAWN_LAUNCH_PREPARED_RECOVERY=1
-      SPAWN_METADATA_RECOVERY=1
-      ;;
-    failed)
-      echo "error: secondmate launch submission failed; exact request evidence is preserved for $ID" >&2
-      exit 1
-      ;;
-    attempted-dead|launch-exited)
-      spawn_launch_guard_cleanup_retryable || {
-        echo "error: interrupted secondmate execution guard could not be retired for $ID" >&2
+      spawn_endpoint_receipt_publish worktree-ready "$WT" || {
+        echo "error: retryable endpoint receipt could not be restored for $ID" >&2
         exit 1
       }
-      spawn_launch_request_cleanup || {
-        echo "error: interrupted secondmate launch evidence could not be retired for $ID" >&2
-        exit 1
-      }
-      SPAWN_LAUNCH_PREPARED_RECOVERY=1
-      SPAWN_METADATA_RECOVERY=1
+      if spawn_metadata_transaction_published; then
+        SPAWN_METADATA_RECOVERY=1
+      fi
       ;;
     *)
-      echo "error: secondmate launch acceptance is ambiguous; exact request evidence is preserved for $ID" >&2
+      echo "error: launch acceptance is ambiguous; exact request evidence is preserved for $ID" >&2
       exit 1
       ;;
   esac
 fi
-if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ] \
-   && [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -eq 1 ]; then
+if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -eq 1 ]; then
+  spawn_metadata_transaction_published || {
+    echo "error: submitted launch has no exact published metadata for $ID" >&2
+    exit 1
+  }
+  SPAWN_METADATA_RECOVERY=1
   launch_request_state=$(spawn_launch_request_state) || {
-    echo "error: submitted secondmate launch evidence is unsafe for $ID" >&2
+    echo "error: submitted launch evidence is unsafe for $ID" >&2
     exit 1
   }
   case "$launch_request_state" in accepted|executed) ;; *)
-    echo "error: submitted secondmate launch lacks exact backend acceptance for $ID" >&2
+    echo "error: submitted launch lacks exact backend acceptance for $ID" >&2
     exit 1 ;;
   esac
-  spawn_launch_request_wait || {
-    echo "error: submitted secondmate launch has not published exact command execution for $ID" >&2
+  spawn_launch_delivery_wait || {
+    echo "error: submitted launch has not published exact backend acceptance for $ID" >&2
     exit 1
   }
-  if [ "$HARNESS" = kimi ]; then
-    SPAWN_KIMI_DELIVERY_RECOVERY=1
-  else
-    commit_secondmate_work_identity || {
-      echo "error: submitted secondmate launch identity requires reconciliation for $ID" >&2
-      exit 1
-    }
-    rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
-      echo "error: submitted secondmate launch receipt could not be retired for $ID" >&2
-      exit 1
-    }
-    spawn_launch_request_cleanup \
-      || echo "warning: submitted secondmate launch request could not be retired for $ID" >&2
-    SPAWN_DISPATCH_PENDING=0
-    echo "spawned $ID harness=$HARNESS kind=secondmate mode=secondmate yolo=off window=$T worktree=$WT"
-    exit 0
-  fi
 fi
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
@@ -3750,10 +3764,11 @@ spawn_worktree_request_cleanup() {
 }
 spawn_send_launch_line() {  # <target> <text>
   case "$BACKEND" in
-    tmux) fm_backend_tmux_send_text_line "$1" "$2" ;;
-    herdr) fm_backend_herdr_send_text_line "$1" "$2" ;;
+    tmux) fm_backend_tmux_send_launch_line "$1" "$2" ;;
+    herdr) fm_backend_herdr_send_launch_line "$1" "$2" ;;
     zellij) fm_backend_zellij_send_launch_line "$1" "$2" "$W" ;;
-    *) return 1 ;;
+    orca) fm_backend_orca_send_launch_line "$1" "$2" ;;
+    cmux) fm_backend_cmux_send_launch_line "$1" "$2" "$W" ;;
   esac
 }
 spawn_send_literal() {  # <target> <text>
@@ -4260,7 +4275,7 @@ kimi_submission_wait() {
 kimi_deliver_launch_brief() {
   local recovery=${1:-fresh} submission_state composer_state journal=0
   if [ "$recovery" = recovery ] && kimi_wait_for_delivery; then return 0; fi
-  if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
+  if [ "$RELAUNCH" -eq 0 ]; then
     journal=1
     submission_state=$(kimi_submission_state) || {
       kimi_spawn_fail "kimi launch brief submission evidence is unsafe"
@@ -5091,12 +5106,6 @@ if [ "$RELAUNCH" -eq 0 ]; then
       exit 1
     }
   fi
-  if [ "$KIND" != secondmate ]; then
-    rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
-      echo "error: could not retire endpoint recovery receipt for $ID" >&2
-      exit 1
-    }
-  fi
 fi
 # A dispatch or relaunch keeps the per-task meta lock through launch delivery.
 # The backlog mutation is deliberately the final fallible commit below, so
@@ -5196,7 +5205,7 @@ spawn_record_traceparent() {
   return "$status"
 }
 
-if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
+if [ "$RELAUNCH" -eq 0 ]; then
   spawn_launch_request_paths || exit 1
   if [ -n "$SPAWN_TRACEPARENT" ]; then
     spawn_record_traceparent || {
@@ -5221,24 +5230,29 @@ if [ "$KIND" = secondmate ] && [ "$RELAUNCH" -eq 0 ]; then
   LAUNCH_CHILD_COMMAND="printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.child.tmp && chmod 600 $sq_launch_guard/.child.tmp && mv $sq_launch_guard/.child.tmp $sq_launch_guard/child || exit 1; exec sh -c $sq_launch_eval"
   sq_launch_child=$(shell_quote "$LAUNCH_CHILD_COMMAND")
   LAUNCH_COMMAND="$LAUNCH_COMMAND && if mkdir $sq_launch_guard 2>/dev/null; then printf '%s:%s\\n' \"\$\$\" $sq_launch_token > $sq_launch_guard/.owner.tmp && chmod 600 $sq_launch_guard/.owner.tmp && mv $sq_launch_guard/.owner.tmp $sq_launch_guard/owner || exit 1; set +m 2>/dev/null || true; sh -c $sq_launch_child & launch_pid=\$!; wait \"\$launch_pid\"; launch_rc=\$?; printf 'exited:%s:%s\\n' \"\$launch_rc\" $sq_launch_token > $sq_launch_request/.outcome.tmp && chmod 600 $sq_launch_request/.outcome.tmp && mv $sq_launch_request/.outcome.tmp $sq_launch_outcome; exit \$launch_rc; fi"
-  spawn_endpoint_receipt_publish launch-prepared "$WT" || {
-    echo "error: secondmate launch preparation could not be journaled" >&2
-    exit 1
-  }
-  spawn_launch_request_start "$LAUNCH_COMMAND" || {
-    echo "error: secondmate launch request owner could not be started" >&2
-    exit 1
-  }
-  spawn_launch_request_wait || {
-    echo "error: secondmate launch submission is incomplete or ambiguous; exact request evidence is preserved" >&2
-    exit 1
-  }
-  spawn_endpoint_receipt_publish launch-submitted "$WT" || {
-    echo "error: secondmate launch was accepted, but its exact acceptance receipt could not be published" >&2
-    exit 1
-  }
+  if [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -ne 1 ]; then
+    spawn_endpoint_receipt_publish launch-prepared "$WT" || {
+      echo "error: launch preparation could not be journaled for $ID" >&2
+      exit 1
+    }
+    spawn_launch_request_start "$LAUNCH_COMMAND" || {
+      echo "error: launch request owner could not be started for $ID" >&2
+      exit 1
+    }
+    spawn_launch_delivery_wait || {
+      echo "error: launch submission is incomplete or ambiguous; exact request evidence is preserved for $ID" >&2
+      exit 1
+    }
+    spawn_endpoint_receipt_publish launch-submitted "$WT" || {
+      echo "error: launch was accepted, but its exact acceptance receipt could not be published for $ID" >&2
+      exit 1
+    }
+  fi
 else
-  spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+  spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp" || {
+    echo "error: relaunch environment could not be delivered for $ID" >&2
+    exit 1
+  }
   if [ -n "$SPAWN_TRACEPARENT" ]; then
     if spawn_send_text_line "$T" "export TRACEPARENT=$SPAWN_TRACEPARENT"; then
       spawn_record_traceparent || {
@@ -5255,33 +5269,35 @@ else
     fi
   fi
   sleep 0.3
-  spawn_send_literal "$T" "$LAUNCH"
+  spawn_send_literal "$T" "$LAUNCH" || {
+    echo "error: relaunch command could not be delivered for $ID" >&2
+    exit 1
+  }
   sleep 0.3
-  if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  if [ "$KIND" = secondmate ]; then
     SECONDMATE_RESERVATION_PRESERVE=1
   fi
-  spawn_send_key "$T" Enter
+  spawn_send_key "$T" Enter || {
+    echo "error: relaunch command could not be submitted for $ID" >&2
+    exit 1
+  }
 fi
 if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   HERDR_PROJECTION_ABORT_CLEANUP=0
   spawn_herdr_presentation_order_lock_release
 fi
 if [ "$HARNESS" = kimi ]; then
-  kimi_deliver_launch_brief || exit 1
+  if [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" = 1 ]; then
+    kimi_deliver_launch_brief recovery || exit 1
+  else
+    kimi_deliver_launch_brief || exit 1
+  fi
 fi
 if [ "$KIND" = secondmate ]; then
   commit_secondmate_work_identity || {
     echo "error: secondmate launch completed, but its unlinked identity could not be committed" >&2
     exit 1
   }
-  if [ "$RELAUNCH" -eq 0 ]; then
-    rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
-      echo "error: secondmate launch identity committed, but its acceptance receipt could not be retired" >&2
-      exit 1
-    }
-    spawn_launch_request_cleanup \
-      || echo "warning: secondmate launch request journal could not be retired for $ID" >&2
-  fi
 fi
 if [ "$KIND" = secondmate ] && [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
   if ! fm_config_reread_discard_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then
@@ -5331,6 +5347,14 @@ fi
 trap - HUP INT TERM
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
+fi
+if [ "$RELAUNCH" -eq 0 ]; then
+  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+    echo "error: accepted launch receipt could not be retired for $ID" >&2
+    exit 1
+  }
+  spawn_launch_request_cleanup \
+    || echo "warning: accepted launch request journal could not be retired for $ID" >&2
 fi
 fm_lock_release "$SPAWN_META_LOCK"
 SPAWN_META_LOCK_HELD=0

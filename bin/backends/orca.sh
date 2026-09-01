@@ -575,6 +575,10 @@ fm_backend_orca_send_text_line() {  # <terminal-id> <text>
   fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$text" --enter --json
 }
 
+fm_backend_orca_send_launch_line() {  # <terminal-id> <text>
+  fm_backend_orca_send_text_line "$1" "$2"
+}
+
 fm_backend_orca_send_literal() {  # <terminal-id> <text>
   local terminal=$1 text=$2
   fm_backend_orca_tool_check || return 1

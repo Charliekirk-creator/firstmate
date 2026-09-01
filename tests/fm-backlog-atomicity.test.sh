@@ -192,6 +192,24 @@ SH
   chmod +x "$case_dir/fakebin/tmux"
 }
 
+restore_launch_delivery() {  # <case-dir> <id>
+  local case_dir=$1 id=$2
+  cat > "$case_dir/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  *"#{pane_current_path}"*) printf '%s\\n' "\${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_command}"*) printf 'bash\\n'; exit 0 ;;
+esac
+case "\${1:-}" in
+  display-message) printf 'firstmate\\n'; exit 0 ;;
+  list-windows) printf 'fm-$id\\n'; exit 0 ;;
+  send-keys|has-session|new-session|new-window|kill-window|set-window-option) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+}
+
 track_teardown_resource_actions() {  # <case-dir>
   local case_dir=$1
   cat > "$case_dir/fakebin/tmux" <<SH
@@ -867,21 +885,36 @@ test_dispatch_reports_an_incomplete_busy_rollback() {
 }
 
 test_dispatch_rolls_back_before_a_failed_launch_delivery() {
-  local case_dir id out rc=0
+  local case_dir home id out rc=0
   id=atomic-dispatch-delivery-fails-b5
   case_dir=$(make_home dispatch-delivery-fails "$id")
+  home=$(home_of "$case_dir")
   add_item "$case_dir" "$id"
   break_launch_delivery "$case_dir"
 
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
   [ "$rc" -ne 0 ] || fail "spawn reported success though launch delivery failed"
-  assert_absent "$(home_of "$case_dir")/state/$id.meta" \
+  assert_absent "$home/state/$id.meta" \
     "a failed launch delivery left its provisional record behind"
-  assert_absent "$(home_of "$case_dir")/state/$id.busy-state" \
+  assert_absent "$home/state/$id.busy-state" \
     "a failed launch delivery left its provisional busy generation behind"
+  assert_present "$home/state/$id.spawn-endpoint.json" \
+    "a failed launch delivery discarded its exact retry receipt"
   [ "$(row_state "$case_dir" "$id")" = queued ] \
     || fail "launch delivery failed after committing backlog state $(row_state "$case_dir" "$id")"
-  pass "dispatch commits neither record nor backlog state before launch delivery succeeds"
+
+  restore_launch_delivery "$case_dir" "$id"
+  rc=0
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -eq 0 ] || fail "exact retry after failed launch delivery did not recover: $out"
+  assert_contains "$out" "spawned $id" "exact launch retry did not report success"
+  assert_absent "$home/state/$id.spawn-endpoint.json" \
+    "successful launch retry retained its endpoint receipt"
+  assert_present "$home/state/$id.meta" \
+    "successful launch retry did not publish its task record"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "successful launch retry left its backlog row $(row_state "$case_dir" "$id")"
+  pass "failed launch delivery stays queued and retries from exact evidence"
 }
 
 test_dispatch_defers_interruption_across_backlog_commit() {

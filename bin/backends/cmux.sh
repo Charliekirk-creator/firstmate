@@ -538,6 +538,12 @@ fm_backend_cmux_send_text_line() {  # <target> <text> [expected-label]
   return 2
 }
 
+fm_backend_cmux_send_launch_line() {  # <target> <text> [expected-label]
+  fm_backend_cmux_target_ready "$1" "${3:-}" || return 1
+  fm_backend_cmux_cli send --workspace "$FM_BACKEND_CMUX_WORKSPACE" \
+    --surface "$FM_BACKEND_CMUX_SURFACE" -- "$2"$'\r' >/dev/null 2>&1
+}
+
 fm_backend_cmux_passive_current_path() {  # <target> [expected-label]
   local target=$1 expected_label=${2:-} path
   fm_backend_cmux_target_ready "$target" "$expected_label" || return 1
