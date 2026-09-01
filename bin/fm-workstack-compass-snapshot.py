@@ -281,6 +281,9 @@ class Observation:
             resolved_info = os.stat(resolved, follow_symlinks=False)
             if self._fingerprint(resolved_info) != self._fingerprint(opened):
                 raise SourceChanged("source changed during observation")
+        except (OSError, RuntimeError) as exc:
+            os.close(descriptor)
+            raise SourceChanged("source changed during observation") from exc
         except Exception:
             os.close(descriptor)
             raise
@@ -1064,16 +1067,22 @@ def inspect_runtime_dependencies(
                     anchors_by_parent[parent] = anchor
                 info = observation.observe_entry(anchor, selected.name)
                 expected = observation._fingerprint(info)
-                aliases = [requested, requested.parent.resolve(strict=True) / requested.name]
-                current = aliases[-1]
-                while current.is_symlink():
-                    target = Path(os.readlink(current))
-                    current = (
-                        target
-                        if target.is_absolute()
-                        else current.parent / target
-                    )
-                    aliases.append(current)
+                try:
+                    aliases = [
+                        requested,
+                        requested.parent.resolve(strict=True) / requested.name,
+                    ]
+                    current = aliases[-1]
+                    while current.is_symlink():
+                        target = Path(os.readlink(current))
+                        current = (
+                            target
+                            if target.is_absolute()
+                            else current.parent / target
+                        )
+                        aliases.append(current)
+                except (OSError, RuntimeError) as exc:
+                    raise SourceChanged("source changed during observation") from exc
                 aliases.append(selected)
                 authorities = tuple(dict.fromkeys(aliases))
                 for alias in authorities:
@@ -1170,11 +1179,19 @@ def tasks_axi_boundary(
         executable=runtime,
     )
     authorities = list(dict.fromkeys((source_anchor, runtime_anchor, *dependency_anchors)))
+    authorities_by_path = {authority.path: authority for authority in authorities}
     for authority in tuple(authorities):
         try:
-            authority.path.relative_to(output_root)
+            relative = authority.path.relative_to(output_root)
         except ValueError:
             continue
+        if relative.parts:
+            container_path = output_root / relative.parts[0]
+            container = authorities_by_path.get(container_path)
+            if container is None:
+                container = observation.observe_directory(container_path)
+                authorities_by_path[container.path] = container
+                authorities.append(container)
         for candidate in (authority.path, *authority.path.parents):
             if candidate == output_root.parent:
                 break

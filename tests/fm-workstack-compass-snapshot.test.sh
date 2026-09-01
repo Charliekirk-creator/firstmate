@@ -691,11 +691,31 @@ SH
       --output "$snapshot"
   [ -z "$(find "$private" -mindepth 1 -maxdepth 1 -print -quit)" ] \
     || fail "reader source containment created an output or temporary file"
+
+  world=$(make_world reader-source-container)
+  package="$world/home/data/reader-source"
+  private="$package/private"
+  snapshot="$private/snapshot.json"
+  mkdir -p "$package/bin" "$private"
+  chmod 0700 "$private"
+  cat > "$package/bin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'count: 0'
+printf '%s\n' 'tasks: 0 tasks in this backlog'
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$package/bin/tasks-axi"
+  run_failure "must not be inside a source repository" env \
+    PATH="$package/bin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --output "$snapshot"
+  [ -z "$(find "$private" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "reader container containment created an output or temporary file"
   pass "reader authorities participate in pre-write repository containment"
 }
 
 test_runtime_dependency_race_refuses() {
-  local world runtime fakebin library replacement snapshot before inject
+  local world runtime fakebin library replacement snapshot before inject output rc
   world=$(make_world runtime-dependency-race)
   runtime="$world/runtime"
   fakebin="$world/fakebin"
@@ -758,6 +778,42 @@ PY
       --project-root "alpha=$world/alpha"
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "runtime dependency race replaced the prior complete snapshot"
+
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+from pathlib import Path
+
+alias_parent = os.environ["FM_TEST_RUNTIME_ALIAS_PARENT"]
+real_resolve = Path.resolve
+
+
+def guarded_resolve(self, *args, **kwargs):
+    if os.fspath(self) == alias_parent:
+        raise FileNotFoundError("runtime dependency alias disappeared")
+    return real_resolve(self, *args, **kwargs)
+
+
+Path.resolve = guarded_resolve
+PY
+  set +e
+  output=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    FM_TEST_RUNTIME_ALIAS_PARENT="$runtime/lib" \
+    PATH="$fakebin:$runtime/bin:/usr/bin:/bin" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "producer accepted a disappearing runtime alias"
+  assert_contains "$output" "source changed during observation" \
+    "runtime alias disappearance did not produce a bounded refusal"
+  assert_not_contains "$output" "Traceback" \
+    "runtime alias disappearance emitted an internal traceback"
+  assert_not_contains "$output" "$runtime" \
+    "runtime alias disappearance emitted a private runtime path"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "runtime alias disappearance replaced the prior complete snapshot"
   pass "runtime dependency races preserve the prior snapshot"
 }
 
