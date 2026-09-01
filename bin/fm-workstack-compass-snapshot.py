@@ -1316,14 +1316,17 @@ def tasks_axi_boundary(
             ReaderAsset((*directory, name), None, False, descriptor)
             for name in names
         )
+    retained_descriptors = {
+        runtime_descriptor,
+        *(
+            asset.descriptor
+            for asset in assets
+            if asset.descriptor is not None
+        ),
+    }
     staging_size = sum(
-        len(asset.payload)
-        if asset.payload is not None
-        else (
-            os.fstat(asset.descriptor).st_size if asset.executable else 0
-        )
-        for asset in assets
-    )
+        len(asset.payload) for asset in assets if asset.payload is not None
+    ) + sum(os.fstat(descriptor).st_size for descriptor in retained_descriptors)
     if staging_size > MAX_READER_STAGING_BYTES:
         raise ProducerError("reader staging image exceeds its size bound")
     executable_staged_relative = ("package", *executable_relative)
@@ -1817,7 +1820,7 @@ def collect_workers(
         }
         workers.append(row)
     workers.sort(key=lambda row: row["worker_incarnation_identity"])
-    return workers, bool(names), omitted, bool(workers)
+    return workers, True, omitted, bool(workers)
 
 
 def inspect_project_sources(

@@ -708,6 +708,9 @@ MD
   run_world "$world" >/dev/null || fail "authoritative empty tasks-axi backlog was refused"
   json_assert "$snapshot" '.worker_incarnations == []' \
     "empty tasks-axi backlog fabricated worker identities"
+  json_assert "$snapshot" \
+    '(.sources[] | select(.source_identity == "source:firstmate-task-identities") | .completeness) == "complete"' \
+    "observed empty task inventories were reported as unavailable"
 
   world=$(make_world literal-none-relation)
   snapshot="$world/home/data/workstack-compass/snapshot.json"
@@ -876,6 +879,111 @@ PY
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "runtime alias disappearance replaced the prior complete snapshot"
   pass "runtime dependency races preserve the prior snapshot"
+}
+
+test_runtime_dependency_aggregate_bound_refuses() {
+  local world runtime fakebin library_one library_two snapshot before inject
+  world=$(make_world runtime-dependency-aggregate-bound)
+  runtime="$world/runtime"
+  fakebin="$world/fakebin"
+  library_one="$runtime/lib/libreader-one.dylib"
+  library_two="$runtime/lib/libreader-two.dylib"
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  inject="$world/inject-runtime-sizes"
+  mkdir -p "$runtime/bin" "$runtime/lib" "$fakebin" "$inject"
+  cat > "$world/reader-runtime.c" <<'C'
+#include <stdio.h>
+extern const char *reader_prefix(void);
+extern const char *reader_suffix(void);
+int main(void) {
+  fputs(reader_prefix(), stdout);
+  fputs(reader_suffix(), stdout);
+  return 0;
+}
+C
+  cat > "$world/reader-one.c" <<'C'
+const char *reader_prefix(void) { return "count: 0\ntasks: 0 tasks in this backlog\n"; }
+C
+  cat > "$world/reader-two.c" <<'C'
+const char *reader_suffix(void) { return "help[0]:\n"; }
+C
+  cc -dynamiclib -install_name "$library_one" "$world/reader-one.c" -o "$library_one"
+  cc -dynamiclib -install_name "$library_two" "$world/reader-two.c" -o "$library_two"
+  cc "$world/reader-runtime.c" "$library_one" "$library_two" -o "$runtime/bin/node"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env node
+SH
+  chmod 0755 "$runtime/bin/node" "$fakebin/tasks-axi"
+  PATH="$fakebin:$runtime/bin:/usr/bin:/bin" run_world "$world" >/dev/null \
+    || fail "aggregate runtime dependency baseline failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+from pathlib import Path
+
+TARGETS = {"libreader-one.dylib", "libreader-two.dylib"}
+INFLATED_SIZE = 140 * 1024 * 1024
+real_close = os.close
+real_fstat = os.fstat
+real_open = os.open
+real_stat = os.stat
+target_descriptors = set()
+
+
+class SizedStat:
+    def __init__(self, value):
+        self.value = value
+
+    def __getattr__(self, name):
+        if name == "st_size":
+            return INFLATED_SIZE
+        return getattr(self.value, name)
+
+
+def is_target(path):
+    try:
+        return Path(os.fspath(path)).name in TARGETS
+    except TypeError:
+        return False
+
+
+def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
+    descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+    if is_target(path):
+        target_descriptors.add(descriptor)
+    return descriptor
+
+
+def guarded_close(descriptor):
+    target_descriptors.discard(descriptor)
+    return real_close(descriptor)
+
+
+def guarded_fstat(descriptor):
+    value = real_fstat(descriptor)
+    return SizedStat(value) if descriptor in target_descriptors else value
+
+
+def guarded_stat(path, *args, **kwargs):
+    value = real_stat(path, *args, **kwargs)
+    return SizedStat(value) if is_target(path) else value
+
+
+os.close = guarded_close
+os.fstat = guarded_fstat
+os.open = guarded_open
+os.stat = guarded_stat
+PY
+  run_failure "reader staging image exceeds its size bound" env \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    PATH="$fakebin:$runtime/bin:/usr/bin:/bin" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "aggregate dependency refusal replaced the prior snapshot"
+  pass "retained runtime dependencies share the aggregate reader size bound"
 }
 
 test_tasks_axi_reader_is_stdin_only_and_confined() {
@@ -1191,6 +1299,7 @@ test_malformed_and_oversized_inputs_and_output_refuse
 test_empty_backlog_and_literal_none_relation
 test_reader_source_repository_containment
 test_runtime_dependency_race_refuses
+test_runtime_dependency_aggregate_bound_refuses
 test_tasks_axi_reader_is_stdin_only_and_confined
 test_tasks_axi_package_race_refuses
 test_reader_executes_captured_authority_and_absolute_shebang
