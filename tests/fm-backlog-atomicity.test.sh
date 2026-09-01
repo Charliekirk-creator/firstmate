@@ -1058,11 +1058,12 @@ test_exited_launch_is_reconciled_without_replay() {
 }
 
 test_failed_exited_launch_is_compensated_before_a_fresh_retry() {
-  local case_dir home id out rc=0 grok_home token auth
+  local case_dir home id out rc=0 grok_home changed_grok_home token auth
   id=atomic-dispatch-failed-launch-b5
   case_dir=$(make_home dispatch-failed-launch "$id")
   home=$(home_of "$case_dir")
   grok_home="$case_dir/grok-home"
+  changed_grok_home="$case_dir/changed-grok-home"
   add_item "$case_dir" "$id"
   execute_launch_then_exit "$case_dir" "$id"
   cat > "$case_dir/fakebin/grok" <<'SH'
@@ -1087,7 +1088,7 @@ SH
     || fail "failed worker launch moved its backlog row"
 
   rc=0
-  out=$(GROK_HOME="$grok_home" run_spawn "$case_dir" "$id" "$case_dir/project" \
+  out=$(GROK_HOME="$changed_grok_home" run_spawn "$case_dir" "$id" "$case_dir/project" \
     --harness grok --mode no-mistakes --yolo off) || rc=$?
   [ "$rc" -ne 0 ] || fail "terminal failed launch compensation was reported as spawned"
   assert_contains "$out" "provisional publication was compensated" \
@@ -1096,7 +1097,10 @@ SH
     || fail "terminal failed launch was replayed during compensation"
   assert_absent "$home/state/$id.meta" \
     "failed launch compensation retained provisional metadata"
-  assert_absent "$auth" "failed launch compensation orphaned its Grok authorization"
+  assert_absent "$auth" \
+    "failed launch compensation orphaned its Grok authorization after GROK_HOME changed"
+  assert_absent "$changed_grok_home/hooks/fm-turn-end.d/$token" \
+    "failed launch compensation reconstructed authorization from the retry environment"
   assert_absent "$home/state/$id.grok-turnend-token" \
     "failed launch compensation retained its Grok authorization token"
   assert_absent "$case_dir/wt/.fm-grok-turnend" \
@@ -1106,14 +1110,14 @@ SH
 
   fm_fake_exit0 "$case_dir/fakebin" grok
   rc=0
-  out=$(GROK_HOME="$grok_home" run_spawn "$case_dir" "$id" "$case_dir/project" \
+  out=$(GROK_HOME="$changed_grok_home" run_spawn "$case_dir" "$id" "$case_dir/project" \
     --harness grok --mode no-mistakes --yolo off) || rc=$?
   [ "$rc" -eq 0 ] || fail "fresh launch after terminal compensation did not succeed: $out"
   [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 2 ] \
     || fail "fresh retry did not launch exactly once after compensation"
   [ "$(row_state "$case_dir" "$id")" = in_flight ] \
     || fail "fresh retry after compensation did not commit the backlog row"
-  pass "failed exited launches retire harness wiring before one fresh retry"
+  pass "failed exited launches retire exact harness authorization after root changes"
 }
 
 test_missing_accepted_endpoint_compensates_before_backlog_commit() {

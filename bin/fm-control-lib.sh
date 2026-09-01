@@ -240,6 +240,27 @@ fm_control_harness_turnend_token_path() {  # <harness> <state-dir> <id>
   esac
 }
 
+fm_control_harness_turnend_auth_root_valid() {  # <harness> <registry-root>
+  local harness=${1-} root=${2-} wrapped
+  case "$root" in /*) ;; *) return 1 ;; esac
+  case "$root" in *[[:cntrl:]]*) return 1 ;; esac
+  wrapped="/${root#/}/"
+  case "$wrapped" in *'//'*|*'/./'*|*'/../'*) return 1 ;; esac
+  case "$harness:$root" in
+    grok:*/hooks/fm-turn-end.d|kimi:*/.kimi-code/fm-turn-end.d) return 0 ;;
+  esac
+  return 1
+}
+
+fm_control_harness_turnend_auth_record_valid() {  # <harness> <token> <absolute-path>
+  local harness=${1-} token=${2-} path=${3-} root
+  case "$token" in fm.????????????) ;; *) return 1 ;; esac
+  case "$token" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "${path##*/}" = "$token" ] || return 1
+  root=${path%/*}
+  fm_control_harness_turnend_auth_root_valid "$harness" "$root"
+}
+
 fm_control_harness_turnend_auth_path() {  # <harness> <token>
   local harness=${1-} token=${2-}
   case "$token" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac

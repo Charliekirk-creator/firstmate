@@ -797,6 +797,7 @@ RELAUNCH_REPLACEMENT_BUSY_GEN=
 RELAUNCH_REPLACEMENT_HARNESS=
 RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
+RELAUNCH_REPLACEMENT_AUTH_PATH=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
 
@@ -1696,7 +1697,8 @@ spawn_abort_cleanup() {
         "$RELAUNCH_REPLACEMENT_HARNESS" \
         "$RELAUNCH_REPLACEMENT_WT" \
         "$RELAUNCH_REPLACEMENT_STATE" \
-        "$ID"; then
+        "$ID" \
+        "$RELAUNCH_REPLACEMENT_AUTH_PATH"; then
       echo "warning: could not remove replacement wiring after aborted relaunch of $ID" >&2
     fi
     if [ -n "$RELAUNCH_REPLACEMENT_BUSY_GEN" ]; then
@@ -1847,7 +1849,8 @@ spawn_herdr_presentation_order_lock_acquire() {
 }
 
 clear_relaunch_harness_wiring() {
-  local harness=$1 wt=$2 state=$3 id=$4 token_path token auth_path path
+  local harness=$1 wt=$2 state=$3 id=$4 recorded_auth_path=${5:-}
+  local token_path token auth_path path
   # The wiring arms above match on harness PREFIXES, because a task launched
   # from a raw command records that command's basename rather than the exact
   # adapter name. The retirement tables are keyed by the exact adapter, so the
@@ -1863,7 +1866,13 @@ clear_relaunch_harness_wiring() {
       && [ "$(spawn_file_link_count "$token_path")" = 1 ] || return 1
     IFS= read -r token < "$token_path" || [ -n "$token" ] || return 1
   fi
-  auth_path=$(fm_control_harness_turnend_auth_path "$harness" "$token") || return 1
+  if [ -n "$recorded_auth_path" ]; then
+    fm_control_harness_turnend_auth_record_valid \
+      "$harness" "$token" "$recorded_auth_path" || return 1
+    auth_path=$recorded_auth_path
+  else
+    auth_path=$(fm_control_harness_turnend_auth_path "$harness" "$token") || return 1
+  fi
   if [ -n "$auth_path" ]; then
     rm -f -- "$auth_path" || return 1
   fi
@@ -2930,16 +2939,17 @@ fm_operational_input_construct launch-brief "$SPAWN_BRIEF_BODY" SPAWN_BRIEF_INPU
 unset SPAWN_BRIEF_BODY
 W="fm-$ID"
 spawn_provisional_harness_wiring_retire() {
-  local meta="$STATE/$ID.meta" recorded_harness recorded_kind recorded_worktree
+  local meta="$STATE/$ID.meta" recorded_harness recorded_kind recorded_worktree recorded_auth_path
   [ "$KIND" != secondmate ] || return 0
   spawn_metadata_transaction_published || return 1
   recorded_harness=$(fm_meta_get "$meta" harness)
   recorded_kind=$(fm_meta_get "$meta" kind)
   recorded_worktree=$(fm_meta_get "$meta" worktree)
+  recorded_auth_path=$(fm_meta_get "$meta" harness_turnend_auth_path)
   [ -n "$recorded_harness" ] && [ "$recorded_kind" = "$KIND" ] \
     && [ -n "$recorded_worktree" ] && [ "$recorded_worktree" = "$WT" ] || return 1
   clear_relaunch_harness_wiring \
-    "$recorded_harness" "$recorded_worktree" "$STATE" "$ID"
+    "$recorded_harness" "$recorded_worktree" "$STATE" "$ID" "$recorded_auth_path"
 }
 
 spawn_terminal_launch_reset() {
@@ -4848,7 +4858,8 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # files and turn-end token registry entries behind, and even a same-harness
   # relaunch would orphan the retired busy generation's token
   # (bin/fm-control-lib.sh owns where those artifacts live).
-  clear_relaunch_harness_wiring "$RELAUNCH_PRIOR_HARNESS" "$WT" "$STATE_REAL" "$ID" || {
+  clear_relaunch_harness_wiring "$RELAUNCH_PRIOR_HARNESS" "$WT" "$STATE_REAL" "$ID" \
+    "$(fm_meta_get "$RELAUNCH_META" harness_turnend_auth_path)" || {
     echo "error: could not retire $RELAUNCH_PRIOR_HARNESS wiring for task $ID; refusing to arm the replacement" >&2
     exit 1
   }
@@ -4857,6 +4868,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   RELAUNCH_REPLACEMENT_STATE=$STATE_REAL
   RELAUNCH_REPLACEMENT_WT=$WT
 fi
+HARNESS_TURNEND_AUTH_PATH=
 if [ "$KIND" != secondmate ] && [ "$SPAWN_METADATA_RECOVERY" -eq 0 ]; then
   # Arm the semantic busy-state contract (bin/fm-busy-lib.sh) for every
   # adapter with a verified semantic source. The launch brief sent below IS a
@@ -5029,11 +5041,19 @@ EOF
       # touches grok's managed config - only firstmate-owned files.
       GROK_HOOKS_DIR="${GROK_HOME:-$HOME/.grok}/hooks"
       GROK_AUTH_DIR="$GROK_HOOKS_DIR/fm-turn-end.d"
+      fm_control_harness_turnend_auth_root_valid grok "$GROK_AUTH_DIR" || {
+        echo "error: Grok turn-end authorization root is unsafe: $GROK_AUTH_DIR" >&2
+        exit 1
+      }
       mkdir -p "$GROK_AUTH_DIR"
       old_umask=$(umask)
       umask 077
       auth_file=$(mktemp "$GROK_AUTH_DIR/fm.XXXXXXXXXXXX")
       umask "$old_umask"
+      fm_control_harness_turnend_auth_record_valid \
+        grok "${auth_file##*/}" "$auth_file" || exit 1
+      HARNESS_TURNEND_AUTH_PATH=$auth_file
+      RELAUNCH_REPLACEMENT_AUTH_PATH=$auth_file
       printf '%s\n' "$TURNEND" > "$auth_file"
       printf '%s\n' "${auth_file##*/}" > "$STATE/$ID.grok-turnend-token"
       sq_grok_auth_dir=$(shell_quote "$GROK_AUTH_DIR")
@@ -5118,10 +5138,18 @@ EOF
       # registry. The installer above owns the format-preserving config edit and
       # the always-zero, silent hook script.
       KIMI_AUTH_DIR="$HOME/.kimi-code/fm-turn-end.d"
+      fm_control_harness_turnend_auth_root_valid kimi "$KIMI_AUTH_DIR" || {
+        echo "error: Kimi turn-end authorization root is unsafe: $KIMI_AUTH_DIR" >&2
+        exit 1
+      }
       old_umask=$(umask)
       umask 077
       auth_file=$(mktemp "$KIMI_AUTH_DIR/fm.XXXXXXXXXXXX")
       umask "$old_umask"
+      fm_control_harness_turnend_auth_record_valid \
+        kimi "${auth_file##*/}" "$auth_file" || exit 1
+      HARNESS_TURNEND_AUTH_PATH=$auth_file
+      RELAUNCH_REPLACEMENT_AUTH_PATH=$auth_file
       printf '%s\n' "$TURNEND" > "$auth_file"
       printf '%s\n' "${auth_file##*/}" > "$STATE/$ID.kimi-turnend-token"
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-kimi-turnend"
@@ -5212,7 +5240,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project launch_brief launch_brief_sha256 work_identity_dispatch_transaction harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent work_identity_schema work_identity_status work_identity_sha256 backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project launch_brief launch_brief_sha256 work_identity_dispatch_transaction harness harness_turnend_auth_path kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent work_identity_schema work_identity_status work_identity_sha256 backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -5227,6 +5255,8 @@ preserve_relaunch_meta() {
   echo "launch_brief_sha256=$LAUNCH_BRIEF_HASH"
   echo "work_identity_dispatch_transaction=$SPAWN_DISPATCH_TRANSACTION"
   echo "harness=$HARNESS"
+  [ -z "$HARNESS_TURNEND_AUTH_PATH" ] || \
+    echo "harness_turnend_auth_path=$HARNESS_TURNEND_AUTH_PATH"
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"

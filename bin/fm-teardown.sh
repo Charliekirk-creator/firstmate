@@ -1103,23 +1103,45 @@ fi
 # owned by bin/fm-control-lib.sh, so teardown and the control plane's relaunch
 # retire the same artifact rather than each carrying its own copy of the path.
 remove_grok_turnend_auth() {
-  local state_dir=$1 id=$2 token_path token='' path
+  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness=
   token_path=$(fm_control_harness_turnend_token_path grok "$state_dir" "$id") || return 1
   if [ -n "$token_path" ] && [ -f "$token_path" ]; then
     IFS= read -r token < "$token_path" || [ -n "$token" ] || return 1
   fi
-  path=$(fm_control_harness_turnend_auth_path grok "$token") || return 1
+  if [ -n "$meta" ]; then
+    recorded_harness=$(meta_value "$meta" harness)
+    recorded_harness=$(fm_control_harness_family "$recorded_harness") || recorded_harness=
+    [ "$recorded_harness" != grok ] || \
+      recorded_path=$(meta_value "$meta" harness_turnend_auth_path)
+  fi
+  if [ -n "$recorded_path" ]; then
+    fm_control_harness_turnend_auth_record_valid grok "$token" "$recorded_path" || return 1
+    path=$recorded_path
+  else
+    path=$(fm_control_harness_turnend_auth_path grok "$token") || return 1
+  fi
   [ -n "$path" ] || return 0
   rm -f -- "$path"
 }
 
 remove_kimi_turnend_auth() {
-  local state_dir=$1 id=$2 token_path token='' path
+  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness=
   token_path=$(fm_control_harness_turnend_token_path kimi "$state_dir" "$id") || return 1
   if [ -n "$token_path" ] && [ -f "$token_path" ]; then
     IFS= read -r token < "$token_path" || [ -n "$token" ] || return 1
   fi
-  path=$(fm_control_harness_turnend_auth_path kimi "$token") || return 1
+  if [ -n "$meta" ]; then
+    recorded_harness=$(meta_value "$meta" harness)
+    recorded_harness=$(fm_control_harness_family "$recorded_harness") || recorded_harness=
+    [ "$recorded_harness" != kimi ] || \
+      recorded_path=$(meta_value "$meta" harness_turnend_auth_path)
+  fi
+  if [ -n "$recorded_path" ]; then
+    fm_control_harness_turnend_auth_record_valid kimi "$token" "$recorded_path" || return 1
+    path=$recorded_path
+  else
+    path=$(fm_control_harness_turnend_auth_path kimi "$token") || return 1
+  fi
   [ -n "$path" ] || return 0
   rm -f -- "$path"
 }
@@ -2821,8 +2843,8 @@ cleanup_firstmate_home_children() {
         safe_rm_rf_child_worktree "$child_wt" "$child_proj"
       fi
     fi
-    remove_grok_turnend_auth "$sub_state" "$child_id" || return 1
-    remove_kimi_turnend_auth "$sub_state" "$child_id" || return 1
+    remove_grok_turnend_auth "$sub_state" "$child_id" "$child_meta" || return 1
+    remove_kimi_turnend_auth "$sub_state" "$child_id" "$child_meta" || return 1
     remove_pr_poll_artifacts "$sub_state" "$child_id" || return 1
     child_busy_gen=$(meta_value "$child_meta" busy_gen)
     if [ -z "$child_busy_gen" ]; then
@@ -3164,8 +3186,8 @@ if [ "$KIND" = secondmate ]; then
     || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
   remove_secondmate_registry_entry "$ID"
 fi
-remove_grok_turnend_auth "$STATE" "$ID" || exit 1
-remove_kimi_turnend_auth "$STATE" "$ID" || exit 1
+remove_grok_turnend_auth "$STATE" "$ID" "$META" || exit 1
+remove_kimi_turnend_auth "$STATE" "$ID" "$META" || exit 1
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
