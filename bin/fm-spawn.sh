@@ -968,8 +968,12 @@ spawn_launch_request_state() {
       printf 'accepted'
       return 0
       ;;
-    exited|abandoned)
+    exited)
       printf 'launch-exited'
+      return 0
+      ;;
+    abandoned)
+      printf 'launch-abandoned'
       return 0
       ;;
   esac
@@ -1072,7 +1076,8 @@ spawn_launch_request_wait() {
         agent_state=$(fm_backend_agent_state "$BACKEND" "$T")
         [ "$agent_state" != alive ] || return 0
         ;;
-      failed|attempted-dead|launch-exited) return 2 ;;
+      launch-exited) return 0 ;;
+      failed|attempted-dead|launch-abandoned) return 2 ;;
     esac
     i=$((i + 1))
     [ "$i" -ge "$max" ] || sleep "$interval"
@@ -1085,8 +1090,8 @@ spawn_launch_acceptance_wait() {
   while [ "$i" -lt "$max" ]; do
     state=$(spawn_launch_request_state) || return 1
     case "$state" in
-      accepted|executed) return 0 ;;
-      failed|attempted-dead|launch-exited) return 2 ;;
+      accepted|executed|launch-exited) return 0 ;;
+      failed|attempted-dead|launch-abandoned) return 2 ;;
     esac
     i=$((i + 1))
     [ "$i" -ge "$max" ] || sleep "$interval"
@@ -1731,7 +1736,7 @@ spawn_abort_cleanup() {
       launch-prepared)
         launch_abort_state=$(spawn_launch_request_state 2>/dev/null || printf ambiguous)
         case "$launch_abort_state" in
-          accepted|executed|attempted-live|unattempted-live) preserve_published_launch=1 ;;
+          accepted|executed|launch-exited|attempted-live|unattempted-live) preserve_published_launch=1 ;;
         esac
         ;;
     esac
@@ -2875,7 +2880,7 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
     exit 1
   }
   case "$launch_request_state" in
-    accepted|executed)
+    accepted|executed|launch-exited)
       spawn_metadata_transaction_published || {
         echo "error: accepted launch has no exact published metadata for $ID" >&2
         exit 1
@@ -2887,7 +2892,7 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
       }
       SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
       ;;
-    absent|failed|unattempted-dead|attempted-dead|launch-exited)
+    absent|failed|unattempted-dead|attempted-dead|launch-abandoned)
       spawn_launch_guard_cleanup_retryable || {
         echo "error: retryable execution guard could not be retired for $ID" >&2
         exit 1
@@ -2920,7 +2925,7 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -eq 1 ]; then
     echo "error: submitted launch evidence is unsafe for $ID" >&2
     exit 1
   }
-  case "$launch_request_state" in accepted|executed) ;; *)
+  case "$launch_request_state" in accepted|executed|launch-exited) ;; *)
     echo "error: submitted launch lacks exact backend acceptance for $ID" >&2
     exit 1 ;;
   esac
@@ -5335,11 +5340,8 @@ else
 fi
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   if [ "$RELAUNCH" -eq 0 ]; then
-    if spawn_fresh_commit_rollback; then
-      echo "error: task $ID's backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR); its record was removed so no worker is left that the backlog does not own - close out endpoint $T and local copy $WT by hand, then re-run the spawn" >&2
-    else
-      echo "error: task $ID's backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR), and failed-dispatch cleanup is incomplete; the provisional record may remain at $STATE/$ID.meta - close out endpoint $T and local copy $WT by hand, then remove the record and busy state before retrying" >&2
-    fi
+    SPAWN_FRESH_COMMIT_PENDING=0
+    echo "error: task $ID's accepted launch could not move its backlog item to In flight ($FM_BACKLOG_TRANSITION_ERROR); exact metadata and launch acceptance were preserved - fix the backlog and re-run the spawn to finish the commit without relaunching" >&2
   else
     echo "error: task $ID was republished but its backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR); fix the backlog and re-run the relaunch" >&2
   fi

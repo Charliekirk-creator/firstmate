@@ -63,7 +63,7 @@ case "${1:-}" in display-message) printf 'firstmate\n'; exit 0 ;; esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse gh gh-axi no-mistakes
+  fm_fake_exit0 "$fakebin" treehouse gh gh-axi no-mistakes claude
 
   fm_git_init_commit "$case_dir/project"
   fm_git_add_origin "$case_dir/project" "$case_dir/project.origin.git"
@@ -208,6 +208,64 @@ esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/tmux"
+}
+
+execute_launch_then_exit() {  # <case-dir> <id>
+  local case_dir=$1 id=$2
+  cat > "$case_dir/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  *"#{pane_current_path}"*) printf '%s\\n' "\${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_command}"*) printf 'bash\\n'; exit 0 ;;
+esac
+case "\${1:-}" in
+  display-message) printf 'firstmate\\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+  send-keys)
+    prior=
+    for arg in "\$@"; do
+      if [ "\$prior" = -l ]; then
+        case "\$arg" in
+          *'.launch-execution.'*)
+            printf 'executed\\n' >> "$case_dir/launch-executions"
+            bash -c "\$arg"
+            exit \$?
+            ;;
+        esac
+      fi
+      prior=\$arg
+    done
+    exit 0
+    ;;
+  has-session|new-session|new-window|kill-window|set-window-option) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+}
+
+fail_launch_submitted_publish_once() {  # <case-dir> <receipt>
+  local case_dir=$1 receipt=$2 real
+  real=$(command -v mv)
+  cat > "$case_dir/fakebin/mv" <<SH
+#!/usr/bin/env bash
+last=
+for arg in "\$@"; do last=\$arg; done
+if [ "\$last" = "$receipt" ] && [ ! -e "$case_dir/submitted-publish-failed" ]; then
+  for arg in "\$@"; do
+    if [ -f "\$arg" ] && jq -e '.phase == "launch-submitted"' "\$arg" >/dev/null 2>&1; then
+      : > "$case_dir/submitted-publish-failed"
+      exit 1
+    fi
+  done
+fi
+exec "$real" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+}
+
+restore_tasks_axi() {  # <case-dir>
+  rm -f -- "$1/fakebin/tasks-axi"
 }
 
 track_teardown_resource_actions() {  # <case-dir>
@@ -822,24 +880,39 @@ test_dispatch_refuses_to_commit_without_a_published_record() {
   pass "dispatch cannot commit without a verified task-record publication"
 }
 
-test_dispatch_leaves_no_record_when_the_transition_fails() {
-  local case_dir id out rc=0
+test_dispatch_preserves_an_accepted_launch_when_the_transition_fails() {
+  local case_dir home id out rc=0
   id=atomic-dispatch-b4
   case_dir=$(make_home dispatch-transition-fails "$id")
+  home=$(home_of "$case_dir")
   add_item "$case_dir" "$id"
   break_verb "$case_dir" start
 
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
   [ "$rc" -ne 0 ] || fail "spawn reported success though the backlog transition failed"
-  assert_contains "$out" "could not be moved to In flight" \
-    "spawn failed without explaining the backlog transition failure"
-  assert_absent "$(home_of "$case_dir")/state/$id.meta" \
-    "a failed backlog transition left an orphaned record behind"
-  assert_absent "$(home_of "$case_dir")/state/$id.busy-state" \
-    "a failed backlog transition left the task's armed busy generation behind"
+  assert_contains "$out" "accepted launch could not move its backlog item" \
+    "spawn failed without explaining its recoverable backlog commit"
+  assert_present "$home/state/$id.meta" \
+    "a failed backlog commit discarded accepted-worker metadata"
+  assert_present "$home/state/$id.busy-state" \
+    "a failed backlog commit discarded the accepted worker's busy generation"
+  assert_present "$home/state/$id.spawn-endpoint.json" \
+    "a failed backlog commit discarded exact launch acceptance"
   [ "$(row_state "$case_dir" "$id")" = queued ] \
     || fail "a failed dispatch left the backlog item in $(row_state "$case_dir" "$id")"
-  pass "a failed backlog transition fails the dispatch loudly and leaves no record"
+
+  restore_tasks_axi "$case_dir"
+  restore_launch_delivery "$case_dir" "$id"
+  rc=0
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -eq 0 ] || fail "accepted launch commit retry did not recover: $out"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "accepted launch retry left the backlog item in $(row_state "$case_dir" "$id")"
+  assert_absent "$home/state/$id.spawn-endpoint.json" \
+    "accepted launch retry retained its completed recovery receipt"
+  assert_present "$home/state/$id.meta" \
+    "accepted launch retry lost its task metadata"
+  pass "accepted launches preserve metadata until backlog commit recovery"
 }
 
 test_dispatch_reports_an_incomplete_record_rollback() {
@@ -848,19 +921,19 @@ test_dispatch_reports_an_incomplete_record_rollback() {
   case_dir=$(make_home dispatch-remove-failure "$id")
   add_item "$case_dir" "$id"
   meta="$(home_of "$case_dir")/state/$id.meta"
-  break_verb "$case_dir" start
+  break_launch_delivery "$case_dir"
   break_meta_removal "$case_dir" "$meta"
 
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
-  [ "$rc" -ne 0 ] || fail "spawn reported success though transition and rollback failed"
-  assert_contains "$out" "failed-dispatch cleanup is incomplete" \
+  [ "$rc" -ne 0 ] || fail "spawn reported success though delivery and rollback failed"
+  assert_contains "$out" "did not remove both task and busy records" \
     "spawn did not report that its provisional record remained"
   assert_present "$meta" "failed record removal was reported as successful"
   assert_absent "$(home_of "$case_dir")/state/$id.busy-state" \
     "record-removal failure prevented busy-state rollback"
   [ "$(row_state "$case_dir" "$id")" = queued ] \
     || fail "failed rollback changed the backlog row"
-  pass "dispatch reports when failed-transition rollback cannot remove its record"
+  pass "dispatch reports when failed-delivery rollback cannot remove its record"
 }
 
 test_dispatch_reports_an_incomplete_busy_rollback() {
@@ -868,7 +941,7 @@ test_dispatch_reports_an_incomplete_busy_rollback() {
   id=atomic-dispatch-busy-remove-failure-b5
   case_dir=$(make_home dispatch-busy-remove-failure "$id")
   add_item "$case_dir" "$id"
-  break_verb "$case_dir" start
+  break_launch_delivery "$case_dir"
   break_busy_removal "$case_dir" "$id"
 
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
@@ -880,8 +953,8 @@ test_dispatch_reports_an_incomplete_busy_rollback() {
   assert_present "$(home_of "$case_dir")/state/$id.busy-state" \
     "busy removal failure was reported as successful"
   [ "$(row_state "$case_dir" "$id")" = queued ] \
-    || fail "failed busy rollback changed the backlog row"
-  pass "dispatch verifies both task and busy records during rollback"
+    || fail "failed rollback changed the backlog row"
+  pass "dispatch verifies both task and busy records during delivery rollback"
 }
 
 test_dispatch_rolls_back_before_a_failed_launch_delivery() {
@@ -915,6 +988,38 @@ test_dispatch_rolls_back_before_a_failed_launch_delivery() {
   [ "$(row_state "$case_dir" "$id")" = in_flight ] \
     || fail "successful launch retry left its backlog row $(row_state "$case_dir" "$id")"
   pass "failed launch delivery stays queued and retries from exact evidence"
+}
+
+test_exited_launch_is_reconciled_without_replay() {
+  local case_dir home id out rc=0
+  id=atomic-dispatch-exited-launch-b5
+  case_dir=$(make_home dispatch-exited-launch "$id")
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  execute_launch_then_exit "$case_dir" "$id"
+  fail_launch_submitted_publish_once "$case_dir" "$home/state/$id.spawn-endpoint.json"
+
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "launch-submitted publication failure was reported as success"
+  assert_contains "$out" "exact acceptance receipt could not be published" \
+    "spawn did not report the interrupted acceptance publication"
+  [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
+    || fail "the interrupted launch did not execute exactly once"
+  assert_present "$home/state/$id.meta" \
+    "an executed launch lost its exact task metadata"
+  jq -e '.phase == "launch-prepared"' "$home/state/$id.spawn-endpoint.json" >/dev/null \
+    || fail "the interrupted launch lost its prepared acceptance boundary"
+
+  rc=0
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -eq 0 ] || fail "executed launch recovery did not reconcile: $out"
+  [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
+    || fail "executed launch recovery submitted the work again"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "executed launch recovery left the backlog row $(row_state "$case_dir" "$id")"
+  assert_absent "$home/state/$id.spawn-endpoint.json" \
+    "executed launch recovery retained its completed acceptance receipt"
+  pass "exited launches reconcile from execution evidence without replay"
 }
 
 test_dispatch_defers_interruption_across_backlog_commit() {
@@ -2273,10 +2378,11 @@ test_dispatch_refuses_an_id_this_home_has_no_item_for
 test_dispatch_reports_a_backlog_read_failure
 test_dispatch_refuses_a_closed_item
 test_dispatch_refuses_to_commit_without_a_published_record
-test_dispatch_leaves_no_record_when_the_transition_fails
+test_dispatch_preserves_an_accepted_launch_when_the_transition_fails
 test_dispatch_reports_an_incomplete_record_rollback
 test_dispatch_reports_an_incomplete_busy_rollback
 test_dispatch_rolls_back_before_a_failed_launch_delivery
+test_exited_launch_is_reconciled_without_replay
 test_dispatch_defers_interruption_across_backlog_commit
 test_dispatch_interruption_during_kimi_readiness_fails_before_commit
 test_dispatch_does_not_resurrect_a_row_closed_after_preflight
