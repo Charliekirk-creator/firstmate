@@ -379,6 +379,16 @@ test_unsafe_outputs_and_sources_refuse() {
   pass "path escapes, symlinks, and unsafe output files are refused"
 }
 
+test_nonexecutable_launcher_refuses_before_publication() {
+  local world snapshot
+  world=$(make_world nonexecutable-launcher)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  chmod 0644 "$world/app/bin/workstack-compass"
+  run_failure "not executable" run_world "$world"
+  [ ! -e "$snapshot" ] || fail "nonexecutable launcher published an unusable snapshot"
+  pass "a nonexecutable Workstack launcher is refused before publication"
+}
+
 test_executable_model_is_confined_and_copy_isolated() {
   local world snapshot marker
   world=$(make_world model-confinement)
@@ -430,6 +440,81 @@ SH
   [ -z "$(find "$relocated" -mindepth 1 -maxdepth 1 -type f -print -quit)" ] \
     || fail "relocated output authority wrote into a bound source repository"
   pass "output authority relocation refuses without modifying a source repository"
+}
+
+test_publication_authority_relocation_cannot_write_source() {
+  local world private relocated inject output rc
+  world=$(make_world publication-authority-race)
+  private="$world/home/data/private"
+  relocated="$world/alpha/relocated-publication"
+  inject="$world/inject"
+  mkdir -m 0700 "$private"
+  mkdir -p "$inject"
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+import subprocess
+
+safe = os.environ["FM_TEST_SAFE_OUTPUT_PARENT"]
+relocated = os.environ["FM_TEST_RELOCATED_OUTPUT_PARENT"]
+real_open = os.open
+real_popen = subprocess.Popen
+
+
+def move_parent(lock):
+    if os.path.isdir(safe) and not os.path.exists(relocated):
+        os.rename(safe, relocated)
+        if lock:
+            os.chmod(relocated, 0o500)
+
+
+def guarded_open(path, flags, *args, **kwargs):
+    directory = kwargs.get("dir_fd")
+    if directory is not None and flags & os.O_CREAT and flags & os.O_EXCL:
+        try:
+            safe_info = os.stat(safe, follow_symlinks=False)
+            directory_info = os.fstat(directory)
+        except OSError:
+            pass
+        else:
+            if (safe_info.st_dev, safe_info.st_ino) == (
+                directory_info.st_dev,
+                directory_info.st_ino,
+            ):
+                move_parent(False)
+                descriptor = real_open(path, flags, *args, **kwargs)
+                os.chmod(relocated, 0o500)
+                return descriptor
+    return real_open(path, flags, *args, **kwargs)
+
+
+class GuardedPopen(real_popen):
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("pass_fds"):
+            move_parent(True)
+        super().__init__(*args, **kwargs)
+
+
+os.open = guarded_open
+subprocess.Popen = GuardedPopen
+PY
+  set +e
+  output=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    FM_TEST_SAFE_OUTPUT_PARENT="$private" \
+    FM_TEST_RELOCATED_OUTPUT_PARENT="$relocated" \
+    FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "alpha=$world/alpha" \
+      --output "$private/snapshot.json" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "producer accepted a relocated publication authority"
+  assert_contains "$output" "publication boundary failed" \
+    "relocated publication authority did not fail closed"
+  [ -d "$relocated" ] || fail "publication race did not relocate the output authority"
+  chmod 0700 "$relocated"
+  [ -z "$(find "$relocated" -mindepth 1 -maxdepth 1 -type f -print -quit)" ] \
+    || fail "publication race created a file inside a bound source repository"
+  pass "sandboxed publication cannot follow a relocated authority into a source"
 }
 
 test_repository_containment_refuses_before_output_writes() {
@@ -587,8 +672,10 @@ test_missing_relations_stay_missing
 test_duplicate_and_broken_identities_refuse
 test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
+test_nonexecutable_launcher_refuses_before_publication
 test_executable_model_is_confined_and_copy_isolated
 test_output_parent_relocation_refuses_without_source_write
+test_publication_authority_relocation_cannot_write_source
 test_repository_containment_refuses_before_output_writes
 test_fifo_source_refuses_without_blocking_or_replacement
 test_malformed_and_oversized_inputs_and_output_refuse

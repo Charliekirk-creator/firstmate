@@ -694,52 +694,6 @@ def prepare_output(
     return output, parent_descriptor
 
 
-def write_private_temp(
-    parent_descriptor: int,
-    prefix: str,
-    payload: bytes,
-    source_roots: Iterable[AnchoredDirectory],
-) -> str:
-    retained_source_roots = tuple(source_roots)
-    for _ in range(64):
-        name = f".{prefix}.{os.getpid()}.{os.urandom(8).hex()}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            reject_source_repository_parent(parent_descriptor, retained_source_roots)
-            descriptor = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise ProducerError("private temporary file could not be created") from exc
-        try:
-            os.fchmod(descriptor, 0o600)
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise ProducerError("private temporary file write was incomplete")
-                view = view[written:]
-            os.fsync(descriptor)
-            info = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_size != len(payload)
-            ):
-                raise ProducerError("private temporary file failed its safety check")
-        except Exception:
-            try:
-                os.unlink(name, dir_fd=parent_descriptor)
-            except OSError:
-                pass
-            raise
-        finally:
-            os.close(descriptor)
-        return name
-    raise ProducerError("private temporary file name allocation failed")
-
-
 def run_bounded(
     argv: Sequence[str],
     env: Mapping[str, str],
@@ -1130,11 +1084,15 @@ def _sandbox_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def model_boundary_argv() -> list[str]:
+def sandboxed_python_argv(
+    program: str,
+    *,
+    read_paths: Iterable[Path] = (),
+    write_paths: Iterable[Path] = (),
+    denied_write_roots: Iterable[Path] = (),
+) -> list[str]:
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-        raise ProducerError(
-            "a supported network-free executable-model sandbox is unavailable"
-        )
+        raise ProducerError("a supported local-only sandbox is unavailable")
     executable = Path(sys.executable).resolve(strict=True)
     read_roots = {
         executable.parent,
@@ -1149,30 +1107,52 @@ def model_boundary_argv() -> list[str]:
     for root in read_roots:
         readable_rules.append(f'(subpath "{_sandbox_literal(os.fspath(root))}")')
         ancestors.update(root.parents)
+    for path in read_paths:
+        readable_rules.append(f'(subpath "{_sandbox_literal(os.fspath(path))}")')
+        ancestors.update(path.parents)
     for ancestor in sorted(ancestors, key=lambda path: (len(path.parts), os.fspath(path))):
         readable_rules.append(f'(literal "{_sandbox_literal(os.fspath(ancestor))}")')
-    profile = " ".join(
-        [
-            "(version 1)",
-            "(deny default)",
-            '(import "system.sb")',
-            "(deny network*)",
-            "(deny file-write*)",
-            "(allow process*)",
-            f"(allow file-read* {' '.join(readable_rules)})",
-        ]
-    )
+    profile_parts = [
+        "(version 1)",
+        "(deny default)",
+        '(import "system.sb")',
+        "(deny network*)",
+        "(allow process*)",
+        f"(allow file-read* {' '.join(readable_rules)})",
+    ]
+    writable = tuple(write_paths)
+    if writable:
+        write_rules = " ".join(
+            f'(literal "{_sandbox_literal(os.fspath(path))}")'
+            for path in writable
+        )
+        profile_parts.append(f"(allow file-write* {write_rules})")
+        for root in denied_write_roots:
+            profile_parts.append(
+                f'(deny file-write* (subpath "{_sandbox_literal(os.fspath(root))}"))'
+            )
+    else:
+        profile_parts.append("(deny file-write*)")
     return [
         "/usr/bin/sandbox-exec",
         "-p",
-        profile,
+        " ".join(profile_parts),
         os.fspath(executable),
         "-I",
         "-S",
         "-B",
         "-c",
-        MODEL_BOUNDARY_PROGRAM,
+        program,
     ]
+
+
+def model_boundary_argv() -> list[str]:
+    try:
+        return sandboxed_python_argv(MODEL_BOUNDARY_PROGRAM)
+    except ProducerError as exc:
+        raise ProducerError(
+            "a supported network-free executable-model sandbox is unavailable"
+        ) from exc
 
 
 def run_model_boundary(
@@ -1222,11 +1202,15 @@ def load_workstack_model(
     model_payload = observation.read_under(
         workstack, ("src", "workstack_compass", "model.py"), MAX_MODEL_BYTES
     )
+    launcher_relative = ("bin", "workstack-compass")
+    launcher_info = observation.observe_entry(workstack, launcher_relative)
     launcher_payload = observation.read_under(
-        workstack, ("bin", "workstack-compass"), MAX_MODEL_BYTES
+        workstack, launcher_relative, MAX_MODEL_BYTES
     )
-    if not launcher_payload.startswith(b"#!"):
-        raise ProducerError("Workstack Compass launcher is malformed")
+    if not launcher_payload.startswith(b"#!") or not executable_by_current_user(
+        launcher_info
+    ):
+        raise ProducerError("Workstack Compass launcher is malformed or not executable")
     try:
         response = run_model_boundary(model_payload, "contract")
     except ProducerError as exc:
@@ -1248,6 +1232,17 @@ def load_workstack_model(
         ModelContract(model_payload, REQUIRED_SCHEMA_VERSION, max_snapshot_bytes),
         workstack,
     )
+
+
+def executable_by_current_user(info: os.stat_result) -> bool:
+    mode = info.st_mode
+    if os.geteuid() == 0:
+        return bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    if info.st_uid == os.geteuid():
+        return bool(mode & stat.S_IXUSR)
+    if info.st_gid == os.getegid() or info.st_gid in os.getgroups():
+        return bool(mode & stat.S_IXGRP)
+    return bool(mode & stat.S_IXOTH)
 
 
 def validate_document(model: ModelContract, document: Mapping[str, Any]) -> None:
@@ -1392,6 +1387,90 @@ def build_document(
     return document
 
 
+PUBLISH_BOUNDARY_PROGRAM = r'''
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+expected_device = int(sys.argv[2])
+expected_inode = int(sys.argv[3])
+output_name = sys.argv[4]
+temp_name = sys.argv[5]
+expected_size = int(sys.argv[6])
+payload = sys.stdin.buffer.read(expected_size + 1)
+if len(payload) != expected_size:
+    raise SystemExit(2)
+parent = os.fstat(parent_descriptor)
+if (
+    parent.st_dev != expected_device
+    or parent.st_ino != expected_inode
+    or not stat.S_ISDIR(parent.st_mode)
+    or parent.st_uid != os.getuid()
+    or stat.S_IMODE(parent.st_mode) & 0o077
+):
+    raise SystemExit(2)
+try:
+    existing = os.stat(output_name, dir_fd=parent_descriptor, follow_symlinks=False)
+except FileNotFoundError:
+    existing = None
+if existing is not None and (
+    not stat.S_ISREG(existing.st_mode)
+    or existing.st_nlink != 1
+    or stat.S_IMODE(existing.st_mode) != 0o600
+):
+    raise SystemExit(2)
+descriptor = None
+try:
+    descriptor = os.open(
+        temp_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=parent_descriptor,
+    )
+    os.fchmod(descriptor, 0o600)
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("incomplete write")
+        view = view[written:]
+    os.fsync(descriptor)
+    written_info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(written_info.st_mode)
+        or written_info.st_nlink != 1
+        or stat.S_IMODE(written_info.st_mode) != 0o600
+        or written_info.st_size != expected_size
+    ):
+        raise OSError("unsafe temporary")
+    os.close(descriptor)
+    descriptor = None
+    os.replace(
+        temp_name,
+        output_name,
+        src_dir_fd=parent_descriptor,
+        dst_dir_fd=parent_descriptor,
+    )
+    os.fsync(parent_descriptor)
+    published = os.stat(output_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(published.st_mode)
+        or published.st_nlink != 1
+        or stat.S_IMODE(published.st_mode) != 0o600
+        or published.st_size != expected_size
+    ):
+        raise OSError("unsafe publication")
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+    try:
+        os.unlink(temp_name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        pass
+'''
+
+
 def publish_snapshot(
     output: Path,
     parent_descriptor: int,
@@ -1404,43 +1483,48 @@ def publish_snapshot(
         raise ProducerError("validated snapshot exceeds the application model size bound")
     retained_source_roots = tuple(source_roots)
     observation.prove_unchanged()
-    temp_name = write_private_temp(
-        parent_descriptor, "workstack-snapshot", payload, retained_source_roots
-    )
+    reject_source_repository_parent(parent_descriptor, retained_source_roots)
+    parent_info = os.fstat(parent_descriptor)
+    temp_name = f".workstack-snapshot.{os.getpid()}.{os.urandom(8).hex()}"
+    parent_path = output.parent
     try:
-        observation.prove_unchanged()
-        reject_source_repository_parent(parent_descriptor, retained_source_roots)
-        try:
-            existing = os.stat(output.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None and (
-            not stat.S_ISREG(existing.st_mode)
-            or existing.st_nlink != 1
-            or stat.S_IMODE(existing.st_mode) != 0o600
-        ):
-            raise ProducerError("snapshot destination became unsafe before replacement")
-        reject_source_repository_parent(parent_descriptor, retained_source_roots)
-        os.replace(
-            temp_name,
-            output.name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
+        argv = sandboxed_python_argv(
+            PUBLISH_BOUNDARY_PROGRAM,
+            read_paths=(parent_path,),
+            write_paths=(parent_path, parent_path / temp_name, output),
+            denied_write_roots=(root.path for root in retained_source_roots),
         )
-        os.fsync(parent_descriptor)
-        published = os.stat(output.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(published.st_mode)
-            or published.st_nlink != 1
-            or stat.S_IMODE(published.st_mode) != 0o600
-            or published.st_size != len(payload)
-        ):
-            raise ProducerError("published snapshot failed its final safety check")
-    finally:
-        try:
-            os.unlink(temp_name, dir_fd=parent_descriptor)
-        except FileNotFoundError:
-            pass
+        argv.extend(
+            (
+                str(parent_descriptor),
+                str(parent_info.st_dev),
+                str(parent_info.st_ino),
+                output.name,
+                temp_name,
+                str(len(payload)),
+            )
+        )
+        run_bounded(
+            argv,
+            {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"},
+            timeout=MODEL_TIMEOUT_SECONDS,
+            cap=1,
+            pass_descriptors=(parent_descriptor,),
+            input_payload=payload,
+            discard_stderr=True,
+        )
+    except ProducerError as exc:
+        raise ProducerError("private snapshot publication boundary failed") from exc
+    observation.prove_unchanged()
+    reject_source_repository_parent(parent_descriptor, retained_source_roots)
+    published = os.stat(output.name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(published.st_mode)
+        or published.st_nlink != 1
+        or stat.S_IMODE(published.st_mode) != 0o600
+        or published.st_size != len(payload)
+    ):
+        raise ProducerError("published snapshot failed its final safety check")
 
 
 def parser() -> argparse.ArgumentParser:
