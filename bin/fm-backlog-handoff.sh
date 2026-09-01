@@ -1513,7 +1513,7 @@ remote_handoff() { # <secondmate-id> <keys...>
     && [ "$(outbox_item_count "$outbox")" -gt 0 ] \
     && { [ -e "$STATE/.backlog-handoff-$id.wake-pending" ] \
          || [ -L "$STATE/.backlog-handoff-$id.wake-pending" ]; }; then
-    resume_remote_outbox "$id" "$outbox" || {
+    resume_remote_outbox "$id" "$outbox" "$handoff_inode" || {
       echo "error: previous remote handoff for secondmate $id could not be completed; nothing new was staged" >&2
       return 1
     }
