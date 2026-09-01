@@ -41,11 +41,14 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
     if $t.pr.url != null then $t.pr.url
     elif $t.paths.report.present then $t.paths.report.path
     else "-" end;
+  def render_path($p):
+    if $p.path == null then null
+    elif $p.present == true then $p.path
+    elif $p.present == false then $p.path + " (absent)"
+    else $p.path + " (unknown)" end;
   def path_of($t):
-    if $t.paths.home.present then $t.paths.home.path
-    elif $t.paths.home.path != null then $t.paths.home.path + " (absent)"
-    elif $t.paths.worktree.present then $t.paths.worktree.path
-    elif $t.paths.worktree.path != null then $t.paths.worktree.path + " (absent)"
+    if $t.paths.home.path != null then render_path($t.paths.home)
+    elif $t.paths.worktree.path != null then render_path($t.paths.worktree)
     else "-" end;
   def action_of($t):
     if $t.kind == "secondmate" then "\($t.actions.send) - \($t.actions.watch)"
