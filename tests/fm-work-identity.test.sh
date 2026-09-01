@@ -2478,6 +2478,40 @@ test_missing_state_directory_is_created_before_locking() {
   pass "identity locking creates and validates its missing state directory"
 }
 
+test_handoff_receiver_reads_chunked_transfer_to_eof() {
+  local parent mate task manifest block backlog_hash transfer bytes
+  parent=$(make_home chunked-handoff-parent)
+  mate="$TMP_ROOT/chunked-handoff-mate"
+  task=chunked-handoff
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects" "$mate/bin"
+  printf '# Firstmate fixture\n' > "$mate/AGENTS.md"
+  printf 'chunked\n' > "$mate/.fm-secondmate-home"
+  manifest="$parent/$task.json"
+  make_max_manifest "$parent" "$task" "$manifest"
+  FM_HOME="$parent" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
+  block="$parent/$task.block"
+  printf '%s\n' "- [ ] $task - chunked transfer identity (repo: firstmate)" > "$block"
+  backlog_hash=$(sha256_file_for_test "$block")
+  transfer=$(FM_HOME="$parent" "$WORK_IDENTITY" handoff-prepare "$task" \
+    --to-home "$mate" --to-home-id secondmate:chunked --backlog-sha256 "$backlog_hash")
+  bytes=$(LC_ALL=C printf '%s' "$transfer" | wc -c | tr -d ' ')
+  [ "$bytes" -gt 4096 ] || fail "chunked handoff fixture was too small to exercise a short transport read"
+  printf '%s\n' "$transfer" | FM_HOME="$mate" "$WORK_IDENTITY" \
+    handoff-stage "$task" --file - >/dev/null \
+    || fail "could not stage the chunked handoff fixture"
+  {
+    printf '%s' "${transfer:0:64}"
+    sleep 0.1
+    printf '%s\n' "${transfer:64}"
+  } | FM_HOME="$mate" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-backlog-receive.sh" --prepare-handoff "$task" >/dev/null \
+    || fail "handoff receiver truncated a valid chunked transfer"
+  jq -e '.state == "backlog-prepared"' \
+    "$mate/data/$task/work-identity-handoff-target.json" >/dev/null \
+    || fail "chunked handoff receipt was not prepared"
+  pass "handoff receiver reads chunked transfers through EOF"
+}
+
 test_handoff_preparation_is_durable_and_rollback_safe() {
   local parent mate task_a task_b task_c race manifest transfer out rc backlog_hash
   command -v tasks-axi >/dev/null 2>&1 || { pass "handoff transaction coverage skipped without tasks-axi"; return; }
@@ -3074,6 +3108,10 @@ case "${FM_TEST_ONLY:-}" in
     test_secondmate_deadlines_are_isolated_per_home
     exit 0
     ;;
+  handoff-short-read)
+    test_handoff_receiver_reads_chunked_transfer_to_eof
+    exit 0
+    ;;
 esac
 
 test_intake_through_fleet_projection
@@ -3122,6 +3160,7 @@ test_delegated_secondmate_projection
 test_handoff_rebinds_identity_and_decision_surfaces
 test_completed_unlinked_handoff_accepts_exact_intake
 test_missing_state_directory_is_created_before_locking
+test_handoff_receiver_reads_chunked_transfer_to_eof
 test_handoff_preparation_is_durable_and_rollback_safe
 test_handoff_rejects_unowned_identical_target_sidecar
 test_unsafe_publication_setup_uses_integrity_exit

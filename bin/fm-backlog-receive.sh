@@ -82,7 +82,7 @@ backlog_task_sha256() {
 handoff_backlog_transition() {
   local action=$1 task=$2 transfer expected section observed state action_rc
   transfer=$(umask 077; mktemp "$FM_HOME/state/.handoff-transfer.XXXXXX") || return 1
-  if ! dd bs=73729 count=1 of="$transfer" 2>/dev/null; then
+  if ! LC_ALL=C head -c 73729 > "$transfer"; then
     rm -f -- "$transfer"
     return 1
   fi
