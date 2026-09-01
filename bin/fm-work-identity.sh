@@ -2931,20 +2931,6 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     receipt_digests[$index]=$receipt_digest
     quarantined+=("$index")
     identity_lock_release
-    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$STATE_REAL" "$STATE_DIR_ID" "$task" \
-      "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
-      "$ACTIVE_PUBLICATION_LOCK" "$owner_pid" "$ACTIVE_PUBLICATION_LOCK_TOKEN" \
-      "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
-      "${receipt_names[$index]}" "${quarantine_names[$index]}" \
-      "$receipt_state" "$receipt_digest" "$batch_token" \
-      "$task.meta" "${metadata_states[$index]}" "${metadata_digests[$index]}" \
-      "$task.launch-brief.md" "${launch_states[$index]}" "${launch_digests[$index]}")
-    if [ -n "$authorizations" ]; then
-      authorizations="$authorizations"$'\n'"$authorization"
-    else
-      authorizations=$authorization
-    fi
   done
   for index in "${!tasks[@]}"; do
     [ "${receipt_present[$index]}" = 1 ] || continue
@@ -2961,6 +2947,40 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
       die "cannot quarantine complete work identity dispatch record set for teardown"
     fi
     identity_lock_release
+  done
+  for index in "${!tasks[@]}"; do
+    [ "${receipt_present[$index]}" = 1 ] || continue
+    task=${tasks[$index]}
+    if [ "${metadata_states[$index]}" != absent ]; then
+      IFS=$'\t' read -r metadata_state metadata_digest \
+        < <(owned_removal_expectation \
+          "$STATE_REAL/.$task.meta.teardown-quarantine" "task dispatch metadata quarantine") \
+        || die "cannot bind quarantined task dispatch metadata"
+      metadata_states[$index]=$metadata_state
+      metadata_digests[$index]=$metadata_digest
+    fi
+    if [ "${launch_states[$index]}" != absent ]; then
+      IFS=$'\t' read -r launch_state launch_digest \
+        < <(owned_removal_expectation \
+          "$STATE_REAL/.$task.launch-brief.md.teardown-quarantine" "task dispatch instructions quarantine") \
+        || die "cannot bind quarantined task dispatch instructions"
+      launch_states[$index]=$launch_state
+      launch_digests[$index]=$launch_digest
+    fi
+    authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$STATE_REAL" "$STATE_DIR_ID" "$task" \
+      "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
+      "$ACTIVE_PUBLICATION_LOCK" "$owner_pid" "$ACTIVE_PUBLICATION_LOCK_TOKEN" \
+      "${receipt_parents[$index]}" "${receipt_parent_ids[$index]}" \
+      "${receipt_names[$index]}" "${quarantine_names[$index]}" \
+      "${receipt_states[$index]}" "${receipt_digests[$index]}" "$batch_token" \
+      "$task.meta" "${metadata_states[$index]}" "${metadata_digests[$index]}" \
+      "$task.launch-brief.md" "${launch_states[$index]}" "${launch_digests[$index]}")
+    if [ -n "$authorizations" ]; then
+      authorizations="$authorizations"$'\n'"$authorization"
+    else
+      authorizations=$authorization
+    fi
   done
   if [ -n "${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS:-}" ]; then
     authorizations="${FM_TEARDOWN_DISPATCH_AUTHORIZATIONS}"$'\n'"$authorizations"

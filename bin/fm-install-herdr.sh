@@ -12,7 +12,7 @@
 # Selects the official GitHub Releases asset for the host OS/arch, downloads
 # with a bounded max size, verifies SHA-256 before install, then refuses to
 # finish unless the binary reports the exact pin version and a client protocol
-# at or above the required floor (16 for the real-Herdr family).
+# at or above the required floor (17 for the real-Herdr family).
 set -eu
 
 # Exact pin - change only with a re-verified real-Herdr matrix.

@@ -1805,6 +1805,68 @@ configure_secondmate_with_tmux_children() {  # <case-dir>
   done
 }
 
+configure_secondmate_child_dispatch() {  # <case-dir> <child-id>
+  local case_dir=$1 child=$2 home="$1/secondmate-home" launch transaction binding hash child_wt
+  home=$(cd "$home" && pwd -P)
+  child_wt="$case_dir/$child-wt"
+  rm -f -- "$home/state/$child.meta"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-brief.sh" "$child" firstmate --mode local-only >/dev/null \
+    || fail "child dispatch fixture could not create a task brief"
+  launch="$home/state/$child.launch-brief.md"
+  transaction="teardown-$child-dispatch"
+  binding=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-work-identity.sh" dispatch-prepare "$child" \
+      --brief "$home/data/$child/brief.md" --instructions-path "$launch" \
+      --transaction "$transaction") || fail "child dispatch fixture could not prepare dispatch"
+  hash=$(printf '%s' "$binding" | jq -r '.instructions_sha256')
+  fm_write_meta "$home/state/$child.meta" \
+    "window=firstmate:fm-$child" "endpoint_task_id=$child" \
+    "worktree=$child_wt" "project=$case_dir/project" \
+    "launch_brief=$launch" "launch_brief_sha256=$hash" \
+    "work_identity_dispatch_transaction=$transaction" "harness=codex" \
+    "kind=ship" "mode=local-only" "yolo=off" \
+    "work_identity_schema=fm-work-identity.v1" "work_identity_status=unlinked"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-work-identity.sh" dispatch-commit "$child" \
+      --brief "$launch" --meta "$home/state/$child.meta" \
+      --transaction "$transaction" \
+    || fail "child dispatch fixture could not commit dispatch"
+}
+
+test_forced_secondmate_teardown_cleans_authorized_children() {
+  local case_dir home child rc=0
+  case_dir=$(make_case authorized-child-cleanup)
+  write_meta "$case_dir" local-only secondmate
+  configure_secondmate_with_tmux_children "$case_dir"
+  home="$case_dir/secondmate-home"
+  configure_secondmate_child_dispatch "$case_dir" child-a
+  : > "$case_dir/kill.log"
+  : > "$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/kill.log"
+SH
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$3" >> "$case_dir/treehouse.log"
+rm -rf -- "\$3"
+SH
+  chmod +x "$case_dir/fakebin/tmux" "$case_dir/fakebin/treehouse"
+
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "authorized child teardown should clean the full home: $(cat "$case_dir/stderr")"
+  for child in child-a child-b; do
+    assert_absent "$case_dir/$child-wt" "authorized child teardown orphaned $child's worktree"
+    assert_grep "fm-$child" "$case_dir/kill.log" \
+      "authorized child teardown did not close $child's endpoint"
+    assert_grep "$case_dir/$child-wt" "$case_dir/treehouse.log" \
+      "authorized child teardown did not return $child's worktree"
+  done
+  assert_absent "$home" "authorized child teardown retained the secondmate home"
+  pass "forced teardown cleans authorization-backed child inventory"
+}
+
 configure_secondmate_with_receipt_only_child() {  # <case-dir> <prepared|completed>
   local case_dir=$1 receipt_state=$2 home="$1/secondmate-home" child=receipt-only-child
   local launch transaction binding hash
@@ -2800,6 +2862,10 @@ EOF
 }
 
 case "${FM_TEST_ONLY:-}" in
+  authorized-child-cleanup)
+    test_forced_secondmate_teardown_cleans_authorized_children
+    exit 0
+    ;;
   dispatch-retirement)
     test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
     test_dispatch_receipt_commits_only_after_successful_teardown
@@ -2811,6 +2877,7 @@ case "${FM_TEST_ONLY:-}" in
     test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt
     test_forced_secondmate_teardown_accepts_completed_receipt_only_home
     test_forced_secondmate_teardown_revalidates_authorized_receipt
+    test_forced_secondmate_teardown_cleans_authorized_children
     exit 0
     ;;
 esac
@@ -2834,6 +2901,7 @@ test_forced_secondmate_herdr_child_preflight_refuses_before_changes
 test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt
 test_forced_secondmate_teardown_accepts_completed_receipt_only_home
 test_forced_secondmate_teardown_revalidates_authorized_receipt
+test_forced_secondmate_teardown_cleans_authorized_children
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
 test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconfirmed
