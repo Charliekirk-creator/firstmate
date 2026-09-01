@@ -31,7 +31,7 @@ FM_HOME=/path/to/firstmate /path/to/firstmate/bin/fm-workstack-compass-snapshot.
   --project-root gl-data-team-tickets=/path/to/gl-data-team-tickets
 ```
 
-The command defaults to the gitignored, captain-private `$FM_HOME/data/workstack-compass/snapshot.json`, validates the complete observation against the supplied application's executable model, replaces the file atomically at mode `0600`, and prints the exact `./bin/workstack-compass --snapshot ...` launch command without running it.
+The command defaults to the gitignored, captain-private `$FM_HOME/data/workstack-compass/snapshot.json`, passes a versioned sanitized evidence envelope to the supplied model's `snapshot_from_evidence` adapter, validates the model-constructed candidate, replaces the file atomically at mode `0600`, and prints the exact `./bin/workstack-compass --snapshot ...` launch command without running it.
 It is local-only and network-free, does not discover project roots, and never launches or controls a worker, acknowledges fleet activity, changes a source, opens a remote connection, or publishes data.
 The producer currently requires the built-in macOS `sandbox-exec` boundary and refuses when its confined subprocess and publication boundary is unavailable.
 Pass another `--project-root NAME=PATH` only when `NAME` is already an exact entry in this home's `data/projects.md`; omit a root to keep that project's upstream detail visibly unavailable rather than allowing a path or repository guess.

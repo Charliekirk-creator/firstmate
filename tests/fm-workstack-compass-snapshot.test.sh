@@ -48,8 +48,12 @@ write_fake_model() {
   mkdir -p "$app/src/workstack_compass" "$app/bin"
   git -C "$app" init -q
   cat > "$app/src/workstack_compass/model.py" <<PY
+import hashlib
+import json
+
 SCHEMA_VERSION = "$schema_version"
 MAX_SNAPSHOT_BYTES = $max_bytes
+EVIDENCE_VERSION = "firstmate.workstack-compass-evidence.v1"
 
 class ValidatedSnapshot:
     def integrity_issues(self):
@@ -61,6 +65,169 @@ def snapshot_from_mapping(document):
     if "$behavior" == "reject":
         raise ValueError("test model rejection")
     return ValidatedSnapshot()
+
+def snapshot_from_evidence(evidence):
+    if evidence.get("evidence_version") != EVIDENCE_VERSION:
+        raise ValueError("test evidence version mismatch")
+    registry = evidence["registry"]
+    tasks = evidence["tasks"]
+    incarnations = tasks["incarnations"]
+    registry_source = {
+        "source_identity": "source:firstmate-project-registry",
+        "label": "Firstmate registered projects",
+        "completeness": "complete" if registry["available"] else "unavailable",
+        "detail": (
+            "The active Firstmate project registry was observed without inferred project joins."
+            if registry["available"]
+            else "The active Firstmate project registry is unavailable."
+        ),
+    }
+    backlog_present = tasks["backlog_available"]
+    meta_present = tasks["metadata_inventory_available"]
+    omitted = tasks["omitted_incarnation_count"]
+    current_state_unavailable = bool(incarnations) and not tasks["current_state_available"]
+    if backlog_present and meta_present:
+        task_completeness = "partial" if omitted or current_state_unavailable else "complete"
+        if omitted and incarnations:
+            task_detail = "Exact task and worker-incarnation identities were observed; worker current state is unavailable, records without exact incarnation identity are omitted, and untyped telemetry remains unavailable."
+        elif omitted:
+            task_detail = "Exact task evidence and task metadata were observed; records without exact incarnation identity are omitted, so no exact worker incarnation is available, and untyped telemetry remains unavailable."
+        elif current_state_unavailable:
+            task_detail = "Exact task and worker-incarnation identities were observed; no worker current-state evidence was available, and untyped telemetry remains unavailable."
+        else:
+            task_detail = "Exact task and worker-incarnation identity sources were observed completely."
+    elif backlog_present or meta_present:
+        task_completeness = "partial"
+        task_detail = "Only part of the exact task identity evidence is available; worker telemetry and untyped relations remain unavailable."
+    else:
+        task_completeness = "unavailable"
+        task_detail = "No local task identity evidence is available."
+    task_source = {
+        "source_identity": "source:firstmate-task-identities",
+        "label": "Firstmate task identity records",
+        "completeness": task_completeness,
+        "detail": task_detail,
+    }
+    sources = [registry_source, task_source]
+    project_source_by_name = {}
+    for source in evidence["project_roots"]:
+        name = source["project_name"]
+        kind = source["evidence_kind"]
+        if kind == "unbound":
+            identity = f"source:project-root:{name}"
+            row = {
+                "source_identity": identity,
+                "label": f"{name} local upstream",
+                "completeness": "unavailable",
+                "detail": "No explicit read-only root was supplied for this registered project.",
+            }
+            project_source_by_name[name] = "source:firstmate-project-registry"
+        elif kind == "data_team_management_board":
+            identity = f"source:data-team-management-board:{source['board_node_identity']}"
+            row = {
+                "source_identity": identity,
+                "label": "Data Team Management board identity",
+                "completeness": "partial",
+                "detail": "The local board identity contract is available; current board rows and typed execution relations are not exported locally.",
+            }
+            project_source_by_name[name] = identity
+        elif kind == "data_team_tickets_artifacts":
+            identity = "source:gl-data-team-tickets-artifacts"
+            row = {
+                "source_identity": identity,
+                "label": "Data Team Tickets artifact repository",
+                "completeness": "partial",
+                "detail": "The explicit artifact repository is available; it publishes no typed plan, stage, work-unit, delivery, or acceptance relation for this snapshot.",
+            }
+            project_source_by_name[name] = identity
+        else:
+            identity = f"source:project-root:{name}"
+            row = {
+                "source_identity": identity,
+                "label": f"{name} explicit project root",
+                "completeness": "partial",
+                "detail": "The registered read-only root is available; no typed Workstack relation producer is published there.",
+            }
+            project_source_by_name[name] = identity
+        sources.append(row)
+    sources.sort(key=lambda row: row["source_identity"])
+    projects = [
+        {
+            "project_identity": f"firstmate-project:{name}",
+            "source_identity": project_source_by_name.get(name, "source:firstmate-project-registry"),
+            "label": name,
+            "outcome": None,
+        }
+        for name in registry["project_names"]
+    ]
+    roles = {"ship": "Ship worker", "scout": "Scout", "secondmate": "Second mate"}
+    workers = [
+        {
+            "worker_incarnation_identity": f"firstmate-worker-incarnation:{row['task_identity']}:{row['generation_identity']}",
+            "worker_identity": f"firstmate-worker:{row['task_identity']}",
+            "role": roles[row["kind"]],
+            "status": "unavailable",
+            "liveness": "unavailable",
+            "live_proof_identity": None,
+            "project_identity": f"firstmate-project:{row['project_name']}" if row["project_name"] else None,
+            "work_unit_identities": [],
+            "context_percent": None,
+            "duration_seconds": None,
+            "source_identity": "source:firstmate-task-identities",
+        }
+        for row in incarnations
+    ]
+    exact_status = "partial" if projects else "unavailable"
+    worker_status = "partial" if workers else "unavailable"
+    interfaces = [
+        {
+            "name": "decision-history",
+            "status": "unavailable",
+            "source_identity": None,
+            "detail": "No authoritative retained-decision exporter is available.",
+        },
+        {
+            "name": "exact-work-identity",
+            "status": exact_status,
+            "source_identity": "source:firstmate-project-registry" if projects else None,
+            "detail": (
+                "Registered project identities are available; typed plan, stage, work-unit, command, next-action, delivery, and acceptance producers are unavailable."
+                if projects else "Exact project and work hierarchy identities are unavailable."
+            ),
+        },
+        {
+            "name": "worker-context-duration",
+            "status": worker_status,
+            "source_identity": "source:firstmate-task-identities" if workers else None,
+            "detail": (
+                "Exact worker incarnations are available; current status, liveness, context, duration, and typed work-unit relations are unavailable."
+                if workers else "No exact worker incarnation with an authoritative generation identity is available."
+            ),
+        },
+    ]
+    document = {
+        "schema_version": SCHEMA_VERSION,
+        "observation_identity": "observation:pending",
+        "observed_at": evidence["observed_at"],
+        "data_classification": "authoritative" if projects or workers else "unavailable",
+        "sources": sources,
+        "interfaces": interfaces,
+        "projects": projects,
+        "plans": [],
+        "stages": [],
+        "work_units": [],
+        "commands": [],
+        "worker_incarnations": workers,
+        "next_actions": [],
+        "deliveries": [],
+        "acceptances": [],
+        "decisions": [],
+    }
+    digest_input = dict(document)
+    digest_input.pop("observation_identity")
+    canonical = json.dumps(digest_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    document["observation_identity"] = "observation:sha256:" + hashlib.sha256(canonical).hexdigest()
+    return document
 PY
   cat > "$app/bin/workstack-compass" <<'SH'
 #!/usr/bin/env bash
@@ -95,10 +262,8 @@ import sys
 
 path = Path(sys.argv[1])
 marker = json.dumps(sys.argv[2])
-path.write_text(f'''SCHEMA_VERSION = "workstack-compass.snapshot.v1"
-MAX_SNAPSHOT_BYTES = 2097152
-
-import os
+text = path.read_text()
+probe = f'''import os
 import socket
 
 try:
@@ -121,14 +286,28 @@ finally:
 if os.environ.get("PRIVATE_ENV_SECRET"):
     raise RuntimeError("private parent environment reached the model")
 
-class ValidatedSnapshot:
-    def integrity_issues(self):
-        return ()
+'''
+text = text.replace(
+    "def snapshot_from_mapping(document):\n",
+    "def snapshot_from_mapping(document):\n    document[\"projects\"][0][\"label\"] = \"MODEL_MUTATION_SECRET\"\n",
+)
+path.write_text(probe + text)
+PY
+}
 
-def snapshot_from_mapping(document):
-    document["projects"][0]["label"] = "MODEL_MUTATION_SECRET"
-    return ValidatedSnapshot()
-''')
+write_model_owned_shape() {
+  local app=$1
+  python3 - "$app/src/workstack_compass/model.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '    digest_input = dict(document)\n'
+new = '    document["model_owned_projection"] = "executable-model"\n    digest_input = dict(document)\n'
+if old not in text:
+    raise SystemExit("fake model projection hook is missing")
+path.write_text(text.replace(old, new))
 PY
 }
 
@@ -295,6 +474,17 @@ test_successful_truthful_projection() {
       "snapshot leaked a private source value: $forbidden"
   done
   pass "sanitized local sources produce a validated, private, truthful snapshot"
+}
+
+test_executable_model_owns_candidate_shape() {
+  local world snapshot
+  world=$(make_world model-owned-shape)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  write_model_owned_shape "$world/app"
+  run_world "$world" >/dev/null || fail "model-owned candidate projection failed"
+  json_assert "$snapshot" '.model_owned_projection == "executable-model"' \
+    "producer copied a local snapshot shape instead of publishing the model projection"
+  pass "the executable model owns candidate construction from sanitized evidence"
 }
 
 test_missing_relations_stay_missing() {
@@ -1370,6 +1560,7 @@ PY
 }
 
 test_successful_truthful_projection
+test_executable_model_owns_candidate_shape
 test_missing_relations_stay_missing
 test_duplicate_and_broken_identities_refuse
 test_state_inventory_bound_refuses_unrelated_runtime_entries
