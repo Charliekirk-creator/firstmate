@@ -5030,6 +5030,12 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+
+spawn_commit_backlog_transition() {
+  [ "$BACKLOG_TRANSITION" = 1 ] || return 0
+  fm_backlog_atomic_transition dispatch "$STATE/$ID.meta" "$DATA" "$ID" "$STATE"
+}
+
 if [ "$SPAWN_METADATA_RECOVERY" -eq 1 ]; then
   spawn_metadata_transaction_published || {
     echo "error: definitely unsent secondmate launch has no exact published metadata for $ID" >&2
@@ -5140,10 +5146,6 @@ FM_HOME="$FM_HOME" \
 # Fuse the backlog In-flight transition into the identity owner's publication
 # that just created the record. The call itself is deferred to the final commit
 # point below so every earlier launch-delivery failure remains unwindable.
-spawn_commit_backlog_transition() {
-  [ "$BACKLOG_TRANSITION" = 1 ] || return 0
-  fm_backlog_atomic_transition dispatch "$STATE/$ID.meta" "$DATA" "$ID" "$STATE"
-}
 [ "$RELAUNCH" -ne 1 ] || RELAUNCH_REPLACEMENT_PENDING=0
 SPAWN_META_PUBLISH_STARTED=0
 published_meta_candidate=$SPAWN_META_TMP
