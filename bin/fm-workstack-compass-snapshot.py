@@ -85,6 +85,7 @@ MODEL_TIMEOUT_SECONDS = 10
 MAX_MODEL_RESPONSE_BYTES = 64 * 1024
 REQUIRED_SCHEMA_VERSION = "workstack-compass.snapshot.v1"
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+TASK_ID_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]+$")
 REGISTRY_LINE_RE = re.compile(
     r"^- ([A-Za-z0-9._-]{1,160})(?: \[[^\]\r\n]+\])? - \S.*$"
 )
@@ -984,7 +985,7 @@ def parse_tasks_axi(payload: bytes) -> list[BacklogTask]:
             raise ProducerError("authoritative local reader returned malformed output")
         record = dict(zip(fields, values))
         identity = record["id"]
-        if not IDENTITY_RE.fullmatch(identity):
+        if not TASK_ID_RE.fullmatch(identity):
             raise ProducerError("backlog contains a broken exact identity")
         if identity in seen:
             raise ProducerError("backlog contains a duplicate exact identity")
@@ -1750,7 +1751,7 @@ def collect_workers(
     observation: Observation,
     backlog_tasks: Iterable[BacklogTask],
     registered: set[str],
-) -> tuple[list[dict[str, Any]], bool, int]:
+) -> tuple[list[dict[str, Any]], bool, int, bool]:
     names = observation.observe_inventory(
         home,
         "state",
@@ -1766,7 +1767,7 @@ def collect_workers(
     omitted = 0
     for name in names:
         identity = name[:-5]
-        if not IDENTITY_RE.fullmatch(identity):
+        if not TASK_ID_RE.fullmatch(identity):
             raise ProducerError("task metadata filename contains a broken exact identity")
         payload = observation.read_under(home, ("state", name), MAX_META_BYTES)
         assert payload is not None
@@ -1815,9 +1816,8 @@ def collect_workers(
             "source_identity": "source:firstmate-task-identities",
         }
         workers.append(row)
-        omitted += 1
     workers.sort(key=lambda row: row["worker_incarnation_identity"])
-    return workers, bool(names), omitted
+    return workers, bool(names), omitted, bool(workers)
 
 
 def inspect_project_sources(
@@ -2192,6 +2192,7 @@ def build_document(
     backlog_present: bool,
     meta_present: bool,
     omitted_task_evidence: int,
+    current_state_unavailable: bool,
     project_sources: list[dict[str, Any]],
     project_source_by_name: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -2206,12 +2207,19 @@ def build_document(
         ),
     }
     if backlog_present and meta_present:
-        task_completeness = "partial" if omitted_task_evidence else "complete"
-        task_detail = (
-            "Exact task and worker-incarnation identities were observed; worker current state is unavailable, records without exact incarnation identity are omitted, and untyped telemetry remains unavailable."
-            if omitted_task_evidence
-            else "Exact task and worker-incarnation identities were observed; no worker current-state evidence was available, and untyped telemetry remains unavailable."
+        task_completeness = (
+            "partial"
+            if omitted_task_evidence or current_state_unavailable
+            else "complete"
         )
+        if omitted_task_evidence and workers:
+            task_detail = "Exact task and worker-incarnation identities were observed; worker current state is unavailable, records without exact incarnation identity are omitted, and untyped telemetry remains unavailable."
+        elif omitted_task_evidence:
+            task_detail = "Exact task evidence and task metadata were observed; records without exact incarnation identity are omitted, so no exact worker incarnation is available, and untyped telemetry remains unavailable."
+        elif current_state_unavailable:
+            task_detail = "Exact task and worker-incarnation identities were observed; no worker current-state evidence was available, and untyped telemetry remains unavailable."
+        else:
+            task_detail = "Exact task and worker-incarnation identity sources were observed completely."
     elif backlog_present or meta_present:
         task_completeness = "partial"
         task_detail = "Only part of the exact task identity evidence is available; worker telemetry and untyped relations remain unavailable."
@@ -2598,9 +2606,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             parent_descriptor,
             source_roots,
         )
-        workers, meta_present, omitted_task_evidence = collect_workers(
-            home, observation, backlog_tasks, set(registered)
-        )
+        (
+            workers,
+            meta_present,
+            omitted_task_evidence,
+            current_state_unavailable,
+        ) = collect_workers(home, observation, backlog_tasks, set(registered))
         document = build_document(
             model,
             registered,
@@ -2609,6 +2620,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             backlog_payload is not None,
             meta_present,
             omitted_task_evidence,
+            current_state_unavailable,
             project_sources,
             project_source_by_name,
         )

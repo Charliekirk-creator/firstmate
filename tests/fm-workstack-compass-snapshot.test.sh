@@ -268,6 +268,9 @@ test_successful_truthful_projection() {
   json_assert "$snapshot" \
     '(.sources[] | select(.source_identity == "source:firstmate-task-identities") | .completeness) == "partial"' \
     "unavailable current-state evidence was reported as complete"
+  json_assert "$snapshot" \
+    '(.sources[] | select(.source_identity == "source:firstmate-task-identities") | .detail | contains("records without exact incarnation identity are omitted")) | not' \
+    "complete worker identities were falsely reported as omitted"
   [ ! -e "$world/home/state/crew-state-invoked" ] \
     || fail "producer invoked the general live-state reader"
   json_assert "$snapshot" \
@@ -303,6 +306,9 @@ kind=ship
 spawn_gen=spawn-orphan
 project=/path/must/not/be/a/join
 META
+  cat > "$world/home/state/no-generation.meta" <<'META'
+kind=ship
+META
   run_world "$world" >/dev/null || fail "missing-relation projection failed"
   json_assert "$snapshot" \
     '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:orphan") | .project_identity) == null' \
@@ -310,11 +316,14 @@ META
   json_assert "$snapshot" \
     '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:orphan") | .work_unit_identities) == []' \
     "producer inferred an orphan worker work relation"
+  json_assert "$snapshot" \
+    '(.sources[] | select(.source_identity == "source:firstmate-task-identities") | .detail | contains("records without exact incarnation identity are omitted"))' \
+    "an actually omitted generation-less record was not disclosed"
   pass "missing exact relations remain explicitly absent"
 }
 
 test_duplicate_and_broken_identities_refuse() {
-  local world snapshot before
+  local world snapshot before fakebin
   world=$(make_world broken-identities)
   snapshot="$world/home/data/workstack-compass/snapshot.json"
   run_world "$world" >/dev/null || fail "baseline generation failed"
@@ -337,6 +346,34 @@ test_duplicate_and_broken_identities_refuse() {
   run_failure "broken incarnation identity" run_world "$world"
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "leading-dot incarnation failure changed the prior complete snapshot"
+  sed -i.bak 's/^spawn_gen=.*/spawn_gen=spawn-task-z/' "$world/home/state/task-z.meta"
+  rm -f "$world/home/state/task-z.meta.bak"
+  cat > "$world/home/state/.hidden.meta" <<'META'
+kind=ship
+spawn_gen=spawn-hidden
+META
+  run_failure "metadata filename contains a broken exact identity" run_world "$world"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "leading-dot metadata identity changed the prior complete snapshot"
+  rm -f "$world/home/state/.hidden.meta"
+  fakebin="$world/fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'count: 1'
+printf '%s\n' 'tasks[1]{id,state,kind,repo,title}:'
+printf '%s\n' '  .hidden,queued,ship,alpha,private-title'
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$fakebin/tasks-axi"
+  run_failure "backlog contains a broken exact identity" env \
+    PATH="$fakebin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "leading-dot backlog identity changed the prior complete snapshot"
   pass "duplicate and broken source identities refuse without partial replacement"
 }
 
