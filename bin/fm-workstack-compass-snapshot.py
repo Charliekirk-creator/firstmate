@@ -49,6 +49,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -645,18 +646,12 @@ def prepare_output(
             continue
         raise ProducerError("snapshot output must not be inside a source repository")
 
-    created_default_parent = False
     if requested is None:
-        previous_umask = os.umask(0)
-        try:
-            os.mkdir(parent_parts[0], 0o700, dir_fd=data.descriptor)
-            created_default_parent = True
-        except FileExistsError:
-            pass
-        except OSError as exc:
-            raise ProducerError("private snapshot directory could not be created") from exc
-        finally:
-            os.umask(previous_umask)
+        create_default_output_parent(
+            data,
+            parent_parts[0],
+            retained_source_roots,
+        )
     try:
         parent_anchor = observation.observe_subdirectory(data, parent_parts)
     except ProducerError as exc:
@@ -665,9 +660,6 @@ def prepare_output(
     try:
         parent_info = os.fstat(parent_descriptor)
         reject_source_repository_parent(parent_descriptor, retained_source_roots)
-        if created_default_parent:
-            os.fchmod(parent_descriptor, 0o700)
-            parent_info = os.fstat(parent_descriptor)
         if (
             not stat.S_ISDIR(parent_info.st_mode)
             or parent_info.st_uid != os.getuid()
@@ -703,6 +695,7 @@ def run_bounded(
     pass_descriptors: Sequence[int] = (),
     input_payload: bytes | None = None,
     discard_stderr: bool = False,
+    cwd: Path | None = None,
 ) -> bytes:
     try:
         process = subprocess.Popen(
@@ -714,6 +707,7 @@ def run_bounded(
             shell=False,
             start_new_session=True,
             pass_fds=tuple(pass_descriptors),
+            cwd=os.fspath(cwd) if cwd is not None else None,
         )
     except OSError as exc:
         raise ProducerError("authoritative local reader could not be started") from exc
@@ -838,27 +832,100 @@ def parse_tasks_axi(payload: bytes) -> list[BacklogTask]:
     return rows
 
 
+def tasks_axi_boundary(path: str) -> tuple[list[str], Path]:
+    selected = shutil.which("tasks-axi", path=path)
+    if selected is None:
+        raise ProducerError("authoritative local reader is unavailable")
+    descriptor: int | None = None
+    try:
+        executable = Path(selected).resolve(strict=True)
+        before = executable.stat()
+        if not stat.S_ISREG(before.st_mode) or not executable_by_current_user(before):
+            raise ProducerError("authoritative local reader is unsafe")
+        descriptor = os.open(
+            executable,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+        ):
+            raise ProducerError("authoritative local reader changed during inspection")
+        shebang = os.read(descriptor, 4096).splitlines(keepends=True)[0]
+    except (OSError, RuntimeError, IndexError) as exc:
+        raise ProducerError("authoritative local reader is unsafe") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not shebang.startswith(b"#!") or len(shebang) == 4096:
+        raise ProducerError("authoritative local reader has an unsupported runtime")
+    try:
+        words = shebang[2:].decode("utf-8", errors="strict").strip().split()
+    except UnicodeDecodeError as exc:
+        raise ProducerError("authoritative local reader has an unsupported runtime") from exc
+    runtime_name: str
+    if len(words) == 2 and words[0] == "/usr/bin/env":
+        runtime_name = words[1]
+    elif len(words) == 1:
+        runtime_name = Path(words[0]).name
+    else:
+        raise ProducerError("authoritative local reader has an unsupported runtime")
+    if runtime_name not in {"bash", "node"}:
+        raise ProducerError("authoritative local reader has an unsupported runtime")
+    runtime_selected = shutil.which(runtime_name, path=path)
+    if runtime_selected is None:
+        raise ProducerError("authoritative local reader runtime is unavailable")
+    try:
+        runtime = Path(runtime_selected).resolve(strict=True)
+        runtime_info = runtime.stat()
+    except (OSError, RuntimeError) as exc:
+        raise ProducerError("authoritative local reader runtime is unsafe") from exc
+    if not stat.S_ISREG(runtime_info.st_mode) or not executable_by_current_user(runtime_info):
+        raise ProducerError("authoritative local reader runtime is unsafe")
+    source_root = executable.parent
+    for candidate in executable.parents:
+        if candidate.name == "tasks-axi" and candidate.parent.name == "node_modules":
+            source_root = candidate
+            break
+    runtime_paths = [runtime]
+    runtime_root = runtime.parent.parent if runtime.parent.name == "bin" else runtime.parent
+    if runtime_root != Path("/"):
+        runtime_paths.append(runtime_root)
+    for ancestor in runtime.parents:
+        if ancestor.name == "Cellar":
+            runtime_paths.extend((ancestor, ancestor.parent / "opt"))
+            break
+    return (
+        sandboxed_command_argv(
+            (runtime, executable, "list", "--file", "/dev/fd/0", "--limit", str(MAX_TASK_RECORDS)),
+            read_paths=(source_root, *runtime_paths),
+            executable=runtime,
+        ),
+        source_root,
+    )
+
+
 def read_backlog_tasks(payload: bytes | None) -> list[BacklogTask]:
     if payload is None:
         return []
     path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-    environment = {
-        "PATH": path,
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "NO_COLOR": "1",
-    }
+    argv, cwd = tasks_axi_boundary(path)
     output = run_bounded(
-        (
-            "tasks-axi",
-            "list",
-            "--file",
-            "/dev/fd/0",
-            "--limit",
-            str(MAX_TASK_RECORDS),
-        ),
-        environment,
+        argv,
+        {
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "NO_COLOR": "1",
+            "OPENSSL_CONF": "/dev/null",
+        },
         input_payload=payload,
+        discard_stderr=True,
+        cwd=cwd,
     )
     return parse_tasks_axi(output)
 
@@ -1084,32 +1151,34 @@ def _sandbox_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def sandboxed_python_argv(
-    program: str,
+def sandboxed_command_argv(
+    command: Sequence[str | Path],
     *,
     read_paths: Iterable[Path] = (),
     write_paths: Iterable[Path] = (),
     denied_write_roots: Iterable[Path] = (),
+    executable: Path,
+    process_executables: Iterable[Path] = (),
 ) -> list[str]:
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
         raise ProducerError("a supported local-only sandbox is unavailable")
-    executable = Path(sys.executable).resolve(strict=True)
+    executable = executable.resolve(strict=True)
+    allowed_executables = {executable, *(path.resolve(strict=True) for path in process_executables)}
     read_roots = {
-        executable.parent,
-        Path(sys.base_prefix).resolve(strict=True),
-        Path(sysconfig.get_path("stdlib")).resolve(strict=True),
         Path("/usr/lib"),
         Path("/System/Library"),
         Path("/private/var/db/dyld"),
+        *read_paths,
     }
-    readable_rules: list[str] = ['(literal "/")', '(literal "/dev/null")']
+    readable_rules: list[str] = [
+        '(literal "/")',
+        '(literal "/dev/null")',
+        '(subpath "/dev/fd")',
+    ]
     ancestors: set[Path] = set()
     for root in read_roots:
         readable_rules.append(f'(subpath "{_sandbox_literal(os.fspath(root))}")')
         ancestors.update(root.parents)
-    for path in read_paths:
-        readable_rules.append(f'(subpath "{_sandbox_literal(os.fspath(path))}")')
-        ancestors.update(path.parents)
     for ancestor in sorted(ancestors, key=lambda path: (len(path.parts), os.fspath(path))):
         readable_rules.append(f'(literal "{_sandbox_literal(os.fspath(ancestor))}")')
     profile_parts = [
@@ -1117,7 +1186,13 @@ def sandboxed_python_argv(
         "(deny default)",
         '(import "system.sb")',
         "(deny network*)",
-        "(allow process*)",
+        "(allow process-exec "
+        + " ".join(
+            f'(literal "{_sandbox_literal(os.fspath(path))}")'
+            for path in sorted(allowed_executables, key=os.fspath)
+        )
+        + ")",
+        "(allow process-info* (target self))",
         f"(allow file-read* {' '.join(readable_rules)})",
     ]
     writable = tuple(write_paths)
@@ -1137,13 +1212,38 @@ def sandboxed_python_argv(
         "/usr/bin/sandbox-exec",
         "-p",
         " ".join(profile_parts),
-        os.fspath(executable),
-        "-I",
-        "-S",
-        "-B",
-        "-c",
-        program,
+        *(os.fspath(value) for value in command),
     ]
+
+
+def sandboxed_python_argv(
+    program: str,
+    *,
+    read_paths: Iterable[Path] = (),
+    write_paths: Iterable[Path] = (),
+    denied_write_roots: Iterable[Path] = (),
+) -> list[str]:
+    executable = Path(sys.executable).resolve(strict=True)
+    version_root = executable.parent.parent
+    framework_executable = (
+        version_root / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    )
+    process_executables = (
+        (framework_executable,) if framework_executable.is_file() else ()
+    )
+    return sandboxed_command_argv(
+        (executable, "-I", "-S", "-B", "-c", program),
+        read_paths=(
+            executable.parent,
+            Path(sys.base_prefix).resolve(strict=True),
+            Path(sysconfig.get_path("stdlib")).resolve(strict=True),
+            *read_paths,
+        ),
+        write_paths=write_paths,
+        denied_write_roots=denied_write_roots,
+        executable=executable,
+        process_executables=process_executables,
+    )
 
 
 def model_boundary_argv() -> list[str]:
@@ -1387,6 +1487,75 @@ def build_document(
     return document
 
 
+CREATE_OUTPUT_PARENT_PROGRAM = r'''
+import os
+import stat
+import sys
+
+data_descriptor = int(sys.argv[1])
+expected_device = int(sys.argv[2])
+expected_inode = int(sys.argv[3])
+name = sys.argv[4]
+data = os.fstat(data_descriptor)
+if (
+    data.st_dev != expected_device
+    or data.st_ino != expected_inode
+    or not stat.S_ISDIR(data.st_mode)
+):
+    raise SystemExit(2)
+try:
+    existing = os.stat(name, dir_fd=data_descriptor, follow_symlinks=False)
+except FileNotFoundError:
+    previous_umask = os.umask(0)
+    try:
+        os.mkdir(name, 0o700, dir_fd=data_descriptor)
+    finally:
+        os.umask(previous_umask)
+    os.fsync(data_descriptor)
+    existing = os.stat(name, dir_fd=data_descriptor, follow_symlinks=False)
+if (
+    not stat.S_ISDIR(existing.st_mode)
+    or existing.st_uid != os.getuid()
+    or stat.S_IMODE(existing.st_mode) & 0o077
+):
+    raise SystemExit(2)
+'''
+
+
+def create_default_output_parent(
+    data: AnchoredDirectory,
+    name: str,
+    source_roots: Iterable[AnchoredDirectory],
+) -> None:
+    data_info = os.fstat(data.descriptor)
+    parent_path = data.path / name
+    try:
+        argv = sandboxed_python_argv(
+            CREATE_OUTPUT_PARENT_PROGRAM,
+            read_paths=(data.path,),
+            write_paths=(data.path, parent_path),
+            denied_write_roots=(root.path for root in source_roots),
+        )
+        argv.extend(
+            (
+                str(data.descriptor),
+                str(data_info.st_dev),
+                str(data_info.st_ino),
+                name,
+            )
+        )
+        run_bounded(
+            argv,
+            {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"},
+            timeout=MODEL_TIMEOUT_SECONDS,
+            cap=1,
+            pass_descriptors=(data.descriptor,),
+            discard_stderr=True,
+        )
+    except ProducerError as exc:
+        raise ProducerError("private snapshot directory could not be created safely") from exc
+
+
 PUBLISH_BOUNDARY_PROGRAM = r'''
 import os
 import stat
@@ -1515,8 +1684,6 @@ def publish_snapshot(
         )
     except ProducerError as exc:
         raise ProducerError("private snapshot publication boundary failed") from exc
-    observation.prove_unchanged()
-    reject_source_repository_parent(parent_descriptor, retained_source_roots)
     published = os.stat(output.name, dir_fd=parent_descriptor, follow_symlinks=False)
     if (
         not stat.S_ISREG(published.st_mode)

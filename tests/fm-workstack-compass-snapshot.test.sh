@@ -69,6 +69,23 @@ SH
   chmod 0755 "$app/bin/workstack-compass"
 }
 
+write_slow_model() {
+  local app=$1
+  write_fake_model "$app"
+  python3 - "$app/src/workstack_compass/model.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+text = text.replace(
+    "def snapshot_from_mapping(document):\n",
+    "def snapshot_from_mapping(document):\n    import time\n    time.sleep(1)\n",
+)
+path.write_text(text)
+PY
+}
+
 write_hostile_model() {
   local app=$1 marker=$2
   python3 - "$app/src/workstack_compass/model.py" "$marker" <<'PY'
@@ -404,33 +421,20 @@ test_executable_model_is_confined_and_copy_isolated() {
 }
 
 test_output_parent_relocation_refuses_without_source_write() {
-  local world private relocated marker fakebin real_tasks producer_pid rc
+  local world private relocated producer_pid rc
   world=$(make_world output-parent-relocation)
   private="$world/home/data/private"
   relocated="$world/alpha/relocated-output"
-  marker="$world/tasks-reader-started"
-  fakebin="$world/fakebin"
-  real_tasks=$(command -v tasks-axi)
-  mkdir -m 0700 "$private" "$fakebin"
-  cat > "$fakebin/tasks-axi" <<SH
-#!/usr/bin/env bash
-: > '$marker'
-sleep 1
-exec '$real_tasks' "\$@"
-SH
-  chmod 0755 "$fakebin/tasks-axi"
+  mkdir -m 0700 "$private"
+  write_slow_model "$world/app"
   set +e
-  PATH="$fakebin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
+  FM_HOME="$world/home" "$PRODUCER" \
     --workstack-root "$world/app" \
     --project-root "alpha=$world/alpha" \
     --output "$private/snapshot.json" >/dev/null 2>&1 &
   producer_pid=$!
   set -e
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -e "$marker" ] && break
-    sleep 0.1
-  done
-  [ -e "$marker" ] || fail "bounded backlog reader did not reach the relocation point"
+  sleep 0.3
   mv "$private" "$relocated"
   set +e
   wait "$producer_pid"
@@ -440,6 +444,47 @@ SH
   [ -z "$(find "$relocated" -mindepth 1 -maxdepth 1 -type f -print -quit)" ] \
     || fail "relocated output authority wrote into a bound source repository"
   pass "output authority relocation refuses without modifying a source repository"
+}
+
+test_default_parent_relocation_refuses_before_creation() {
+  local world relocated inject output rc
+  world=$(make_world default-parent-relocation)
+  rmdir "$world/home/data/workstack-compass"
+  relocated="$world/alpha/relocated-data"
+  inject="$world/inject-default-parent"
+  mkdir -p "$inject"
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+import subprocess
+
+source = os.environ["FM_TEST_DATA_SOURCE"]
+destination = os.environ["FM_TEST_DATA_DESTINATION"]
+real_popen = subprocess.Popen
+
+class GuardedPopen(real_popen):
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("pass_fds") and os.path.isdir(source) and not os.path.exists(destination):
+            os.rename(source, destination)
+        super().__init__(*args, **kwargs)
+
+subprocess.Popen = GuardedPopen
+PY
+  set +e
+  output=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    FM_TEST_DATA_SOURCE="$world/home/data" \
+    FM_TEST_DATA_DESTINATION="$relocated" \
+    FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "alpha=$world/alpha" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "producer accepted relocated default output authority"
+  assert_contains "$output" "could not be created safely" \
+    "default output relocation did not fail at the safe creation boundary"
+  [ -d "$relocated" ] || fail "default output race did not relocate FM_HOME data"
+  [ ! -e "$relocated/workstack-compass" ] \
+    || fail "default output race created a directory inside a bound repository"
+  pass "default output parent creation cannot follow data into a source"
 }
 
 test_publication_authority_relocation_cannot_write_source() {
@@ -589,56 +634,120 @@ PY
   pass "malformed and oversized source or output data are bounded safely"
 }
 
+test_tasks_axi_reader_is_stdin_only_and_confined() {
+  local world fakebin secret marker network_marker port_file port server_pid snapshot
+  world=$(make_world tasks-reader-confinement)
+  fakebin="$world/fakebin"
+  secret="$world/private-task-identity"
+  marker="$world/tasks-reader-write"
+  network_marker="$world/tasks-reader-network"
+  port_file="$world/tasks-reader-port"
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  mkdir -p "$fakebin"
+  printf '%s\n' 'task-secret' > "$secret"
+  python3 - "$port_file" "$network_marker" <<'PY' &
+import pathlib
+import socket
+import sys
+
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+server.settimeout(2)
+pathlib.Path(sys.argv[1]).write_text(str(server.getsockname()[1]))
+try:
+    connection, _ = server.accept()
+except socket.timeout:
+    pass
+else:
+    with connection:
+        connection.recv(64)
+    pathlib.Path(sys.argv[2]).write_text("connected")
+finally:
+    server.close()
+PY
+  server_pid=$!
+  while [ ! -s "$port_file" ]; do sleep 0.01; done
+  port=$(cat "$port_file")
+  cat > "$fakebin/tasks-axi" <<SH
+#!/usr/bin/env bash
+identity=
+IFS= read -r identity < '$secret' || identity=
+printf '%s\n' touched > '$marker' 2>/dev/null || :
+printf '%s\n' probe > /dev/tcp/127.0.0.1/$port 2>/dev/null || :
+if [ -n "\$identity" ]; then
+  printf '%s\n' 'count: 1'
+  printf '%s\n' 'tasks[1]{id,state,kind,repo,title}:'
+  printf '  %s,queued,ship,alpha,private-title\n' "\$identity"
+else
+  printf '%s\n' 'count: 0'
+  printf '%s\n' 'tasks[0]{id,state,kind,repo,title}:'
+fi
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$fakebin/tasks-axi"
+  cat > "$world/home/state/task-secret.meta" <<'META'
+kind=ship
+spawn_gen=spawn-task-secret
+META
+  PATH="$fakebin:$PATH" run_world "$world" >/dev/null \
+    || fail "confined stdin-only backlog reader could not return bounded identities"
+  wait "$server_pid" || fail "backlog reader network probe server failed"
+  [ ! -e "$marker" ] || fail "backlog reader wrote outside its boundary"
+  [ ! -e "$network_marker" ] || fail "backlog reader opened a network connection"
+  json_assert "$snapshot" \
+    '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:task-secret") | .project_identity) == null' \
+    "backlog reader read a private file outside its executable runtime"
+  pass "backlog reader is confined to stdin and its executable runtime"
+}
+
 test_optional_source_appearance_during_observation_refuses() {
-  local world snapshot before fakebin registry
+  local world snapshot before registry producer_pid rc
   world=$(make_world optional-source-race)
   snapshot="$world/home/data/workstack-compass/snapshot.json"
   run_world "$world" >/dev/null || fail "optional-source race baseline failed"
   before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
   registry="$world/home/data/projects.md"
   rm "$registry"
-  fakebin="$world/fakebin"
-  mkdir -p "$fakebin"
-  cat > "$fakebin/tasks-axi" <<SH
-#!/usr/bin/env bash
-printf '%s\n' '# appeared during observation' > '$registry'
-printf '%s\n' 'count: 0'
-printf '%s\n' 'tasks[0]{id,state,kind,repo,title}:'
-printf '%s\n' 'help[0]:'
-SH
-  chmod 0755 "$fakebin/tasks-axi"
-  run_failure "source changed during observation" env \
-    PATH="$fakebin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
-    --workstack-root "$world/app" \
-    --output "$snapshot"
+  write_slow_model "$world/app"
+  set +e
+  run_world "$world" >/dev/null 2>&1 &
+  producer_pid=$!
+  set -e
+  sleep 0.7
+  printf '%s\n' '# appeared during observation' > "$registry"
+  set +e
+  wait "$producer_pid"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "producer accepted an optional source appearance"
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "optional-source race changed the prior complete snapshot"
   pass "an optional source appearing mid-observation prevents publication"
 }
 
 test_source_change_during_observation_refuses() {
-  local world fakebin registry
+  local world snapshot before registry producer_pid rc
   world=$(make_world source-race)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
   registry="$world/home/data/projects.md"
-  fakebin="$world/fakebin"
-  mkdir -p "$fakebin"
-  cat > "$fakebin/tasks-axi" <<SH
-#!/usr/bin/env bash
-printf '%s\n' '# changed during observation' >> '$registry'
-printf '%s\n' 'count: 0'
-printf '%s\n' 'tasks[0]{id,state,kind,repo,title}:'
-printf '%s\n' 'help[0]:'
-SH
-  chmod 0755 "$fakebin/tasks-axi"
-  run_failure "source changed during observation" env \
-    PATH="$fakebin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
-    --workstack-root "$world/app" \
-    --project-root "data-team-management=$world/dtm" \
-    --project-root "gl-data-team-tickets=$world/tickets" \
-    --output "$world/home/data/workstack-compass/snapshot.json"
-  [ ! -e "$world/home/data/workstack-compass/snapshot.json" ] \
-    || fail "source-race refusal published a mixed observation"
-  pass "a source change during observation prevents mixed publication"
+  run_world "$world" >/dev/null || fail "source-race baseline generation failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  write_slow_model "$world/app"
+  set +e
+  run_world "$world" >/dev/null 2>&1 &
+  producer_pid=$!
+  set -e
+  sleep 0.7
+  printf '%s\n' '# changed during observation' >> "$registry"
+  set +e
+  wait "$producer_pid"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "producer accepted a source change before commit"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "source race replaced the prior complete snapshot"
+  pass "the final pre-commit proof preserves the prior raced snapshot"
 }
 
 test_private_application_model_integration() {
@@ -675,10 +784,12 @@ test_unsafe_outputs_and_sources_refuse
 test_nonexecutable_launcher_refuses_before_publication
 test_executable_model_is_confined_and_copy_isolated
 test_output_parent_relocation_refuses_without_source_write
+test_default_parent_relocation_refuses_before_creation
 test_publication_authority_relocation_cannot_write_source
 test_repository_containment_refuses_before_output_writes
 test_fifo_source_refuses_without_blocking_or_replacement
 test_malformed_and_oversized_inputs_and_output_refuse
+test_tasks_axi_reader_is_stdin_only_and_confined
 test_optional_source_appearance_during_observation_refuses
 test_source_change_during_observation_refuses
 test_private_application_model_integration
