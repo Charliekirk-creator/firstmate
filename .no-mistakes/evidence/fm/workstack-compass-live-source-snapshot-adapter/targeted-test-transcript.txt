@@ -1,0 +1,22 @@
+ok - sanitized local sources produce a validated, private, truthful snapshot
+ok - missing exact relations remain explicitly absent
+ok - duplicate and broken source identities refuse without partial replacement
+ok - complete snapshots replace atomically and model rejection preserves the prior file
+ok - path escapes, symlinks, and unsafe output files are refused
+ok - a nonexecutable Workstack launcher is refused before publication
+ok - executable model has no network, write, environment, or mutation authority
+ok - output authority relocation refuses without modifying a source repository
+ok - default output parent creation cannot follow data into a source
+ok - sandboxed publication cannot follow a relocated authority into a source
+ok - canonical repository containment is refused before output writes
+ok - special source files are refused without blocking or replacement
+ok - malformed and oversized source or output data are bounded safely
+ok - empty backlogs and literal none identities follow tasks-axi contracts
+ok - reader authorities participate in pre-write repository containment
+ok - runtime dependency races preserve the prior snapshot
+ok - backlog reader is confined to stdin and its executable runtime
+ok - reader package races preserve the prior snapshot
+ok - captured reader authorities and absolute shebang runtimes are exact
+ok - an optional source appearing mid-observation prevents publication
+ok - the final pre-commit proof preserves the prior raced snapshot
+ok - private Workstack executable model validates the sanitized generated snapshot

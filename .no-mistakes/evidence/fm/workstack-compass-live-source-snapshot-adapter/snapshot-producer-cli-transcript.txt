@@ -1,0 +1,9 @@
+$ fm-workstack-compass-snapshot.py --workstack-root <executable-model> --project-root <exact registered bindings>
+Snapshot: <isolated-fixture>/home/data/workstack-compass/snapshot.json
+Launch: cd <isolated-fixture>/app && ./bin/workstack-compass --snapshot <isolated-fixture>/home/data/workstack-compass/snapshot.json --color --reduced-motion
+Published file mode: 0600
+Executable-model schema accepted: workstack-compass.snapshot.v1
+Exact private snapshot path and launch command reported: yes
+Unavailable evidence remained unavailable: yes
+Fixture source/status prose, environment values, and private paths absent: yes
+Bound source repositories unchanged: yes

@@ -1,0 +1,5 @@
+Snapshot: /private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-workstack-e2e.6YiiGL/home/data/workstack-compass/snapshot.json
+Launch: cd /private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-workstack-e2e.6YiiGL/app && ./bin/workstack-compass --snapshot /private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-workstack-e2e.6YiiGL/home/data/workstack-compass/snapshot.json --color --reduced-motion
+Published file mode: 600
+Published file is complete JSON: yes
+Workstack Compass launched: no
