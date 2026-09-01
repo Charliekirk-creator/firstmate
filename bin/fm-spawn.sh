@@ -770,6 +770,8 @@ SPAWN_DISPATCH_TRANSACTION=
 SPAWN_ENDPOINT_RECEIPT=
 SPAWN_ENDPOINT_RECOVERED=0
 SPAWN_ENDPOINT_CREATING_RECOVERY=0
+SPAWN_ENDPOINT_MISSING=0
+SPAWN_ENDPOINT_WAS_SUBMITTED=0
 SPAWN_ENDPOINT_PHASE=
 SPAWN_LAUNCH_PREPARED_RECOVERY=0
 SPAWN_LAUNCH_SUBMITTED_RECOVERY=0
@@ -843,15 +845,15 @@ spawn_launch_request_paths() {
   SPAWN_LAUNCH_REQUEST_TOKEN="$SPAWN_DISPATCH_TRANSACTION:$LAUNCH_BRIEF_HASH"
 }
 
-spawn_launch_guard_state() {
-  local owner child value pid token
-  if [ ! -e "$SPAWN_LAUNCH_GUARD" ] && [ ! -L "$SPAWN_LAUNCH_GUARD" ]; then
+spawn_launch_guard_state_at() {
+  local guard=$1 owner child value pid token
+  if [ ! -e "$guard" ] && [ ! -L "$guard" ]; then
     printf 'absent'
     return 0
   fi
-  [ -d "$SPAWN_LAUNCH_GUARD" ] && [ ! -L "$SPAWN_LAUNCH_GUARD" ] || return 1
-  owner="$SPAWN_LAUNCH_GUARD/owner"
-  child="$SPAWN_LAUNCH_GUARD/child"
+  [ -d "$guard" ] && [ ! -L "$guard" ] || return 1
+  owner="$guard/owner"
+  child="$guard/child"
   if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then
     printf 'abandoned'
     return 0
@@ -883,6 +885,10 @@ spawn_launch_guard_state() {
   fi
 }
 
+spawn_launch_guard_state() {
+  spawn_launch_guard_state_at "$SPAWN_LAUNCH_GUARD"
+}
+
 spawn_launch_child_exec_state() {
   local child="$SPAWN_LAUNCH_GUARD/child" value pid token command
   [ -f "$child" ] && [ ! -L "$child" ] \
@@ -902,18 +908,37 @@ spawn_launch_child_exec_state() {
 }
 
 spawn_launch_guard_cleanup_retryable() {
-  local state entry
+  local state entry retired restore=0
   state=$(spawn_launch_guard_state) || return 1
-  case "$state" in absent) return 0 ;; abandoned|exited) ;; *) return 1 ;; esac
+  case "$state" in absent) return 0 ;; abandoned) ;; *) return 1 ;; esac
   [ ! -e "$SPAWN_LAUNCH_EXECUTED" ] && [ ! -L "$SPAWN_LAUNCH_EXECUTED" ] || return 1
-  for entry in "$SPAWN_LAUNCH_GUARD"/* "$SPAWN_LAUNCH_GUARD"/.[!.]* "$SPAWN_LAUNCH_GUARD"/..?*; do
+  retired=$(umask 077; mktemp -d "$STATE/.$ID.launch-execution-retired.XXXXXX") || return 1
+  rmdir -- "$retired" || return 1
+  mv -- "$SPAWN_LAUNCH_GUARD" "$retired" || return 1
+  state=$(spawn_launch_guard_state_at "$retired") || restore=1
+  if [ "$restore" -eq 0 ]; then
+    case "$state" in abandoned|starting) ;; *) restore=1 ;; esac
+  fi
+  if [ -e "$retired/child" ] || [ -L "$retired/child" ]; then restore=1; fi
+  if [ "$restore" -eq 1 ]; then
+    mv -- "$retired" "$SPAWN_LAUNCH_GUARD" || return 1
+    return 1
+  fi
+  for entry in "$retired"/* "$retired"/.[!.]* "$retired"/..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
-    case "${entry##*/}" in owner|child|.owner.tmp|.child.tmp) ;; *) return 1 ;; esac
+    case "${entry##*/}" in owner|.owner.tmp|.child.tmp) ;; *) restore=1; break ;; esac
     [ -f "$entry" ] && [ ! -L "$entry" ] \
-      && [ "$(spawn_file_link_count "$entry")" = 1 ] || return 1
+      && [ "$(spawn_file_link_count "$entry")" = 1 ] || { restore=1; break; }
+  done
+  if [ "$restore" -eq 1 ]; then
+    mv -- "$retired" "$SPAWN_LAUNCH_GUARD" || return 1
+    return 1
+  fi
+  for entry in "$retired"/* "$retired"/.[!.]* "$retired"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
     rm -f -- "$entry" || return 1
   done
-  rmdir -- "$SPAWN_LAUNCH_GUARD"
+  rmdir -- "$retired"
 }
 
 spawn_launch_request_file_matches() {  # <path> <value>
@@ -948,7 +973,11 @@ spawn_launch_request_state() {
         outcome=${outcome#exited:}
         outcome=${outcome%:"$SPAWN_LAUNCH_REQUEST_TOKEN"}
         case "$outcome" in ''|*[!0-9]*) return 1 ;; esac
-        printf 'launch-exited'
+        if [ "$outcome" -eq 0 ]; then
+          printf 'launch-exited'
+        else
+          printf 'launch-failed'
+        fi
         ;;
       *) return 1 ;;
     esac
@@ -1077,7 +1106,7 @@ spawn_launch_request_wait() {
         [ "$agent_state" != alive ] || return 0
         ;;
       launch-exited) return 0 ;;
-      failed|attempted-dead|launch-abandoned) return 2 ;;
+      failed|attempted-dead|launch-abandoned|launch-failed) return 2 ;;
     esac
     i=$((i + 1))
     [ "$i" -ge "$max" ] || sleep "$interval"
@@ -1091,7 +1120,7 @@ spawn_launch_acceptance_wait() {
     state=$(spawn_launch_request_state) || return 1
     case "$state" in
       accepted|executed|launch-exited) return 0 ;;
-      failed|attempted-dead|launch-abandoned) return 2 ;;
+      failed|attempted-dead|launch-abandoned|launch-failed) return 2 ;;
     esac
     i=$((i + 1))
     [ "$i" -ge "$max" ] || sleep "$interval"
@@ -1218,6 +1247,7 @@ spawn_endpoint_receipt_load() {
     return 1
   }
   SPAWN_ENDPOINT_PHASE=$(printf '%s' "$canonical" | jq -r '.phase') || return 1
+  [ "$SPAWN_ENDPOINT_PHASE" != launch-submitted ] || SPAWN_ENDPOINT_WAS_SUBMITTED=1
   if [ "$KIND" = secondmate ] && [ "$SECONDMATE_RESERVATION_PENDING" -eq 1 ]; then
     SECONDMATE_RESERVATION_PRESERVE=1
   fi
@@ -1231,11 +1261,17 @@ spawn_endpoint_receipt_load() {
   if ! fm_backend_target_exists "$BACKEND" "$target" "$W"; then
     endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
     if [ "$endpoint_state" = missing ]; then
-      echo "error: recorded spawn endpoint is gone for $ID: $target" >&2
-      return 2
+      case "$SPAWN_ENDPOINT_PHASE" in
+        launch-prepared|launch-submitted) SPAWN_ENDPOINT_MISSING=1 ;;
+        *)
+          echo "error: recorded spawn endpoint is gone for $ID: $target" >&2
+          return 2
+          ;;
+      esac
+    else
+      echo "error: recorded spawn endpoint is unavailable for $ID: $target" >&2
+      return 1
     fi
-    echo "error: recorded spawn endpoint is unavailable for $ID: $target" >&2
-    return 1
   fi
   if [ "$BACKEND" = tmux ] || [ "$BACKEND" = herdr ]; then
     endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
@@ -1736,7 +1772,7 @@ spawn_abort_cleanup() {
       launch-prepared)
         launch_abort_state=$(spawn_launch_request_state 2>/dev/null || printf ambiguous)
         case "$launch_abort_state" in
-          accepted|executed|launch-exited|attempted-live|unattempted-live) preserve_published_launch=1 ;;
+          accepted|executed|launch-exited|launch-failed|attempted-live|unattempted-live) preserve_published_launch=1 ;;
         esac
         ;;
     esac
@@ -2867,9 +2903,7 @@ if [ "$RELAUNCH" -eq 0 ] \
   endpoint_receipt_rc=0
   spawn_endpoint_receipt_load || endpoint_receipt_rc=$?
   if [ "$endpoint_receipt_rc" -eq 2 ]; then
-    rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || exit 1
-    SECONDMATE_RESERVATION_PRESERVE=0
-    echo "error: retired the missing endpoint receipt for $ID; rerun spawn to create a replacement" >&2
+    echo "error: recorded endpoint is gone for $ID; exact receipt is preserved for reconciliation" >&2
     exit 1
   fi
   [ "$endpoint_receipt_rc" -eq 0 ] || exit "$endpoint_receipt_rc"
@@ -2892,7 +2926,15 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
       }
       SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
       ;;
+    launch-failed)
+      echo "error: launch command for $ID exited unsuccessfully; terminal execution evidence is preserved" >&2
+      exit 1
+      ;;
     absent|failed|unattempted-dead|attempted-dead|launch-abandoned)
+      if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
+        echo "error: recorded endpoint disappeared before launch acceptance for $ID; exact evidence is preserved" >&2
+        exit 1
+      fi
       spawn_launch_guard_cleanup_retryable || {
         echo "error: retryable execution guard could not be retired for $ID" >&2
         exit 1
@@ -2929,10 +2971,15 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -eq 1 ]; then
     echo "error: submitted launch lacks exact backend acceptance for $ID" >&2
     exit 1 ;;
   esac
-  spawn_launch_delivery_wait || {
-    echo "error: submitted launch has not published exact backend acceptance for $ID" >&2
+  if [ "$SPAWN_ENDPOINT_MISSING" -ne 1 ]; then
+    spawn_launch_delivery_wait || {
+      echo "error: submitted launch has not published exact backend acceptance for $ID" >&2
+      exit 1
+    }
+  elif [ "$SPAWN_ENDPOINT_WAS_SUBMITTED" -ne 1 ] && [ "$KIND" = secondmate ]; then
+    echo "error: secondmate endpoint disappeared before durable launch acceptance for $ID; exact evidence is preserved" >&2
     exit 1
-  }
+  fi
 fi
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
@@ -5351,6 +5398,10 @@ if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
 fi
 if [ "$RELAUNCH" -eq 0 ]; then
+  if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
+    echo "error: accepted launch for $ID was reconciled, but its endpoint is gone; exact receipt is preserved" >&2
+    exit 1
+  fi
   rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
     echo "error: accepted launch receipt could not be retired for $ID" >&2
     exit 1

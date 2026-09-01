@@ -244,6 +244,32 @@ SH
   chmod +x "$case_dir/fakebin/tmux"
 }
 
+make_worker_exit_nonzero() {  # <case-dir>
+  cat > "$1/fakebin/claude" <<'SH'
+#!/usr/bin/env bash
+exit 42
+SH
+  chmod +x "$1/fakebin/claude"
+}
+
+remove_launch_endpoint() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "$*" in *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;; esac
+case "${1:-}" in
+  display-message)
+    case "$*" in *"#{pane_id}"*|*"#{pane_current_command}"*) exit 1 ;; esac
+    printf 'firstmate\n'
+    exit 0
+    ;;
+  has-session|list-windows) exit 1 ;;
+esac
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+}
+
 fail_launch_submitted_publish_once() {  # <case-dir> <receipt>
   local case_dir=$1 receipt=$2 real
   real=$(command -v mv)
@@ -1020,6 +1046,63 @@ test_exited_launch_is_reconciled_without_replay() {
   assert_absent "$home/state/$id.spawn-endpoint.json" \
     "executed launch recovery retained its completed acceptance receipt"
   pass "exited launches reconcile from execution evidence without replay"
+}
+
+test_failed_exited_launch_is_terminal_and_never_replayed() {
+  local case_dir home id out rc=0
+  id=atomic-dispatch-failed-launch-b5
+  case_dir=$(make_home dispatch-failed-launch "$id")
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  execute_launch_then_exit "$case_dir" "$id"
+  make_worker_exit_nonzero "$case_dir"
+
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "failed worker launch was reported as spawned"
+  [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
+    || fail "failed worker launch did not execute exactly once"
+  assert_present "$home/state/$id.meta" \
+    "failed worker launch lost its terminal execution metadata"
+  [ "$(row_state "$case_dir" "$id")" = queued ] \
+    || fail "failed worker launch moved its backlog row"
+
+  rc=0
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "terminal failed launch was reported as spawned on retry"
+  assert_contains "$out" "exited unsuccessfully" \
+    "failed launch retry did not report terminal execution evidence"
+  [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
+    || fail "terminal failed launch was replayed"
+  pass "failed exited launches remain terminal without replay"
+}
+
+test_missing_accepted_endpoint_reconciles_without_losing_its_receipt() {
+  local case_dir home id out rc=0
+  id=atomic-dispatch-missing-accepted-endpoint-b5
+  case_dir=$(make_home dispatch-missing-accepted-endpoint "$id")
+  home=$(home_of "$case_dir")
+  add_item "$case_dir" "$id"
+  break_verb "$case_dir" start
+
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "accepted launch with failed backlog commit reported success"
+  assert_present "$home/state/$id.spawn-endpoint.json" \
+    "accepted launch lost its endpoint receipt"
+
+  restore_tasks_axi "$case_dir"
+  remove_launch_endpoint "$case_dir"
+  rc=0
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "missing accepted endpoint was reported as a live spawn"
+  assert_contains "$out" "was reconciled, but its endpoint is gone" \
+    "missing accepted endpoint did not report conservative reconciliation"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "missing accepted endpoint left accepted metadata paired with queued work"
+  assert_present "$home/state/$id.meta" \
+    "missing accepted endpoint reconciliation lost task metadata"
+  assert_present "$home/state/$id.spawn-endpoint.json" \
+    "missing accepted endpoint reconciliation lost its exact receipt"
+  pass "missing accepted endpoints reconcile without discarding exact receipts"
 }
 
 test_dispatch_defers_interruption_across_backlog_commit() {
@@ -2383,6 +2466,8 @@ test_dispatch_reports_an_incomplete_record_rollback
 test_dispatch_reports_an_incomplete_busy_rollback
 test_dispatch_rolls_back_before_a_failed_launch_delivery
 test_exited_launch_is_reconciled_without_replay
+test_failed_exited_launch_is_terminal_and_never_replayed
+test_missing_accepted_endpoint_reconciles_without_losing_its_receipt
 test_dispatch_defers_interruption_across_backlog_commit
 test_dispatch_interruption_during_kimi_readiness_fails_before_commit
 test_dispatch_does_not_resurrect_a_row_closed_after_preflight
