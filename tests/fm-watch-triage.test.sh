@@ -976,7 +976,7 @@ EOF
 completed transcript
 ────────────────────────
 gigachad:~/work
-main  ctx:0%  0  Sol 5.6 (272k context)  10:04  · compact in 94%
+main  ctx:0%  0  Sol 5.6 (272k context)  10:03  · compact in 94%
 ▶▶ agent ready · high thinking
 EOF
   old_pane=$(cat "$old_capture")
@@ -1029,6 +1029,52 @@ EOF
     || fail "genuine Pi progress after legacy migration did not surface when it became stale"
   unset FM_FAKE_CREW_STATE
   pass "legacy Pi hashes fail closed then migrate without duplicate stale wakes"
+}
+
+test_pi_legacy_hash_migration_preserves_unseen_progress() {
+  local dir state fakebin out capture_file old_capture window key old_pane old_hash formatf pid
+  dir=$(make_case pi-legacy-hash-unseen-progress); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; old_capture="$dir/old-pane.txt"
+  window="test:fm-pi-legacy-progress"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  formatf="$state/.pane-hash-format-$key"
+  cat > "$old_capture" <<'EOF'
+completed transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:03  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+  cat > "$capture_file" <<'EOF'
+completed transcript
+new tool output rendered before migration
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:03  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+  old_pane=$(cat "$old_capture")
+  old_hash=$(hash_text "$old_pane")
+  printf 'window=%s\nkind=ship\nharness=pi\n' "$window" > "$state/legacy-progress.meta"
+  printf '%s' "$old_hash" > "$state/.hash-$key"
+  printf '%s' "$old_hash" > "$state/.stale-$key"
+  printf '2\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · idle Pi fixture'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { reap "$pid"; fail "Pi progress rendered before legacy migration was classified as already stale"; }
+  grep -Fx "stale: $window" "$out" >/dev/null \
+    || fail "Pi progress rendered before legacy migration did not surface when it became stale"
+  [ "$(cat "$formatf" 2>/dev/null || true)" = pi-footer-clock-v1 ] \
+    || fail "Pi progress migration did not publish its normalized baseline"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" != "$old_hash" ] \
+    || fail "Pi progress migration retained its legacy stale classification"
+  unset FM_FAKE_CREW_STATE
+  pass "legacy Pi migration preserves progress rendered after the old marker"
 }
 
 test_turn_ended_churn_resets_prior_stale_classification() {
@@ -4153,6 +4199,7 @@ test_turn_ended_churning_pane_absorbed
 test_turn_ended_pi_clock_tick_is_not_churn
 test_turn_ended_pi_capture_uses_snapshot_harness
 test_turn_ended_pi_legacy_hash_migrates_without_false_progress
+test_pi_legacy_hash_migration_preserves_unseen_progress
 test_turn_ended_churn_resets_prior_stale_classification
 test_turn_ended_churn_resets_wedge_state_before_stale_poll
 test_turn_ended_still_pane_surfaced

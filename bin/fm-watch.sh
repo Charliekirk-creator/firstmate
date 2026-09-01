@@ -1817,8 +1817,12 @@ EOF
       stale_hash=$(cat "$sf" 2>/dev/null || true)
       printf '%s' "$h" > "$hf" || continue
       echo 0 > "$cf" || continue
-      if [ -n "$prev" ] && [ "$stale_hash" = "$prev" ]; then
+      if [ -n "$prev" ] && [ "$stale_hash" = "$prev" ] \
+        && [ "$(printf '%s' "$tail40" | hash_pane)" = "$prev" ]; then
         printf '%s' "$h" > "$sf" || continue
+      else
+        rm -f "$sf" "$ssf" "$ewf" || continue
+        clear_write_tracking "$key"
       fi
       case "$harness" in
         pi|pi-signed) printf '%s' "$PANE_MARKER_PI_FORMAT" > "$formatf" || continue ;;
