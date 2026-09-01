@@ -729,6 +729,24 @@ META
   pass "empty backlogs and literal none identities follow tasks-axi contracts"
 }
 
+test_in_flight_tasks_without_generation_metadata_are_partial() {
+  local world snapshot
+  world=$(make_world missing-in-flight-metadata)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  rm -f "$world/home/state"/*.meta
+  run_world "$world" >/dev/null \
+    || fail "in-flight tasks without generation metadata were refused"
+  json_assert "$snapshot" '.worker_incarnations == []' \
+    "missing generation metadata fabricated worker incarnations"
+  json_assert "$snapshot" \
+    '(.sources[] | select(.source_identity == "source:firstmate-task-identities") | .completeness) == "partial"' \
+    "missing in-flight generation metadata was reported as complete"
+  json_assert "$snapshot" \
+    '(.sources[] | select(.source_identity == "source:firstmate-task-identities") | .detail | contains("records without exact incarnation identity are omitted"))' \
+    "missing in-flight generation metadata was not disclosed"
+  pass "in-flight generation gaps remain partial evidence"
+}
+
 test_reader_source_repository_containment() {
   local world package private snapshot
   world=$(make_world reader-source-containment)
@@ -984,6 +1002,75 @@ PY
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "aggregate dependency refusal replaced the prior snapshot"
   pass "retained runtime dependencies share the aggregate reader size bound"
+}
+
+test_runtime_growth_refuses_before_materialization() {
+  local world runtime fakebin library snapshot before inject marker
+  world=$(make_world runtime-growth-before-materialization)
+  runtime="$world/runtime"
+  fakebin="$world/fakebin"
+  library="$runtime/lib/libreader.dylib"
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  inject="$world/inject-runtime-growth"
+  marker="$world/reader-staging-started"
+  mkdir -p "$runtime/bin" "$runtime/lib" "$fakebin" "$inject"
+  cat > "$world/reader-runtime.c" <<'C'
+#include <stdio.h>
+extern const char *reader_output(void);
+int main(void) { fputs(reader_output(), stdout); return 0; }
+C
+  cat > "$world/reader-library.c" <<'C'
+const char *reader_output(void) { return "count: 0\ntasks: 0 tasks in this backlog\nhelp[0]:\n"; }
+C
+  cc -dynamiclib -install_name "$library" "$world/reader-library.c" -o "$library"
+  cc "$world/reader-runtime.c" "$library" -o "$runtime/bin/node"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env node
+SH
+  chmod 0755 "$runtime/bin/node" "$fakebin/tasks-axi"
+  PATH="$fakebin:$runtime/bin:/usr/bin:/bin" run_world "$world" >/dev/null \
+    || fail "runtime growth baseline failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+
+library = Path(os.environ["FM_TEST_RUNTIME_LIBRARY"])
+marker = Path(os.environ["FM_TEST_STAGING_MARKER"])
+real_popen = subprocess.Popen
+grown = False
+
+
+class GuardedPopen(real_popen):
+    def __init__(self, args, *pargs, **kwargs):
+        global grown
+        values = [os.fspath(value) for value in args]
+        if not grown and values and values[-1] == "workstack-compass":
+            with library.open("r+b") as stream:
+                stream.truncate(300 * 1024 * 1024)
+            grown = True
+        if any(Path(value).name.startswith(".workstack-reader.") for value in values):
+            marker.write_text("started")
+            raise OSError("unsafe reader staging started")
+        super().__init__(args, *pargs, **kwargs)
+
+
+subprocess.Popen = GuardedPopen
+PY
+  run_failure "source changed during observation" env \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    FM_TEST_RUNTIME_LIBRARY="$library" \
+    FM_TEST_STAGING_MARKER="$marker" \
+    PATH="$fakebin:$runtime/bin:/usr/bin:/bin" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha"
+  [ ! -e "$marker" ] || fail "grown runtime reached the staging boundary"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "runtime growth refusal replaced the prior snapshot"
+  pass "runtime growth refuses before reader materialization"
 }
 
 test_tasks_axi_reader_is_stdin_only_and_confined() {
@@ -1297,9 +1384,11 @@ test_repository_containment_refuses_before_output_writes
 test_fifo_source_refuses_without_blocking_or_replacement
 test_malformed_and_oversized_inputs_and_output_refuse
 test_empty_backlog_and_literal_none_relation
+test_in_flight_tasks_without_generation_metadata_are_partial
 test_reader_source_repository_containment
 test_runtime_dependency_race_refuses
 test_runtime_dependency_aggregate_bound_refuses
+test_runtime_growth_refuses_before_materialization
 test_tasks_axi_reader_is_stdin_only_and_confined
 test_tasks_axi_package_race_refuses
 test_reader_executes_captured_authority_and_absolute_shebang

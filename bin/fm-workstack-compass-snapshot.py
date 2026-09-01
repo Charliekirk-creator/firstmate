@@ -149,6 +149,7 @@ class ReaderAsset:
     payload: bytes | None
     executable: bool
     descriptor: int | None = None
+    fingerprint: Fingerprint | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ class ReaderBoundary:
     dependency_directories: tuple[tuple[str, ...], ...]
     cwd: Path
     source_roots: tuple[AnchoredDirectory, ...]
+    retained_entries: tuple[tuple[int, Fingerprint], ...]
 
 
 class Observation:
@@ -501,7 +503,7 @@ class Observation:
         self,
         anchor: AnchoredDirectory,
         relative: str | Path | Sequence[str],
-    ) -> int:
+    ) -> tuple[int, Fingerprint]:
         parts = self._parts(anchor, relative)
         try:
             descriptor = self._open_entry(anchor, parts)
@@ -513,8 +515,20 @@ class Observation:
             if "descriptor" in locals():
                 os.close(descriptor)
             raise
+        fingerprint = self._fingerprint(info)
         self._retained_entries.append(descriptor)
-        return descriptor
+        return descriptor, fingerprint
+
+    def prove_retained(
+        self, entries: Iterable[tuple[int, Fingerprint]]
+    ) -> None:
+        for descriptor, expected in entries:
+            try:
+                current = os.fstat(descriptor)
+            except OSError as exc:
+                raise SourceChanged("source changed during observation") from exc
+            if self._fingerprint(current) != expected:
+                raise SourceChanged("source changed during observation")
 
     def _remember(
         self,
@@ -1280,16 +1294,25 @@ def tasks_axi_boundary(
         runtime, runtime_anchor, observation
     )
     assets = list(package_assets)
-    runtime_descriptor = observation.retain_under(runtime_anchor, runtime.name)
-    runtime_size = os.fstat(runtime_descriptor).st_size
-    if runtime_size > MAX_READER_STAGING_BYTES:
+    runtime_descriptor, runtime_fingerprint = observation.retain_under(
+        runtime_anchor, runtime.name
+    )
+    if runtime_fingerprint.size > MAX_READER_STAGING_BYTES:
         raise ProducerError("reader staging image exceeds its size bound")
     runtime_relative: tuple[str, ...] | None = None
     if not any(
         runtime.is_relative_to(root) for root in (Path("/bin"), Path("/usr/bin"))
     ):
         runtime_relative = ("runtime", runtime.name)
-        assets.append(ReaderAsset(runtime_relative, None, True, runtime_descriptor))
+        assets.append(
+            ReaderAsset(
+                runtime_relative,
+                None,
+                True,
+                runtime_descriptor,
+                runtime_fingerprint,
+            )
+        )
     dependency_directories: list[tuple[str, ...]] = []
     dependency_names: set[str] = set()
     for index, (dependency, names) in enumerate(dependencies):
@@ -1306,27 +1329,35 @@ def tasks_axi_boundary(
         )
         if anchor is None:
             raise ProducerError("runtime dependency authority is unavailable")
-        descriptor = observation.retain_under(anchor, dependency.name)
-        dependency_size = os.fstat(descriptor).st_size
-        if dependency_size > MAX_READER_STAGING_BYTES:
+        descriptor, dependency_fingerprint = observation.retain_under(
+            anchor, dependency.name
+        )
+        if dependency_fingerprint.size > MAX_READER_STAGING_BYTES:
             raise ProducerError("reader staging image exceeds its size bound")
         directory = ("dependencies", str(index))
         dependency_directories.append(directory)
         assets.extend(
-            ReaderAsset((*directory, name), None, False, descriptor)
+            ReaderAsset(
+                (*directory, name),
+                None,
+                False,
+                descriptor,
+                dependency_fingerprint,
+            )
             for name in names
         )
-    retained_descriptors = {
-        runtime_descriptor,
-        *(
-            asset.descriptor
-            for asset in assets
-            if asset.descriptor is not None
-        ),
-    }
+    retained_entries = {runtime_descriptor: runtime_fingerprint}
+    for asset in assets:
+        if asset.descriptor is None:
+            continue
+        if asset.fingerprint is None:
+            raise ProducerError("reader staging image contains an unsafe retained asset")
+        prior = retained_entries.setdefault(asset.descriptor, asset.fingerprint)
+        if prior != asset.fingerprint:
+            raise SourceChanged("source changed during observation")
     staging_size = sum(
         len(asset.payload) for asset in assets if asset.payload is not None
-    ) + sum(os.fstat(descriptor).st_size for descriptor in retained_descriptors)
+    ) + sum(fingerprint.size for fingerprint in retained_entries.values())
     if staging_size > MAX_READER_STAGING_BYTES:
         raise ProducerError("reader staging image exceeds its size bound")
     executable_staged_relative = ("package", *executable_relative)
@@ -1372,6 +1403,7 @@ def tasks_axi_boundary(
         tuple(dependency_directories),
         empty_home,
         tuple(dict.fromkeys(authorities)),
+        tuple(retained_entries.items()),
     )
 
 
@@ -1548,19 +1580,24 @@ os.fsync(parent_descriptor)
 
 
 def reader_stage_payload(assets: Sequence[ReaderAsset]) -> bytes:
-    manifest = [
-        {
-            "path": list(asset.relative),
-            "size": (
-                len(asset.payload)
-                if asset.payload is not None
-                else os.fstat(asset.descriptor).st_size
-            ),
-            "executable": asset.executable,
-            "descriptor": asset.descriptor,
-        }
-        for asset in assets
-    ]
+    manifest: list[dict[str, Any]] = []
+    for asset in assets:
+        if asset.payload is not None:
+            if asset.descriptor is not None or asset.fingerprint is not None:
+                raise ProducerError("reader staging image contains an unsafe asset")
+            size = len(asset.payload)
+        else:
+            if asset.descriptor is None or asset.fingerprint is None:
+                raise ProducerError("reader staging image contains an unsafe retained asset")
+            size = asset.fingerprint.size
+        manifest.append(
+            {
+                "path": list(asset.relative),
+                "size": size,
+                "executable": asset.executable,
+                "descriptor": asset.descriptor,
+            }
+        )
     header = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
     if len(header) > 1024 * 1024:
         raise ProducerError("reader staging image exceeds its metadata bound")
@@ -1608,6 +1645,7 @@ def read_backlog_tasks(
     output: Path,
     parent_descriptor: int,
     source_roots: Sequence[AnchoredDirectory],
+    observation: Observation,
 ) -> list[BacklogTask]:
     if payload is None:
         return []
@@ -1616,6 +1654,7 @@ def read_backlog_tasks(
     parent_info = os.fstat(parent_descriptor)
     stage_name = f".workstack-reader.{os.getpid()}.{os.urandom(8).hex()}"
     stage_path = output.parent / stage_name
+    observation.prove_retained(boundary.retained_entries)
     staging_payload = reader_stage_payload(boundary.assets)
     try:
         stage_argv = sandboxed_python_argv(
@@ -1652,6 +1691,7 @@ def read_backlog_tasks(
             )
         except ProducerError as exc:
             raise ProducerError(f"reader staging boundary failed: {exc}") from exc
+        observation.prove_retained(boundary.retained_entries)
         runtime = (
             stage_path.joinpath(*boundary.runtime_relative)
             if boundary.runtime_relative is not None
@@ -1767,7 +1807,8 @@ def collect_workers(
     tasks = {record.identity: record for record in backlog_tasks}
     workers: list[dict[str, Any]] = []
     total_bytes = 0
-    omitted = 0
+    omitted_identities: set[str] = set()
+    generation_identities: set[str] = set()
     for name in names:
         identity = name[:-5]
         if not TASK_ID_RE.fullmatch(identity):
@@ -1783,7 +1824,7 @@ def collect_workers(
             if line.startswith("spawn_gen=")
         )
         if spawn_generation_count == 0:
-            omitted += 1
+            omitted_identities.add(identity)
             continue
         if spawn_generation_count != 1:
             raise ProducerError(
@@ -1819,8 +1860,14 @@ def collect_workers(
             "source_identity": "source:firstmate-task-identities",
         }
         workers.append(row)
+        generation_identities.add(identity)
+    omitted_identities.update(
+        task.identity
+        for task in tasks.values()
+        if task.state == "in_flight" and task.identity not in generation_identities
+    )
     workers.sort(key=lambda row: row["worker_incarnation_identity"])
-    return workers, True, omitted, bool(workers)
+    return workers, True, len(omitted_identities), bool(workers)
 
 
 def inspect_project_sources(
@@ -2608,6 +2655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output,
             parent_descriptor,
             source_roots,
+            observation,
         )
         (
             workers,
