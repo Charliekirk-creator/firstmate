@@ -214,13 +214,15 @@ run() {  # <home> <fakebin> <args...>
 }
 
 write_remote_home_summary() {  # <remote-home> <generated-epoch>
-  local home=$1 epoch=$2
+  local home=$1 epoch=$2 home_id
+  home_id="secondmate:ledger-${home##*-}"
   mkdir -p "$home/state"
-  jq -n --arg home "$home" --argjson epoch "$epoch" '{
+  jq -n --arg home "$home" --arg home_id "$home_id" --argjson epoch "$epoch" '{
     schema:"fm-secondmate-home-summary.v1",
-    generated:"2026-09-01T22:00:00Z",generated_epoch:$epoch,home:$home,
+    generated:"2026-09-01T22:00:00Z",generated_epoch:$epoch,home:$home,home_id:$home_id,
     valid:true,reason:null,invalidity:{kind:null,ids:[]},state:"no_active_work",
     active_children:[],decisions_open:[],holds:[],queued:[],landed:[],endpoints:[],
+    work_identity_index:[],
     counts:{active_children:0,decisions_open:0,holds:0,queued:0,landed:0,endpoints:0},omitted:[]
   }' > "$home/state/home-summary.json"
 }
@@ -620,6 +622,53 @@ test_bad_secondmate_homes_never_revive_parent_work() {
       and (.secondmate_reconcile[1].kind == "child_current_unavailable")
   ' >/dev/null || fail "bad home outcomes revived stale work or lacked provenance: $json"
   pass "unsafe homes stop publication while unavailable summaries stay explicit"
+}
+
+test_unsampled_remote_secondmates_are_not_probed() {
+  local home fakebin fake_ssh calls canonical id host remote_home
+  home=$(make_home bounded-remote-probes)
+  fakebin=$(make_fakebin "$home")
+  fake_ssh="$fakebin/fake-ssh"
+  calls="$home/remote-calls"
+  : > "$home/data/secondmates.md"
+  : > "$calls"
+  for id in remote-a remote-b remote-c; do
+    host="host-$id"
+    remote_home="/remote/$id"
+    printf -- '- %s - bounded remote fixture (host: %s; root: %s; home: %s; scope: bounded reads; projects: firstmate; added 2026-07-11)\n' \
+      "$id" "$host" "$ROOT" "$remote_home" >> "$home/data/secondmates.md"
+    fm_write_meta "$home/state/$id.meta" \
+      "window=remote:$id" "endpoint_task_id=$id" "worktree=$remote_home" \
+      "project=$ROOT" "harness=codex" "kind=secondmate" "mode=secondmate" \
+      "home=$remote_home" "projects=firstmate" "remote_host=$host" \
+      "remote_root=$ROOT" "remote_backend=herdr" "remote_target=target-$id"
+  done
+  cat > "$fake_ssh" <<SH
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$calls"
+exit 255
+SH
+  chmod +x "$fake_ssh"
+  canonical=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_SSH_BIN="$fake_ssh" FM_SNAPSHOT_SECONDMATES=1 \
+    FM_SNAPSHOT_SECONDMATE_TIMEOUT=2 FM_SNAPSHOT_NOW=2026-07-11T18:00:00Z \
+    "$ROOT/bin/fm-fleet-snapshot.sh" --json)
+  [ "$(wc -l < "$calls" | tr -d ' ')" -eq 1 ] \
+    || fail "remote task inventory bypassed the sampled-home bound: $(cat "$calls")"
+  assert_contains "$(cat "$calls")" "host-remote-a" \
+    "the first sampled remote home was not queried"
+  assert_not_contains "$(cat "$calls")" "host-remote-b" \
+    "an unsampled remote home was queried"
+  assert_not_contains "$(cat "$calls")" "host-remote-c" \
+    "an unsampled remote home was queried"
+  printf '%s' "$canonical" | jq -e '
+    .secondmate_current.shown == 1
+      and .secondmate_current.truncated == 2
+      and ([.tasks[] | select(.id == "remote-b" or .id == "remote-c")
+        | select(.current_state.state == "unknown"
+          and .endpoint.exists == null and .endpoint.agent_alive == "unknown")] | length) == 2
+  ' >/dev/null || fail "unsampled remote task state was not explicitly unknown: $canonical"
+  pass "remote home reads respect the sampled secondmate bound"
 }
 
 test_oversized_secondmate_summary_stays_strict_unknown() {
@@ -2302,6 +2351,13 @@ test_a_remote_home_without_any_ledger_is_explicitly_unreadable_without_remote_co
   pass "a missing remote ledger stays explicitly unreadable without remote summary computation"
 }
 
+case "${1:-}" in
+  remote-probe-bound)
+    test_unsampled_remote_secondmates_are_not_probed
+    exit 0
+    ;;
+esac
+
 test_remote_ledgers_share_one_concurrent_budget_and_fall_back_to_cache
 test_a_remote_home_without_any_ledger_is_explicitly_unreadable_without_remote_compute
 test_domain_alpha_stale_parent_event_does_not_become_current_work
@@ -2310,6 +2366,7 @@ test_parent_activity_evidence_is_bounded_and_disclosed
 test_active_child_overrides_old_parent_event
 test_structured_child_decision_reaches_captains_call
 test_bad_secondmate_homes_never_revive_parent_work
+test_unsampled_remote_secondmates_are_not_probed
 test_oversized_secondmate_summary_stays_strict_unknown
 test_secondmate_and_child_bounds_are_disclosed
 test_parent_decision_is_untrusted_contradiction_only

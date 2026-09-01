@@ -216,18 +216,6 @@ command_hold() {
   exec "$CAPTAIN_HOLD" hold "$id" --origin "$origin" "$@"
 }
 
-with_backlog_mutation_lock() {
-  local operation=$1
-  shift
-  mkdir -p "$STATE" || fail "could not create state directory"
-  DECISION_BACKLOG_LOCK="$STATE/.backlog-mutation.lock"
-  fm_lock_acquire_wait "$DECISION_BACKLOG_LOCK"
-  DECISION_BACKLOG_LOCK_HELD=1
-  "$operation" "$@"
-  fm_lock_release "$DECISION_BACKLOG_LOCK"
-  DECISION_BACKLOG_LOCK_HELD=0
-}
-
 case "${1:-}" in
   id) shift; [ "$#" -eq 2 ] || { usage >&2; exit 2; }; compose "$1" "$2"; printf '\n' ;;
   hold) shift; command_hold "$@" ;;

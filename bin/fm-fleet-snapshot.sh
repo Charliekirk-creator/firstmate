@@ -39,9 +39,9 @@
 #     unsafe, stale, cross-home, or task-mismatched linked records refuse the
 #     whole snapshot rather than disappearing or falling back to fuzzy fields.
 #     Local current_state is parsed from bin/fm-crew-state.sh <id> and preserves
-#     state, source, detail, and raw line separately. Remote secondmate rows use
-#     an explicit unknown value because their endpoint liveness belongs to
-#     supervision rather than this snapshot path.
+#     state, source, detail, and raw line separately. Remote task inventory uses
+#     an explicit unknown value here; bounded remote-home state is projected only
+#     through sampled secondmate_current records.
 #     paths.status_log.last_event is historical wake-event data only, never
 #     current state.
 #     hints.open_decisions is the keyed open-decision set returned by
@@ -50,8 +50,8 @@
 #     booleans derived from that set.
 #     endpoint.exists is the cheap local backend endpoint-presence read.
 #     endpoint.agent_alive is populated for local secondmates only, where it is
-#     useful return-channel supervision data; remote secondmates use "unknown"
-#     without a probe, and other tasks use "not_checked".
+#     useful return-channel supervision data; remote task endpoint state remains
+#     unknown without a probe, and other tasks use "not_checked".
 #   scout_reports[]: present data/<id>/report.md pointers.
 #   main_inventory: {valid,reason,orphan_in_flight[],unstructured_current_count} -
 #     main-home current-inventory checks shared with secondmate_home_summary_json
@@ -223,7 +223,8 @@ when the live read fails, is invalid, or consumes the budget. A home with neithe
 a valid ledger nor a valid cached copy is reported unreadable with the reason;
 collection never computes a summary in that home. Exact identity streams get a
 fresh FM_SNAPSHOT_SECONDMATE_TIMEOUT deadline per sampled home, without affecting
-later homes. Each local per-task current-state read is bounded by
+later homes. Unsampled remote task inventory remains unknown without contacting
+its route. Each local per-task current-state read is bounded by
 FM_SNAPSHOT_CREW_STATE_TIMEOUT (default 10 seconds); a read that hits the bound
 reports state unknown. Remote secondmate endpoint liveness is not probed by this
 command.
