@@ -104,6 +104,64 @@ SH
   pass "grok fresh abort retires provisional harness wiring"
 }
 
+test_grok_crash_recovers_provisional_authorization() {
+  local rec case_dir home proj wt fakebin grok_home id out status=0 real_chmod marker old_auth auth_count
+  rec=$(make_spawn_case crash-wiring)
+  IFS='|' read -r case_dir home proj wt fakebin grok_home id <<EOF
+$rec
+EOF
+  real_chmod=$(command -v chmod)
+  marker="$case_dir/killed-during-wiring"
+  {
+    cat <<SH
+#!/usr/bin/env bash
+set -u
+target=\${!#}
+case "\$target" in
+  */hooks/fm-turn-end.sh)
+    if [ ! -e "$marker" ]; then
+      : > "$marker"
+      kill -KILL "\$PPID"
+      exit 0
+    fi
+    ;;
+esac
+SH
+    printf 'exec %q "$@"\n' "$real_chmod"
+  } > "$fakebin/chmod"
+  chmod +x "$fakebin/chmod"
+
+  out=$(run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "interrupted provisional Grok wiring unexpectedly spawned"
+  assert_present "$home/state/$id.harness-wiring-provisional.json" \
+    "interrupted Grok wiring lost its durable receipt"
+  old_auth=$(find "$grok_home/hooks/fm-turn-end.d" -type f -name 'fm.*' -print -quit)
+  [ -n "$old_auth" ] || fail "interrupted Grok wiring did not reach authorization creation"
+
+  {
+    cat <<'SH'
+#!/usr/bin/env bash
+set -u
+target=${!#}
+case "$target" in
+  *.meta.*) exit 1 ;;
+esac
+SH
+    printf 'exec %q "$@"\n' "$real_chmod"
+  } > "$fakebin/chmod"
+  chmod +x "$fakebin/chmod"
+  status=0
+  out=$(FM_FAKE_DUPLICATE_WINDOW="fm-$id" FM_FAKE_TMUX_CURRENT_COMMAND=bash \
+    run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "recovery fixture unexpectedly published Grok metadata"
+  assert_absent "$old_auth" "recovered Grok spawn orphaned the interrupted authorization"
+  assert_absent "$home/state/$id.harness-wiring-provisional.json" \
+    "recovered Grok spawn retained its provisional wiring receipt"
+  auth_count=$(find "$grok_home/hooks/fm-turn-end.d" -type f -name 'fm.*' | wc -l | tr -d ' ')
+  [ "$auth_count" -eq 0 ] || fail "recovered Grok abort retained $auth_count authorizations"
+  pass "grok spawn recovers authorization after process interruption"
+}
+
 test_grok_teardown_removes_pointer_and_token() {
   local rec case_dir home proj wt fakebin grok_home id out status token
   rec=$(make_spawn_case teardown)
@@ -148,8 +206,13 @@ SH
 }
 
 case "${FM_TEST_ONLY:-}" in
+  provisional-wiring-crash)
+    test_grok_crash_recovers_provisional_authorization
+    exit 0
+    ;;
   wiring-cleanup-recovery)
     test_grok_fresh_abort_retires_provisional_wiring
+    test_grok_crash_recovers_provisional_authorization
     test_grok_teardown_removes_pointer_and_token
     exit 0
     ;;
@@ -157,5 +220,6 @@ esac
 
 test_grok_hook_requires_registered_token
 test_grok_fresh_abort_retires_provisional_wiring
+test_grok_crash_recovers_provisional_authorization
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder

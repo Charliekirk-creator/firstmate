@@ -788,6 +788,7 @@ SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
 SPAWN_FRESH_COMMIT_PENDING=0
 SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=0
+SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT=
 SPAWN_TASK_SET_LOCK=
 SPAWN_TASK_SET_LOCK_HELD=0
 SECONDMATE_RESERVATION_TRANSACTION=
@@ -2865,6 +2866,7 @@ STATE=$(cd -P "$STATE" && pwd -P) \
   || { echo "error: could not anchor state directory for launch brief" >&2; exit 1; }
 BRIEF_SNAPSHOT="$STATE/$ID.launch-brief.md"
 SPAWN_ENDPOINT_RECEIPT="$STATE/$ID.spawn-endpoint.json"
+SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT="$STATE/$ID.harness-wiring-provisional.json"
 [ "$BACKEND" != orca ] || SPAWN_ORCA_OPERATION="$STATE/$ID.spawn-orca-operation"
 if [ -e "$BRIEF_SNAPSHOT" ] || [ -L "$BRIEF_SNAPSHOT" ]; then
   [ -f "$BRIEF_SNAPSHOT" ] && [ ! -L "$BRIEF_SNAPSHOT" ] \
@@ -2951,6 +2953,125 @@ fm_operational_input_construct launch-brief "$SPAWN_BRIEF_BODY" SPAWN_BRIEF_INPU
   || { echo "error: could not encode captured launch brief" >&2; exit 1; }
 unset SPAWN_BRIEF_BODY
 W="fm-$ID"
+spawn_provisional_harness_wiring_receipt_load() {
+  local receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT canonical links bytes
+  [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
+  links=$(spawn_file_link_count "$receipt") || return 1
+  [ "$links" = 1 ] || return 1
+  bytes=$(LC_ALL=C wc -c < "$receipt" | tr -d ' ')
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 4096 ] || return 1
+  canonical=$(jq -e -S -c -s \
+    --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" \
+    --arg task "$ID" --arg kind "$KIND" --arg worktree "$WT" '
+      def exact($keys): (keys | sort) == ($keys | sort);
+      select(length == 1) | .[0] | . as $r | select(
+        type == "object"
+        and exact(["schema","binding","transaction_id","harness","kind","worktree","auth_path"])
+        and .schema == "fm-spawn-harness-wiring.v1"
+        and .binding == {home:$home,home_id:$home_id,task_id:$task}
+        and (.transaction_id | type) == "string" and (.transaction_id | length) > 0
+        and (.harness == "grok" or .harness == "kimi")
+        and .kind == $kind and .worktree == $worktree
+        and (.auth_path | type) == "string" and (.auth_path | length) > 0
+      ) | $r
+    ' "$receipt" 2>/dev/null) || return 1
+  printf '%s\n' "$canonical" | cmp -s "$receipt" - || return 1
+  SPAWN_PROVISIONAL_RECEIPT_TRANSACTION=$(printf '%s' "$canonical" | jq -r '.transaction_id') || return 1
+  SPAWN_PROVISIONAL_RECEIPT_HARNESS=$(printf '%s' "$canonical" | jq -r '.harness') || return 1
+  SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH=$(printf '%s' "$canonical" | jq -r '.auth_path') || return 1
+  fm_control_harness_turnend_auth_record_valid \
+    "$SPAWN_PROVISIONAL_RECEIPT_HARNESS" "" \
+    "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH"
+}
+
+spawn_provisional_harness_wiring_receipt_publish() {  # <harness> <auth-path>
+  local harness=$1 auth_path=$2 payload tmp receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT
+  [ ! -e "$receipt" ] && [ ! -L "$receipt" ] || return 1
+  fm_control_harness_turnend_auth_record_valid "$harness" "" "$auth_path" || return 1
+  payload=$(jq -n -S -c \
+    --arg schema fm-spawn-harness-wiring.v1 \
+    --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" \
+    --arg task "$ID" --arg transaction "$SPAWN_DISPATCH_TRANSACTION" \
+    --arg harness "$harness" --arg kind "$KIND" --arg worktree "$WT" \
+    --arg auth_path "$auth_path" \
+    '{schema:$schema,binding:{home:$home,home_id:$home_id,task_id:$task},
+      transaction_id:$transaction,harness:$harness,kind:$kind,
+      worktree:$worktree,auth_path:$auth_path}') || return 1
+  tmp=$(umask 077; mktemp "$STATE/.$ID.harness-wiring-provisional.XXXXXX") || return 1
+  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
+    && mv -- "$tmp" "$receipt" || { rm -f -- "$tmp"; return 1; }
+}
+
+spawn_provisional_harness_wiring_receipt_retire() {
+  local receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT
+  [ ! -e "$receipt" ] && [ ! -L "$receipt" ] && return 0
+  spawn_provisional_harness_wiring_receipt_load || return 1
+  rm -f -- "$receipt"
+}
+
+spawn_provisional_harness_wiring_metadata_matches_receipt() {
+  local meta="$STATE/$ID.meta" family
+  [ -f "$meta" ] && [ ! -L "$meta" ] \
+    && [ "$(spawn_file_link_count "$meta")" = 1 ] || return 1
+  [ "$(fm_meta_get "$meta" work_identity_dispatch_transaction)" = "$SPAWN_PROVISIONAL_RECEIPT_TRANSACTION" ] \
+    || return 1
+  family=$(fm_control_harness_family "$(fm_meta_get "$meta" harness)") || return 1
+  [ "$family" = "$SPAWN_PROVISIONAL_RECEIPT_HARNESS" ] \
+    && [ "$(fm_meta_get "$meta" kind)" = "$KIND" ] \
+    && [ "$(fm_meta_get "$meta" worktree)" = "$WT" ] \
+    && [ "$(fm_meta_get "$meta" harness_turnend_auth_path)" = "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" ]
+}
+
+spawn_provisional_harness_wiring_recover() {
+  local receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT
+  [ ! -e "$receipt" ] && [ ! -L "$receipt" ] && return 0
+  spawn_provisional_harness_wiring_receipt_load || {
+    echo "error: provisional harness wiring receipt is unsafe or mismatched: $receipt" >&2
+    return 1
+  }
+  if spawn_provisional_harness_wiring_metadata_matches_receipt; then
+    if [ "$SPAWN_PROVISIONAL_RECEIPT_TRANSACTION" != "$SPAWN_DISPATCH_TRANSACTION" ]; then
+      [ "$RELAUNCH" -eq 1 ] || {
+        echo "error: published harness wiring transaction is mismatched for $ID" >&2
+        return 1
+      }
+    else
+      SPAWN_METADATA_RECOVERY=1
+    fi
+  else
+    clear_relaunch_harness_wiring \
+      "$SPAWN_PROVISIONAL_RECEIPT_HARNESS" "$WT" "$STATE" "$ID" \
+      "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" || return 1
+  fi
+  rm -f -- "$receipt"
+}
+
+spawn_provisional_harness_auth_path() {  # <harness> <auth-root>
+  local harness=$1 root=$2 candidate attempt=0
+  fm_control_harness_turnend_auth_root_valid "$harness" "$root" || return 1
+  mkdir -p "$root" || return 1
+  while [ "$attempt" -lt 100 ]; do
+    candidate=$(mktemp -u "$root/fm.XXXXXXXXXXXX") || return 1
+    fm_control_harness_turnend_auth_record_valid "$harness" "" "$candidate" || return 1
+    if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+spawn_provisional_harness_auth_create() {  # <auth-path>
+  local auth_path=$1
+  [ ! -e "$auth_path" ] && [ ! -L "$auth_path" ] || return 1
+  (umask 077; set -o noclobber; printf '%s\n' "$TURNEND" > "$auth_path") 2>/dev/null \
+    || return 1
+  [ -f "$auth_path" ] && [ ! -L "$auth_path" ] \
+    && [ "$(spawn_file_link_count "$auth_path")" = 1 ]
+}
+
 spawn_provisional_harness_wiring_retire() {
   local meta="$STATE/$ID.meta" recorded_harness recorded_kind recorded_worktree recorded_auth_path
   local published=0
@@ -2971,6 +3092,7 @@ spawn_provisional_harness_wiring_retire() {
     && [ -n "$recorded_worktree" ] && [ "$recorded_worktree" = "$WT" ] || return 1
   clear_relaunch_harness_wiring \
     "$recorded_harness" "$recorded_worktree" "$STATE" "$ID" "$recorded_auth_path" || return 1
+  spawn_provisional_harness_wiring_receipt_retire || return 1
   if [ "$published" -eq 0 ] && [ -n "${BUSY_GEN:-}" ]; then
     "$FM_ROOT/bin/fm-busy-event.sh" retire "$STATE" "$ID" --gen "$BUSY_GEN" >/dev/null 2>&1 \
       || return 1
@@ -4852,6 +4974,9 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     esac
   fi
 fi
+if [ "$KIND" != secondmate ]; then
+  spawn_provisional_harness_wiring_recover || exit 1
+fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] \
    && [ "$SPAWN_METADATA_RECOVERY" -eq 0 ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
@@ -4879,7 +5004,7 @@ exclude_path() {
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
-if [ "$RELAUNCH" -eq 1 ]; then
+if [ "$RELAUNCH" -eq 1 ] && [ "$SPAWN_METADATA_RECOVERY" -eq 0 ]; then
   # Retire the previous incarnation's per-task harness wiring before arming the
   # new one. Without this, a harness switch would leave the old adapter's hook
   # files and turn-end token registry entries behind, and even a same-harness
@@ -4898,6 +5023,30 @@ fi
 HARNESS_TURNEND_AUTH_PATH=
 if [ "$KIND" != secondmate ] && [ "$SPAWN_METADATA_RECOVERY" -eq 0 ]; then
   [ "$RELAUNCH" -ne 0 ] || SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=1
+  HARNESS_FAMILY=$(fm_control_harness_family "$HARNESS" 2>/dev/null || true)
+  case "$HARNESS_FAMILY" in
+    grok)
+      HARNESS_AUTH_ROOT="${GROK_HOME:-$HOME/.grok}/hooks/fm-turn-end.d"
+      ;;
+    kimi)
+      HARNESS_AUTH_ROOT="$HOME/.kimi-code/fm-turn-end.d"
+      ;;
+
+    *) HARNESS_AUTH_ROOT= ;;
+  esac
+  if [ -n "$HARNESS_AUTH_ROOT" ]; then
+    HARNESS_TURNEND_AUTH_PATH=$(spawn_provisional_harness_auth_path \
+      "$HARNESS_FAMILY" "$HARNESS_AUTH_ROOT") || {
+      echo "error: could not reserve exact $HARNESS_FAMILY turn-end authorization for $ID" >&2
+      exit 1
+    }
+    RELAUNCH_REPLACEMENT_AUTH_PATH=$HARNESS_TURNEND_AUTH_PATH
+    spawn_provisional_harness_wiring_receipt_publish \
+      "$HARNESS_FAMILY" "$HARNESS_TURNEND_AUTH_PATH" || {
+      echo "error: could not journal provisional $HARNESS_FAMILY wiring for $ID" >&2
+      exit 1
+    }
+  fi
   # Arm the semantic busy-state contract (bin/fm-busy-lib.sh) for every
   # adapter with a verified semantic source. The launch brief sent below IS a
   # submitted turn, so the seed record is busy/fm-spawn. The minted gen is
@@ -5069,20 +5218,13 @@ EOF
       # touches grok's managed config - only firstmate-owned files.
       GROK_HOOKS_DIR="${GROK_HOME:-$HOME/.grok}/hooks"
       GROK_AUTH_DIR="$GROK_HOOKS_DIR/fm-turn-end.d"
-      fm_control_harness_turnend_auth_root_valid grok "$GROK_AUTH_DIR" || {
-        echo "error: Grok turn-end authorization root is unsafe: $GROK_AUTH_DIR" >&2
-        exit 1
-      }
-      mkdir -p "$GROK_AUTH_DIR"
-      old_umask=$(umask)
-      umask 077
-      auth_file=$(mktemp "$GROK_AUTH_DIR/fm.XXXXXXXXXXXX")
-      umask "$old_umask"
+      auth_file=$HARNESS_TURNEND_AUTH_PATH
       fm_control_harness_turnend_auth_record_valid \
         grok "${auth_file##*/}" "$auth_file" || exit 1
-      HARNESS_TURNEND_AUTH_PATH=$auth_file
-      RELAUNCH_REPLACEMENT_AUTH_PATH=$auth_file
-      printf '%s\n' "$TURNEND" > "$auth_file"
+      spawn_provisional_harness_auth_create "$auth_file" || {
+        echo "error: could not create exact Grok turn-end authorization for $ID" >&2
+        exit 1
+      }
       printf '%s\n' "${auth_file##*/}" > "$STATE/$ID.grok-turnend-token"
       sq_grok_auth_dir=$(shell_quote "$GROK_AUTH_DIR")
       cat > "$GROK_HOOKS_DIR/fm-turn-end.sh" <<EOF
@@ -5166,19 +5308,13 @@ EOF
       # registry. The installer above owns the format-preserving config edit and
       # the always-zero, silent hook script.
       KIMI_AUTH_DIR="$HOME/.kimi-code/fm-turn-end.d"
-      fm_control_harness_turnend_auth_root_valid kimi "$KIMI_AUTH_DIR" || {
-        echo "error: Kimi turn-end authorization root is unsafe: $KIMI_AUTH_DIR" >&2
-        exit 1
-      }
-      old_umask=$(umask)
-      umask 077
-      auth_file=$(mktemp "$KIMI_AUTH_DIR/fm.XXXXXXXXXXXX")
-      umask "$old_umask"
+      auth_file=$HARNESS_TURNEND_AUTH_PATH
       fm_control_harness_turnend_auth_record_valid \
         kimi "${auth_file##*/}" "$auth_file" || exit 1
-      HARNESS_TURNEND_AUTH_PATH=$auth_file
-      RELAUNCH_REPLACEMENT_AUTH_PATH=$auth_file
-      printf '%s\n' "$TURNEND" > "$auth_file"
+      spawn_provisional_harness_auth_create "$auth_file" || {
+        echo "error: could not create exact Kimi turn-end authorization for $ID" >&2
+        exit 1
+      }
       printf '%s\n' "${auth_file##*/}" > "$STATE/$ID.kimi-turnend-token"
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-kimi-turnend"
       exclude_path '.fm-kimi-turnend'
@@ -5346,6 +5482,10 @@ FM_HOME="$FM_HOME" \
     --brief "$BRIEF" --meta "$SPAWN_META_PATH" \
     --transaction "$SPAWN_DISPATCH_TRANSACTION" >/dev/null \
   || exit 1
+spawn_provisional_harness_wiring_receipt_retire || {
+  echo "error: published harness wiring receipt could not be retired for $ID" >&2
+  exit 1
+}
 
 # Fuse the backlog In-flight transition into the identity owner's publication
 # that just created the record. The call itself is deferred to the final commit
