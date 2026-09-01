@@ -19,9 +19,10 @@ Mechanics and safety boundaries:
   ``$FM_HOME/data``.  Symlinks, special
   files, hard-linked destinations, unsafe parents, source changes, malformed
   or oversized inputs, and oversized model output are refused.
-* The command is local-only and network-free.  Executable-model validation uses
-  the built-in macOS sandbox and refuses when that boundary is unavailable.  It
-  never retains or emits transcripts or status prose, launches or controls a worker, changes a source,
+* The command is local-only and network-free.  Its model, backlog-reader,
+  staging, cleanup, and publication subprocesses use the built-in macOS sandbox,
+  and the command refuses when that boundary is unavailable.  It never retains
+  or emits transcripts or status prose, launches or controls a worker, changes a source,
   acknowledges an event, opens a connection, launches Workstack Compass, or
   publishes data.
 * Firstmate project identity, bounded tasks-axi backlog identity, and task
