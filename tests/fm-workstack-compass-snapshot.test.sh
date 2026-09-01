@@ -634,6 +634,133 @@ PY
   pass "malformed and oversized source or output data are bounded safely"
 }
 
+test_empty_backlog_and_literal_none_relation() {
+  local world snapshot
+  world=$(make_world empty-backlog)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  cat > "$world/home/data/backlog.md" <<'MD'
+# Backlog
+
+## In flight
+
+## Queued
+
+## Done
+MD
+  rm -f "$world/home/state"/*.meta
+  run_world "$world" >/dev/null || fail "authoritative empty tasks-axi backlog was refused"
+  json_assert "$snapshot" '.worker_incarnations == []' \
+    "empty tasks-axi backlog fabricated worker identities"
+
+  world=$(make_world literal-none-relation)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  printf '%s\n' '- none [local-only] - exact sanitized project identity (added 2026-01-01)' \
+    >> "$world/home/data/projects.md"
+  tasks-axi add task-none "PRIVATE NONE TITLE" \
+    --file "$world/home/data/backlog.md" --kind ship --repo none --priority 3 --start >/dev/null
+  cat > "$world/home/state/task-none.meta" <<'META'
+kind=ship
+spawn_gen=spawn-task-none
+META
+  run_world "$world" >/dev/null || fail "literal none project relation was refused"
+  json_assert "$snapshot" \
+    '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:task-none") | .project_identity) == "firstmate-project:none"' \
+    "literal none project identity was decoded as missing"
+  pass "empty backlogs and literal none identities follow tasks-axi contracts"
+}
+
+test_reader_source_repository_containment() {
+  local world package private snapshot
+  world=$(make_world reader-source-containment)
+  package="$world/home/data/reader-source"
+  private="$package/private"
+  snapshot="$private/snapshot.json"
+  mkdir -p "$package/bin" "$private"
+  chmod 0700 "$private"
+  git -C "$package" init -q
+  cat > "$package/bin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'count: 0'
+printf '%s\n' 'tasks: 0 tasks in this backlog'
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$package/bin/tasks-axi"
+  run_failure "must not be inside a source repository" env \
+    PATH="$package/bin:$PATH" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --output "$snapshot"
+  [ -z "$(find "$private" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "reader source containment created an output or temporary file"
+  pass "reader authorities participate in pre-write repository containment"
+}
+
+test_runtime_dependency_race_refuses() {
+  local world runtime fakebin library replacement snapshot before inject
+  world=$(make_world runtime-dependency-race)
+  runtime="$world/runtime"
+  fakebin="$world/fakebin"
+  library="$runtime/lib/libreader.dylib"
+  replacement="$runtime/lib/libreader.replacement.dylib"
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  inject="$world/inject-runtime-race"
+  mkdir -p "$runtime/bin" "$runtime/lib" "$fakebin" "$inject"
+  cat > "$world/reader-runtime.c" <<'C'
+#include <stdio.h>
+extern const char *reader_output(void);
+int main(void) { fputs(reader_output(), stdout); return 0; }
+C
+  cat > "$world/reader-empty.c" <<'C'
+const char *reader_output(void) { return "count: 0\ntasks: 0 tasks in this backlog\nhelp[0]:\n"; }
+C
+  cat > "$world/reader-replacement.c" <<'C'
+const char *reader_output(void) { return "count: 1\ntasks[1]{id,state,kind,repo,title}:\n  injected,queued,ship,alpha,private-title\nhelp[0]:\n"; }
+C
+  cc -dynamiclib -install_name "$library" "$world/reader-empty.c" -o "$library"
+  cc -dynamiclib -install_name "$library" "$world/reader-replacement.c" -o "$replacement"
+  cc "$world/reader-runtime.c" "$library" -o "$runtime/bin/node"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env node
+SH
+  chmod 0755 "$runtime/bin/node" "$fakebin/tasks-axi"
+  PATH="$fakebin:$runtime/bin:/usr/bin:/bin" run_world "$world" >/dev/null \
+    || fail "baseline generation with exact runtime dependencies failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+import subprocess
+
+reader = os.environ["FM_TEST_TASKS_AXI"]
+library = os.environ["FM_TEST_RUNTIME_LIBRARY"]
+replacement = os.environ["FM_TEST_RUNTIME_REPLACEMENT"]
+real_popen = subprocess.Popen
+replaced = False
+
+class GuardedPopen(real_popen):
+    def __init__(self, args, *pargs, **kwargs):
+        global replaced
+        values = [os.fspath(value) for value in args]
+        if not replaced and reader in values:
+            os.replace(replacement, library)
+            replaced = True
+        super().__init__(args, *pargs, **kwargs)
+
+subprocess.Popen = GuardedPopen
+PY
+  run_failure "source changed during observation" env \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    FM_TEST_TASKS_AXI="$fakebin/tasks-axi" \
+    FM_TEST_RUNTIME_LIBRARY="$library" \
+    FM_TEST_RUNTIME_REPLACEMENT="$replacement" \
+    PATH="$fakebin:$runtime/bin:/usr/bin:/bin" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "runtime dependency race replaced the prior complete snapshot"
+  pass "runtime dependency races preserve the prior snapshot"
+}
+
 test_tasks_axi_reader_is_stdin_only_and_confined() {
   local world fakebin ambient_home secret marker network_marker port_file port server_pid snapshot
   world=$(make_world tasks-reader-confinement)
@@ -688,7 +815,7 @@ if [ -n "\$identity" ]; then
   printf '  %s,queued,ship,alpha,private-title\n' "\$identity"
 else
   printf '%s\n' 'count: 0'
-  printf '%s\n' 'tasks[0]{id,state,kind,repo,title}:'
+  printf '%s\n' 'tasks: 0 tasks in this backlog'
 fi
 printf '%s\n' 'help[0]:'
 SH
@@ -718,7 +845,7 @@ test_tasks_axi_package_race_refuses() {
   cat > "$fakebin/tasks-axi" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' 'count: 0'
-printf '%s\n' 'tasks[0]{id,state,kind,repo,title}:'
+printf '%s\n' 'tasks: 0 tasks in this backlog'
 printf '%s\n' 'help[0]:'
 SH
   chmod 0755 "$fakebin/tasks-axi"
@@ -849,6 +976,9 @@ test_publication_authority_relocation_cannot_write_source
 test_repository_containment_refuses_before_output_writes
 test_fifo_source_refuses_without_blocking_or_replacement
 test_malformed_and_oversized_inputs_and_output_refuse
+test_empty_backlog_and_literal_none_relation
+test_reader_source_repository_containment
+test_runtime_dependency_race_refuses
 test_tasks_axi_reader_is_stdin_only_and_confined
 test_tasks_axi_package_race_refuses
 test_optional_source_appearance_during_observation_refuses

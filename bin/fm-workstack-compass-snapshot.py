@@ -74,6 +74,7 @@ MAX_MODEL_BYTES = 512 * 1024
 MAX_READER_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_READER_PACKAGE_BYTES = 32 * 1024 * 1024
 MAX_READER_PACKAGE_ENTRIES = 4_000
+MAX_RUNTIME_DEPENDENCIES = 256
 MAX_TASK_RECORDS = 10_000
 TASKS_AXI_TIMEOUT_SECONDS = 10
 MODEL_TIMEOUT_SECONDS = 10
@@ -137,6 +138,13 @@ class ModelContract:
     max_snapshot_bytes: int
 
 
+@dataclass(frozen=True)
+class ReaderBoundary:
+    argv: tuple[str, ...]
+    cwd: Path
+    source_roots: tuple[AnchoredDirectory, ...]
+
+
 class Observation:
     """Capture bounded source bytes beneath retained directory authorities."""
 
@@ -147,6 +155,7 @@ class Observation:
         self._inventories: dict[
             tuple[int, tuple[str, ...], str], tuple[str, ...]
         ] = {}
+        self._aliases: dict[Path, Fingerprint] = {}
 
     @staticmethod
     def _fingerprint(info: os.stat_result) -> Fingerprint:
@@ -438,6 +447,18 @@ class Observation:
             raise SourceChanged("source changed during observation")
         self._observed[key] = fingerprint
 
+    def observe_alias(self, path: Path, expected: Fingerprint) -> None:
+        try:
+            current = self._fingerprint(os.stat(path))
+        except OSError as exc:
+            raise ProducerError("runtime dependency authority is unavailable") from exc
+        if current != expected:
+            raise SourceChanged("source changed during observation")
+        prior = self._aliases.get(path)
+        if prior is not None and prior != expected:
+            raise SourceChanged("source changed during observation")
+        self._aliases[path] = expected
+
     def prove_unchanged(self) -> None:
         anchors = {anchor.descriptor: anchor for anchor in self._anchors}
         for anchor in self._anchors:
@@ -482,6 +503,13 @@ class Observation:
                     os.close(current_descriptor)
                     del current_descriptor
             if self._fingerprint(current) != expected:
+                raise SourceChanged("source changed during observation")
+        for path, expected in self._aliases.items():
+            try:
+                current = self._fingerprint(os.stat(path))
+            except OSError as exc:
+                raise SourceChanged("source changed during observation") from exc
+            if current != expected:
                 raise SourceChanged("source changed during observation")
         for (descriptor, parts, pattern), expected in self._inventories.items():
             anchor = anchors[descriptor]
@@ -826,18 +854,27 @@ def parse_tasks_axi(payload: bytes) -> list[BacklogTask]:
     if len(lines) < 2:
         raise ProducerError("authoritative local reader returned malformed output")
     count_match = re.fullmatch(r"count: (\d+)(?: of (\d+) total)?", lines[0])
-    header_match = re.fullmatch(r"tasks\[(\d+)\]\{([^}]+)\}:", lines[1])
-    if count_match is None or header_match is None:
+    if count_match is None:
         raise ProducerError("authoritative local reader returned malformed output")
     shown = int(count_match.group(1))
     total = int(count_match.group(2) or shown)
-    declared = int(header_match.group(1))
-    if shown != total or shown != declared or shown > MAX_TASK_RECORDS:
+    if shown != total or shown > MAX_TASK_RECORDS:
         raise ProducerError("authoritative local reader returned incomplete output")
-    fields = header_match.group(2).split(",")
     expected = ["id", "state", "kind", "repo", "title"]
-    if fields != expected:
-        raise ProducerError("authoritative local reader contract is unsupported")
+    if shown == 0:
+        if lines[1] != "tasks: 0 tasks in this backlog":
+            raise ProducerError("authoritative local reader returned malformed output")
+        fields = expected
+    else:
+        header_match = re.fullmatch(r"tasks\[(\d+)\]\{([^}]+)\}:", lines[1])
+        if header_match is None:
+            raise ProducerError("authoritative local reader returned malformed output")
+        declared = int(header_match.group(1))
+        fields = header_match.group(2).split(",")
+        if declared != shown:
+            raise ProducerError("authoritative local reader returned incomplete output")
+        if fields != expected:
+            raise ProducerError("authoritative local reader contract is unsupported")
     rows: list[BacklogTask] = []
     seen: set[str] = set()
     for line in lines[2:]:
@@ -863,8 +900,8 @@ def parse_tasks_axi(payload: bytes) -> list[BacklogTask]:
         state = record["state"]
         if state not in {"queued", "in_flight", "done", "held"}:
             raise ProducerError("backlog reader returned an unsupported task state")
-        kind = None if record["kind"] in {"", "-", "none"} else record["kind"]
-        project_name = None if record["repo"] in {"", "-", "none"} else record["repo"]
+        kind = None if record["kind"] == "-" else record["kind"]
+        project_name = None if record["repo"] == "-" else record["repo"]
         if kind is not None and not IDENTITY_RE.fullmatch(kind):
             raise ProducerError("backlog contains a broken kind identity")
         if project_name is not None and not IDENTITY_RE.fullmatch(project_name):
@@ -875,9 +912,187 @@ def parse_tasks_axi(payload: bytes) -> list[BacklogTask]:
     return rows
 
 
+def inspect_runtime_dependencies(
+    runtime: Path,
+    runtime_anchor: AnchoredDirectory,
+    observation: Observation,
+) -> tuple[tuple[Path, ...], tuple[AnchoredDirectory, ...]]:
+    tool = next(
+        (
+            candidate
+            for candidate in (
+                Path("/Library/Developer/CommandLineTools/usr/bin/otool-classic"),
+                Path("/Library/Developer/CommandLineTools/usr/bin/otool"),
+                Path(
+                    "/Applications/Xcode.app/Contents/Developer/Toolchains/"
+                    "XcodeDefault.xctoolchain/usr/bin/otool-classic"
+                ),
+                Path(
+                    "/Applications/Xcode.app/Contents/Developer/Toolchains/"
+                    "XcodeDefault.xctoolchain/usr/bin/otool"
+                ),
+                Path("/usr/bin/otool"),
+            )
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if tool is None:
+        raise ProducerError("runtime dependency inspector is unavailable")
+    tool_root = tool.parent
+    for ancestor in tool.parents:
+        if ancestor.name in {"CommandLineTools", "Xcode.app"}:
+            tool_root = ancestor
+            break
+
+    def inspect(candidate: Path, option: str) -> str:
+        argv = sandboxed_command_argv(
+            (tool, option, candidate),
+            read_paths=(tool_root, candidate),
+            executable=tool,
+        )
+        output = run_bounded(
+            argv,
+            {"LANG": "C", "LC_ALL": "C"},
+            cap=MAX_READER_OUTPUT_BYTES,
+            discard_stderr=True,
+            cwd=Path("/var/empty"),
+        )
+        return decode_utf8(output, "runtime dependency metadata")
+
+    def metadata(candidate: Path) -> tuple[list[str], list[str]]:
+        dependencies = []
+        for line in inspect(candidate, "-L").splitlines():
+            stripped = line.strip()
+            marker = " (compatibility version "
+            if line[:1].isspace() and marker in stripped:
+                dependencies.append(stripped.split(marker, 1)[0])
+        rpaths: list[str] = []
+        awaiting_path = False
+        for line in inspect(candidate, "-l").splitlines():
+            stripped = line.strip()
+            if stripped == "cmd LC_RPATH":
+                awaiting_path = True
+            elif awaiting_path and stripped.startswith("path "):
+                value = stripped[5:].rsplit(" (offset ", 1)[0]
+                rpaths.append(value)
+                awaiting_path = False
+        return dependencies, rpaths
+
+    def expand(value: str, loader: Path, rpaths: Sequence[str]) -> list[Path]:
+        if value.startswith("@loader_path/"):
+            return [loader.parent / value.removeprefix("@loader_path/")]
+        if value.startswith("@executable_path/"):
+            return [runtime.parent / value.removeprefix("@executable_path/")]
+        if value.startswith("@rpath/"):
+            suffix = value.removeprefix("@rpath/")
+            expanded: list[Path] = []
+            for rpath in rpaths:
+                if rpath == "@loader_path":
+                    expanded.append(loader.parent / suffix)
+                elif rpath.startswith("@loader_path/"):
+                    expanded.append(
+                        loader.parent / rpath.removeprefix("@loader_path/") / suffix
+                    )
+                elif rpath == "@executable_path":
+                    expanded.append(runtime.parent / suffix)
+                elif rpath.startswith("@executable_path/"):
+                    expanded.append(
+                        runtime.parent
+                        / rpath.removeprefix("@executable_path/")
+                        / suffix
+                    )
+                elif Path(rpath).is_absolute():
+                    expanded.append(Path(rpath) / suffix)
+            return expanded
+        if Path(value).is_absolute():
+            return [Path(value)]
+        raise ProducerError("runtime dependency authority is unsupported")
+
+    runtime_dependencies, runtime_rpaths = metadata(runtime)
+    pending: list[tuple[Path, list[str]]] = [(runtime, runtime_rpaths)]
+    dependencies_by_path: dict[Path, tuple[Path, ...]] = {}
+    anchors_by_parent: dict[Path, AnchoredDirectory] = {
+        runtime_anchor.path: runtime_anchor
+    }
+    visited: set[Path] = set()
+    first = True
+    while pending:
+        loader, inherited_rpaths = pending.pop()
+        if loader in visited:
+            continue
+        visited.add(loader)
+        if first:
+            load_values = runtime_dependencies
+            loader_rpaths = runtime_rpaths
+            first = False
+        else:
+            load_values, loader_rpaths = metadata(loader)
+        search_rpaths = [*loader_rpaths, *inherited_rpaths, *runtime_rpaths]
+        for value in load_values:
+            if value.startswith("/usr/lib/") or value.startswith("/System/Library/"):
+                continue
+            candidates = expand(value, loader, search_rpaths)
+            selected: Path | None = None
+            for candidate in candidates:
+                try:
+                    selected = candidate.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    continue
+                break
+            if selected is None:
+                raise ProducerError("runtime dependency authority is unavailable")
+            if selected.is_relative_to(Path("/usr/lib")) or selected.is_relative_to(
+                Path("/System/Library")
+            ):
+                continue
+            if selected not in dependencies_by_path:
+                if len(dependencies_by_path) >= MAX_RUNTIME_DEPENDENCIES:
+                    raise ProducerError("runtime dependency inventory exceeds its bound")
+                requested = candidates[0]
+                for candidate in candidates:
+                    try:
+                        if candidate.resolve(strict=True) == selected:
+                            requested = candidate
+                            break
+                    except (OSError, RuntimeError):
+                        continue
+                parent = selected.parent
+                anchor = anchors_by_parent.get(parent)
+                if anchor is None:
+                    anchor = observation.observe_directory(parent)
+                    anchors_by_parent[parent] = anchor
+                info = observation.observe_entry(anchor, selected.name)
+                expected = observation._fingerprint(info)
+                aliases = [requested, requested.parent.resolve(strict=True) / requested.name]
+                current = aliases[-1]
+                while current.is_symlink():
+                    target = Path(os.readlink(current))
+                    current = (
+                        target
+                        if target.is_absolute()
+                        else current.parent / target
+                    )
+                    aliases.append(current)
+                aliases.append(selected)
+                authorities = tuple(dict.fromkeys(aliases))
+                for alias in authorities:
+                    observation.observe_alias(alias, expected)
+                dependencies_by_path[selected] = authorities
+                pending.append((selected, search_rpaths))
+    read_paths = tuple(
+        dict.fromkeys(
+            path
+            for authorities in dependencies_by_path.values()
+            for path in authorities
+        )
+    )
+    return read_paths, tuple(anchors_by_parent.values())
+
+
 def tasks_axi_boundary(
-    path: str, observation: Observation
-) -> tuple[list[str], Path]:
+    path: str, observation: Observation, output_root: Path
+) -> ReaderBoundary:
     selected = shutil.which("tasks-axi", path=path)
     if selected is None:
         raise ProducerError("authoritative local reader is unavailable")
@@ -946,35 +1161,49 @@ def tasks_axi_boundary(
             raise ProducerError("authoritative local reader empty home is unsafe")
     except (OSError, RuntimeError) as exc:
         raise ProducerError("authoritative local reader empty home is unsafe") from exc
-    runtime_paths = [runtime]
-    runtime_root = runtime.parent.parent if runtime.parent.name == "bin" else runtime.parent
-    if runtime_root != Path("/"):
-        runtime_paths.append(runtime_root)
-    for ancestor in runtime.parents:
-        if ancestor.name == "Cellar":
-            runtime_paths.extend((ancestor, ancestor.parent / "opt"))
-            break
-    return (
-        sandboxed_command_argv(
-            (runtime, executable, "list", "--file", "/dev/fd/0", "--limit", str(MAX_TASK_RECORDS)),
-            read_paths=(source_root, empty_home, *runtime_paths),
-            executable=runtime,
-        ),
-        empty_home,
+    dependency_paths, dependency_anchors = inspect_runtime_dependencies(
+        runtime, runtime_anchor, observation
     )
+    argv = sandboxed_command_argv(
+        (runtime, executable, "list", "--file", "/dev/fd/0", "--limit", str(MAX_TASK_RECORDS)),
+        read_paths=(source_root, empty_home, runtime, *dependency_paths),
+        executable=runtime,
+    )
+    authorities = list(dict.fromkeys((source_anchor, runtime_anchor, *dependency_anchors)))
+    for authority in tuple(authorities):
+        try:
+            authority.path.relative_to(output_root)
+        except ValueError:
+            continue
+        for candidate in (authority.path, *authority.path.parents):
+            if candidate == output_root.parent:
+                break
+            try:
+                marker = os.stat(candidate / ".git", follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ProducerError("reader source repository authority is unsafe") from exc
+            if not (stat.S_ISDIR(marker.st_mode) or stat.S_ISREG(marker.st_mode)):
+                raise ProducerError("reader source repository authority is unsafe")
+            repository = observation.observe_directory(candidate)
+            observation.observe_entry(repository, ".git")
+            authorities.append(repository)
+            break
+    return ReaderBoundary(tuple(argv), empty_home, tuple(dict.fromkeys(authorities)))
 
 
 def read_backlog_tasks(
-    payload: bytes | None, observation: Observation
+    payload: bytes | None, boundary: ReaderBoundary | None
 ) -> list[BacklogTask]:
     if payload is None:
         return []
-    path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-    argv, cwd = tasks_axi_boundary(path, observation)
+    if boundary is None:
+        raise ProducerError("authoritative local reader is unavailable")
     output = run_bounded(
-        argv,
+        boundary.argv,
         {
-            "HOME": os.fspath(cwd),
+            "HOME": os.fspath(boundary.cwd),
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "NO_COLOR": "1",
@@ -982,7 +1211,7 @@ def read_backlog_tasks(
         },
         input_payload=payload,
         discard_stderr=True,
-        cwd=cwd,
+        cwd=boundary.cwd,
     )
     return parse_tasks_axi(output)
 
@@ -1234,7 +1463,8 @@ def sandboxed_command_argv(
     ]
     ancestors: set[Path] = set()
     for root in read_roots:
-        readable_rules.append(f'(subpath "{_sandbox_literal(os.fspath(root))}")')
+        literal = _sandbox_literal(os.fspath(root))
+        readable_rules.extend((f'(literal "{literal}")', f'(subpath "{literal}")'))
         ancestors.update(root.parents)
     for ancestor in sorted(ancestors, key=lambda path: (len(path.parts), os.fspath(path))):
         readable_rules.append(f'(literal "{_sandbox_literal(os.fspath(ancestor))}")')
@@ -1804,19 +2034,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         bindings = bind_project_roots(
             arguments.project_root, set(registered), observation
         )
-        output, parent_descriptor = prepare_output(
-            home,
-            arguments.output,
-            [workstack_root, *(binding.root for binding in bindings.values())],
-            observation,
-        )
         project_sources, project_source_by_name = inspect_project_sources(
             registered, bindings, observation
         )
         backlog_payload = observation.read_under(
             home, ("data", "backlog.md"), MAX_BACKLOG_BYTES, missing_ok=True
         )
-        backlog_tasks = read_backlog_tasks(backlog_payload, observation)
+        reader_boundary = (
+            tasks_axi_boundary(
+                os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                observation,
+                home.path / "data",
+            )
+            if backlog_payload is not None
+            else None
+        )
+        source_roots = [
+            workstack_root,
+            *(binding.root for binding in bindings.values()),
+            *(reader_boundary.source_roots if reader_boundary is not None else ()),
+        ]
+        output, parent_descriptor = prepare_output(
+            home,
+            arguments.output,
+            source_roots,
+            observation,
+        )
+        backlog_tasks = read_backlog_tasks(backlog_payload, reader_boundary)
         workers, meta_present, omitted_task_evidence = collect_workers(
             home, observation, backlog_tasks, set(registered)
         )
@@ -1847,7 +2091,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parent_descriptor,
             payload,
             model.max_snapshot_bytes,
-            [workstack_root, *(binding.root for binding in bindings.values())],
+            source_roots,
             observation,
         )
         launch = (
