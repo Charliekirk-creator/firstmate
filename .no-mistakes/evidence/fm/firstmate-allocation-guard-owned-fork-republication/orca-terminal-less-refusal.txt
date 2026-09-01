@@ -1,0 +1,17 @@
+=== End-user Orca spawn receives a foreign worktree with no terminal ===
+Task: fm-orca-terminal-less-evidence
+Orca worktree id: wt-terminal-less
+Terminal: <not allocated>
+--- fm-spawn output ---
+warning: /var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T//fm-evidence-orca-terminal-less.IfYlER/data/orca-terminal-less-evidence/brief.md records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode no-mistakes - confirm its definition of done matches
+error: Git common-directory mismatch after orca worktree create: requested project '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-orca-terminal-less.IfYlER/requested-project' uses '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-orca-terminal-less.IfYlER/requested-project/.git', but allocated worktree '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-orca-terminal-less.IfYlER/foreign-worktree' uses '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-orca-terminal-less.IfYlER/foreign/.git'. Refusing before worker launch. No supported non-cleaning allocation return or quarantine operation is available, so the allocated local copy and any existing endpoint are preserved in place. Inspect task 'fm-orca-terminal-less-evidence', Orca worktree id 'wt-terminal-less' and reconcile the mixed clone-family pool or provider through its guarded ownership path before retrying; do not force-return, clean, reset, or remove this allocation
+Exit status: 1
+--- Orca operations ---
+orca status --json
+orca repo show --repo path:/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-orca-terminal-less.IfYlER/requested-project --json
+orca repo add --path /var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-orca-terminal-less.IfYlER/requested-project --json
+orca worktree create --repo id:repo-foreign-family --name fm-orca-terminal-less-evidence --no-parent --setup skip --json
+--- verification ---
+HEAD before: 7862f8289db436a69a6d9dd686c8bc8eccab2fd4
+HEAD after:  7862f8289db436a69a6d9dd686c8bc8eccab2fd4
+RESULT: TRUTHFUL TERMINAL-LESS REFUSAL; NO TERMINAL CREATED, NO WORKTREE REMOVED, NO WORKER LAUNCHED.

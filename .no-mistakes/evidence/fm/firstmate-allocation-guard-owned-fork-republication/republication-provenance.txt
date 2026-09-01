@@ -1,0 +1,22 @@
+=== Reviewed-patch republication provenance ===
+Configured origin: https://github.com/Charliekirk-creator/firstmate.git
+Captain base: a56a78ac431833381a265d28cbc9c5ab6094117d fix(bin): absorb turn-end wakes during bounded pane churn (#2877)
+Target head: 2b365b82659d1522d8dd53f9f6af190169c657e3 no-mistakes(review): Expand ref preservation and terminal-less Orca coverage
+Target commits after captain base: 2
+--- source-to-target range equivalence ---
+1:  9888484 = 1:  d291643 fix: reject foreign clone-family allocations
+2:  c2e3ee8 = 2:  2b365b8 no-mistakes(review): Expand ref preservation and terminal-less Orca coverage
+--- stable patch IDs (source then target for each reviewed commit) ---
+9888484b0e7d15342bdb36b086fc81b2b87574ba e2c5bc05f1901847e0731066294419025c1b809e
+d291643fec69b5b9556a474e81d37e4a18318268 e2c5bc05f1901847e0731066294419025c1b809e
+c2e3ee8aa6da613e9865c5e70746c93f78928568 1a45b7f1f0214269c4798915b1f6f76bc16fbb10
+2b365b82659d1522d8dd53f9f6af190169c657e3 1a45b7f1f0214269c4798915b1f6f76bc16fbb10
+--- complete changed-path set against captain base ---
+bin/fm-spawn.sh
+bin/fm-test-run.sh
+docs/architecture.md
+tests/fm-backend-orca.test.sh
+tests/fm-control-relaunch.test.sh
+tests/fm-spawn-batch.test.sh
+tests/fm-spawn-common-dir.test.sh
+tests/fm-spawn-worktree-settle.test.sh

@@ -1,0 +1,21 @@
+=== End-user spawn request with a foreign Treehouse allocation ===
+Requested Git common directory: /private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-common-dir.PTVtKi/requested-project/.git
+Allocated Git common directory: /private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-common-dir.PTVtKi/foreign-clone/.git
+Preserved precondition (branch/status/refs):
+M  tracked-staged.txt
+ M tracked-unstaged.txt
+?? untracked-preserve.txt
+!! ignored-preserve.txt
+--- refs that must survive ---
+refs/firstmate/preserved-custom
+refs/stash
+refs/tags/preserved-tag
+--- fm-spawn output ---
+error: Git common-directory mismatch after treehouse get: requested project '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-common-dir.PTVtKi/requested-project' uses '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-common-dir.PTVtKi/requested-project/.git', but allocated worktree '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-common-dir.PTVtKi/mixed-slot' uses '/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-evidence-common-dir.PTVtKi/foreign-clone/.git'. Refusing before worker launch. No supported non-cleaning allocation return or quarantine operation is available, so the allocated local copy and any existing endpoint are preserved in place. Inspect firstmate:fm-mixed-common-dir-evidence and reconcile the mixed clone-family pool or provider through its guarded ownership path before retrying; do not force-return, clean, reset, or remove this allocation
+Exit status: 1
+--- provider/endpoint operations ---
+tmuxsend-keys-t@mixedtreehouse getEnter
+--- preservation verification ---
+Before snapshot SHA-256: f888001d0fa48586b4516d8302c080a004b6936e550c9147540704bbf01c1388
+After snapshot SHA-256:  f888001d0fa48586b4516d8302c080a004b6936e550c9147540704bbf01c1388
+RESULT: REFUSED BEFORE WORKER LAUNCH; GIT STATE, ALLOCATION, AND ENDPOINT PRESERVED.
