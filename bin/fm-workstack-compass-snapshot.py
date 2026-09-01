@@ -74,9 +74,11 @@ MAX_MODEL_BYTES = 512 * 1024
 MAX_READER_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_READER_PACKAGE_BYTES = 32 * 1024 * 1024
 MAX_READER_PACKAGE_ENTRIES = 4_000
+MAX_READER_STAGING_BYTES = 256 * 1024 * 1024
 MAX_RUNTIME_DEPENDENCIES = 256
 MAX_TASK_RECORDS = 10_000
 TASKS_AXI_TIMEOUT_SECONDS = 10
+READER_STAGING_TIMEOUT_SECONDS = 60
 MODEL_TIMEOUT_SECONDS = 10
 MAX_MODEL_RESPONSE_BYTES = 64 * 1024
 REQUIRED_SCHEMA_VERSION = "workstack-compass.snapshot.v1"
@@ -139,8 +141,21 @@ class ModelContract:
 
 
 @dataclass(frozen=True)
+class ReaderAsset:
+    relative: tuple[str, ...]
+    payload: bytes | None
+    executable: bool
+    descriptor: int | None = None
+
+
+@dataclass(frozen=True)
 class ReaderBoundary:
-    argv: tuple[str, ...]
+    assets: tuple[ReaderAsset, ...]
+    runtime_descriptor: int
+    runtime_authority: Path
+    runtime_relative: tuple[str, ...] | None
+    executable_relative: tuple[str, ...]
+    dependency_directories: tuple[tuple[str, ...], ...]
     cwd: Path
     source_roots: tuple[AnchoredDirectory, ...]
 
@@ -150,6 +165,7 @@ class Observation:
 
     def __init__(self) -> None:
         self._anchors: list[AnchoredDirectory] = []
+        self._retained_entries: list[int] = []
         self._observed: dict[tuple[int, tuple[str, ...]], Fingerprint] = {}
         self._absent: set[tuple[int, tuple[str, ...]]] = set()
         self._inventories: dict[
@@ -350,8 +366,9 @@ class Observation:
         self._inventories[(anchor.descriptor, parts, pattern)] = names
         return list(names)
 
-    def observe_tree(self, anchor: AnchoredDirectory) -> None:
+    def capture_tree(self, anchor: AnchoredDirectory) -> tuple[ReaderAsset, ...]:
         pending: list[tuple[str, ...]] = [()]
+        assets: list[ReaderAsset] = []
         entries = 0
         total_bytes = 0
         while pending:
@@ -384,12 +401,19 @@ class Observation:
                     )
                 if stat.S_ISDIR(entry.st_mode):
                     pending.append(child)
-                else:
-                    total_bytes += entry.st_size
-                    if total_bytes > MAX_READER_PACKAGE_BYTES:
-                        raise ProducerError(
-                            "authoritative local reader package exceeds its size bound"
-                        )
+                    continue
+                payload = self.read_under(anchor, child, MAX_READER_PACKAGE_BYTES)
+                assert payload is not None
+                total_bytes += len(payload)
+                if total_bytes > MAX_READER_PACKAGE_BYTES:
+                    raise ProducerError(
+                        "authoritative local reader package exceeds its size bound"
+                    )
+                assets.append(
+                    ReaderAsset(child, payload, executable_by_current_user(entry))
+                )
+        assets.sort(key=lambda asset: asset.relative)
+        return tuple(assets)
 
     def read_under(
         self,
@@ -435,6 +459,25 @@ class Observation:
             os.close(descriptor)
         self._remember(anchor, parts, self._fingerprint(after))
         return b"".join(chunks)
+
+    def retain_under(
+        self,
+        anchor: AnchoredDirectory,
+        relative: str | Path | Sequence[str],
+    ) -> int:
+        parts = self._parts(anchor, relative)
+        try:
+            descriptor = self._open_entry(anchor, parts)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ProducerError("source input is not a single ordinary file")
+            self._remember(anchor, parts, self._fingerprint(info))
+        except Exception:
+            if "descriptor" in locals():
+                os.close(descriptor)
+            raise
+        self._retained_entries.append(descriptor)
+        return descriptor
 
     def _remember(
         self,
@@ -535,6 +578,12 @@ class Observation:
                 raise SourceChanged("source inventory changed during observation")
 
     def close(self) -> None:
+        while self._retained_entries:
+            descriptor = self._retained_entries.pop()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         while self._anchors:
             anchor = self._anchors.pop()
             try:
@@ -919,7 +968,11 @@ def inspect_runtime_dependencies(
     runtime: Path,
     runtime_anchor: AnchoredDirectory,
     observation: Observation,
-) -> tuple[tuple[Path, ...], tuple[AnchoredDirectory, ...]]:
+) -> tuple[
+    tuple[Path, ...],
+    tuple[tuple[Path, tuple[str, ...]], ...],
+    tuple[AnchoredDirectory, ...],
+]:
     tool = next(
         (
             candidate
@@ -1096,7 +1149,17 @@ def inspect_runtime_dependencies(
             for path in authorities
         )
     )
-    return read_paths, tuple(anchors_by_parent.values())
+    return (
+        read_paths,
+        tuple(
+            (
+                dependency,
+                tuple(dict.fromkeys(path.name for path in authorities)),
+            )
+            for dependency, authorities in dependencies_by_path.items()
+        ),
+        tuple(anchors_by_parent.values()),
+    )
 
 
 def tasks_axi_boundary(
@@ -1123,7 +1186,7 @@ def tasks_axi_boundary(
         executable_payload = observation.read_under(
             source_anchor, executable_relative, MAX_READER_PACKAGE_BYTES
         )
-        observation.observe_tree(source_anchor)
+        package_assets = observation.capture_tree(source_anchor)
         assert executable_payload is not None
         shebang = executable_payload[:4096].splitlines(keepends=True)[0]
     except (OSError, RuntimeError, IndexError, ValueError, ProducerError) as exc:
@@ -1139,15 +1202,17 @@ def tasks_axi_boundary(
     except UnicodeDecodeError as exc:
         raise ProducerError("authoritative local reader has an unsupported runtime") from exc
     runtime_name: str
+    runtime_selected: str | None
     if len(words) == 2 and words[0] == "/usr/bin/env":
         runtime_name = words[1]
-    elif len(words) == 1:
+        runtime_selected = shutil.which(runtime_name, path=path)
+    elif len(words) == 1 and Path(words[0]).is_absolute():
         runtime_name = Path(words[0]).name
+        runtime_selected = words[0]
     else:
         raise ProducerError("authoritative local reader has an unsupported runtime")
     if runtime_name not in {"bash", "node"}:
         raise ProducerError("authoritative local reader has an unsupported runtime")
-    runtime_selected = shutil.which(runtime_name, path=path)
     if runtime_selected is None:
         raise ProducerError("authoritative local reader runtime is unavailable")
     try:
@@ -1170,14 +1235,61 @@ def tasks_axi_boundary(
             raise ProducerError("authoritative local reader empty home is unsafe")
     except (OSError, RuntimeError) as exc:
         raise ProducerError("authoritative local reader empty home is unsafe") from exc
-    dependency_paths, dependency_anchors = inspect_runtime_dependencies(
+    _dependency_paths, dependencies, dependency_anchors = inspect_runtime_dependencies(
         runtime, runtime_anchor, observation
     )
-    argv = sandboxed_command_argv(
-        (runtime, executable, "list", "--file", "/dev/fd/0", "--limit", str(MAX_TASK_RECORDS)),
-        read_paths=(source_root, empty_home, runtime, *dependency_paths),
-        executable=runtime,
+    assets = list(package_assets)
+    runtime_descriptor = observation.retain_under(runtime_anchor, runtime.name)
+    runtime_size = os.fstat(runtime_descriptor).st_size
+    if runtime_size > MAX_READER_STAGING_BYTES:
+        raise ProducerError("reader staging image exceeds its size bound")
+    runtime_relative: tuple[str, ...] | None = None
+    if not any(
+        runtime.is_relative_to(root) for root in (Path("/bin"), Path("/usr/bin"))
+    ):
+        runtime_relative = ("runtime", runtime.name)
+        assets.append(ReaderAsset(runtime_relative, None, True, runtime_descriptor))
+    dependency_directories: list[tuple[str, ...]] = []
+    dependency_names: set[str] = set()
+    for index, (dependency, names) in enumerate(dependencies):
+        if dependency_names.intersection(names):
+            raise ProducerError("runtime dependency authority is ambiguous")
+        dependency_names.update(names)
+        anchor = next(
+            (
+                candidate
+                for candidate in dependency_anchors
+                if candidate.path == dependency.parent
+            ),
+            None,
+        )
+        if anchor is None:
+            raise ProducerError("runtime dependency authority is unavailable")
+        descriptor = observation.retain_under(anchor, dependency.name)
+        dependency_size = os.fstat(descriptor).st_size
+        if dependency_size > MAX_READER_STAGING_BYTES:
+            raise ProducerError("reader staging image exceeds its size bound")
+        directory = ("dependencies", str(index))
+        dependency_directories.append(directory)
+        assets.extend(
+            ReaderAsset((*directory, name), None, False, descriptor)
+            for name in names
+        )
+    staging_size = sum(
+        len(asset.payload)
+        if asset.payload is not None
+        else (
+            os.fstat(asset.descriptor).st_size if asset.executable else 0
+        )
+        for asset in assets
     )
+    if staging_size > MAX_READER_STAGING_BYTES:
+        raise ProducerError("reader staging image exceeds its size bound")
+    executable_staged_relative = ("package", *executable_relative)
+    assets = [
+        ReaderAsset(("package", *asset.relative), asset.payload, asset.executable)
+        for asset in assets[: len(package_assets)]
+    ] + assets[len(package_assets) :]
     authorities = list(dict.fromkeys((source_anchor, runtime_anchor, *dependency_anchors)))
     authorities_by_path = {authority.path: authority for authority in authorities}
     for authority in tuple(authorities):
@@ -1207,30 +1319,367 @@ def tasks_axi_boundary(
             observation.observe_entry(repository, ".git")
             authorities.append(repository)
             break
-    return ReaderBoundary(tuple(argv), empty_home, tuple(dict.fromkeys(authorities)))
+    return ReaderBoundary(
+        tuple(assets),
+        runtime_descriptor,
+        runtime,
+        runtime_relative,
+        executable_staged_relative,
+        tuple(dependency_directories),
+        empty_home,
+        tuple(dict.fromkeys(authorities)),
+    )
+
+
+STAGE_READER_PROGRAM = r'''
+import json
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+expected_device = int(sys.argv[2])
+expected_inode = int(sys.argv[3])
+stage_name = sys.argv[4]
+os.umask(0)
+header_size = int.from_bytes(sys.stdin.buffer.read(8), "big")
+if header_size < 2 or header_size > 1024 * 1024:
+    raise SystemExit(2)
+manifest = json.loads(sys.stdin.buffer.read(header_size))
+parent = os.fstat(parent_descriptor)
+if (
+    parent.st_dev != expected_device
+    or parent.st_ino != expected_inode
+    or not stat.S_ISDIR(parent.st_mode)
+    or parent.st_uid != os.getuid()
+    or stat.S_IMODE(parent.st_mode) & 0o077
+):
+    raise SystemExit(2)
+os.mkdir(stage_name, 0o700, dir_fd=parent_descriptor)
+stage = os.open(
+    stage_name,
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    dir_fd=parent_descriptor,
+)
+try:
+    directories = {() : stage}
+    for record in manifest:
+        parts = tuple(record["path"])
+        size = record["size"]
+        if (
+            not parts
+            or any(not isinstance(part, str) or part in {"", ".", ".."} or "/" in part for part in parts)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(record["executable"], bool)
+        ):
+            raise SystemExit(2)
+        parent_parts = parts[:-1]
+        for depth in range(1, len(parent_parts) + 1):
+            current = parent_parts[:depth]
+            if current in directories:
+                continue
+            owner = directories[current[:-1]]
+            try:
+                os.mkdir(current[-1], 0o700, dir_fd=owner)
+            except FileExistsError:
+                pass
+            directories[current] = os.open(
+                current[-1],
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=owner,
+            )
+        owner = directories[parent_parts]
+        source_descriptor = record.get("descriptor")
+        if source_descriptor is not None:
+            if isinstance(source_descriptor, bool) or not isinstance(source_descriptor, int):
+                raise SystemExit(2)
+            if not record["executable"]:
+                os.symlink(
+                    f"/dev/fd/{source_descriptor}", parts[-1], dir_fd=owner
+                )
+                continue
+            descriptor = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=owner,
+            )
+            os.lseek(source_descriptor, 0, os.SEEK_SET)
+            remaining = size
+            while remaining:
+                chunk = os.read(source_descriptor, min(65536, remaining))
+                if not chunk:
+                    raise SystemExit(2)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise SystemExit(2)
+                    view = view[written:]
+                remaining -= len(chunk)
+            try:
+                os.fchmod(descriptor, 0o500)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            continue
+        descriptor = os.open(
+            parts[-1],
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=owner,
+        )
+        remaining = size
+        while remaining:
+            chunk = sys.stdin.buffer.read(min(65536, remaining))
+            if not chunk:
+                raise SystemExit(2)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise SystemExit(2)
+                view = view[written:]
+            remaining -= len(chunk)
+        try:
+            os.fchmod(descriptor, 0o500 if record["executable"] else 0o400)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    if sys.stdin.buffer.read(1):
+        raise SystemExit(2)
+    for parts, descriptor in sorted(directories.items(), reverse=True):
+        if parts:
+            os.fsync(descriptor)
+            os.close(descriptor)
+    os.fsync(stage)
+    os.fsync(parent_descriptor)
+finally:
+    os.close(stage)
+'''
+
+
+REMOVE_READER_STAGE_PROGRAM = r'''
+import os
+import stat
+import sys
+
+parent_descriptor = int(sys.argv[1])
+expected_device = int(sys.argv[2])
+expected_inode = int(sys.argv[3])
+stage_name = sys.argv[4]
+parent = os.fstat(parent_descriptor)
+if (
+    parent.st_dev != expected_device
+    or parent.st_ino != expected_inode
+    or not stat.S_ISDIR(parent.st_mode)
+):
+    raise SystemExit(2)
+
+def remove_tree(owner, name):
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=owner,
+    )
+    try:
+        for child in os.listdir(descriptor):
+            info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                remove_tree(descriptor, child)
+            else:
+                os.unlink(child, dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=owner)
+
+try:
+    remove_tree(parent_descriptor, stage_name)
+except FileNotFoundError:
+    pass
+os.fsync(parent_descriptor)
+'''
+
+
+def reader_stage_payload(assets: Sequence[ReaderAsset]) -> bytes:
+    manifest = [
+        {
+            "path": list(asset.relative),
+            "size": (
+                len(asset.payload)
+                if asset.payload is not None
+                else os.fstat(asset.descriptor).st_size
+            ),
+            "executable": asset.executable,
+            "descriptor": asset.descriptor,
+        }
+        for asset in assets
+    ]
+    header = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    if len(header) > 1024 * 1024:
+        raise ProducerError("reader staging image exceeds its metadata bound")
+    return len(header).to_bytes(8, "big") + header + b"".join(
+        asset.payload for asset in assets if asset.payload is not None
+    )
+
+
+def remove_reader_stage(
+    parent_descriptor: int,
+    parent_path: Path,
+    stage_name: str,
+    source_roots: Sequence[AnchoredDirectory],
+) -> None:
+    parent_info = os.fstat(parent_descriptor)
+    stage_path = parent_path / stage_name
+    argv = sandboxed_python_argv(
+        REMOVE_READER_STAGE_PROGRAM,
+        read_paths=(parent_path, stage_path),
+        write_paths=(parent_path,),
+        write_subpaths=(stage_path,),
+        denied_write_roots=(root.path for root in source_roots),
+    )
+    argv.extend(
+        (
+            str(parent_descriptor),
+            str(parent_info.st_dev),
+            str(parent_info.st_ino),
+            stage_name,
+        )
+    )
+    run_bounded(
+        argv,
+        {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"},
+        timeout=MODEL_TIMEOUT_SECONDS,
+        cap=1,
+        pass_descriptors=(parent_descriptor,),
+        discard_stderr=True,
+    )
 
 
 def read_backlog_tasks(
-    payload: bytes | None, boundary: ReaderBoundary | None
+    payload: bytes | None,
+    boundary: ReaderBoundary | None,
+    output: Path,
+    parent_descriptor: int,
+    source_roots: Sequence[AnchoredDirectory],
 ) -> list[BacklogTask]:
     if payload is None:
         return []
     if boundary is None:
         raise ProducerError("authoritative local reader is unavailable")
-    output = run_bounded(
-        boundary.argv,
-        {
+    parent_info = os.fstat(parent_descriptor)
+    stage_name = f".workstack-reader.{os.getpid()}.{os.urandom(8).hex()}"
+    stage_path = output.parent / stage_name
+    staging_payload = reader_stage_payload(boundary.assets)
+    try:
+        stage_argv = sandboxed_python_argv(
+            STAGE_READER_PROGRAM,
+            read_paths=(output.parent, *(root.path for root in source_roots)),
+            write_paths=(output.parent,),
+            write_subpaths=(stage_path,),
+            denied_write_roots=(root.path for root in source_roots),
+        )
+        stage_argv.extend(
+            (
+                str(parent_descriptor),
+                str(parent_info.st_dev),
+                str(parent_info.st_ino),
+                stage_name,
+            )
+        )
+        try:
+            run_bounded(
+                stage_argv,
+                {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"},
+                timeout=READER_STAGING_TIMEOUT_SECONDS,
+                cap=1,
+                pass_descriptors=(
+                    parent_descriptor,
+                    *(
+                        asset.descriptor
+                        for asset in boundary.assets
+                        if asset.descriptor is not None
+                    ),
+                ),
+                input_payload=staging_payload,
+                discard_stderr=True,
+            )
+        except ProducerError as exc:
+            raise ProducerError(f"reader staging boundary failed: {exc}") from exc
+        runtime = (
+            stage_path.joinpath(*boundary.runtime_relative)
+            if boundary.runtime_relative is not None
+            else boundary.runtime_authority
+        )
+        executable = stage_path.joinpath(*boundary.executable_relative)
+        dependency_paths = [
+            stage_path.joinpath(*relative)
+            for relative in boundary.dependency_directories
+        ]
+        reader_command = (
+            runtime,
+            executable,
+            "list",
+            "--file",
+            "/dev/fd/0",
+            "--limit",
+            str(MAX_TASK_RECORDS),
+        )
+        sandbox_executable = runtime
+        process_executables: tuple[Path, ...] = ()
+        reader_paths = [stage_path, boundary.cwd]
+        if dependency_paths:
+            environment_tool = Path("/usr/bin/env")
+            reader_command = (
+                environment_tool,
+                "DYLD_LIBRARY_PATH="
+                + os.pathsep.join(os.fspath(path) for path in dependency_paths),
+                *reader_command,
+            )
+            sandbox_executable = environment_tool
+            process_executables = (runtime,)
+            reader_paths.append(environment_tool)
+        argv = sandboxed_command_argv(
+            reader_command,
+            read_paths=reader_paths,
+            executable=sandbox_executable,
+            process_executables=process_executables,
+        )
+        environment = {
             "HOME": os.fspath(boundary.cwd),
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "NO_COLOR": "1",
             "OPENSSL_CONF": "/dev/null",
-        },
-        input_payload=payload,
-        discard_stderr=True,
-        cwd=boundary.cwd,
-    )
-    return parse_tasks_axi(output)
+        }
+        try:
+            output_payload = run_bounded(
+                argv,
+                environment,
+                input_payload=payload,
+                discard_stderr=True,
+                cwd=boundary.cwd,
+                pass_descriptors=(
+                    boundary.runtime_descriptor,
+                    *(
+                        asset.descriptor
+                        for asset in boundary.assets
+                        if asset.descriptor is not None
+                    ),
+                ),
+            )
+        except ProducerError as exc:
+            raise ProducerError(f"captured backlog reader failed: {exc}") from exc
+    finally:
+        remove_reader_stage(
+            parent_descriptor,
+            output.parent,
+            stage_name,
+            source_roots,
+        )
+    return parse_tasks_axi(output_payload)
 
 
 def parse_meta(payload: bytes) -> dict[str, str]:
@@ -1459,14 +1908,21 @@ def sandboxed_command_argv(
     *,
     read_paths: Iterable[Path] = (),
     write_paths: Iterable[Path] = (),
+    write_subpaths: Iterable[Path] = (),
     denied_write_roots: Iterable[Path] = (),
     executable: Path,
     process_executables: Iterable[Path] = (),
 ) -> list[str]:
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
         raise ProducerError("a supported local-only sandbox is unavailable")
-    executable = executable.resolve(strict=True)
-    allowed_executables = {executable, *(path.resolve(strict=True) for path in process_executables)}
+    try:
+        executable = executable.resolve(strict=True)
+        allowed_executables = {
+            executable,
+            *(path.resolve(strict=True) for path in process_executables),
+        }
+    except (OSError, RuntimeError) as exc:
+        raise SourceChanged("source changed during observation") from exc
     read_roots = {
         Path("/usr/lib"),
         Path("/System/Library"),
@@ -1500,12 +1956,17 @@ def sandboxed_command_argv(
         f"(allow file-read* {' '.join(readable_rules)})",
     ]
     writable = tuple(write_paths)
-    if writable:
-        write_rules = " ".join(
+    writable_subpaths = tuple(write_subpaths)
+    if writable or writable_subpaths:
+        write_rules = [
             f'(literal "{_sandbox_literal(os.fspath(path))}")'
             for path in writable
+        ]
+        write_rules.extend(
+            f'(subpath "{_sandbox_literal(os.fspath(path))}")'
+            for path in writable_subpaths
         )
-        profile_parts.append(f"(allow file-write* {write_rules})")
+        profile_parts.append(f"(allow file-write* {' '.join(write_rules)})")
         for root in denied_write_roots:
             profile_parts.append(
                 f'(deny file-write* (subpath "{_sandbox_literal(os.fspath(root))}"))'
@@ -1525,10 +1986,16 @@ def sandboxed_python_argv(
     *,
     read_paths: Iterable[Path] = (),
     write_paths: Iterable[Path] = (),
+    write_subpaths: Iterable[Path] = (),
     denied_write_roots: Iterable[Path] = (),
 ) -> list[str]:
-    executable = Path(sys.executable).resolve(strict=True)
-    version_root = executable.parent.parent
+    try:
+        executable = Path(sys.executable).resolve(strict=True)
+        version_root = executable.parent.parent
+        base_prefix = Path(sys.base_prefix).resolve(strict=True)
+        stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SourceChanged("source changed during observation") from exc
     framework_executable = (
         version_root / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
     )
@@ -1539,11 +2006,12 @@ def sandboxed_python_argv(
         (executable, "-I", "-S", "-B", "-c", program),
         read_paths=(
             executable.parent,
-            Path(sys.base_prefix).resolve(strict=True),
-            Path(sysconfig.get_path("stdlib")).resolve(strict=True),
+            base_prefix,
+            stdlib,
             *read_paths,
         ),
         write_paths=write_paths,
+        write_subpaths=write_subpaths,
         denied_write_roots=denied_write_roots,
         executable=executable,
         process_executables=process_executables,
@@ -2077,7 +2545,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_roots,
             observation,
         )
-        backlog_tasks = read_backlog_tasks(backlog_payload, reader_boundary)
+        backlog_tasks = read_backlog_tasks(
+            backlog_payload,
+            reader_boundary,
+            output,
+            parent_descriptor,
+            source_roots,
+        )
         workers, meta_present, omitted_task_evidence = collect_workers(
             home, observation, backlog_tasks, set(registered)
         )

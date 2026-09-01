@@ -553,8 +553,8 @@ PY
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "producer accepted a relocated publication authority"
-  assert_contains "$output" "publication boundary failed" \
-    "relocated publication authority did not fail closed"
+  assert_contains "$output" "boundary failed" \
+    "relocated output authority did not fail closed"
   [ -d "$relocated" ] || fail "publication race did not relocate the output authority"
   chmod 0700 "$relocated"
   [ -z "$(find "$relocated" -mindepth 1 -maxdepth 1 -type f -print -quit)" ] \
@@ -759,7 +759,11 @@ class GuardedPopen(real_popen):
     def __init__(self, args, *pargs, **kwargs):
         global replaced
         values = [os.fspath(value) for value in args]
-        if not replaced and reader in values:
+        staged_reader = any(
+            ".workstack-reader." in value and value.endswith("/package/tasks-axi")
+            for value in values
+        )
+        if not replaced and staged_reader:
             os.replace(replacement, library)
             replaced = True
         super().__init__(args, *pargs, **kwargs)
@@ -921,7 +925,12 @@ replaced = False
 class GuardedPopen(real_popen):
     def __init__(self, args, *pargs, **kwargs):
         global replaced
-        if not replaced and reader in [os.fspath(value) for value in args]:
+        values = [os.fspath(value) for value in args]
+        staged_reader = any(
+            ".workstack-reader." in value and value.endswith("/package/tasks-axi")
+            for value in values
+        )
+        if not replaced and staged_reader:
             replacement = reader + ".replacement"
             shutil.copy2(reader, replacement)
             os.replace(replacement, reader)
@@ -942,6 +951,95 @@ PY
   [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
     || fail "reader authority race replaced the prior complete snapshot"
   pass "reader package races preserve the prior snapshot"
+}
+
+test_reader_executes_captured_authority_and_absolute_shebang() {
+  local world fakebin inject snapshot before
+  world=$(make_world captured-reader-authority)
+  fakebin="$world/fakebin"
+  inject="$world/inject-captured-reader"
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  mkdir -p "$fakebin" "$inject"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/bin/bash
+printf '%s\n' 'count: 0'
+printf '%s\n' 'tasks: 0 tasks in this backlog'
+printf '%s\n' 'help[0]:'
+SH
+  cat > "$fakebin/tasks-axi.replacement" <<'SH'
+#!/bin/bash
+printf '%s\n' 'count: 1'
+printf '%s\n' 'tasks[1]{id,state,kind,repo,title}:'
+printf '%s\n' '  injected,queued,ship,alpha,private-title'
+printf '%s\n' 'help[0]:'
+SH
+  cat > "$fakebin/bash" <<'SH'
+#!/bin/bash
+printf '%s\n' 'count: 1'
+printf '%s\n' 'tasks[1]{id,state,kind,repo,title}:'
+printf '%s\n' '  injected,queued,ship,alpha,private-title'
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$fakebin/tasks-axi" "$fakebin/tasks-axi.replacement" "$fakebin/bash"
+  cat > "$world/home/state/injected.meta" <<'META'
+kind=ship
+spawn_gen=spawn-injected
+META
+  cat > "$inject/sitecustomize.py" <<'PY'
+import os
+import subprocess
+
+reader = os.environ["FM_TEST_TASKS_AXI"]
+replacement = reader + ".replacement"
+saved = reader + ".saved"
+real_popen = subprocess.Popen
+swapped = False
+
+
+class GuardedPopen(real_popen):
+    def __init__(self, args, *pargs, **kwargs):
+        global swapped
+        values = [os.fspath(value) for value in args]
+        staged_reader = any(
+            ".workstack-reader." in value and value.endswith("/package/tasks-axi")
+            for value in values
+        )
+        if staged_reader and not swapped:
+            os.replace(reader, saved)
+            os.replace(replacement, reader)
+            try:
+                super().__init__(args, *pargs, **kwargs)
+            finally:
+                os.replace(reader, replacement)
+                os.replace(saved, reader)
+            swapped = True
+            return
+        super().__init__(args, *pargs, **kwargs)
+
+
+subprocess.Popen = GuardedPopen
+PY
+  PATH="$fakebin:/usr/bin:/bin" run_world "$world" >/dev/null \
+    || fail "the reader's absolute shebang runtime was not honored"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  run_failure "source changed during observation" env \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$inject" \
+    FM_TEST_TASKS_AXI="$fakebin/tasks-axi" \
+    PATH="$fakebin:/usr/bin:/bin" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "temporary reader substitution replaced the prior snapshot"
+  json_assert "$snapshot" \
+    '(.worker_incarnations[] | select(.worker_identity == "firstmate-worker:injected") | .project_identity) == null' \
+    "a temporarily substituted reader supplied a fabricated project relation"
+  [ ! -e "$fakebin/tasks-axi.saved" ] \
+    || fail "temporary reader substitution was not restored"
+  [ -z "$(find "$world/home/data/workstack-compass" -name '.workstack-reader.*' -print -quit)" ] \
+    || fail "captured reader staging data was retained"
+  pass "captured reader authorities and absolute shebang runtimes are exact"
 }
 
 test_optional_source_appearance_during_observation_refuses() {
@@ -1037,6 +1135,7 @@ test_reader_source_repository_containment
 test_runtime_dependency_race_refuses
 test_tasks_axi_reader_is_stdin_only_and_confined
 test_tasks_axi_package_race_refuses
+test_reader_executes_captured_authority_and_absolute_shebang
 test_optional_source_appearance_during_observation_refuses
 test_source_change_during_observation_refuses
 test_private_application_model_integration
