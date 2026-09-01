@@ -20,6 +20,28 @@ run_failure() {
   assert_contains "$output" "$expected" "producer refusal did not explain the safe failure"
 }
 
+run_failure_with_timeout() {
+  local expected=$1
+  shift
+  python3 - "$expected" "$@" <<'PY'
+import subprocess
+import sys
+
+expected = sys.argv[1]
+try:
+    completed = subprocess.run(
+        sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=3
+    )
+except subprocess.TimeoutExpired:
+    raise SystemExit("producer blocked while opening an unsafe source")
+output = completed.stdout.decode("utf-8", errors="replace")
+if completed.returncode == 0:
+    raise SystemExit(f"producer accepted an unsafe source; output: {output}")
+if expected not in output:
+    raise SystemExit(f"producer refusal omitted {expected!r}; output: {output}")
+PY
+}
+
 write_fake_model() {
   local app=$1 max_bytes=${2:-2097152} behavior=${3:-accept}
   local schema_version=${4:-workstack-compass.snapshot.v1}
@@ -40,7 +62,13 @@ def _race_open(path, flags, mode=0o777, *, dir_fd=None):
     destination = os.environ.get("FM_TEST_OUTPUT_SWAP_DESTINATION")
     target = os.environ.get("FM_TEST_OUTPUT_OPEN_TARGET")
     text = os.fspath(path)
-    if source and destination and not _output_raced and (text == target or text == "private"):
+    move_source = os.environ.get("FM_TEST_OUTPUT_MOVE_SOURCE")
+    move_destination = os.environ.get("FM_TEST_OUTPUT_MOVE_DESTINATION")
+    if move_source and move_destination and not _output_raced and text == target:
+        _output_raced = True
+        os.rename(move_destination, move_destination + ".retained")
+        os.rename(move_source, move_destination)
+    elif source and destination and not _output_raced and (text == target or text == "private"):
         _output_raced = True
         os.rename(source, source + ".retained")
         os.symlink(destination, source)
@@ -391,6 +419,29 @@ test_output_parent_substitution_refuses_before_source_write() {
   pass "output traversal rejects ancestor substitution before any source write"
 }
 
+test_project_root_moved_to_output_refuses_before_write() {
+  local world private before after
+  world=$(make_world output-project-move)
+  private="$world/home/data/private"
+  mkdir "$private"
+  chmod 0700 "$private" "$world/alpha"
+  before=$(python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$world/alpha")
+  run_failure "must not be inside a source repository" env \
+    FM_TEST_OUTPUT_MOVE_SOURCE="$world/alpha" \
+    FM_TEST_OUTPUT_MOVE_DESTINATION="$private" \
+    FM_TEST_OUTPUT_OPEN_TARGET=private \
+    FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "alpha=$world/alpha" \
+      --output "$private/snapshot.json"
+  after=$(python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$private")
+  [ "$after" = "$before" ] \
+    || fail "output preparation created and removed a file in the moved project root"
+  [ -z "$(find "$private" -mindepth 1 -maxdepth 1 -type f -print -quit)" ] \
+    || fail "output preparation left a file in the moved project root"
+  pass "retained output ancestry refuses a moved project before any write"
+}
+
 test_repository_containment_refuses_before_output_writes() {
   local world project alias
   world=$(make_world repository-containment)
@@ -417,6 +468,24 @@ test_repository_containment_refuses_before_output_writes() {
   [ -z "$(find "$project/private" -mindepth 1 -maxdepth 1 -print -quit)" ] \
     || fail "project-root containment refusal created an output or temporary file"
   pass "canonical repository containment is refused before output writes"
+}
+
+test_fifo_source_refuses_without_blocking_or_replacement() {
+  local world snapshot before
+  world=$(make_world fifo-source)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  run_world "$world" >/dev/null || fail "FIFO source baseline generation failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+  rm "$world/dtm/config/board.json"
+  mkfifo "$world/dtm/config/board.json"
+  run_failure_with_timeout "could not be opened safely" env \
+    FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "data-team-management=$world/dtm" \
+      --output "$snapshot"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "FIFO source refusal changed the prior complete snapshot"
+  pass "special source files are refused without blocking or replacement"
 }
 
 test_malformed_and_oversized_inputs_and_output_refuse() {
@@ -530,7 +599,9 @@ test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
 test_component_swap_cannot_escape_bound_source
 test_output_parent_substitution_refuses_before_source_write
+test_project_root_moved_to_output_refuses_before_write
 test_repository_containment_refuses_before_output_writes
+test_fifo_source_refuses_without_blocking_or_replacement
 test_malformed_and_oversized_inputs_and_output_refuse
 test_optional_source_appearance_during_observation_refuses
 test_source_change_during_observation_refuses

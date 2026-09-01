@@ -201,16 +201,40 @@ class Observation:
         anchor: AnchoredDirectory,
         parts: Sequence[str],
         *,
-        directory: bool = False,
+        expected_type: str = "file",
     ) -> int:
         parent = self._open_directory(anchor, parts[:-1])
-        flags = self._directory_flags() if directory else (
+        flags = self._directory_flags() if expected_type == "directory" else (
             os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
         )
+
+        def expected(info: os.stat_result) -> bool:
+            if expected_type == "file":
+                return stat.S_ISREG(info.st_mode)
+            if expected_type == "directory":
+                return stat.S_ISDIR(info.st_mode)
+            return stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)
+
         try:
-            return os.open(parts[-1], flags, dir_fd=parent)
+            before = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode):
+                raise OSError(errno.ELOOP, "source entry is a symlink")
+            if not expected(before):
+                raise OSError(errno.EINVAL, "source entry has an unsafe type")
+            descriptor = os.open(parts[-1], flags, dir_fd=parent)
+            opened = os.fstat(descriptor)
+            if (
+                not expected(opened)
+                or opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or stat.S_IFMT(opened.st_mode) != stat.S_IFMT(before.st_mode)
+            ):
+                os.close(descriptor)
+                raise SourceChanged("source changed during observation")
+            return descriptor
         finally:
             os.close(parent)
 
@@ -263,7 +287,7 @@ class Observation:
     ) -> os.stat_result:
         parts = self._parts(anchor, relative)
         try:
-            descriptor = self._open_entry(anchor, parts)
+            descriptor = self._open_entry(anchor, parts, expected_type="entry")
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                 raise ProducerError("source path contains a symlink or unsafe component") from exc
@@ -378,7 +402,7 @@ class Observation:
         for descriptor, parts in self._absent:
             anchor = anchors[descriptor]
             try:
-                present = self._open_entry(anchor, parts)
+                present = self._open_entry(anchor, parts, expected_type="entry")
             except FileNotFoundError:
                 continue
             except OSError as exc:
@@ -390,7 +414,11 @@ class Observation:
             anchor = anchors[descriptor]
             try:
                 current_descriptor = self._open_entry(
-                    anchor, parts, directory=stat.S_ISDIR(expected.mode_type)
+                    anchor,
+                    parts,
+                    expected_type=(
+                        "directory" if stat.S_ISDIR(expected.mode_type) else "file"
+                    ),
                 )
                 current = os.fstat(current_descriptor)
             except OSError as exc:
@@ -531,6 +559,41 @@ def bind_project_roots(
     return bindings
 
 
+def reject_source_repository_parent(
+    parent_descriptor: int, source_roots: Iterable[AnchoredDirectory]
+) -> None:
+    source_identities = {
+        (info.st_dev, info.st_ino)
+        for info in (os.fstat(root.descriptor) for root in source_roots)
+    }
+    current = os.dup(parent_descriptor)
+    visited: set[tuple[int, int]] = set()
+    try:
+        while True:
+            info = os.fstat(current)
+            identity = (info.st_dev, info.st_ino)
+            if identity in source_identities:
+                raise ProducerError(
+                    "snapshot output must not be inside a source repository"
+                )
+            if identity in visited:
+                raise ProducerError("snapshot output parent ancestry is unsafe")
+            visited.add(identity)
+            ancestor = os.open("..", Observation._directory_flags(), dir_fd=current)
+            ancestor_info = os.fstat(ancestor)
+            if (ancestor_info.st_dev, ancestor_info.st_ino) == identity:
+                os.close(ancestor)
+                return
+            os.close(current)
+            current = ancestor
+    except ProducerError:
+        raise
+    except OSError as exc:
+        raise ProducerError("snapshot output parent ancestry is unsafe") from exc
+    finally:
+        os.close(current)
+
+
 def prepare_output(
     home: AnchoredDirectory,
     requested: str | None,
@@ -539,6 +602,7 @@ def prepare_output(
 ) -> tuple[Path, int]:
     data = observation.observe_subdirectory(home, "data")
     canonical_data = data.path
+    retained_source_roots = tuple(source_roots)
     if requested is None:
         parent_parts = ("workstack-compass",)
         output_name = "snapshot.json"
@@ -564,7 +628,7 @@ def prepare_output(
         raise ProducerError("snapshot destination name is unsafe")
     output = canonical_data.joinpath(*parent_parts, output_name)
     reject_control_path(output)
-    for source_root in source_roots:
+    for source_root in retained_source_roots:
         try:
             output.relative_to(source_root.path)
         except ValueError:
@@ -593,6 +657,7 @@ def prepare_output(
     parent_descriptor = os.dup(parent_anchor.descriptor)
     try:
         parent_info = os.fstat(parent_descriptor)
+        reject_source_repository_parent(parent_descriptor, retained_source_roots)
         if created_default_parent:
             os.fchmod(parent_descriptor, 0o700)
             parent_info = os.fstat(parent_descriptor)
