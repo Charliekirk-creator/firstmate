@@ -40,6 +40,7 @@ new_case() {
   local platform=$1 want_herdr=${2:-with-herdr} want_gui=${3:-gui}
   unset CASE_REMOTE_JOB_ACTIVE
   unset CASE_PLATFORM_OVERRIDE
+  unset CASE_BASE_PATH
   CASE_N=$((CASE_N + 1))
   CASE_DIR="$TMP_ROOT/case$CASE_N"
   CASE_BIN="$CASE_DIR/bin"
@@ -224,7 +225,7 @@ doctor() {
   DOCTOR_OUT=$(
     HOME="$CASE_HOME" \
     FM_HOME="$CASE_PROJECT_HOME" \
-    PATH="$CASE_HOME/.local/bin:$CASE_BIN:$BASE_PATH" \
+    PATH="$CASE_HOME/.local/bin:$CASE_BIN:${CASE_BASE_PATH:-$BASE_PATH}" \
     FM_FAKE_STATE="$CASE_STATE" \
     FM_FAKE_LAUNCHCTL_LOG="$CASE_LAUNCHCTL_LOG" \
     FM_FAKE_FORBIDDEN_LOG="$CASE_FORBIDDEN_LOG" \
@@ -331,7 +332,16 @@ pass "remote doctor checks the dedicated Herdr session protocol"
 [ "${FM_TEST_ONLY:-}" != herdr-prompt-floor ] || exit 0
 
 new_case Darwin with-herdr gui
+NO_PYTHON_PATH="$CASE_DIR/path-without-python"
+mkdir -p "$NO_PYTHON_PATH"
+for executable in /usr/bin/* /bin/* /usr/sbin/* /sbin/*; do
+  [ -f "$executable" ] && [ -x "$executable" ] || continue
+  name=${executable##*/}
+  [ "$name" != python3 ] || continue
+  [ -e "$NO_PYTHON_PATH/$name" ] || ln -s "$executable" "$NO_PYTHON_PATH/$name"
+done
 rm -f "$TOOLS/python3"
+CASE_BASE_PATH="$TOOLS:$NO_PYTHON_PATH"
 doctor
 expect_code 1 "$DOCTOR_RC" "a remote host without python3 was reported ready"
 assert_contains "$DOCTOR_OUT" 'required python3=MISSING' "missing python3 was omitted from remote readiness"
