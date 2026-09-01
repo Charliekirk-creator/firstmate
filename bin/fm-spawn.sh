@@ -787,6 +787,7 @@ SPAWN_META_LOCK=
 SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
 SPAWN_FRESH_COMMIT_PENDING=0
+SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=0
 SPAWN_TASK_SET_LOCK=
 SPAWN_TASK_SET_LOCK_HELD=0
 SECONDMATE_RESERVATION_TRANSACTION=
@@ -1799,10 +1800,22 @@ spawn_abort_cleanup() {
         esac
         ;;
     esac
-    if [ "$preserve_published_launch" = 1 ]; then
-      SPAWN_FRESH_COMMIT_PENDING=0
-      echo "warning: published task metadata and exact launch evidence for $ID were preserved for retry" >&2
-    elif ! spawn_fresh_commit_rollback; then
+  fi
+  if [ "$preserve_published_launch" = 1 ]; then
+    SPAWN_FRESH_COMMIT_PENDING=0
+    SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=0
+    echo "warning: published task metadata and exact launch evidence for $ID were preserved for retry" >&2
+  else
+    if [ "$SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING" = 1 ]; then
+      if spawn_provisional_harness_wiring_retire; then
+        SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=0
+      else
+        status=1
+      fi
+    fi
+    if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ] \
+       && [ "$SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING" = 0 ] \
+       && ! spawn_fresh_commit_rollback; then
       status=1
     fi
   fi
@@ -2940,16 +2953,30 @@ unset SPAWN_BRIEF_BODY
 W="fm-$ID"
 spawn_provisional_harness_wiring_retire() {
   local meta="$STATE/$ID.meta" recorded_harness recorded_kind recorded_worktree recorded_auth_path
+  local published=0
   [ "$KIND" != secondmate ] || return 0
-  spawn_metadata_transaction_published || return 1
-  recorded_harness=$(fm_meta_get "$meta" harness)
-  recorded_kind=$(fm_meta_get "$meta" kind)
-  recorded_worktree=$(fm_meta_get "$meta" worktree)
-  recorded_auth_path=$(fm_meta_get "$meta" harness_turnend_auth_path)
+  if spawn_metadata_transaction_published; then
+    published=1
+    recorded_harness=$(fm_meta_get "$meta" harness)
+    recorded_kind=$(fm_meta_get "$meta" kind)
+    recorded_worktree=$(fm_meta_get "$meta" worktree)
+    recorded_auth_path=$(fm_meta_get "$meta" harness_turnend_auth_path)
+  else
+    recorded_harness=$HARNESS
+    recorded_kind=$KIND
+    recorded_worktree=$WT
+    recorded_auth_path=${HARNESS_TURNEND_AUTH_PATH:-}
+  fi
   [ -n "$recorded_harness" ] && [ "$recorded_kind" = "$KIND" ] \
     && [ -n "$recorded_worktree" ] && [ "$recorded_worktree" = "$WT" ] || return 1
   clear_relaunch_harness_wiring \
-    "$recorded_harness" "$recorded_worktree" "$STATE" "$ID" "$recorded_auth_path"
+    "$recorded_harness" "$recorded_worktree" "$STATE" "$ID" "$recorded_auth_path" || return 1
+  if [ "$published" -eq 0 ] && [ -n "${BUSY_GEN:-}" ]; then
+    "$FM_ROOT/bin/fm-busy-event.sh" retire "$STATE" "$ID" --gen "$BUSY_GEN" >/dev/null 2>&1 \
+      || return 1
+    [ ! -e "$STATE/$ID.busy-state" ] && [ ! -L "$STATE/$ID.busy-state" ] \
+      && [ ! -e "$STATE/$ID.busy-gen" ] && [ ! -L "$STATE/$ID.busy-gen" ] || return 1
+  fi
 }
 
 spawn_terminal_launch_reset() {
@@ -4870,6 +4897,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
 fi
 HARNESS_TURNEND_AUTH_PATH=
 if [ "$KIND" != secondmate ] && [ "$SPAWN_METADATA_RECOVERY" -eq 0 ]; then
+  [ "$RELAUNCH" -ne 0 ] || SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=1
   # Arm the semantic busy-state contract (bin/fm-busy-lib.sh) for every
   # adapter with a verified semantic source. The launch brief sent below IS a
   # submitted turn, so the seed record is busy/fm-spawn. The minted gen is
@@ -5556,16 +5584,19 @@ fi
 SPAWN_BACKLOG_COMMIT_STATUS=0
 if spawn_commit_backlog_transition; then
   SPAWN_FRESH_COMMIT_PENDING=0
+  SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=0
 else
   SPAWN_BACKLOG_COMMIT_STATUS=$?
   if spawn_commit_backlog_transition; then
     SPAWN_BACKLOG_COMMIT_STATUS=0
     SPAWN_FRESH_COMMIT_PENDING=0
+    SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=0
   fi
 fi
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   if [ "$RELAUNCH" -eq 0 ]; then
     SPAWN_FRESH_COMMIT_PENDING=0
+    SPAWN_PROVISIONAL_HARNESS_WIRING_PENDING=0
     echo "error: task $ID's accepted launch could not move its backlog item to In flight ($FM_BACKLOG_TRANSITION_ERROR); exact metadata and launch acceptance were preserved - fix the backlog and re-run the spawn to finish the commit without relaunching" >&2
   else
     echo "error: task $ID was republished but its backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR); fix the backlog and re-run the relaunch" >&2

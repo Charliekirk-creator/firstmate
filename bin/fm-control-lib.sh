@@ -253,10 +253,11 @@ fm_control_harness_turnend_auth_root_valid() {  # <harness> <registry-root>
 }
 
 fm_control_harness_turnend_auth_record_valid() {  # <harness> <token> <absolute-path>
-  local harness=${1-} token=${2-} path=${3-} root
-  case "$token" in fm.????????????) ;; *) return 1 ;; esac
-  case "$token" in *[!A-Za-z0-9._-]*) return 1 ;; esac
-  [ "${path##*/}" = "$token" ] || return 1
+  local harness=${1-} token=${2-} path=${3-} root recorded_token
+  recorded_token=${path##*/}
+  [ -z "$token" ] || [ "$token" = "$recorded_token" ] || return 1
+  case "$recorded_token" in fm.????????????) ;; *) return 1 ;; esac
+  case "$recorded_token" in *[!A-Za-z0-9._-]*) return 1 ;; esac
   root=${path%/*}
   fm_control_harness_turnend_auth_root_valid "$harness" "$root"
 }

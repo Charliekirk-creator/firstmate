@@ -26,6 +26,7 @@ make_spawn_case() {
 
 run_grok_spawn() {
   local home=$1 proj=$2 wt=$3 fakebin=$4 grok_home=$5 id=$6
+  grok_home=$(cd "$grok_home" && pwd -P)
   GROK_HOME="$grok_home" \
     fm_test_run_spawn "$home" "$wt" "$fakebin" \
     "$id" "$proj" grok --mode no-mistakes --yolo off
@@ -70,6 +71,39 @@ EOF
   pass "grok global hook requires a firstmate registry token"
 }
 
+test_grok_fresh_abort_retires_provisional_wiring() {
+  local rec case_dir home proj wt fakebin grok_home id out status=0 real_chmod auth_file
+  rec=$(make_spawn_case fresh-abort-wiring)
+  IFS='|' read -r case_dir home proj wt fakebin grok_home id <<EOF
+$rec
+EOF
+  real_chmod=$(command -v chmod)
+  {
+    cat <<'SH'
+#!/usr/bin/env bash
+set -u
+target=${!#}
+case "$target" in
+  *.meta.*) exit 1 ;;
+esac
+SH
+    printf 'exec %q "$@"\n' "$real_chmod"
+  } > "$fakebin/chmod"
+  chmod +x "$fakebin/chmod"
+
+  out=$(run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "metadata publication failure unexpectedly spawned Grok"
+  assert_absent "$home/state/$id.meta" "fresh abort retained provisional metadata"
+  assert_absent "$home/state/$id.grok-turnend-token" "fresh abort retained Grok's token sidecar"
+  assert_absent "$wt/.fm-grok-turnend" "fresh abort retained Grok's worktree pointer"
+  auth_file=
+  if [ -d "$grok_home/hooks/fm-turn-end.d" ]; then
+    auth_file=$(find "$grok_home/hooks/fm-turn-end.d" -type f -name 'fm.*' -print -quit)
+  fi
+  [ -z "$auth_file" ] || fail "fresh abort retained Grok's global authorization: $auth_file"
+  pass "grok fresh abort retires provisional harness wiring"
+}
+
 test_grok_teardown_removes_pointer_and_token() {
   local rec case_dir home proj wt fakebin grok_home id out status token
   rec=$(make_spawn_case teardown)
@@ -80,6 +114,7 @@ EOF
   status=$?
   expect_code 0 "$status" "grok spawn should succeed before teardown"
   token=$(sed -n 's/^token=//p' "$wt/.fm-grok-turnend")
+  rm "$home/state/$id.grok-turnend-token"
 
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
@@ -89,7 +124,7 @@ EOF
   assert_absent "$wt/.fm-grok-turnend" "grok pointer survived teardown"
   assert_absent "$grok_home/hooks/fm-turn-end.d/$token" "grok auth token survived teardown"
   assert_absent "$home/state/$id.grok-turnend-token" "grok state token survived teardown"
-  pass "grok teardown removes pointer and token state"
+  pass "grok teardown resumes after token-sidecar removal"
 }
 
 test_fm_lock_recognizes_grok_holder() {
@@ -112,6 +147,15 @@ SH
   pass "fm-lock recognizes grok harness processes"
 }
 
+case "${FM_TEST_ONLY:-}" in
+  wiring-cleanup-recovery)
+    test_grok_fresh_abort_retires_provisional_wiring
+    test_grok_teardown_removes_pointer_and_token
+    exit 0
+    ;;
+esac
+
 test_grok_hook_requires_registered_token
+test_grok_fresh_abort_retires_provisional_wiring
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder
