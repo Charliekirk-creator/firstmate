@@ -1103,7 +1103,7 @@ fi
 # owned by bin/fm-control-lib.sh, so teardown and the control plane's relaunch
 # retire the same artifact rather than each carrying its own copy of the path.
 remove_grok_turnend_auth() {
-  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness=
+  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness= state_real
   token_path=$(fm_control_harness_turnend_token_path grok "$state_dir" "$id") || return 1
   if [ -n "$token_path" ] && [ -f "$token_path" ]; then
     IFS= read -r token < "$token_path" || [ -n "$token" ] || return 1
@@ -1121,11 +1121,13 @@ remove_grok_turnend_auth() {
     path=$(fm_control_harness_turnend_auth_path grok "$token") || return 1
   fi
   [ -n "$path" ] || return 0
-  rm -f -- "$path"
+  state_real=$(cd -P "$state_dir" && pwd -P) || return 1
+  fm_control_harness_turnend_auth_remove_exact \
+    grok "$token" "$path" "$state_real/$id.turn-ended"
 }
 
 remove_kimi_turnend_auth() {
-  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness=
+  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness= state_real
   token_path=$(fm_control_harness_turnend_token_path kimi "$state_dir" "$id") || return 1
   if [ -n "$token_path" ] && [ -f "$token_path" ]; then
     IFS= read -r token < "$token_path" || [ -n "$token" ] || return 1
@@ -1143,7 +1145,9 @@ remove_kimi_turnend_auth() {
     path=$(fm_control_harness_turnend_auth_path kimi "$token") || return 1
   fi
   [ -n "$path" ] || return 0
-  rm -f -- "$path"
+  state_real=$(cd -P "$state_dir" && pwd -P) || return 1
+  fm_control_harness_turnend_auth_remove_exact \
+    kimi "$token" "$path" "$state_real/$id.turn-ended"
 }
 
 retire_busy_state() {

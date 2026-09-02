@@ -151,15 +151,94 @@ SH
   } > "$fakebin/chmod"
   chmod +x "$fakebin/chmod"
   status=0
+  out=$(run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "missing interrupted Grok endpoint unexpectedly recovered"
+  assert_contains "$out" "recorded spawn endpoint is not safely recoverable" \
+    "missing endpoint recovery did not reach endpoint reconciliation"
+  assert_absent "$old_auth" "missing endpoint recovery orphaned the interrupted authorization"
+  assert_absent "$home/state/$id.harness-wiring-provisional.json" \
+    "missing endpoint recovery retained its provisional wiring receipt"
+  auth_count=$(find "$grok_home/hooks/fm-turn-end.d" -type f -name 'fm.*' | wc -l | tr -d ' ')
+  [ "$auth_count" -eq 0 ] || fail "missing endpoint recovery retained $auth_count authorizations"
+  pass "grok spawn recovers authorization before endpoint refusal"
+}
+
+test_grok_provisional_receipt_refuses_concurrent_record() {
+  local rec case_dir home proj wt fakebin grok_home id out status=0 real_chmod receipt
+  rec=$(make_spawn_case receipt-no-clobber)
+  IFS='|' read -r case_dir home proj wt fakebin grok_home id <<EOF
+$rec
+EOF
+  real_chmod=$(command -v chmod)
+  receipt="$home/state/$id.harness-wiring-provisional.json"
+  {
+    cat <<SH
+#!/usr/bin/env bash
+set -u
+target=\${!#}
+case "\$target" in
+  */.$id.harness-wiring-provisional.*)
+    printf '%s\\n' competing-record > "$receipt"
+    ;;
+esac
+SH
+    printf 'exec %q "$@"\n' "$real_chmod"
+  } > "$fakebin/chmod"
+  chmod +x "$fakebin/chmod"
+
+  out=$(run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "concurrent provisional receipt was overwritten"
+  [ "$(cat "$receipt")" = competing-record ] \
+    || fail "provisional receipt publication clobbered a concurrent record"
+  assert_contains "$out" "could not journal provisional grok wiring" \
+    "concurrent provisional receipt was not refused"
+  pass "grok provisional receipt publication is no-clobber"
+}
+
+test_grok_recovery_refuses_changed_authorization() {
+  local rec case_dir home proj wt fakebin grok_home id out status=0 real_chmod marker old_auth receipt
+  rec=$(make_spawn_case changed-authorization)
+  IFS='|' read -r case_dir home proj wt fakebin grok_home id <<EOF
+$rec
+EOF
+  real_chmod=$(command -v chmod)
+  marker="$case_dir/killed-during-wiring"
+  {
+    cat <<SH
+#!/usr/bin/env bash
+set -u
+target=\${!#}
+case "\$target" in
+  */hooks/fm-turn-end.sh)
+    if [ ! -e "$marker" ]; then
+      : > "$marker"
+      kill -KILL "\$PPID"
+      exit 0
+    fi
+    ;;
+esac
+SH
+    printf 'exec %q "$@"\n' "$real_chmod"
+  } > "$fakebin/chmod"
+  chmod +x "$fakebin/chmod"
+
+  out=$(run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "interrupted Grok authorization fixture unexpectedly spawned"
+  receipt="$home/state/$id.harness-wiring-provisional.json"
+  old_auth=$(find "$grok_home/hooks/fm-turn-end.d" -type f -name 'fm.*' -print -quit)
+  [ -n "$old_auth" ] || fail "interrupted Grok wiring did not create authorization"
+  printf '%s\n' competing-content > "$old_auth"
+
+  status=0
   out=$(FM_FAKE_DUPLICATE_WINDOW="fm-$id" FM_FAKE_TMUX_CURRENT_COMMAND=bash \
     run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
-  [ "$status" -ne 0 ] || fail "recovery fixture unexpectedly published Grok metadata"
-  assert_absent "$old_auth" "recovered Grok spawn orphaned the interrupted authorization"
-  assert_absent "$home/state/$id.harness-wiring-provisional.json" \
-    "recovered Grok spawn retained its provisional wiring receipt"
-  auth_count=$(find "$grok_home/hooks/fm-turn-end.d" -type f -name 'fm.*' | wc -l | tr -d ' ')
-  [ "$auth_count" -eq 0 ] || fail "recovered Grok abort retained $auth_count authorizations"
-  pass "grok spawn recovers authorization after process interruption"
+  [ "$status" -ne 0 ] || fail "changed Grok authorization was accepted during recovery"
+  [ "$(cat "$old_auth")" = competing-content ] \
+    || fail "recovery removed or changed a non-owned authorization"
+  assert_present "$receipt" "recovery retired the receipt for a changed authorization"
+  assert_contains "$out" "provisional harness authorization is unsafe or mismatched" \
+    "changed authorization recovery was not refused"
+  pass "grok recovery preserves changed authorization records"
 }
 
 test_grok_teardown_removes_pointer_and_token() {
@@ -208,11 +287,15 @@ SH
 case "${FM_TEST_ONLY:-}" in
   provisional-wiring-crash)
     test_grok_crash_recovers_provisional_authorization
+    test_grok_provisional_receipt_refuses_concurrent_record
+    test_grok_recovery_refuses_changed_authorization
     exit 0
     ;;
   wiring-cleanup-recovery)
     test_grok_fresh_abort_retires_provisional_wiring
     test_grok_crash_recovers_provisional_authorization
+    test_grok_provisional_receipt_refuses_concurrent_record
+    test_grok_recovery_refuses_changed_authorization
     test_grok_teardown_removes_pointer_and_token
     exit 0
     ;;
@@ -221,5 +304,7 @@ esac
 test_grok_hook_requires_registered_token
 test_grok_fresh_abort_retires_provisional_wiring
 test_grok_crash_recovers_provisional_authorization
+test_grok_provisional_receipt_refuses_concurrent_record
+test_grok_recovery_refuses_changed_authorization
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder

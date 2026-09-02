@@ -1282,6 +1282,11 @@ spawn_endpoint_receipt_load() {
   target=$(printf '%s' "$canonical" | jq -r '.endpoint.target') || return 1
   worktree=$(printf '%s' "$canonical" | jq -r '.worktree // ""') || return 1
   details=$(printf '%s' "$canonical" | jq -c '.endpoint.details') || return 1
+  T=$target
+  WT=$worktree
+  if [ "$KIND" != secondmate ]; then
+    spawn_provisional_harness_wiring_recover || return 1
+  fi
   if ! fm_backend_target_exists "$BACKEND" "$target" "$W"; then
     endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
     if [ "$endpoint_state" = missing ]; then
@@ -1312,8 +1317,6 @@ spawn_endpoint_receipt_load() {
   elif [ "$SPAWN_ENDPOINT_PHASE" = launch-submitted ]; then
     SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
   fi
-  T=$target
-  WT=$worktree
   case "$BACKEND" in
     tmux)
       printf '%s' "$details" | jq -e '(keys | sort) == (["session","window_id"] | sort)' >/dev/null \
@@ -1888,7 +1891,8 @@ clear_relaunch_harness_wiring() {
     auth_path=$(fm_control_harness_turnend_auth_path "$harness" "$token") || return 1
   fi
   if [ -n "$auth_path" ]; then
-    rm -f -- "$auth_path" || return 1
+    fm_control_harness_turnend_auth_remove_exact \
+      "$harness" "$token" "$auth_path" "$state/$id.turn-ended" || return 1
   fi
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -3000,7 +3004,8 @@ spawn_provisional_harness_wiring_receipt_publish() {  # <harness> <auth-path>
       worktree:$worktree,auth_path:$auth_path}') || return 1
   tmp=$(umask 077; mktemp "$STATE/.$ID.harness-wiring-provisional.XXXXXX") || return 1
   printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
-    && mv -- "$tmp" "$receipt" || { rm -f -- "$tmp"; return 1; }
+    && ln -- "$tmp" "$receipt" && rm -f -- "$tmp" \
+    || { rm -f -- "$tmp"; return 1; }
 }
 
 spawn_provisional_harness_wiring_receipt_retire() {
@@ -3042,25 +3047,25 @@ spawn_provisional_harness_wiring_recover() {
   else
     clear_relaunch_harness_wiring \
       "$SPAWN_PROVISIONAL_RECEIPT_HARNESS" "$WT" "$STATE" "$ID" \
-      "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" || return 1
+      "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" || {
+      echo "error: provisional harness authorization is unsafe or mismatched: $SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" >&2
+      return 1
+    }
   fi
   rm -f -- "$receipt"
 }
 
 spawn_provisional_harness_auth_path() {  # <harness> <auth-root>
-  local harness=$1 root=$2 candidate attempt=0
+  local harness=$1 root=$2 digest candidate
   fm_control_harness_turnend_auth_root_valid "$harness" "$root" || return 1
   mkdir -p "$root" || return 1
-  while [ "$attempt" -lt 100 ]; do
-    candidate=$(mktemp -u "$root/fm.XXXXXXXXXXXX") || return 1
-    fm_control_harness_turnend_auth_record_valid "$harness" "" "$candidate" || return 1
-    if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-    attempt=$((attempt + 1))
-  done
-  return 1
+  digest=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION:$harness:$root:$ID" | spawn_sha256_stream) \
+    || return 1
+  case "$digest" in *[!0-9a-fA-F]*|'') return 1 ;; esac
+  candidate="$root/fm.${digest:0:12}"
+  fm_control_harness_turnend_auth_record_valid "$harness" "" "$candidate" || return 1
+  [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+  printf '%s\n' "$candidate"
 }
 
 spawn_provisional_harness_auth_create() {  # <auth-path>

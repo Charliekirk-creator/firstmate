@@ -271,3 +271,23 @@ fm_control_harness_turnend_auth_path() {  # <harness> <token>
     *) return 0 ;;
   esac
 }
+
+fm_control_harness_turnend_auth_remove_exact() {  # <harness> <token> <absolute-path> <expected-target>
+  local harness=${1-} token=${2-} path=${3-} expected=${4-} links owner current_uid
+  fm_control_harness_turnend_auth_record_valid "$harness" "$token" "$path" || return 1
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    links=$(stat -f '%l' "$path" 2>/dev/null) || return 1
+    owner=$(stat -f '%u' "$path" 2>/dev/null) || return 1
+  else
+    links=$(stat -c '%h' "$path" 2>/dev/null) || return 1
+    owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
+  fi
+  current_uid=$(id -u) || return 1
+  [ "$links" = 1 ] && [ "$owner" = "$current_uid" ] || return 1
+  printf '%s\n' "$expected" | cmp -s "$path" - || return 1
+  rm -f -- "$path"
+}
