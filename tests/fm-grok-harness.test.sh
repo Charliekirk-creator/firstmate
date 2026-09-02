@@ -287,6 +287,29 @@ SH
   pass "grok authorization removal is conditional on exact inode"
 }
 
+test_grok_authorization_removal_rejects_wrong_size_before_digest() {
+  local case_dir root auth expected out status=0
+  case_dir="$TMP_ROOT/auth-remove-size"
+  root="$case_dir/grok/hooks/fm-turn-end.d"
+  auth="$root/fm.0123456789ab"
+  expected="$case_dir/state/task.turn-ended"
+  mkdir -p "$root"
+  case_dir=$(cd "$case_dir" && pwd -P)
+  root="$case_dir/grok/hooks/fm-turn-end.d"
+  auth="$root/fm.0123456789ab"
+  expected="$case_dir/state/task.turn-ended"
+  printf '%s\nextra\n' "$expected" > "$auth"
+
+  out=$(bash -c \
+    '. "$1"; fm_control_harness_turnend_auth_remove_exact grok "" "$2" "$3"' \
+    _ "$ROOT/bin/fm-control-lib.sh" "$auth" "$expected" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "oversized authorization was removed"
+  assert_contains "$out" "owned destination size does not match expected size" \
+    "oversized authorization was hashed instead of rejected by size"
+  assert_present "$auth" "oversized authorization refusal removed the record"
+  pass "grok authorization cleanup bounds digest input by exact size"
+}
+
 test_grok_recovery_refuses_changed_authorization() {
   local rec case_dir home proj wt fakebin grok_home id out status=0 real_chmod marker old_auth receipt
   rec=$(make_spawn_case changed-authorization)
@@ -382,6 +405,7 @@ case "${FM_TEST_ONLY:-}" in
     test_grok_provisional_receipt_refuses_concurrent_record
     test_grok_recovery_refuses_changed_authorization
     test_grok_authorization_removal_is_inode_conditional
+    test_grok_authorization_removal_rejects_wrong_size_before_digest
     exit 0
     ;;
   wiring-cleanup-recovery)
@@ -390,6 +414,7 @@ case "${FM_TEST_ONLY:-}" in
     test_grok_provisional_receipt_refuses_concurrent_record
     test_grok_recovery_refuses_changed_authorization
     test_grok_authorization_removal_is_inode_conditional
+    test_grok_authorization_removal_rejects_wrong_size_before_digest
     test_grok_teardown_removes_pointer_and_token
     exit 0
     ;;
@@ -401,5 +426,6 @@ test_grok_crash_recovers_provisional_authorization
 test_grok_provisional_receipt_refuses_concurrent_record
 test_grok_recovery_refuses_changed_authorization
 test_grok_authorization_removal_is_inode_conditional
+test_grok_authorization_removal_rejects_wrong_size_before_digest
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder

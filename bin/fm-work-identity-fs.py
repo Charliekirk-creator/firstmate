@@ -170,26 +170,34 @@ def entry_state(directory_fd, name):
     return state
 
 
-def entry_digest(directory_fd, name, allowed_links=(1,)):
+def entry_digest(directory_fd, name, allowed_links=(1,), expected_size=None):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(name, flags, dir_fd=directory_fd)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink not in allowed_links:
             fail(f"owned destination entry is unsafe: {name}")
+        if expected_size is not None and info.st_size != expected_size:
+            fail(f"owned destination size does not match expected size: {name}")
         digest = hashlib.sha256()
+        total = 0
         while True:
             chunk = os.read(fd, 131072)
             if not chunk:
                 break
+            total += len(chunk)
+            if expected_size is not None and total > expected_size:
+                fail(f"owned destination size does not match expected size: {name}")
             digest.update(chunk)
+        if expected_size is not None and total != expected_size:
+            fail(f"owned destination size does not match expected size: {name}")
         return digest.hexdigest()
     finally:
         os.close(fd)
 
 
-def file_digest(directory_fd, name):
-    return entry_digest(directory_fd, name)
+def file_digest(directory_fd, name, expected_size=None):
+    return entry_digest(directory_fd, name, expected_size=expected_size)
 
 
 def state_from_info(info):
@@ -1517,6 +1525,16 @@ def main():
             os.mkdir(probe, 0o700, dir_fd=directory_fd)
             os.rmdir(probe, dir_fd=directory_fd)
         elif command in ("describe", "describe-raw", "describe-digest", "describe-replace"):
+            expected_size = None
+            if command == "describe-digest" and len(sys.argv) == 6:
+                try:
+                    expected_size = int(sys.argv[5])
+                except ValueError:
+                    fail("owned destination expected size is malformed")
+                if expected_size < 0:
+                    fail("owned destination expected size is malformed")
+            elif len(sys.argv) != 5:
+                fail(f"{command} received unexpected arguments")
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_no_clobber(directory_fd, name)
@@ -1534,7 +1552,7 @@ def main():
                         else:
                             fail(f"owned destination is absent: {name}")
                     else:
-                        print(f"{state}\t{file_digest(directory_fd, name)}")
+                        print(f"{state}\t{file_digest(directory_fd, name, expected_size)}")
             finally:
                 os.close(mutex_fd)
         elif command == "snapshot":

@@ -274,7 +274,7 @@ fm_control_harness_turnend_auth_path() {  # <harness> <token>
 
 fm_control_harness_turnend_auth_remove_exact() {  # <harness> <token> <absolute-path> <expected-target>
   local harness=${1-} token=${2-} path=${3-} expected=${4-}
-  local root name root_inode raw details entry_state entry_digest expected_digest fs_owner owner current_uid
+  local root name root_inode raw details entry_state entry_digest expected_digest expected_size fs_owner owner current_uid
   fm_control_harness_turnend_auth_record_valid "$harness" "$token" "$path" || return 1
   root=${path%/*}
   name=${path##*/}
@@ -295,8 +295,11 @@ fm_control_harness_turnend_auth_remove_exact() {  # <harness> <token> <absolute-
     owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
   fi
   [ "$owner" = "$current_uid" ] || return 1
-  details=$(python3 "$fs_owner" describe-digest "$root" "$root_inode" "$name") \
+  expected_size=$(printf '%s\n' "$expected" | LC_ALL=C wc -c | awk '{print $1}') \
     || return 1
+  case "$expected_size" in ''|*[!0-9]*) return 1 ;; esac
+  details=$(python3 "$fs_owner" describe-digest "$root" "$root_inode" "$name" \
+    "$expected_size") || return 1
   entry_state=${details%%$'\t'*}
   entry_digest=${details#*$'\t'}
   [ "$entry_state" != "$details" ] || return 1
