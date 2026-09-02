@@ -1,0 +1,9 @@
+$ FM_HOME=<TEST_FM_HOME> fm-workstack-compass-snapshot.py --workstack-root <APPROVED_WORKSTACK_ROOT> --project-root <EXACT_NAME=READ_ONLY_ROOT> ...
+Snapshot: <TEST_FM_HOME>/data/workstack-compass/snapshot.json
+Launch: cd <APPROVED_WORKSTACK_ROOT> && ./bin/workstack-compass --snapshot <TEST_FM_HOME>/data/workstack-compass/snapshot.json --color --reduced-motion
+$ stat -f %Lp <TEST_FM_HOME>/data/workstack-compass/snapshot.json
+600
+$ private Workstack JsonFileSnapshotProvider.load()
+accepted; integrity issues: none
+$ compare source-repository and approved-model repository state before/after
+unchanged

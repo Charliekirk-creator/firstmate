@@ -1,0 +1,4 @@
+ok - empty id or missing state dir refuses loudly and never rms a stray path
+ok - happy path removes only the named check.sh and check-trust
+ok - hard-linked or symlinked artifacts are refused and left in place
+ok - state directory replacement cannot redirect custom check removal
