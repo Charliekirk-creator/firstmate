@@ -246,6 +246,27 @@ test_handled_mv_dedups_by_sequence() {
   pass "inbox: the handled mv is the idempotent ack and sequences are never reissued"
 }
 
+test_lock_disappearance_during_acquire_retries() {
+  local state rec
+  state="$TMP_ROOT/lock-disappearance/state"; mkdir -p "$state"
+  rec=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    eval "$(declare -f fm_lock_try_create | sed "1s/fm_lock_try_create/_original_fm_lock_try_create/")"
+    create_attempts=0
+    fm_lock_try_create() {
+      create_attempts=$((create_attempts + 1))
+      [ "$create_attempts" -ne 1 ] || return 1
+      _original_fm_lock_try_create "$@"
+    }
+    fm_task_inbox_write "$2" t1 "write after vanished holder"
+  ' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$state") \
+    || fail "a lock released between create and observation rejected the write"
+  [ "$rec" = "$state/t1.inbox/001.msg" ] \
+    || fail "retry after the lock disappeared published an unexpected record: $rec"
+  [ -f "$rec" ] || fail "retry after the lock disappeared did not publish its record"
+  pass "inbox: a lock released during acquisition is retried within the bound"
+}
+
 test_concurrent_writers_never_clobber() {
   local state i pids=() count
   state="$TMP_ROOT/race/state"; mkdir -p "$state"
@@ -501,6 +522,7 @@ test_write_is_durable_and_exact
 test_idempotent_write_dedups_exact_body
 test_idempotent_write_follows_concurrent_ack
 test_handled_mv_dedups_by_sequence
+test_lock_disappearance_during_acquire_retries
 test_concurrent_writers_never_clobber
 test_ladder_writes_ignore_vanished_inbox
 test_fire_and_forget_records_never_enter_the_ladder

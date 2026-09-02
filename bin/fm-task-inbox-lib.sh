@@ -127,7 +127,9 @@ fm_task_inbox_lock_acquire() {  # <lock-path>
   rm -f "$probe" || return 1
   if [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
     fm_lock_try_create "$lock" && return 0
-    [ -e "$lock" ] || [ -L "$lock" ] || return 1
+    # A competing holder can release between our failed create and this
+    # process observing its lock. Treat that disappearance as contention and
+    # retry within the same bound rather than failing a valid concurrent write.
   fi
   deadline=$(( $(date +%s) + wait ))
   while ! fm_lock_try_acquire "$lock"; do
