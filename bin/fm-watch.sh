@@ -251,10 +251,11 @@ afk_present() { [ -e "$STATE/.afk" ]; }
 # pi-signed, and the clock must sit on the structured context line immediately
 # above Pi's ready/working state line. Other timestamps, harnesses, and every
 # other pane byte remain significant to stale detection.
+PI_PANE_MARKER_STATE_RE='^[[:space:]]*▶▶ agent (ready|working)([[:space:]].*)?$'
+PI_PANE_MARKER_CONTEXT_RE='^(.*ctx:(\?|[0-9]+%).*\([0-9]+(\.[0-9]+)?[kM]? context\).*  )([0-9][0-9]:[0-9][0-9])(.*)$'
+
 normalize_pane_for_marker_hash() {  # <harness>, pane bytes on stdin
-  local harness=$1 pane='' before_state state_line context_line prefix normalized_context
-  local state_re='^[[:space:]]*▶▶ agent (ready|working)([[:space:]].*)?$'
-  local context_re='^(.*ctx:(\?|[0-9]+%).*\([0-9]+(\.[0-9]+)?[kM]? context\).*  )([0-9][0-9]:[0-9][0-9])(.*)$'
+  local harness=$1 pane='' before_state state_line context_line prefix normalized_context clock hour minute
   IFS= read -r -d '' pane || true
   case "$harness" in
     pi|pi-signed) ;;
@@ -267,17 +268,23 @@ normalize_pane_for_marker_hash() {  # <harness>, pane bytes on stdin
   state_line=${pane##*$'\n'}
   before_state=${pane%$'\n'*}
   context_line=${before_state##*$'\n'}
-  if [[ "$state_line" =~ $state_re ]] && [[ "$context_line" =~ $context_re ]]; then
-    normalized_context="${BASH_REMATCH[1]}<clock>${BASH_REMATCH[5]}"
-    if [ "$before_state" = "$context_line" ]; then
-      prefix=''
-    else
-      prefix="${before_state%$'\n'*}"$'\n'
+  if [[ "$state_line" =~ $PI_PANE_MARKER_STATE_RE ]] \
+    && [[ "$context_line" =~ $PI_PANE_MARKER_CONTEXT_RE ]]; then
+    clock=${BASH_REMATCH[4]}
+    hour=${clock%:*}
+    minute=${clock#*:}
+    if [ $((10#$hour)) -le 23 ] && [ $((10#$minute)) -le 59 ]; then
+      normalized_context="${BASH_REMATCH[1]}<clock>${BASH_REMATCH[5]}"
+      if [ "$before_state" = "$context_line" ]; then
+        prefix=''
+      else
+        prefix="${before_state%$'\n'*}"$'\n'
+      fi
+      printf '%s%s\n%s' "$prefix" "$normalized_context" "$state_line"
+      return
     fi
-    printf '%s%s\n%s' "$prefix" "$normalized_context" "$state_line"
-  else
-    printf '%s' "$pane"
   fi
+  printf '%s' "$pane"
 }
 
 hash_pane() {
@@ -288,6 +295,70 @@ PANE_MARKER_PI_FORMAT=pi-footer-clock-v1
 
 pane_marker_hash() {  # <harness>, pane bytes on stdin
   normalize_pane_for_marker_hash "$1" | hash_pane
+}
+
+legacy_pane_marker_matches() {  # <harness> <legacy-hash>, pane bytes on stdin
+  local harness=$1 expected=$2 pane='' before_state state_line context_line prefix before_clock after_clock
+  local clock hour minute current_minutes delta candidate_minutes candidate_hour candidate_minute candidate_clock
+  local candidates hashes matched
+  IFS= read -r -d '' pane || true
+  [[ $expected =~ ^[0-9a-f]{32}$ ]] || return 1
+  [ "$(printf '%s' "$pane" | hash_pane)" != "$expected" ] || return 0
+  case "$harness" in pi|pi-signed) ;; *) return 1 ;; esac
+  case "$pane" in *$'\n'*) ;; *) return 1 ;; esac
+  state_line=${pane##*$'\n'}
+  before_state=${pane%$'\n'*}
+  context_line=${before_state##*$'\n'}
+  [[ "$state_line" =~ $PI_PANE_MARKER_STATE_RE ]] || return 1
+  [[ "$context_line" =~ $PI_PANE_MARKER_CONTEXT_RE ]] || return 1
+  before_clock=${BASH_REMATCH[1]}
+  clock=${BASH_REMATCH[4]}
+  after_clock=${BASH_REMATCH[5]}
+  hour=${clock%:*}
+  minute=${clock#*:}
+  [ $((10#$hour)) -le 23 ] && [ $((10#$minute)) -le 59 ] || return 1
+  if [ "$before_state" = "$context_line" ]; then
+    prefix=''
+  else
+    prefix="${before_state%$'\n'*}"$'\n'
+  fi
+  current_minutes=$((10#$hour * 60 + 10#$minute))
+  delta=1
+  while [ "$delta" -le 2 ]; do
+    candidate_minutes=$(( (current_minutes - delta + 1440) % 1440 ))
+    candidate_hour=$((candidate_minutes / 60))
+    candidate_minute=$((candidate_minutes % 60))
+    printf -v candidate_clock '%02d:%02d' "$candidate_hour" "$candidate_minute"
+    if [ "$(printf '%s%s%s%s\n%s' "$prefix" "$before_clock" "$candidate_clock" "$after_clock" "$state_line" | hash_pane)" = "$expected" ]; then
+      return 0
+    fi
+    delta=$((delta + 1))
+  done
+  candidates=$(mktemp -d "$STATE/.pane-hash-migration.XXXXXX") || return 1
+  delta=3
+  while [ "$delta" -lt 1440 ]; do
+    candidate_minutes=$(( (current_minutes - delta + 1440) % 1440 ))
+    candidate_hour=$((candidate_minutes / 60))
+    candidate_minute=$((candidate_minutes % 60))
+    printf -v candidate_clock '%02d:%02d' "$candidate_hour" "$candidate_minute"
+    if ! printf '%s%s%s%s\n%s' "$prefix" "$before_clock" "$candidate_clock" "$after_clock" "$state_line" \
+      > "$candidates/$delta"; then
+      rm -rf "$candidates"
+      return 1
+    fi
+    delta=$((delta + 1))
+  done
+  hashes="$candidates/.hashes"
+  if command -v md5 >/dev/null 2>&1; then
+    find "$candidates" -type f ! -name .hashes -exec md5 -q {} + > "$hashes" 2>/dev/null
+  else
+    find "$candidates" -type f ! -name .hashes -exec md5sum {} + 2>/dev/null \
+      | cut -d' ' -f1 > "$hashes"
+  fi
+  matched=1
+  grep -Fx "$expected" "$hashes" >/dev/null 2>&1 && matched=0
+  rm -rf "$candidates"
+  return "$matched"
 }
 
 pane_marker_format_current() {  # <harness> <window-key>
@@ -1818,7 +1889,7 @@ EOF
       printf '%s' "$h" > "$hf" || continue
       echo 0 > "$cf" || continue
       if [ -n "$prev" ] && [ "$stale_hash" = "$prev" ] \
-        && [ "$(printf '%s' "$tail40" | hash_pane)" = "$prev" ]; then
+        && printf '%s' "$tail40" | legacy_pane_marker_matches "$harness" "$prev"; then
         printf '%s' "$h" > "$sf" || continue
       else
         rm -f "$sf" "$ssf" "$ewf" || continue
@@ -1828,7 +1899,7 @@ EOF
         pi|pi-signed) printf '%s' "$PANE_MARKER_PI_FORMAT" > "$formatf" || continue ;;
         *)            rm -f "$formatf" || continue ;;
       esac
-      prev=$h
+      continue
     fi
     # Busy match: a backend's native semantic state when available (herdr), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified

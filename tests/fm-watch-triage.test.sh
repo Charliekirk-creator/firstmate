@@ -959,7 +959,7 @@ EOF
 }
 
 test_turn_ended_pi_legacy_hash_migrates_without_false_progress() {
-  local dir state fakebin out capture_file old_capture window key old_pane old_hash formatf pid
+  local dir state fakebin out capture_file old_capture window key old_pane old_hash formatf pid i
   dir=$(make_case turn-ended-pi-legacy-hash); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; old_capture="$dir/old-pane.txt"
   window="test:fm-pi-legacy-hash"
@@ -976,7 +976,7 @@ EOF
 completed transcript
 ────────────────────────
 gigachad:~/work
-main  ctx:0%  0  Sol 5.6 (272k context)  10:03  · compact in 94%
+main  ctx:0%  0  Sol 5.6 (272k context)  10:04  · compact in 94%
 ▶▶ agent ready · high thinking
 EOF
   old_pane=$(cat "$old_capture")
@@ -1004,16 +1004,24 @@ EOF
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_CONFIG_OVERRIDE="$(churn_config "$dir")" \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=0 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=0 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_poll_cycle "$state" "$pid" 100 \
-    || { reap "$pid"; fail "legacy Pi marker migration emitted a repeated stale notification: $(cat "$out")"; }
+  i=0
+  while [ "$i" -lt 100 ] \
+    && [ "$(cat "$formatf" 2>/dev/null || true)" != pi-footer-clock-v1 ]; do
+    kill -0 "$pid" 2>/dev/null \
+      || { reap "$pid"; fail "legacy Pi marker migration emitted a repeated stale notification: $(cat "$out")"; }
+    sleep 0.1
+    i=$((i + 1))
+  done
   [ "$(cat "$formatf" 2>/dev/null || true)" = pi-footer-clock-v1 ] \
     || { reap "$pid"; fail "legacy Pi marker migration did not publish its normalized baseline"; }
   [ ! -s "$out" ] || { reap "$pid"; fail "legacy Pi baseline migration printed a wake: $(cat "$out")"; }
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" != "$old_hash" ] \
     || { reap "$pid"; fail "legacy Pi stale classification was not migrated with its baseline"; }
+  [ "$(cat "$state/.count-$key" 2>/dev/null || true)" = 0 ] \
+    || { reap "$pid"; fail "legacy Pi baseline counted its establishing capture as a repeat"; }
 
   cat > "$capture_file" <<'EOF'
 completed transcript
