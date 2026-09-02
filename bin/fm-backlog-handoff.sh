@@ -366,7 +366,7 @@ seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
   base=$(basename "$target")
   case "$base" in ''|.|..|*/*) return 1 ;; esac
   (
-    local staging tmp target_inode rc=0 report=${3:-}
+    local staging tmp target_inode source_details source_state source_digest rc=0 report=${3:-}
     cd -P "$dir" || exit 1
     [ "$(backlog_file_inode .)" = "$expected_dir_inode" ] || exit 1
     target=$base
@@ -374,7 +374,14 @@ seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
     tmp=$(umask 077; mktemp './.backlog-scaffold.XXXXXX') || exit 1
     printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
       && chmod 600 "$tmp" || { rm -f -- "$tmp"; exit 1; }
-    python3 "$FS_OWNER" no-clobber . "$expected_dir_inode" "$target" "$tmp" "$staging" || rc=$?
+    source_details=$(python3 "$FS_OWNER" describe-source "$tmp" 1024) \
+      || { rm -f -- "$tmp"; exit 1; }
+    source_state=${source_details%%$'\t'*}
+    source_digest=${source_details#*$'\t'}
+    [ "$source_state" != "$source_details" ] \
+      || { rm -f -- "$tmp"; exit 1; }
+    python3 "$FS_OWNER" no-clobber . "$expected_dir_inode" "$target" "$tmp" "$staging" \
+      "$source_state" "$source_digest" || rc=$?
     rm -f -- "$tmp" || exit 1
     case "$rc" in
       0)
