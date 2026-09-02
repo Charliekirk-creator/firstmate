@@ -172,7 +172,7 @@ Both recorded runtime identities now classify the exact `pi-launcher` foreground
 Pi's optional Claude-style footer clock was verified on 2026-09-01 with Pi 0.84.1 and tmux 3.6b on macOS arm64.
 The live guard launched the real interactive harness on a private tmux socket without submitting a prompt, observed its idle `HH:MM` value change, proved a re-armed watcher completed another stale scan without printing or queuing a second wake, then typed unsubmitted composer text and observed a new stale wake.
 The installed machine had no `pi-signed` wrapper, so the guard reported that identity absent rather than treating it as verified.
-The portable regression in `tests/fm-watch-triage.test.sh` covers both `pi` and `pi-signed`, the unchanged-idle counter path, a bottom-anchoring counterexample, genuine pane progress, non-Pi clock-shaped content, and the existing wedge path.
+The portable regression in `tests/fm-watch-triage.test.sh` covers both `pi` and `pi-signed`, the unchanged-idle counter path, a bottom-anchoring counterexample, genuine pane progress, non-Pi clock-shaped content, turn-end churn, interrupted marker migration, and the existing wedge and pause-cadence paths.
 
 Refresh the real rendered-surface evidence after either Pi identity or the footer extension changes:
 
