@@ -4,8 +4,9 @@
 The executable model at the operator-supplied Workstack Compass root is the
 sole owner of ``workstack-compass.snapshot.v1``.  This producer loads that
 model, collects sanitized exact-identity evidence from Firstmate and explicitly
-bound read-only project roots, asks the model to construct and validate the
-complete projection, and then atomically replaces one mode-0600 private file.
+bound read-only project roots, projects that evidence through this shipped
+adapter, asks the model to validate the complete candidate, and then atomically
+replaces one mode-0600 private file.
 
 Mechanics and safety boundaries:
 
@@ -26,7 +27,8 @@ Mechanics and safety boundaries:
   acknowledges an event, opens a connection, launches Workstack Compass, or
   publishes data.
 * Firstmate project identity, bounded tasks-axi backlog identity, and task
-  incarnation metadata are supplied through the model's evidence adapter.
+  incarnation metadata are projected by this producer and accepted only when
+  the supplied model's existing mapping interface validates the candidate.
   Missing typed producers remain unavailable rather than being inferred.
 
 Usage:
@@ -44,6 +46,7 @@ import argparse
 import csv
 import errno
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -1932,14 +1935,12 @@ try:
     exec(compile(source, module.__file__, "exec"), module.__dict__)
     schema_version = getattr(module, "SCHEMA_VERSION", None)
     max_snapshot_bytes = getattr(module, "MAX_SNAPSHOT_BYTES", None)
-    projector = getattr(module, "snapshot_from_evidence", None)
     validator = getattr(module, "snapshot_from_mapping", None)
     if (
         schema_version != "workstack-compass.snapshot.v1"
         or isinstance(max_snapshot_bytes, bool)
         or not isinstance(max_snapshot_bytes, int)
         or max_snapshot_bytes < 1
-        or not callable(projector)
         or not callable(validator)
     ):
         raise ValueError("unsupported contract")
@@ -1949,33 +1950,20 @@ try:
         "max_snapshot_bytes": max_snapshot_bytes,
         "valid": True,
     }
-    if operation == "project":
-        projected = projector(request["evidence"])
-        if not isinstance(projected, dict):
-            raise ValueError("projection is not a mapping")
+    if operation == "validate":
         document = json.loads(
             json.dumps(
-                projected,
+                request["document"],
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
                 allow_nan=False,
             )
         )
-        validation_copy = json.loads(
-            json.dumps(
-                document,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-        )
-        snapshot = validator(validation_copy)
+        snapshot = validator(document)
         issues = snapshot.integrity_issues()
         if not isinstance(issues, tuple) or issues:
             raise ValueError("integrity failure")
-        response["document"] = document
     elif operation != "contract":
         raise ValueError("unsupported operation")
     sys.stdout.write(
@@ -2123,16 +2111,14 @@ def model_boundary_argv() -> list[str]:
 def run_model_boundary(
     source: bytes,
     operation: str,
-    evidence: Mapping[str, Any] | None = None,
-    *,
-    response_cap: int = MAX_MODEL_RESPONSE_BYTES,
+    document: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     request: dict[str, Any] = {
         "operation": operation,
         "source": decode_utf8(source, "Workstack Compass executable model"),
     }
-    if evidence is not None:
-        request["evidence"] = evidence
+    if document is not None:
+        request["document"] = document
     payload = json.dumps(
         request,
         ensure_ascii=False,
@@ -2151,7 +2137,7 @@ def run_model_boundary(
             boundary_argv,
             environment,
             timeout=MODEL_TIMEOUT_SECONDS,
-            cap=response_cap,
+            cap=MAX_MODEL_RESPONSE_BYTES,
             input_payload=payload,
             discard_stderr=True,
         )
@@ -2159,8 +2145,6 @@ def run_model_boundary(
     except (ProducerError, json.JSONDecodeError) as exc:
         raise ProducerError("Workstack Compass executable model boundary failed") from exc
     expected_keys = {"schema_version", "max_snapshot_bytes", "valid"}
-    if operation == "project":
-        expected_keys.add("document")
     if not isinstance(response, Mapping) or set(response) != expected_keys:
         raise ProducerError("Workstack Compass executable model returned a malformed result")
     return response
@@ -2276,27 +2260,211 @@ def build_evidence(
 def project_document(
     model: ModelContract, evidence: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    try:
-        response = run_model_boundary(
-            model.source,
-            "project",
-            evidence,
-            response_cap=model.max_snapshot_bytes + MAX_MODEL_RESPONSE_BYTES,
+    registry = evidence["registry"]
+    tasks = evidence["tasks"]
+    incarnations = tasks["incarnations"]
+    registry_source = {
+        "source_identity": "source:firstmate-project-registry",
+        "label": "Firstmate registered projects",
+        "completeness": "complete" if registry["available"] else "unavailable",
+        "detail": (
+            "The active Firstmate project registry was observed without inferred project joins."
+            if registry["available"]
+            else "The active Firstmate project registry is unavailable."
+        ),
+    }
+    backlog_present = tasks["backlog_available"]
+    meta_present = tasks["metadata_inventory_available"]
+    omitted = tasks["omitted_incarnation_count"]
+    current_state_unavailable = bool(incarnations) and not tasks[
+        "current_state_available"
+    ]
+    if backlog_present and meta_present:
+        task_completeness = (
+            "partial" if omitted or current_state_unavailable else "complete"
         )
+        if omitted and incarnations:
+            task_detail = "Exact task and worker-incarnation identities were observed; worker current state is unavailable, records without exact incarnation identity are omitted, and untyped telemetry remains unavailable."
+        elif omitted:
+            task_detail = "Exact task evidence and task metadata were observed; records without exact incarnation identity are omitted, so no exact worker incarnation is available, and untyped telemetry remains unavailable."
+        elif current_state_unavailable:
+            task_detail = "Exact task and worker-incarnation identities were observed; no worker current-state evidence was available, and untyped telemetry remains unavailable."
+        else:
+            task_detail = "Exact task and worker-incarnation identity sources were observed completely."
+    elif backlog_present or meta_present:
+        task_completeness = "partial"
+        task_detail = "Only part of the exact task identity evidence is available; worker telemetry and untyped relations remain unavailable."
+    else:
+        task_completeness = "unavailable"
+        task_detail = "No local task identity evidence is available."
+    sources = [
+        registry_source,
+        {
+            "source_identity": "source:firstmate-task-identities",
+            "label": "Firstmate task identity records",
+            "completeness": task_completeness,
+            "detail": task_detail,
+        },
+    ]
+    project_source_by_name: dict[str, str] = {}
+    for source in evidence["project_roots"]:
+        name = source["project_name"]
+        kind = source["evidence_kind"]
+        if kind == "unbound":
+            identity = f"source:project-root:{name}"
+            row = {
+                "source_identity": identity,
+                "label": f"{name} local upstream",
+                "completeness": "unavailable",
+                "detail": "No explicit read-only root was supplied for this registered project.",
+            }
+            project_source_by_name[name] = "source:firstmate-project-registry"
+        elif kind == "data_team_management_board":
+            identity = (
+                "source:data-team-management-board:"
+                + source["board_node_identity"]
+            )
+            row = {
+                "source_identity": identity,
+                "label": "Data Team Management board identity",
+                "completeness": "partial",
+                "detail": "The local board identity contract is available; current board rows and typed execution relations are not exported locally.",
+            }
+            project_source_by_name[name] = identity
+        elif kind == "data_team_tickets_artifacts":
+            identity = "source:gl-data-team-tickets-artifacts"
+            row = {
+                "source_identity": identity,
+                "label": "Data Team Tickets artifact repository",
+                "completeness": "partial",
+                "detail": "The explicit artifact repository is available; it publishes no typed plan, stage, work-unit, delivery, or acceptance relation for this snapshot.",
+            }
+            project_source_by_name[name] = identity
+        else:
+            identity = f"source:project-root:{name}"
+            row = {
+                "source_identity": identity,
+                "label": f"{name} explicit project root",
+                "completeness": "partial",
+                "detail": "The registered read-only root is available; no typed Workstack relation producer is published there.",
+            }
+            project_source_by_name[name] = identity
+        sources.append(row)
+    sources.sort(key=lambda row: row["source_identity"])
+    projects = [
+        {
+            "project_identity": f"firstmate-project:{name}",
+            "source_identity": project_source_by_name.get(
+                name, "source:firstmate-project-registry"
+            ),
+            "label": name,
+            "outcome": None,
+        }
+        for name in registry["project_names"]
+    ]
+    roles = {
+        "ship": "Ship worker",
+        "scout": "Scout",
+        "secondmate": "Second mate",
+    }
+    workers = [
+        {
+            "worker_incarnation_identity": f"firstmate-worker-incarnation:{row['task_identity']}:{row['generation_identity']}",
+            "worker_identity": f"firstmate-worker:{row['task_identity']}",
+            "role": roles[row["kind"]],
+            "status": "unavailable",
+            "liveness": "unavailable",
+            "live_proof_identity": None,
+            "project_identity": (
+                f"firstmate-project:{row['project_name']}"
+                if row["project_name"]
+                else None
+            ),
+            "work_unit_identities": [],
+            "context_percent": None,
+            "duration_seconds": None,
+            "source_identity": "source:firstmate-task-identities",
+        }
+        for row in incarnations
+    ]
+    exact_status = "partial" if projects else "unavailable"
+    worker_status = "partial" if workers else "unavailable"
+    interfaces = [
+        {
+            "name": "decision-history",
+            "status": "unavailable",
+            "source_identity": None,
+            "detail": "No authoritative retained-decision exporter is available.",
+        },
+        {
+            "name": "exact-work-identity",
+            "status": exact_status,
+            "source_identity": (
+                "source:firstmate-project-registry" if projects else None
+            ),
+            "detail": (
+                "Registered project identities are available; typed plan, stage, work-unit, command, next-action, delivery, and acceptance producers are unavailable."
+                if projects
+                else "Exact project and work hierarchy identities are unavailable."
+            ),
+        },
+        {
+            "name": "worker-context-duration",
+            "status": worker_status,
+            "source_identity": (
+                "source:firstmate-task-identities" if workers else None
+            ),
+            "detail": (
+                "Exact worker incarnations are available; current status, liveness, context, duration, and typed work-unit relations are unavailable."
+                if workers
+                else "No exact worker incarnation with an authoritative generation identity is available."
+            ),
+        },
+    ]
+    document: dict[str, Any] = {
+        "schema_version": model.schema_version,
+        "observation_identity": "observation:pending",
+        "observed_at": evidence["observed_at"],
+        "data_classification": (
+            "authoritative" if projects or workers else "unavailable"
+        ),
+        "sources": sources,
+        "interfaces": interfaces,
+        "projects": projects,
+        "plans": [],
+        "stages": [],
+        "work_units": [],
+        "commands": [],
+        "worker_incarnations": workers,
+        "next_actions": [],
+        "deliveries": [],
+        "acceptances": [],
+        "decisions": [],
+    }
+    digest_input = dict(document)
+    digest_input.pop("observation_identity")
+    canonical = json.dumps(
+        digest_input,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    document["observation_identity"] = (
+        "observation:sha256:" + hashlib.sha256(canonical).hexdigest()
+    )
+    try:
+        response = run_model_boundary(model.source, "validate", document)
     except ProducerError as exc:
         raise ProducerError(
-            "Workstack Compass executable model rejected the snapshot evidence"
+            "Workstack Compass executable model rejected the snapshot"
         ) from exc
-    document = response.get("document")
     if (
         response.get("schema_version") != model.schema_version
         or response.get("max_snapshot_bytes") != model.max_snapshot_bytes
         or response.get("valid") is not True
-        or not isinstance(document, Mapping)
     ):
-        raise ProducerError(
-            "Workstack Compass executable model rejected the snapshot evidence"
-        )
+        raise ProducerError("Workstack Compass executable model rejected the snapshot")
     return document
 
 
@@ -2511,12 +2679,12 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="fm-workstack-compass-snapshot.py",
         description=(
-            "Collect sanitized local evidence, ask Workstack Compass to project and "
+            "Collect and project sanitized local evidence, ask Workstack Compass to "
             "validate it, then atomically publish without running the application."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "The Workstack executable model owns snapshot construction and validation. "
+            "The Workstack executable model owns schema validation. "
             "Project roots are explicit NAME=PATH identity bindings and are never discovered. "
             "The default output is $FM_HOME/data/workstack-compass/snapshot.json; "
             "custom outputs require an owner-private subdirectory below FM_HOME data."

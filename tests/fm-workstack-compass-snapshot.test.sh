@@ -295,19 +295,28 @@ path.write_text(probe + text)
 PY
 }
 
-write_model_owned_shape() {
+write_validator_only_model() {
   local app=$1
-  python3 - "$app/src/workstack_compass/model.py" <<'PY'
-from pathlib import Path
-import sys
+  cat > "$app/src/workstack_compass/model.py" <<'PY'
+SCHEMA_VERSION = "workstack-compass.snapshot.v1"
+MAX_SNAPSHOT_BYTES = 2097152
 
-path = Path(sys.argv[1])
-text = path.read_text()
-old = '    digest_input = dict(document)\n'
-new = '    document["model_owned_projection"] = "executable-model"\n    digest_input = dict(document)\n'
-if old not in text:
-    raise SystemExit("fake model projection hook is missing")
-path.write_text(text.replace(old, new))
+class ValidatedSnapshot:
+    def integrity_issues(self):
+        return ()
+
+def snapshot_from_mapping(document):
+    required = {
+        "schema_version",
+        "observation_identity",
+        "observed_at",
+        "sources",
+        "projects",
+        "worker_incarnations",
+    }
+    if document.get("schema_version") != SCHEMA_VERSION or not required <= document.keys():
+        raise ValueError("test model rejection")
+    return ValidatedSnapshot()
 PY
 }
 
@@ -476,15 +485,17 @@ test_successful_truthful_projection() {
   pass "sanitized local sources produce a validated, private, truthful snapshot"
 }
 
-test_executable_model_owns_candidate_shape() {
+test_existing_validator_only_model_interface() {
   local world snapshot
-  world=$(make_world model-owned-shape)
+  world=$(make_world validator-only-model)
   snapshot="$world/home/data/workstack-compass/snapshot.json"
-  write_model_owned_shape "$world/app"
-  run_world "$world" >/dev/null || fail "model-owned candidate projection failed"
-  json_assert "$snapshot" '.model_owned_projection == "executable-model"' \
-    "producer copied a local snapshot shape instead of publishing the model projection"
-  pass "the executable model owns candidate construction from sanitized evidence"
+  write_validator_only_model "$world/app"
+  run_world "$world" >/dev/null \
+    || fail "the shipped adapter was incompatible with the existing model interface"
+  json_assert "$snapshot" \
+    '.schema_version == "workstack-compass.snapshot.v1" and (.projects | length) == 4 and (.worker_incarnations | length) == 2' \
+    "the shipped adapter did not produce a validated usable snapshot"
+  pass "the shipped adapter supports the existing validator-only model interface"
 }
 
 test_missing_relations_stay_missing() {
@@ -1534,11 +1545,17 @@ test_source_change_during_observation_refuses() {
 }
 
 test_private_application_model_integration() {
-  local app=${FM_WORKSTACK_COMPASS_TEST_APP:-} world snapshot
-  if [ -z "$app" ]; then
-    printf '%s\n' 'ok - private Workstack executable-model integration skipped (set FM_WORKSTACK_COMPASS_TEST_APP)'
-    return 0
-  fi
+  local app=${FM_WORKSTACK_COMPASS_TEST_APP:-} approved_root world snapshot
+  [ -n "$app" ] \
+    || fail "FM_WORKSTACK_COMPASS_TEST_APP must name the approved private Workstack root"
+  case "$app" in
+    /*) ;;
+    *) fail "FM_WORKSTACK_COMPASS_TEST_APP must be an absolute approved root" ;;
+  esac
+  approved_root=$(git -C "$app" rev-parse --show-toplevel 2>/dev/null) \
+    || fail "the approved private Workstack root is not a Git worktree"
+  [ "$approved_root" = "$(cd "$app" && pwd -P)" ] \
+    || fail "FM_WORKSTACK_COMPASS_TEST_APP must name the approved repository root"
   world=$(make_world private-model)
   snapshot="$world/home/data/workstack-compass/snapshot.json"
   FM_HOME="$world/home" "$PRODUCER" \
@@ -1560,7 +1577,7 @@ PY
 }
 
 test_successful_truthful_projection
-test_executable_model_owns_candidate_shape
+test_existing_validator_only_model_interface
 test_missing_relations_stay_missing
 test_duplicate_and_broken_identities_refuse
 test_state_inventory_bound_refuses_unrelated_runtime_entries
