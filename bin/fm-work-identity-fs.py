@@ -115,6 +115,8 @@ def snapshot_path(path, maximum):
 
 def copy_to_new(source, directory_fd, name):
     source_fd, source_info = open_source(source)
+    source_state = state_from_info(source_info)
+    source_digest = hashlib.sha256()
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -127,12 +129,25 @@ def copy_to_new(source, directory_fd, name):
             chunk = os.read(source_fd, 131072)
             if not chunk:
                 break
+            source_digest.update(chunk)
             view = memoryview(chunk)
             while view:
                 written = os.write(target_fd, view)
                 view = view[written:]
+        if state_from_info(os.fstat(source_fd)) != source_state:
+            fail(f"publication source changed during copying: {source}")
+        try:
+            current = os.stat(source, follow_symlinks=False)
+        except FileNotFoundError:
+            fail(f"publication source changed during copying: {source}")
+        if state_from_info(current) != source_state:
+            fail(f"publication source changed during copying: {source}")
         os.fchmod(target_fd, stat.S_IMODE(source_info.st_mode))
         os.fsync(target_fd)
+        target_info = os.fstat(target_fd)
+        if target_info.st_size != source_info.st_size:
+            fail(f"publication candidate does not match its source: {name}")
+        return source_state, source_digest.hexdigest()
     finally:
         os.close(target_fd)
         os.close(source_fd)
@@ -1011,11 +1026,14 @@ def replace_entry(directory_fd, name, source, expected_state, expected_digest):
     stage = f".{name}.replace-candidate"
     previous = f".{name}.replace-previous"
     journal = f".{name}.replace-journal"
-    copy_to_new(source, directory_fd, stage)
+    source_state, source_digest = copy_to_new(source, directory_fd, stage)
     candidate_state = raw_entry_state(directory_fd, stage)
     if not candidate_state.startswith("regular:"):
         fail(f"owned replacement candidate is unsafe: {stage}")
     candidate_digest = file_digest(directory_fd, stage)
+    if candidate_digest != source_digest \
+            or committed_entry_size(candidate_state) != committed_entry_size(source_state):
+        fail(f"owned replacement candidate does not match its source: {stage}")
     publish_replace_journal(
         directory_fd, journal, stage, previous, expected_state, expected_digest,
         candidate_state, candidate_digest

@@ -136,11 +136,13 @@ ACTIVE_IDENTITY_LOCK_PARENT=
 ACTIVE_IDENTITY_LOCK_PARENT_ID=
 ACTIVE_IDENTITY_LOCK_TOKEN=
 ACTIVE_IDENTITY_LOCK_HELD=0
+ACTIVE_IDENTITY_LOCK_EXTERNAL=0
 ACTIVE_PUBLICATION_LOCK=
 ACTIVE_PUBLICATION_LOCK_PARENT=
 ACTIVE_PUBLICATION_LOCK_PARENT_ID=
 ACTIVE_PUBLICATION_LOCK_TOKEN=
 ACTIVE_PUBLICATION_LOCK_HELD=0
+ACTIVE_PUBLICATION_LOCK_EXTERNAL=0
 RECORD_HANDOFF_TRANSITION=0
 RECORD_HANDOFF_TRANSFER=
 CONTRACT_INPUT_TMP=
@@ -186,15 +188,19 @@ work_identity_cleanup() {
   fi
   if [ "${ACTIVE_IDENTITY_LOCK_HELD:-0}" -eq 1 ]; then
     ACTIVE_IDENTITY_LOCK_HELD=0
-    python3 "$FS_OWNER" lock-release "$ACTIVE_IDENTITY_LOCK_PARENT" \
-      "$ACTIVE_IDENTITY_LOCK_PARENT_ID" "$ACTIVE_IDENTITY_LOCK" \
-      "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN" >/dev/null 2>&1 || true
+    if [ "${ACTIVE_IDENTITY_LOCK_EXTERNAL:-0}" -ne 1 ]; then
+      python3 "$FS_OWNER" lock-release "$ACTIVE_IDENTITY_LOCK_PARENT" \
+        "$ACTIVE_IDENTITY_LOCK_PARENT_ID" "$ACTIVE_IDENTITY_LOCK" \
+        "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN" >/dev/null 2>&1 || true
+    fi
   fi
   if [ "${ACTIVE_PUBLICATION_LOCK_HELD:-0}" -eq 1 ]; then
     ACTIVE_PUBLICATION_LOCK_HELD=0
-    python3 "$FS_OWNER" lock-release "$ACTIVE_PUBLICATION_LOCK_PARENT" \
-      "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" "$ACTIVE_PUBLICATION_LOCK" \
-      "${BASHPID:-$$}" "$ACTIVE_PUBLICATION_LOCK_TOKEN" >/dev/null 2>&1 || true
+    if [ "${ACTIVE_PUBLICATION_LOCK_EXTERNAL:-0}" -ne 1 ]; then
+      python3 "$FS_OWNER" lock-release "$ACTIVE_PUBLICATION_LOCK_PARENT" \
+        "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" "$ACTIVE_PUBLICATION_LOCK" \
+        "${BASHPID:-$$}" "$ACTIVE_PUBLICATION_LOCK_TOKEN" >/dev/null 2>&1 || true
+    fi
   fi
   return "$status"
 }
@@ -1103,9 +1109,21 @@ publication_lock_acquire() {
   ACTIVE_PUBLICATION_LOCK=.work-identity-publication.lock
   ACTIVE_PUBLICATION_LOCK_PARENT=$DATA_REAL
   ACTIVE_PUBLICATION_LOCK_PARENT_ID=$DATA_DIR_ID
-  ACTIVE_PUBLICATION_LOCK_TOKEN="publication-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
-  owned_lock_acquire "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
-    "$ACTIVE_PUBLICATION_LOCK" "$ACTIVE_PUBLICATION_LOCK_TOKEN" "work identity publication"
+  if [ -n "${FM_WORK_IDENTITY_BATCH_LOCK_PID:-}" ] \
+     || [ -n "${FM_WORK_IDENTITY_BATCH_LOCK_TOKEN:-}" ]; then
+    case "${FM_WORK_IDENTITY_BATCH_LOCK_PID:-}" in ''|*[!0-9]*) die "delegated work identity lock owner is malformed" ;; esac
+    case "${FM_WORK_IDENTITY_BATCH_LOCK_TOKEN:-}" in ''|*[!A-Za-z0-9._:-]*) die "delegated work identity lock token is malformed" ;; esac
+    python3 "$FS_OWNER" lock-held "$ACTIVE_PUBLICATION_LOCK_PARENT" \
+      "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" "$ACTIVE_PUBLICATION_LOCK" \
+      "$FM_WORK_IDENTITY_BATCH_LOCK_PID" "$FM_WORK_IDENTITY_BATCH_LOCK_TOKEN" \
+      || die "delegated work identity publication lock is absent or mismatched"
+    ACTIVE_PUBLICATION_LOCK_TOKEN=$FM_WORK_IDENTITY_BATCH_LOCK_TOKEN
+    ACTIVE_PUBLICATION_LOCK_EXTERNAL=1
+  else
+    ACTIVE_PUBLICATION_LOCK_TOKEN="publication-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
+    owned_lock_acquire "$ACTIVE_PUBLICATION_LOCK_PARENT" "$ACTIVE_PUBLICATION_LOCK_PARENT_ID" \
+      "$ACTIVE_PUBLICATION_LOCK" "$ACTIVE_PUBLICATION_LOCK_TOKEN" "work identity publication"
+  fi
   ACTIVE_PUBLICATION_LOCK_HELD=1
 }
 
@@ -1120,9 +1138,26 @@ identity_lock_acquire() {  # <task-id>
   ACTIVE_IDENTITY_LOCK=".work-identity-task-${lock_key}.lock"
   ACTIVE_IDENTITY_LOCK_PARENT=$STATE_REAL
   ACTIVE_IDENTITY_LOCK_PARENT_ID=$STATE_DIR_ID
-  ACTIVE_IDENTITY_LOCK_TOKEN="task-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
-  owned_lock_acquire "$ACTIVE_IDENTITY_LOCK_PARENT" "$ACTIVE_IDENTITY_LOCK_PARENT_ID" \
-    "$ACTIVE_IDENTITY_LOCK" "$ACTIVE_IDENTITY_LOCK_TOKEN" "work identity task"
+  if [ -n "${FM_WORK_IDENTITY_BATCH_LOCK_PID:-}" ] \
+     || [ -n "${FM_WORK_IDENTITY_BATCH_LOCK_TOKEN:-}" ] \
+     || [ -n "${FM_WORK_IDENTITY_BATCH_LOCK_TASKS:-}" ]; then
+    case "${FM_WORK_IDENTITY_BATCH_LOCK_PID:-}" in ''|*[!0-9]*) die "delegated work identity lock owner is malformed" ;; esac
+    case "${FM_WORK_IDENTITY_BATCH_LOCK_TOKEN:-}" in ''|*[!A-Za-z0-9._:-]*) die "delegated work identity lock token is malformed" ;; esac
+    case $'\n'"${FM_WORK_IDENTITY_BATCH_LOCK_TASKS:-}"$'\n' in
+      *$'\n'"$task"$'\n'*) ;;
+      *) die "delegated work identity task lock does not authorize $task" ;;
+    esac
+    python3 "$FS_OWNER" lock-held "$ACTIVE_IDENTITY_LOCK_PARENT" \
+      "$ACTIVE_IDENTITY_LOCK_PARENT_ID" "$ACTIVE_IDENTITY_LOCK" \
+      "$FM_WORK_IDENTITY_BATCH_LOCK_PID" "$FM_WORK_IDENTITY_BATCH_LOCK_TOKEN" \
+      || die "delegated work identity task lock is absent or mismatched for $task"
+    ACTIVE_IDENTITY_LOCK_TOKEN=$FM_WORK_IDENTITY_BATCH_LOCK_TOKEN
+    ACTIVE_IDENTITY_LOCK_EXTERNAL=1
+  else
+    ACTIVE_IDENTITY_LOCK_TOKEN="task-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
+    owned_lock_acquire "$ACTIVE_IDENTITY_LOCK_PARENT" "$ACTIVE_IDENTITY_LOCK_PARENT_ID" \
+      "$ACTIVE_IDENTITY_LOCK" "$ACTIVE_IDENTITY_LOCK_TOKEN" "work identity task"
+  fi
   ACTIVE_IDENTITY_LOCK_HELD=1
   locate_task_dir "$task"
   if [ -d "$TASK_DIR" ]; then
@@ -1141,11 +1176,14 @@ identity_lock_acquire() {  # <task-id>
 
 identity_lock_release() {
   [ "$ACTIVE_IDENTITY_LOCK_HELD" -eq 1 ] || return 0
-  python3 "$FS_OWNER" lock-release "$ACTIVE_IDENTITY_LOCK_PARENT" \
-    "$ACTIVE_IDENTITY_LOCK_PARENT_ID" "$ACTIVE_IDENTITY_LOCK" \
-    "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN" \
-    || die "cannot release work identity task lock"
+  if [ "$ACTIVE_IDENTITY_LOCK_EXTERNAL" -ne 1 ]; then
+    python3 "$FS_OWNER" lock-release "$ACTIVE_IDENTITY_LOCK_PARENT" \
+      "$ACTIVE_IDENTITY_LOCK_PARENT_ID" "$ACTIVE_IDENTITY_LOCK" \
+      "${BASHPID:-$$}" "$ACTIVE_IDENTITY_LOCK_TOKEN" \
+      || die "cannot release work identity task lock"
+  fi
   ACTIVE_IDENTITY_LOCK_HELD=0
+  ACTIVE_IDENTITY_LOCK_EXTERNAL=0
   ACTIVE_IDENTITY_LOCK=
   ACTIVE_IDENTITY_LOCK_PARENT=
   ACTIVE_IDENTITY_LOCK_PARENT_ID=
@@ -1930,9 +1968,9 @@ handoff_backlog_complete() {  # <task-id> <transfer-path> <backlog-sha256>
   read_handoff_state "$TARGET_HANDOFF" target "$task"
   [ "$HANDOFF_TRANSFER" = "$requested" ] || die "task $task prepared a different incoming handoff"
   case "$HANDOFF_STATE" in
-    backlog-prepared) write_handoff_state "$TARGET_HANDOFF" target backlog-completed "$requested" ;;
+    prepared|backlog-prepared) write_handoff_state "$TARGET_HANDOFF" target backlog-completed "$requested" ;;
     backlog-completed|completed) ;;
-    *) die "task $task destination backlog was not reserved before receipt" ;;
+    *) die "task $task destination backlog was not validated before receipt" ;;
   esac
 }
 

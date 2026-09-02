@@ -1190,6 +1190,20 @@ EOF
   [ "${#SPAWN_ENDPOINT_ENTRY_DIGEST}" -eq 64 ]
 }
 
+spawn_endpoint_receipt_retire() {
+  local base state_inode
+  [ -n "$SPAWN_ENDPOINT_RECEIPT" ] || return 1
+  [ -n "$SPAWN_ENDPOINT_ENTRY_STATE" ] && [ -n "$SPAWN_ENDPOINT_ENTRY_DIGEST" ] || return 1
+  base=$(basename -- "$SPAWN_ENDPOINT_RECEIPT") || return 1
+  state_inode=$(spawn_file_inode_identity "$STATE") || return 1
+  python3 "$SCRIPT_DIR/fm-work-identity-fs.py" remove \
+    "$STATE" "$state_inode" "$base" \
+    "$SPAWN_ENDPOINT_ENTRY_STATE" "$SPAWN_ENDPOINT_ENTRY_DIGEST" >/dev/null || return 1
+  SPAWN_ENDPOINT_PHASE=
+  SPAWN_ENDPOINT_ENTRY_STATE=
+  SPAWN_ENDPOINT_ENTRY_DIGEST=
+}
+
 spawn_endpoint_receipt_publish() {  # <phase> [worktree]
   local phase=$1 worktree=${2:-} details payload payload_digest tmp base state_inode rc=0
   case "$phase" in endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-retryable|worktree-acquired|worktree-ready|launch-prepared|launch-submitted) ;; *) return 1 ;; esac
@@ -1716,7 +1730,7 @@ spawn_orca_operation_wait() {
           echo "error: compensated Orca endpoint journal could not be retired for $ID" >&2
           return 1
         }
-        rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+        spawn_endpoint_receipt_retire || {
           echo "error: compensated Orca endpoint receipt could not be retired for $ID" >&2
           return 1
         }
@@ -1825,7 +1839,7 @@ spawn_abort_cleanup() {
     if ! spawn_orca_operation_retire 2>/dev/null; then
       echo "warning: compensated Orca operation journal could not be retired; preserving its endpoint receipt for recovery" >&2
     elif [ -n "$SPAWN_ENDPOINT_RECEIPT" ] \
-      && ! rm -f -- "$SPAWN_ENDPOINT_RECEIPT" 2>/dev/null; then
+      && ! spawn_endpoint_receipt_retire 2>/dev/null; then
       echo "warning: compensated Orca endpoint receipt could not be retired; work identity dispatch requires reconciliation" >&2
     fi
   fi
@@ -3258,7 +3272,7 @@ spawn_missing_endpoint_compensate() {
   fi
   spawn_launch_request_cleanup || return 1
   spawn_launch_guard_cleanup_terminal || return 1
-  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || return 1
+  spawn_endpoint_receipt_retire || return 1
   SPAWN_DISPATCH_PENDING=0
   SPAWN_FRESH_COMMIT_PENDING=0
 }
@@ -4886,7 +4900,7 @@ if [ "$SPAWN_KIMI_DELIVERY_RECOVERY" -eq 1 ]; then
     echo "error: delivered secondmate launch identity requires reconciliation for $ID" >&2
     exit 1
   }
-  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+  spawn_endpoint_receipt_retire || {
     echo "error: delivered secondmate launch receipt could not be retired for $ID" >&2
     exit 1
   }
@@ -5862,7 +5876,7 @@ if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
 fi
 if [ "$RELAUNCH" -eq 0 ]; then
-  rm -f -- "$SPAWN_ENDPOINT_RECEIPT" || {
+  spawn_endpoint_receipt_retire || {
     echo "error: accepted launch receipt could not be retired for $ID" >&2
     exit 1
   }

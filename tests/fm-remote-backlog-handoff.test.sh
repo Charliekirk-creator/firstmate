@@ -263,8 +263,62 @@ EOF
   pass "receiver validates every target commitment before batch move"
 }
 
+receiver_refuses_malformed_later_receipt_without_reserving_earlier_key() {
+  local first second first_row second_row first_hash second_hash first_transfer second_transfer
+  local delivery bytes digest first_receipt rc=0
+  first=receipt-batch-valid
+  second=receipt-batch-malformed
+  first_row='- [ ] receipt-batch-valid - valid earlier batch row (repo: alpha)'
+  second_row='- [ ] receipt-batch-malformed - malformed later batch row (repo: alpha)'
+  printf '%s\n' "$first_row" > "$TMP_ROOT/receipt-batch-first-row"
+  printf '%s\n' "$second_row" > "$TMP_ROOT/receipt-batch-second-row"
+  first_hash=$(sha256_file "$TMP_ROOT/receipt-batch-first-row")
+  second_hash=$(sha256_file "$TMP_ROOT/receipt-batch-second-row")
+  first_transfer=$(FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" \
+    handoff-prepare "$first" --to-home "$REMOTE" --to-home-id secondmate:ios \
+      --backlog-sha256 "$first_hash")
+  second_transfer=$(FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" \
+    handoff-prepare "$second" --to-home "$REMOTE" --to-home-id secondmate:ios \
+      --backlog-sha256 "$second_hash")
+  printf '%s\n' "$first_transfer" | FM_HOME="$REMOTE" \
+    "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-stage "$first" --file - >/dev/null
+  printf '%s\n' "$second_transfer" | FM_HOME="$REMOTE" \
+    "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-stage "$second" --file - >/dev/null
+  first_receipt="$REMOTE/data/$first/work-identity-handoff-target.json"
+  printf '%s\n' malformed > "$REMOTE/data/$second/work-identity-handoff-target.json"
+  delivery="$TMP_ROOT/receipt-batch-delivery.md"
+  cat > "$delivery" <<EOF
+## In flight
+
+## Queued
+$first_row
+$second_row
+
+## Done
+EOF
+  bytes=$(LC_ALL=C wc -c < "$delivery" | tr -d ' ')
+  digest=$(sha256_file "$delivery")
+  FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-remote-file.sh" \
+    put state/handoff/receipt-batch.outbox.md 1048576 "$bytes" "$digest" 1 \
+    < "$delivery" >/dev/null
+  FM_HOME="$REMOTE" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+    "$REMOTE_ROOT/bin/fm-backlog-receive.sh" state/handoff/receipt-batch.outbox.md \
+      "$bytes" "$digest" 1 > "$TMP_ROOT/receipt-batch.out" 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "receiver accepted a malformed later identity receipt"
+  jq -e '.role == "target" and .state == "prepared"' "$first_receipt" >/dev/null \
+    || fail "receiver partially reserved the earlier identity before refusing the batch"
+  if [ -e "$REMOTE/data/backlog.md" ]; then
+    assert_no_grep "$first" "$REMOTE/data/backlog.md" \
+      "receiver moved the earlier row before refusing the malformed later receipt"
+    assert_no_grep "$second" "$REMOTE/data/backlog.md" \
+      "receiver moved the malformed later row"
+  fi
+  pass "receiver validates the complete identity batch before reservation"
+}
+
 if [ "${FM_TEST_ONLY:-}" = receiver-preflight ]; then
   receiver_preflight_refuses_changed_commitment
+  receiver_refuses_malformed_later_receipt_without_reserving_earlier_key
   exit 0
 fi
 
@@ -460,6 +514,7 @@ jq -e '.state == "completed" and .transfer.target.home_id == "secondmate:ios"' \
 pass "remote handoff commits an exact destination identity and source tombstone"
 
 receiver_preflight_refuses_changed_commitment
+receiver_refuses_malformed_later_receipt_without_reserving_earlier_key
 
 recovered_task=receipt-recovery-a
 conflicting_task=receipt-recovery-b

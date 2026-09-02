@@ -303,6 +303,22 @@ SH
   chmod +x "$case_dir/fakebin/python3"
 }
 
+race_endpoint_receipt_retirement() {  # <case-dir> <receipt>
+  local case_dir=$1 receipt=$2 receipt_base real
+  receipt_base=$(basename -- "$receipt")
+  real=$(command -v python3)
+  cat > "$case_dir/fakebin/python3" <<SH
+#!/usr/bin/env bash
+if [ "\${2:-}" = remove ] && [ "\${5:-}" = "$receipt_base" ] \
+   && [ ! -e "$case_dir/endpoint-retirement-raced" ]; then
+  : > "$case_dir/endpoint-retirement-raced"
+  printf '%s\n' competing-endpoint-receipt > "$receipt"
+fi
+exec "$real" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/python3"
+}
+
 restore_tasks_axi() {  # <case-dir>
   rm -f -- "$1/fakebin/tasks-axi"
 }
@@ -940,6 +956,28 @@ test_endpoint_receipt_publication_refuses_concurrent_state() {
       || fail "$operation endpoint publication changed the backlog row: $out"
   done
   pass "endpoint receipt publication is no-clobber and revision-conditional"
+}
+
+test_endpoint_receipt_retirement_refuses_concurrent_state() {
+  local case_dir home id receipt out rc=0
+  id=atomic-endpoint-retire-b4
+  case_dir=$(make_home endpoint-retirement "$id")
+  home=$(home_of "$case_dir")
+  receipt="$home/state/$id.spawn-endpoint.json"
+  add_item "$case_dir" "$id"
+  race_endpoint_receipt_retirement "$case_dir" "$receipt"
+
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "endpoint retirement removed concurrent state"
+  [ "$(cat "$receipt")" = competing-endpoint-receipt ] \
+    || fail "endpoint retirement changed the competing receipt"
+  assert_contains "$out" "accepted launch receipt could not be retired" \
+    "spawn did not report conditional endpoint retirement refusal"
+  assert_present "$home/state/$id.meta" \
+    "endpoint retirement race discarded accepted task metadata"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "endpoint retirement race did not preserve the committed backlog state"
+  pass "endpoint receipt retirement is revision-conditional"
 }
 
 test_dispatch_preserves_an_accepted_launch_when_the_transition_fails() {
@@ -2525,6 +2563,7 @@ test_a_persistent_secondmate_is_never_a_backlog_item() {
 
 if [ "${FM_TEST_ONLY:-}" = endpoint-receipt-publication ]; then
   test_endpoint_receipt_publication_refuses_concurrent_state
+  test_endpoint_receipt_retirement_refuses_concurrent_state
   exit 0
 fi
 
@@ -2547,6 +2586,7 @@ test_dispatch_reports_a_backlog_read_failure
 test_dispatch_refuses_a_closed_item
 test_dispatch_refuses_to_commit_without_a_published_record
 test_endpoint_receipt_publication_refuses_concurrent_state
+test_endpoint_receipt_retirement_refuses_concurrent_state
 test_dispatch_preserves_an_accepted_launch_when_the_transition_fails
 test_dispatch_reports_an_incomplete_record_rollback
 test_dispatch_reports_an_incomplete_busy_rollback

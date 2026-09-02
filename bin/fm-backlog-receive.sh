@@ -106,9 +106,10 @@ handoff_backlog_transition() {
   section=$(backlog_key_section "$DEST" "$task" 2>/dev/null || true)
   if [ "$action" = prepare ] && [ -z "$section" ]; then
     action_rc=0
-    FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
-      "$SCRIPT_DIR/fm-work-identity.sh" handoff-backlog-prepare "$task" --file "$transfer" >/dev/null \
+    state=$(FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
+      "$SCRIPT_DIR/fm-work-identity.sh" handoff-backlog-state "$task" --file "$transfer") \
       || action_rc=$?
+    case "$state" in prepared|backlog-prepared|backlog-completed|completed) ;; *) action_rc=1 ;; esac
     rm -f -- "$transfer"
     return "$action_rc"
   fi
@@ -210,7 +211,32 @@ TRANSFER_LOCK="$PARENT_REAL/.$ID.upload.lock"
 BACKLOG_LOCK="$FM_HOME/state/.backlog-mutation.lock"
 TRANSFER_LOCK_HELD=0
 BACKLOG_LOCK_HELD=0
+IDENTITY_BATCH_LOCKS_HELD=0
+IDENTITY_BATCH_LOCK_NAMES=()
+IDENTITY_BATCH_LOCK_TOKEN=
+IDENTITY_BATCH_LOCK_PID=
+IDENTITY_BATCH_STATE_REAL=
+IDENTITY_BATCH_STATE_ID=
+IDENTITY_BATCH_DATA_REAL=
+IDENTITY_BATCH_DATA_ID=
+identity_batch_locks_release() {
+  local index name
+  [ "$IDENTITY_BATCH_LOCKS_HELD" -eq 1 ] || return 0
+  index=${#IDENTITY_BATCH_LOCK_NAMES[@]}
+  while [ "$index" -gt 0 ]; do
+    index=$((index - 1))
+    name=${IDENTITY_BATCH_LOCK_NAMES[$index]}
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-release \
+      "$IDENTITY_BATCH_STATE_REAL" "$IDENTITY_BATCH_STATE_ID" "$name" \
+      "$IDENTITY_BATCH_LOCK_PID" "$IDENTITY_BATCH_LOCK_TOKEN" >/dev/null 2>&1 || true
+  done
+  python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-release \
+    "$IDENTITY_BATCH_DATA_REAL" "$IDENTITY_BATCH_DATA_ID" ".work-identity-publication.lock" \
+    "$IDENTITY_BATCH_LOCK_PID" "$IDENTITY_BATCH_LOCK_TOKEN" >/dev/null 2>&1 || true
+  IDENTITY_BATCH_LOCKS_HELD=0
+}
 receive_locks_release() {
+  identity_batch_locks_release
   [ "$BACKLOG_LOCK_HELD" -eq 0 ] || fm_lock_release "$BACKLOG_LOCK" || true
   [ "$TRANSFER_LOCK_HELD" -eq 0 ] || fm_lock_release "$TRANSFER_LOCK" || true
 }
@@ -253,7 +279,56 @@ for key in "${KEYS[@]}"; do
   [ "$section" = '## Queued' ] || die "delivered outbox contains non-Queued item $key under $section"
 done
 
-mkdir -p "$FM_HOME/data"
+mkdir -p "$FM_HOME/data" "$FM_HOME/state"
+IDENTITY_BATCH_STATE_REAL=$(CDPATH='' cd -- "$FM_HOME/state" && pwd -P) \
+  || die "cannot resolve work identity state directory"
+IDENTITY_BATCH_DATA_REAL=$(CDPATH='' cd -- "$FM_HOME/data" && pwd -P) \
+  || die "cannot resolve work identity data directory"
+if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+  IDENTITY_BATCH_STATE_ID=$(stat -f '%d:%i' "$IDENTITY_BATCH_STATE_REAL") \
+    || die "cannot identify work identity state directory"
+  IDENTITY_BATCH_DATA_ID=$(stat -f '%d:%i' "$IDENTITY_BATCH_DATA_REAL") \
+    || die "cannot identify work identity data directory"
+else
+  IDENTITY_BATCH_STATE_ID=$(stat -c '%d:%i' "$IDENTITY_BATCH_STATE_REAL") \
+    || die "cannot identify work identity state directory"
+  IDENTITY_BATCH_DATA_ID=$(stat -c '%d:%i' "$IDENTITY_BATCH_DATA_REAL") \
+    || die "cannot identify work identity data directory"
+fi
+IDENTITY_BATCH_LOCK_PID=${BASHPID:-$$}
+IDENTITY_BATCH_LOCK_TOKEN="handoff-${IDENTITY_BATCH_LOCK_PID}-${RANDOM}-${RANDOM}"
+while :; do
+  lock_rc=0
+  python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-try \
+    "$IDENTITY_BATCH_DATA_REAL" "$IDENTITY_BATCH_DATA_ID" ".work-identity-publication.lock" \
+    "$IDENTITY_BATCH_LOCK_PID" "$IDENTITY_BATCH_LOCK_TOKEN" "${FM_LOCK_STALE_AFTER:-2}" >/dev/null \
+    || lock_rc=$?
+  case "$lock_rc" in 0) break ;; 2) sleep 0.1 ;; *) die "work identity publication lock is unsafe" ;; esac
+done
+IDENTITY_BATCH_LOCKS_HELD=1
+LOCK_TASKS=()
+while IFS= read -r key; do
+  [ -n "$key" ] && LOCK_TASKS+=("$key")
+done < <(printf '%s\n' "${KEYS[@]}" | LC_ALL=C sort -u)
+for key in "${LOCK_TASKS[@]}"; do
+  case "$key" in ''|.*|*[!A-Za-z0-9._-]*) die "delivered task id is unsafe: $key" ;; esac
+  lock_key=$(printf '%s' "$key" | sha256_stream) || die "cannot identify work identity task lock"
+  lock_name=".work-identity-task-${lock_key}.lock"
+  while :; do
+    lock_rc=0
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" lock-try \
+      "$IDENTITY_BATCH_STATE_REAL" "$IDENTITY_BATCH_STATE_ID" "$lock_name" \
+      "$IDENTITY_BATCH_LOCK_PID" "$IDENTITY_BATCH_LOCK_TOKEN" "${FM_LOCK_STALE_AFTER:-2}" >/dev/null \
+      || lock_rc=$?
+    case "$lock_rc" in 0) break ;; 2) sleep 0.1 ;; *) die "work identity task lock is unsafe for $key" ;; esac
+  done
+  IDENTITY_BATCH_LOCK_NAMES+=("$lock_name")
+done
+FM_WORK_IDENTITY_BATCH_LOCK_TASKS=$(printf '%s\n' "${LOCK_TASKS[@]}")
+export FM_WORK_IDENTITY_BATCH_LOCK_PID="$IDENTITY_BATCH_LOCK_PID"
+export FM_WORK_IDENTITY_BATCH_LOCK_TOKEN="$IDENTITY_BATCH_LOCK_TOKEN"
+export FM_WORK_IDENTITY_BATCH_LOCK_TASKS
+
 DEST_CREATED=0
 TO_MOVE=()
 ALREADY=()
@@ -318,6 +393,8 @@ for key in "${KEYS[@]}"; do
     || die "exact destination backlog receipt is incomplete for $key"
 done
 rm -f -- "$DELIVERED" || die "receipt succeeded but delivered scratch cleanup failed"
+identity_batch_locks_release
+unset FM_WORK_IDENTITY_BATCH_LOCK_PID FM_WORK_IDENTITY_BATCH_LOCK_TOKEN FM_WORK_IDENTITY_BATCH_LOCK_TASKS
 fm_lock_release "$BACKLOG_LOCK" || die "receipt succeeded but backlog lock cleanup failed"
 BACKLOG_LOCK_HELD=0
 fm_lock_release "$TRANSFER_LOCK" || die "receipt succeeded but transfer lock cleanup failed"

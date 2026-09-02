@@ -710,6 +710,56 @@ test_owned_replace_refuses_changed_unsafe_destination() {
   pass "owned replacement and removal refuse changed destinations"
 }
 
+test_owned_replace_refuses_a_changing_source() {
+  local home parent inode source target details state digest hook out rc=0
+  home=$(make_home owned-replace-source-race)
+  parent="$home/state"
+  source="$home/replacement"
+  target="$parent/authoritative"
+  hook="$home/python-hook"
+  printf 'replacement\n' > "$source"
+  printf 'original\n' > "$target"
+  inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$parent")
+  details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-replace \
+    "$parent" "$inode" authoritative) || fail "could not capture replacement destination"
+  state=${details%%$'\t'*}
+  digest=${details#*$'\t'}
+  mkdir -p "$hook"
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+_source = os.environ["FM_TEST_CHANGE_SOURCE"]
+_source_info = os.stat(_source, follow_symlinks=False)
+_real_read = os.read
+_changed = False
+
+
+def raced_read(fd, count):
+    global _changed
+    info = os.fstat(fd)
+    if not _changed and (info.st_dev, info.st_ino) == (_source_info.st_dev, _source_info.st_ino):
+        _changed = True
+        append_fd = os.open(_source, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(append_fd, b"changed\n")
+        finally:
+            os.close(append_fd)
+    return _real_read(fd, count)
+
+
+os.read = raced_read
+PY
+  out=$(PYTHONPATH="$hook" FM_TEST_CHANGE_SOURCE="$source" \
+    python3 "$ROOT/bin/fm-work-identity-fs.py" replace \
+    "$parent" "$inode" authoritative "$source" "$state" "$digest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "owned replacement accepted a changing source"
+  [ "$(cat "$target")" = original ] \
+    || fail "changing source partially replaced the authoritative destination"
+  assert_contains "$out" "publication source changed during copying" \
+    "owned replacement did not identify its changing source"
+  pass "owned replacement pins its source through copying"
+}
+
 test_owned_removal_bounds_digest_after_concurrent_growth() {
   local home parent inode target details state digest hook out rc=0
   home=$(make_home owned-removal-growth)
@@ -2554,9 +2604,9 @@ test_handoff_receiver_reads_chunked_transfer_to_eof() {
   } | FM_HOME="$mate" FM_ROOT_OVERRIDE="$ROOT" \
     "$ROOT/bin/fm-backlog-receive.sh" --prepare-handoff "$task" >/dev/null \
     || fail "handoff receiver truncated a valid chunked transfer"
-  jq -e '.state == "backlog-prepared"' \
+  jq -e '.state == "prepared"' \
     "$mate/data/$task/work-identity-handoff-target.json" >/dev/null \
-    || fail "chunked handoff receipt was not prepared"
+    || fail "chunked handoff preflight changed the target receipt"
   pass "handoff receiver reads chunked transfers through EOF"
 }
 
@@ -2652,9 +2702,9 @@ EOF
     || fail "could not prepare the interrupted target backlog receipt"
   tasks-axi mv "$task_c" --file "$parent/data/backlog.md" --to "$mate/data/backlog.md" >/dev/null \
     || fail "could not move the interrupted prepared-target backlog fixture"
-  jq -e '.state == "backlog-prepared"' \
+  jq -e '.state == "prepared"' \
     "$mate/data/$task_c/work-identity-handoff-target.json" >/dev/null \
-    || fail "interrupted prepared-target fixture was not backlog-prepared"
+    || fail "interrupted prepared-target fixture changed during preflight"
   rc=0
   out=$(FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" \
     transaction "$task_c" "$task_b" 2>&1) || rc=$?
@@ -3161,6 +3211,10 @@ case "${FM_TEST_ONLY:-}" in
     test_handoff_receiver_reads_chunked_transfer_to_eof
     exit 0
     ;;
+  owned-replace-source)
+    test_owned_replace_refuses_a_changing_source
+    exit 0
+    ;;
 esac
 
 test_intake_through_fleet_projection
@@ -3174,6 +3228,7 @@ test_no_clobber_conflict_retires_owned_transaction
 test_no_clobber_journal_rejects_unrelated_staging
 test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
+test_owned_replace_refuses_a_changing_source
 test_owned_removal_bounds_digest_after_concurrent_growth
 test_owned_snapshot_binds_validated_entry
 test_identity_lock_refuses_replaced_storage_parent

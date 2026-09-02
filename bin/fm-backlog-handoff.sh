@@ -950,7 +950,7 @@ remote_target_backlog_action() { # <secondmate-id> <prepare|complete> <task-id> 
           handoff-backlog-state "$task" --file -) || state_rc=$?
     if [ "$state_rc" -eq 0 ]; then
       case "$action:$state" in
-        prepare:backlog-prepared|prepare:backlog-completed|prepare:completed|complete:backlog-completed|complete:completed) rc=0 ;;
+        prepare:prepared|prepare:backlog-prepared|prepare:backlog-completed|prepare:completed|complete:backlog-completed|complete:completed) rc=0 ;;
       esac
     fi
   fi
