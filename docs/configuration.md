@@ -18,7 +18,7 @@ Untracked files and directories whose names begin with `scratchpad` are also git
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
 The producing PR and Relay helpers own the fields they append, `bin/fm-classify-lib.sh` owns status-event vocabulary, and `bin/fm-crew-state.sh` owns current-state reconciliation.
 Wake, watcher, away-mode, and Relay-specific state mechanics remain with their named scripts and reference sections rather than being duplicated into one exhaustive state tree here.
-Exact project, plan, work-unit, and source identity intake is documented in [`work-identity.md`](work-identity.md), while `bin/fm-work-identity.sh` owns the complete versioned sidecar contract and validation mechanics.
+Exact project or initiative, plan, stage, work-unit, and source identity intake is documented in [`work-identity.md`](work-identity.md), while `bin/fm-work-identity.sh` owns the complete versioned sidecar contract and validation mechanics.
 
 `bin/fm-session-start.sh`'s header is the single owner of session-start ordering, composed commands, digest contents, and the digest's startup mechanism.
 `bin/fm-startup-network.sh`'s header owns the deferred startup stage that keeps every external-network call and the potentially slow inactive-outcome scan off that digest's blocking path, including its state files and the safety argument for running them later.
@@ -119,7 +119,10 @@ See [`docs/cmux-backend.md`](cmux-backend.md#runtime-detection) for why cmux can
 Auto-detected herdr or cmux prints a stderr notice naming `config/backend` and `--backend tmux` as opt-outs; auto-detected tmux stays silent to preserve existing default behavior.
 Zellij and Orca are never auto-detected; select them by putting the name in a local `config/backend` file, by exporting `FM_BACKEND=<name>`, or by telling the first mate in chat.
 Any value other than `tmux`, `herdr`, `zellij`, `orca`, or `cmux` is rejected until another adapter is implemented and verified.
-`fm-spawn.sh` accepts `tmux`, `herdr`, `zellij`, `orca`, and `cmux` for ship and scout tasks; `backend=orca` and `backend=cmux` both still refuse `--secondmate` until secondmate launch semantics are designed for each. Persistent Kimi secondmates require `backend=tmux`; Herdr does not expose the transaction-scoped prompt receipt required for deterministic remote Kimi delivery. Existing completed remote Kimi routes remain manageable, but cannot be launched or resumed. Non-tmux Kimi ship and scout tasks remain supported.
+`fm-spawn.sh` accepts `tmux`, `herdr`, `zellij`, `orca`, and `cmux` for ship and scout tasks; `backend=orca` and `backend=cmux` both still refuse `--secondmate` until secondmate launch semantics are designed for each.
+Persistent Kimi secondmates require `backend=tmux`; the [Herdr backend guide](herdr-backend.md) owns why its prompt boundary cannot safely launch or resume them.
+Existing completed remote Kimi routes remain manageable, but cannot be launched or resumed.
+Non-tmux Kimi ship and scout tasks remain supported.
 `codex-app` is not an accepted runtime backend yet; [`docs/codex-app-backend.md`](codex-app-backend.md) owns the Codex App boundary.
 The session-start secondmate liveness sweep uses the recovery-grade `fm_backend_agent_state` classifier where verified.
 The comment above that function in `bin/fm-backend.sh` is the single owner of its detailed state contract and recovery authorization.

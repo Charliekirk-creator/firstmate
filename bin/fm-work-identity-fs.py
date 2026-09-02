@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Descriptor-bound filesystem primitives for fm-work-identity.sh.
+#
+# The shell owner defines relation semantics and calls this helper only for
+# race-resistant directory entry inspection, publication, locking, and removal.
+# Keeping path traversal and file-descriptor checks here avoids weakening those
+# guarantees into repeated shell pathname checks.
 import ctypes
 import errno
 import fcntl

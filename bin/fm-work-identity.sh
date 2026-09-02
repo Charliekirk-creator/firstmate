@@ -30,8 +30,11 @@
 #   fm-work-identity.sh unlinked-commit <task-id> --transaction <id>
 #   fm-work-identity.sh unlinked-abort <task-id> --transaction <id>
 #   fm-work-identity.sh home-id
-#   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--result]
+#   fm-work-identity.sh handoff-prepare <task-id> --to-home <absolute-home> --to-home-id <home-id> [--backlog-sha256 <digest>] [--result]
 #   fm-work-identity.sh handoff-stage <task-id> --file <transfer.json|->
+#   fm-work-identity.sh handoff-backlog-prepare <task-id> --file <transfer.json|->
+#   fm-work-identity.sh handoff-backlog-complete <task-id> --file <transfer.json|-> --backlog-sha256 <digest>
+#   fm-work-identity.sh handoff-backlog-state <task-id> --file <transfer.json|->
 #   fm-work-identity.sh handoff-commit <task-id> --file <transfer.json|->
 #   fm-work-identity.sh handoff-abort <task-id> --file <transfer.json|->
 #   fm-work-identity.sh handoff-target-state <task-id> --file <transfer.json|->

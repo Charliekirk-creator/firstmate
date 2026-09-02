@@ -3294,6 +3294,10 @@ case "${FM_TEST_ONLY:-}" in
     test_handoff_receiver_reads_chunked_transfer_to_eof
     exit 0
     ;;
+  handoff-rebinding)
+    test_handoff_rebinds_identity_and_decision_surfaces
+    exit 0
+    ;;
   contract-validation)
     test_namespace_separation_and_contract_rejections
     test_unsafe_files_labels_and_exact_binding

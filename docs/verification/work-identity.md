@@ -7,48 +7,44 @@ Audience: maintainer verification.
 
 ## Public-interface evidence
 
-The contract was verified on 2026-08-14 on macOS arm64 through public commands and fleet projections:
+The current contract was verified on 2026-09-02 on macOS arm64 through public commands, lifecycle entrypoints, and fleet projections:
 
 ```sh
-tests/fm-work-identity.test.sh
-tests/fm-remote-backlog-handoff.test.sh
-tests/fm-brief.test.sh
-tests/fm-fleet-snapshot-view.test.sh
+bin/fm-test-run.sh tests/fm-work-identity.test.sh
+bin/fm-test-run.sh tests/fm-backlog-handoff.test.sh
+bin/fm-test-run.sh tests/fm-remote-backlog-handoff.test.sh
+bin/fm-test-run.sh tests/fm-brief.test.sh
+bin/fm-test-run.sh tests/fm-fleet-snapshot-view.test.sh
 ```
 
-Bounded output:
+Bounded completion output:
 
 ```text
 ok - exact multi-work-unit intake survives instructions, metadata, snapshot, and Bearings once per worker
 ok - spawn delivers validated bytes despite source and snapshot replacement
-ok - sidecar validation hashes one captured byte sequence
-ok - manifest intake canonicalizes one capture and rejects source rewrites
-ok - concurrent identical records converge and intentional unlinked intake stays explicit
-ok - spawn retries adopt one exact endpoint creation receipt
-ok - pre-metadata dispatch retries resume one exact owner receipt
-ok - metadata projection validates one stable captured byte sequence
+ok - dispatch publication validates, publishes, and completes under one owner lock
 ok - namespaces remain distinct and version, role, duplicate, contradiction, and id syntax are closed
 ok - unsafe manifests, labels, stored files, cross-home copies, and task mismatches refuse
-ok - generated instructions and metadata freeze the exact relation against stale edits
 ok - legacy tasks stay explicitly unlinked despite every fuzzy fallback signal
-ok - secondmate structured summary and Bearings expose one exact delegated-child worker
+ok - delegated summaries preserve ids and reject unsafe home identity paths
 ok - linked handoff rebinds identity for delegated decision summaries and Bearings
-ok - handoff preparation freezes intake and failed batches leave no immutable target sidecars
-ok - snapshot preflight blocks prepared ownership and recovers exact dispatch metadata
+ok - completed unlinked handoff records one explicit intake transition
 ok - delegated linked integrity failures stop parent publication
 ok - schema-maximum delegated identities use bounded remote pages
 ok - Bearings preserves complete IDs and labels for every bounded worker row
 ok - remote handoff commits an exact destination identity and source tombstone
+ok - fresh remote work gets a new wake after confirmed cleanup recovery
 ok - fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly
 ok - fixture snapshot covers task rows, backlog rows, pointers, and stable ordering
 ```
 
 The focused suite covers single and multiple work units, Work Aligner `plan_id` and `work_units`, DTM project and issue IDs, Data Team Ticket IDs, local Firstmate plans, namespace separation, complete stable IDs paired with labels, absent and filesystem-component-overlong legacy records, idempotence, exact path/task/stable-home binding, local and remote handoff rebinding, malformed versions and syntax, duplicate and contradictory IDs, unsafe paths, C1 controls, Unicode format controls, symlink and hardlink refusal, stale digest refusal, delegated fail-stop propagation, schema-maximum per-home paging under one deadline, stable snapshot output, active and held delegated-child projections, main and delegated status decisions, nested active, decision, hold, and queue omission disclosure, and every prohibited fuzzy signal.
-It also confirms that relation recording changes no runtime task-state file, manifest intake and metadata projection each validate one captured byte sequence and refuse a same-size source rewrite, and all tools receive one captured launch input even when the source and launch snapshot change after preflight. Metadata binds the delivered byte digest and exact transaction receipt, projection refuses advertised transactions without that owner receipt, an exact pre-metadata retry adopts its task-bound endpoint and resumes the prepared receipt, completed dispatch history retires after lifecycle cleanup, prepared ownership omitted from backlog and metadata still blocks every snapshot mode, exact published metadata recovers an interrupted dispatch commit, secondmate projection follows the metadata-bound launch snapshot, handoff prepare excludes concurrent intake, failed multi-item staging publishes no immutable destination sidecar, and successful or recovered local and remote transfers retain exact source tombstones and destination commit receipts.
+It also covers one-capture manifest, sidecar, metadata, and instruction validation; no-clobber publication recovery; replaced storage parents and lock entries; exact endpoint creation-intent recovery; worktree-request no-resend behavior; atomic metadata publication; replacement dispatch; whole-task-set dispatch retirement; and exact cleanup authorization.
+The handoff coverage validates each complete local or remote batch before mutation, preserves exact source and target receipts, rejects unsafe or unrelated records, forwards the exact captured transfer payload, and retains recoverable work until identity ownership and the receiver wake converge.
 
 ## Runtime-backend applicability
 
-The backend review covered every spawn-capable runtime supported on 2026-08-14:
+The backend review covered every spawn-capable runtime supported on 2026-09-02:
 
 | Runtime backend | Applicability | Evidence boundary |
 | --- | --- | --- |
@@ -60,18 +56,19 @@ The backend review covered every spawn-capable runtime supported on 2026-08-14:
 
 No backend parses the relation or receives a backend-specific identity format.
 All five converge on the same captured launch input and schema/status/identity-digest/instruction-digest metadata fields.
-A secondmate child uses the same interface in its own exact `FM_HOME`; local and remote parent projections consume the bounded `fm-secondmate-home-summary.v1` result rather than scanning or reconstructing that child home.
+A secondmate child uses the same interface in its own exact `FM_HOME`.
+Local and remote parent projections consume the bounded `fm-secondmate-home-summary.v1` result rather than scanning or reconstructing that child home.
 
 The common spawn and projection boundaries were exercised with:
 
 ```sh
-tests/fm-spawn-worktree-settle.test.sh
-tests/fm-spawn-batch.test.sh
-tests/fm-trace-context-spawn.test.sh
-tests/fm-bearings-snapshot.test.sh
+bin/fm-test-run.sh tests/fm-spawn-worktree-settle.test.sh
+bin/fm-test-run.sh tests/fm-spawn-batch.test.sh
+bin/fm-test-run.sh tests/fm-trace-context-spawn.test.sh
+bin/fm-test-run.sh tests/fm-bearings-snapshot.test.sh
 ```
 
-Bounded output:
+Bounded completion output:
 
 ```text
 ok - a single transient stale pane_current_path read is not accepted as the worktree
@@ -82,7 +79,7 @@ ok - TOON and JSON are parity representations of the same model
 
 ## Worker-tool applicability
 
-The launch-template review covered every verified worker tool supported on 2026-08-14:
+The launch-template review covered every verified worker tool supported on 2026-09-02:
 
 | Worker tool | Validated launch-snapshot path | Applicability |
 | --- | --- | --- |
@@ -96,6 +93,18 @@ The launch-template review covered every verified worker tool supported on 2026-
 | Cursor | Full snapshot passed with the exact workspace | Applicable without a tool-specific parser. |
 | Muse | Full encoded snapshot passed at launch | Applicable for its supported crewmate and scout roles. |
 
+The worker-specific launch and recovery boundaries were exercised with:
+
+```sh
+bin/fm-test-run.sh tests/fm-spawn-dispatch-profile.test.sh
+bin/fm-test-run.sh tests/fm-grok-harness.test.sh
+bin/fm-test-run.sh tests/fm-kimi-harness.test.sh
+bin/fm-test-run.sh tests/fm-secondmate-harness.test.sh
+```
+
 Persistent secondmate agents are not work-unit workers themselves.
-Their local and remote control tasks refuse linked intake before endpoint or home mutation and record the route as explicitly unlinked; their ship and scout children use the same table in the secondmate home's ordinary spawn path, while Muse remains inapplicable to the persistent secondmate role for its pre-existing supervision limitation.
+Their local and remote control tasks refuse linked intake before endpoint or home mutation and record the route as explicitly unlinked.
+Their ship and scout children use the same worker table in the secondmate home's ordinary spawn path.
+Persistent Kimi secondmates are limited to local tmux routes, while remote Herdr routes refuse Kimi launch or interrupted-delivery resume; this does not restrict Kimi ship or scout workers.
+Muse remains inapplicable to the persistent secondmate role because of its pre-existing supervision limitation.
 No tool may infer a relation from rendered output, process identity, endpoint labels, or status prose.

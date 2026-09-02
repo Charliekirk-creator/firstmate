@@ -610,23 +610,24 @@ assert_absent "$PARENT/data/handoff/ios.outbox.md" \
   "remote receiver wake recovery left its outbox pending"
 pass "remote handoff wakes its supported endpoint or remains loudly recoverable"
 
-RM_FAKEBIN="$TMP_ROOT/rm-fakebin"
-mkdir -p "$RM_FAKEBIN"
-REAL_RM=$(command -v rm)
-cat > "$RM_FAKEBIN/rm" <<'SH'
+CLEANUP_FAKEBIN="$TMP_ROOT/cleanup-fakebin"
+mkdir -p "$CLEANUP_FAKEBIN"
+REAL_PYTHON3=$(command -v python3)
+cat > "$CLEANUP_FAKEBIN/python3" <<'SH'
 #!/usr/bin/env bash
-last=${!#}
-if [ "$last" = "$FM_FAIL_RM_PATH" ]; then
+if [ "${1:-}" = "$FM_FAIL_PYTHON_OWNER" ] && [ "${2:-}" = remove ] \
+  && [ "${3:-}/${5:-}" = "$FM_FAIL_REMOVE_PATH" ]; then
   exit 1
 fi
-exec "$FM_REAL_RM" "$@"
+exec "$FM_REAL_PYTHON3" "$@"
 SH
-chmod +x "$RM_FAKEBIN/rm"
+chmod +x "$CLEANUP_FAKEBIN/python3"
 write_backlog '- [ ] cleanup-retry - confirmed wake survives cleanup retry (repo: alpha)'
 wakes_before=$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")
 set +e
-PATH="$RM_FAKEBIN:$PATH" FM_REAL_RM="$REAL_RM" \
-  FM_FAIL_RM_PATH="$PARENT/data/handoff/ios.outbox.md" \
+PATH="$CLEANUP_FAKEBIN:$PATH" FM_REAL_PYTHON3="$REAL_PYTHON3" \
+  FM_FAIL_PYTHON_OWNER="$ROOT/bin/fm-work-identity-fs.py" \
+  FM_FAIL_REMOVE_PATH="$PARENT/data/handoff/ios.outbox.md" \
   handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios cleanup-retry \
   > "$TMP_ROOT/cleanup-retry.out" 2>&1
 rc=$?

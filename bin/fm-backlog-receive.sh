@@ -3,17 +3,17 @@
 #
 # Usage:
 #   fm-backlog-receive.sh state/handoff/<secondmate-id>.outbox.md <bytes> <sha256> <generation>
+#   fm-backlog-receive.sh {--prepare-handoff|--complete-handoff} <task-id> < <transfer.json>
 #
-# The delivered file must be a non-symlink backlog-format scratch file confined
-# to FM_HOME/state/handoff. Every item must be Queued. Keys already present in
-# data/backlog.md are skipped; every remaining key moves in one dependency-closed
-# `tasks-axi mv` transaction under tasks-axi's own locks. On an ambiguous caller
-# retry, destination-present classification makes this operation idempotent.
-#
-# If tasks-axi reports a lock failure, this host may remove and retry once only
-# for its own backlog or delivered lock whose pid is dead and whose mtime is at
-# least 30 seconds old. No live or uncertain lock is touched. On confirmed
-# receipt the delivered scratch file is removed; no other path is deletable.
+# Delivered-file mode accepts one confined non-symlink backlog scratch file and
+# moves destination-absent Queued keys through one dependency-closed tasks-axi
+# transaction. Destination-present classification makes caller retry idempotent.
+# Receipt mode reads one exact transfer envelope and asks fm-work-identity.sh to
+# validate or advance its destination backlog-ownership state.
+# If tasks-axi reports a lock failure, this host may retry once only after proving
+# its own backlog or delivered lock has a dead pid and is at least 30 seconds old.
+# No live or uncertain lock is touched.
+# After a confirmed receipt, the delivered scratch file is removed.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,57 +1,53 @@
 # Exact work identity
 
 Firstmate can bind one task to an exact project or initiative, plan, stage, one or more work units, and one or more source-system records before dispatch.
+Tasks without an intake record remain compatible and are projected explicitly as unlinked.
 The public intake command is [`bin/fm-work-identity.sh`](../bin/fm-work-identity.sh).
 Its header and `--help` output are the single owner of the complete `fm-work-identity.v1` schema, namespace matrix, syntax, storage, binding, and refusal rules.
+This guide covers the operator workflow without copying that contract.
 
 ## Record an intake relation
 
-Generate a home-bound and task-bound manifest template into an ordinary temporary file:
+Run the commands from the active Firstmate home so the generated binding names the correct physical and stable home identity.
+Create the editable manifest as a private regular file rather than redirecting to a predictable path:
 
 ```sh
-bin/fm-work-identity.sh template <task-id> > /tmp/<task-id>-work-identity.json
+manifest=$(mktemp "${TMPDIR:-/tmp}/fm-work-identity.XXXXXX")
+trap 'rm -f -- "$manifest"' EXIT HUP INT TERM
+bin/fm-work-identity.sh template <task-id> > "$manifest"
 ```
 
-Replace every placeholder ID and label with accepted exact values.
-The command records identities but does not verify that an external system currently contains them, so intake must use the accepted IDs from the authoritative project, plan, DTM, or ticket source.
+Edit only the generated identity objects, leaving `schema` and `binding` unchanged.
+Use accepted exact IDs from the authoritative project, plan, DTM, or ticket source.
+The command validates the local identity contract but does not contact an external system to prove that an ID currently exists there.
 
-Record the completed manifest before generating the task instructions:
+Record the completed manifest before generating the task brief:
 
 ```sh
-bin/fm-work-identity.sh record <task-id> --file /tmp/<task-id>-work-identity.json
+bin/fm-work-identity.sh record <task-id> --file "$manifest"
 bin/fm-work-identity.sh verify <task-id> | jq .
 ```
 
 Then scaffold and dispatch the task normally.
-`fm-brief.sh` embeds the canonical payload and digest in the generated instructions and asks the contract owner to publish the validated bytes atomically.
-`fm-spawn.sh` enters an owner-managed prepare/commit transaction before creating an endpoint, copies the brief to a per-task launch snapshot, and binds its path, SHA-256 digest, and dispatch transaction receipt in task metadata before delivering the frozen operational input. Until metadata publication, it also retains an exact task, transaction, backend, endpoint, and worktree creation receipt, so an interrupted retry adopts the recorded endpoint instead of creating a duplicate. If execution stops before metadata publication, an exact retry resumes the prepared owner receipt; if it stops after metadata publication but before commit, the contract owner completes only that exact metadata-bound transaction. Projection requires that receipt whenever metadata advertises a transaction, validates one stable metadata capture, and reads the bound launch snapshot rather than an older source brief. Teardown retires completed dispatch history after removing its metadata and launch snapshot, so publication preflight does not grow with unreferenced tasks. Backlog ownership handoff is excluded while dispatch is prepared and remains unavailable once source dispatch metadata exists.
-A ship or scout relaunch validates the prior snapshot and metadata under the same owner transaction before replacing them with the progress-note-bearing instructions; a pre-publication abort restores the prior binding.
-Persistent secondmate control tasks are not work-unit workers and must remain explicitly unlinked; local and remote launch refuse a linked relation before endpoint or home mutation, while tasks dispatched inside the secondmate home use the full contract normally.
-Kimi receives the same frozen input after its readiness gate. Replacing the source brief during launch therefore cannot change what any supported worker tool receives.
+`fm-brief.sh` and `fm-spawn.sh` consume the contract owner's validated binding so the frozen worker instructions, metadata, and later projections agree.
 Repeating `record` with the same manifest is an idempotent no-op.
-A relation is immutable once recorded, and a changed relation requires a new task identity.
+A recorded relation is immutable, so a different relation requires a new task identity.
+Persistent secondmate control tasks remain explicitly unlinked, while ship and scout tasks dispatched inside a secondmate home use the ordinary intake flow.
 
 ## Namespaces and labels
 
-Work Aligner `plan_id` and `work_units`, DTM projects and issues, Data Team Tickets, and local Firstmate plan identities use separate namespaces.
-A task can carry several exact work units while remaining one worker in fleet counts.
-Every exact identity is paired with a human display label, but the namespace, kind, and ID tuple alone establishes identity.
+The accepted namespace and kind combinations distinguish Work Aligner plans and work units, DTM projects and issues, Data Team Tickets, and local Firstmate plans and work units.
+Consult the command header for the complete closed matrix rather than inventing a namespace or kind.
+Every human label is display-only, and only the namespace, kind, and ID tuple establishes identity.
+One task may carry several exact work units while still counting as one worker.
+Never construct a relation from a title, repository, branch, endpoint, worker name, timestamp, label, or status text.
 
-The binding combines the physical home path with a stable `main` or `secondmate:<id>` home identity, so a remote secondmate at the same absolute path as its primary remains a different owner.
-Tasks without a record remain compatible and appear explicitly as unlinked, including path-safe legacy task IDs longer than both the current intake limit and one filesystem component; read-only projection uses a bounded derived lock key and does not create a task data directory.
-Firstmate never constructs a relation from a task title, repository, branch, endpoint, worker name, time, label, or status text.
+## Read-only projections and handoff
 
-## Read-only projections
-
-The authoritative fleet snapshot exposes the structured identity on task rows, backlog rows, and validated secondmate child summaries.
-A child summary carries one normalized task reference index, and the primary resolves each exact projection once through ordered transport-bounded pages under one per-home deadline before publishing any delegated surface.
-Bearings keeps one row per worker and renders every complete exact ID beside its label, including delegated children that are active or held inside a secondmate home; nested active, decision, hold, and queue caps are disclosed explicitly.
-The primary does not reconstruct local or remote child trees, and an identity-integrity failure in a readable child home stops the parent snapshot instead of becoming an unknown transport result.
-
-A local or remote backlog handoff durably prepares an exact source-to-destination transfer through the same contract owner before the backlog row can move.
-New intake and every snapshot mode stop while that transfer is pending; the contract owner holds a home-wide publication guard, checks every prepared ownership record even when its task is absent from the current backlog and metadata, and excludes concurrent identity mutations through final output. After the backlog arrives, the destination retains an exact completed-transfer receipt and the source retains a completed ownership tombstone. A retry that proves destination backlog or identity commit completes rather than cancels source ownership.
-A failed pre-move batch cancels only source prepares created by that attempt before any destination backlog, outbox, or target state existed. Recovered local prepares with destination backlog are completed, while uncertain local or remote prepares remain guarded; a matching completed target receipt advances the source to its completed tombstone. A remote outbox remains available for `--resume-pending` until delivery converges.
-Reading, recording, or rebinding this local relation does not change task lifecycle state, assignment, GitHub, DTM, Data Team Ticket, or a Work Aligner plan.
-Malformed, stale, unsafe, cross-home, or task-mismatched linked records stop publication instead of being shown as unlinked.
+The authoritative fleet snapshot exposes the structured relation for task rows, structured backlog rows, and validated secondmate child summaries.
+Fleet view and Bearings render that snapshot, including delegated child work, without reconstructing a local or remote child tree.
+`fm-backlog-handoff.sh` preserves linked relations and explicit unlinked status when queued work moves to a secondmate; its header owns the exact transfer and recovery mechanics.
+The public `template`, `record`, and `verify` operations do not change task lifecycle state, assignment, GitHub, DTM, a Data Team Ticket, or a Work Aligner plan.
+Malformed, stale, unsafe, cross-home, or task-mismatched linked records are refused, and fleet publication fails rather than silently downgrading them to unlinked.
 
 Maintainer coverage and the backend and worker-tool applicability review are recorded in [`verification/work-identity.md`](verification/work-identity.md).

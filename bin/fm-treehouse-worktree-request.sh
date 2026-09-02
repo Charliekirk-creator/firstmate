@@ -1,4 +1,12 @@
 #!/usr/bin/env sh
+# Internal owner of one durable Treehouse lease request for fm-spawn.sh.
+#
+# The caller supplies an unused absolute private marker directory and a validated
+# lease-holder token. This process publishes owner and result records around the
+# one `treehouse get --lease` side effect so an interrupted parent can reconcile
+# the exact lease before deciding whether any retry is safe. Ambiguous allocation
+# is retained for caller reconciliation instead of issuing another request.
+# Usage: fm-treehouse-worktree-request.sh <absolute-marker-dir> <lease-holder>
 
 fm_treehouse_request_marker=${1:-}
 fm_treehouse_request_holder=${2:-}
