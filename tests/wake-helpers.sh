@@ -90,6 +90,9 @@ if [ "${1:-}" = "capture-pane" ]; then
   if [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ]; then
     cat "$FM_FAKE_TMUX_CAPTURE"
   fi
+  if [ -n "${FM_FAKE_TMUX_CAPTURE_HOOK:-}" ]; then
+    "$FM_FAKE_TMUX_CAPTURE_HOOK"
+  fi
   exit 0
 fi
 if [ "${1:-}" = "display-message" ]; then
