@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only Workstack Compass producer security, truthfulness, and integration tests.
+# Source-read-only Workstack Compass producer security, truthfulness, and integration tests.
 set -eu
 
 # shellcheck source=tests/lib.sh

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Produce one private, read-only Workstack Compass upstream snapshot.
+"""Produce one private, source-read-only Workstack Compass upstream snapshot.
 
 The executable model at the operator-supplied Workstack Compass root is the
 sole owner of ``workstack-compass.snapshot.v1``.  This producer loads that

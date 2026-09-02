@@ -5,7 +5,9 @@
 # explicitly empty override, an invalid id, or a resolved state path that is
 # not an existing non-symlink directory is refused before removal.
 # Each existing named artifact must be an ordinary single-link file on the
-# state directory's device; only <id>.check.sh and <id>.check-trust are removed.
+# retained state directory's device; removal stays anchored to that directory's
+# verified identity so a concurrent path replacement cannot redirect it.
+# Only <id>.check.sh and <id>.check-trust are removed.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
