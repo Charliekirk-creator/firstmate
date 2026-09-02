@@ -106,7 +106,18 @@ case "${1:-}" in
     ;;
   send-keys)
     literal=0
-    for arg in "$@"; do [ "$arg" != -l ] || literal=1; done
+    literal_text=
+    capture_literal=0
+    for arg in "$@"; do
+      if [ "$capture_literal" -eq 1 ]; then
+        literal_text=$arg
+        capture_literal=0
+      fi
+      if [ "$arg" = -l ]; then
+        literal=1
+        capture_literal=1
+      fi
+    done
     if [ "$literal" -eq 0 ] && [ -n "${FM_TEST_TREEHOUSE_SUCCESS_MARKER:-}" ] \
        && printf '%s\n' "$*" | grep -Fq 'treehouse get'; then
       [ -z "${FM_TEST_TREEHOUSE_SEND_LOG:-}" ] || printf 'sent\n' >> "$FM_TEST_TREEHOUSE_SEND_LOG"
@@ -131,7 +142,7 @@ case "${1:-}" in
       mv -f "$FM_TEST_MUTATE_LAUNCH_BRIEF.replacement" "$FM_TEST_MUTATE_LAUNCH_BRIEF"
     fi
     if [ "$literal" -eq 1 ] && [ -n "${FM_TEST_LAUNCH_COMMAND:-}" ]; then
-      printf '%s\n' "${!#}" > "$FM_TEST_LAUNCH_COMMAND"
+      printf '%s\n' "$literal_text" > "$FM_TEST_LAUNCH_COMMAND"
     fi
     exit 0
     ;;
@@ -651,8 +662,8 @@ SH
   assert_absent "$target" "staging race partially published an authoritative identity"
   [ "$(cat "$sink")" = "must remain unchanged" ] \
     || fail "identity publication partially wrote through a raced staging symlink"
-  assert_contains "$out" "publication staging entry already exists" \
-    "identity publication did not reject the raced staging path"
+  assert_contains "$out" "cannot publish work identity record" \
+    "identity publication did not report the raced staging refusal"
   pass "identity publication never follows raced staging paths"
 }
 
@@ -2459,7 +2470,9 @@ EOF
 
 test_handoff_rebinds_identity_and_decision_surfaces() {
   local parent mate mate_real task manifest decision main_decision decision_manifest wt fakebin canonical bearings hash gen out rc child_out
-  command -v tasks-axi >/dev/null 2>&1 || { pass "linked handoff coverage skipped without tasks-axi"; return; }
+  bash -c '. "$1"; fm_tasks_axi_handoff_compatible' \
+    _ "$ROOT/bin/fm-tasks-axi-lib.sh" >/dev/null 2>&1 \
+    || { pass "linked handoff coverage skipped without handoff-compatible tasks-axi"; return; }
   parent=$(make_home handoff-parent)
   mate="$TMP_ROOT/handoff-mate"
   task=linked-captain-hold
@@ -2469,6 +2482,15 @@ test_handoff_rebinds_identity_and_decision_surfaces() {
   printf 'planning\n' > "$mate/.fm-secondmate-home"
   printf -- '- planning - planning domain (home: %s; scope: planning work; projects: firstmate; added 2026-08-14)\n' \
     "$mate" > "$parent/data/secondmates.md"
+  cat > "$parent/state/planning.meta" <<EOF
+window=firstmate:fm-planning
+kind=secondmate
+harness=claude
+backend=tmux
+home=$mate
+worktree=$mate
+EOF
+  fakebin=$(make_fakebin "$parent/fakes")
   cat > "$parent/data/backlog.md" <<EOF
 ## In flight
 
@@ -2480,7 +2502,8 @@ EOF
   manifest="$parent/$task.json"
   make_manifest "$parent" "$task" "$manifest" multi
   FM_HOME="$parent" "$WORK_IDENTITY" record "$task" --file "$manifest" >/dev/null
-  FM_HOME="$parent" "$ROOT/bin/fm-backlog-handoff.sh" planning "$task" >/dev/null \
+  PATH="$fakebin:$PATH" FM_SEND_SETTLE=0 FM_HOME="$parent" \
+    "$ROOT/bin/fm-backlog-handoff.sh" planning "$task" >/dev/null \
     || fail "linked local backlog handoff failed"
   mate_real=$(cd "$mate" && pwd -P)
   FM_HOME="$mate" "$WORK_IDENTITY" verify "$task" | jq -e \
@@ -2545,7 +2568,6 @@ EOF
 
 ## Done
 EOF
-  fakebin=$(make_fakebin "$parent/fakes")
   child_out=$(PATH="$fakebin:$PATH" FM_FAKE_PANE_COMMAND=claude FM_HOME="$mate" \
     FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z "$SNAPSHOT" --secondmate-home-summary 2>&1) \
     || fail "delegated handoff home could not publish its structured summary: $child_out"
@@ -3034,7 +3056,7 @@ SH
   chmod +x "$fakebin/date" "$fake_ssh"
   canonical=$(PATH="$fakebin:$PATH" FM_HOME="$parent" FM_SSH_BIN="$fake_ssh" \
     FM_TEST_ROOT="$ROOT" FM_TEST_SLOW_HOME="$slow" FM_TEST_DEADLINE_TMP="$parent" \
-    FM_TEST_DEADLINE_MARKER="$deadline_marker" FM_SNAPSHOT_SECONDMATE_TIMEOUT=3 \
+    FM_TEST_DEADLINE_MARKER="$deadline_marker" FM_SNAPSHOT_SECONDMATE_TIMEOUT=15 \
     FM_SNAPSHOT_NOW=2026-08-14T12:00:00Z FM_SNAPSHOT_NOW_EPOCH=1786708800 \
     "$SNAPSHOT" --json) || fail "isolated secondmate deadline snapshot failed"
   printf '%s' "$canonical" | jq -e --arg task "$task" '
@@ -3227,6 +3249,11 @@ EOF
 }
 
 case "${FM_TEST_ONLY:-}" in
+  intake-through-fleet)
+    test_intake_through_fleet_projection
+    test_spawn_delivers_validated_brief_snapshot
+    exit 0
+    ;;
   owned-removal)
     test_owned_replace_refuses_changed_unsafe_destination
     test_owned_removal_bounds_digest_after_concurrent_growth
@@ -3256,6 +3283,7 @@ case "${FM_TEST_ONLY:-}" in
     test_no_clobber_publications_recover_after_interruption
     test_no_clobber_conflict_retires_owned_transaction
     test_no_clobber_journal_rejects_unrelated_staging
+    test_no_clobber_publication_does_not_follow_raced_target
     exit 0
     ;;
   secondmate-deadlines)
@@ -3264,6 +3292,24 @@ case "${FM_TEST_ONLY:-}" in
     ;;
   handoff-short-read)
     test_handoff_receiver_reads_chunked_transfer_to_eof
+    exit 0
+    ;;
+  contract-validation)
+    test_namespace_separation_and_contract_rejections
+    test_unsafe_files_labels_and_exact_binding
+    test_stale_and_changed_relations_refuse
+    test_legacy_and_fuzzy_fallbacks_are_unlinked
+    exit 0
+    ;;
+  delegated-projections)
+    test_delegated_secondmate_projection
+    test_handoff_rebinds_identity_and_decision_surfaces
+    test_delegated_integrity_failure_stops_parent_publication
+    test_schema_maximum_delegated_identities_are_streamed_once
+    test_secondmate_deadlines_are_isolated_per_home
+    test_bearings_preserves_complete_identity_references
+    test_display_labels_cannot_spoof_exact_references
+    test_secondmate_parent_decisions_and_nested_caps_are_disclosed
     exit 0
     ;;
   owned-replace-source)

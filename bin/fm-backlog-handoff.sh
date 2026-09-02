@@ -928,14 +928,14 @@ local_target_handoff_action() { # <target-home> <stage|commit|abort> <task-id> <
 remote_target_handoff_action() { # <secondmate-id> <stage|commit|abort> <task-id> <payload>
   local id=$1 action=$2 task=$3 payload=$4
   printf '%s\n' "$payload" \
-    | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh \
+    | "$SCRIPT_DIR/fm-on.sh" --stdin "$id" fm-work-identity.sh \
         "handoff-$action" "$task" --file - >/dev/null
 }
 
 remote_target_handoff_state() { # <secondmate-id> <task-id> <payload>
   local id=$1 task=$2 payload=$3
   printf '%s\n' "$payload" \
-    | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh \
+    | "$SCRIPT_DIR/fm-on.sh" --stdin "$id" fm-work-identity.sh \
         handoff-target-state "$task" --file -
 }
 
@@ -949,11 +949,11 @@ local_target_backlog_action() { # <target-home> <prepare|complete> <task-id> <pa
 remote_target_backlog_action() { # <secondmate-id> <prepare|complete> <task-id> <payload>
   local id=$1 action=$2 task=$3 payload=$4 rc=0 state state_rc=0
   printf '%s\n' "$payload" \
-    | "$SCRIPT_DIR/fm-on.sh" "$id" fm-backlog-receive.sh \
+    | "$SCRIPT_DIR/fm-on.sh" --stdin "$id" fm-backlog-receive.sh \
         "--${action}-handoff" "$task" || rc=$?
   if [ "$rc" -eq 255 ]; then
     state=$(printf '%s\n' "$payload" \
-      | "$SCRIPT_DIR/fm-on.sh" "$id" fm-work-identity.sh \
+      | "$SCRIPT_DIR/fm-on.sh" --stdin "$id" fm-work-identity.sh \
           handoff-backlog-state "$task" --file -) || state_rc=$?
     if [ "$state_rc" -eq 0 ]; then
       case "$action:$state" in
