@@ -773,6 +773,8 @@ SPAWN_ENDPOINT_CREATING_RECOVERY=0
 SPAWN_ENDPOINT_MISSING=0
 SPAWN_ENDPOINT_WAS_SUBMITTED=0
 SPAWN_ENDPOINT_PHASE=
+SPAWN_ENDPOINT_ENTRY_STATE=
+SPAWN_ENDPOINT_ENTRY_DIGEST=
 SPAWN_LAUNCH_PREPARED_RECOVERY=0
 SPAWN_LAUNCH_SUBMITTED_RECOVERY=0
 SPAWN_KIMI_DELIVERY_RECOVERY=0
@@ -1168,8 +1170,28 @@ spawn_launch_delivery_wait() {
   fi
 }
 
+spawn_endpoint_receipt_commitment_load() {  # <state-inode> <base>
+  local state_inode=$1 base=$2 state kind dev inode mode links bytes mtime ctime extra commitment
+  state=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe \
+    "$STATE" "$state_inode" "$base") || return 1
+  IFS=: read -r kind dev inode mode links bytes mtime ctime extra <<EOF
+$state
+EOF
+  [ -z "$extra" ] && [ "$kind" = regular ] || return 1
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 65536 ] || return 1
+  commitment=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-digest \
+    "$STATE" "$state_inode" "$base" "$bytes") || return 1
+  IFS=$'\t' read -r SPAWN_ENDPOINT_ENTRY_STATE SPAWN_ENDPOINT_ENTRY_DIGEST extra <<EOF
+$commitment
+EOF
+  [ -z "$extra" ] && [ "$SPAWN_ENDPOINT_ENTRY_STATE" = "$state" ] || return 1
+  case "$SPAWN_ENDPOINT_ENTRY_DIGEST" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#SPAWN_ENDPOINT_ENTRY_DIGEST}" -eq 64 ]
+}
+
 spawn_endpoint_receipt_publish() {  # <phase> [worktree]
-  local phase=$1 worktree=${2:-} details payload tmp
+  local phase=$1 worktree=${2:-} details payload payload_digest tmp base state_inode rc=0
   case "$phase" in endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-retryable|worktree-acquired|worktree-ready|launch-prepared|launch-submitted) ;; *) return 1 ;; esac
   case "$BACKEND" in
     tmux)
@@ -1211,9 +1233,28 @@ spawn_endpoint_receipt_publish() {  # <phase> [worktree]
       backend:$backend,kind:$kind,project:$project,
       endpoint:{label:$label,target:(if $phase == "endpoint-creating" and $target == "" then null else $target end),details:$details},
       worktree:(if $worktree == "" then null else $worktree end)}') || return 1
+  payload_digest=$(printf '%s\n' "$payload" | spawn_sha256_stream) || return 1
   tmp=$(umask 077; mktemp "$STATE/.$ID.spawn-endpoint.XXXXXX") || return 1
-  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
-    && mv -f -- "$tmp" "$SPAWN_ENDPOINT_RECEIPT" || { rm -f -- "$tmp"; return 1; }
+  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  base=$(basename -- "$SPAWN_ENDPOINT_RECEIPT") || { rm -f -- "$tmp"; return 1; }
+  state_inode=$(spawn_file_inode_identity "$STATE") || { rm -f -- "$tmp"; return 1; }
+  if [ -z "$SPAWN_ENDPOINT_PHASE" ]; then
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" no-clobber \
+      "$STATE" "$state_inode" "$base" "$tmp" "${base}.publishing" >/dev/null || rc=$?
+  else
+    [ -n "$SPAWN_ENDPOINT_ENTRY_STATE" ] && [ -n "$SPAWN_ENDPOINT_ENTRY_DIGEST" ] \
+      || { rm -f -- "$tmp"; return 1; }
+    python3 "$SCRIPT_DIR/fm-work-identity-fs.py" replace \
+      "$STATE" "$state_inode" "$base" "$tmp" \
+      "$SPAWN_ENDPOINT_ENTRY_STATE" "$SPAWN_ENDPOINT_ENTRY_DIGEST" >/dev/null || rc=$?
+  fi
+  rm -f -- "$tmp" || return 1
+  [ "$rc" -eq 0 ] || return "$rc"
+  spawn_endpoint_receipt_commitment_load "$state_inode" "$base" || return 1
+  [ "$SPAWN_ENDPOINT_ENTRY_DIGEST" = "$payload_digest" ] || return 1
   SPAWN_ENDPOINT_PHASE=$phase
   if [ "$KIND" = secondmate ] && [ "$SECONDMATE_RESERVATION_PENDING" -eq 1 ]; then
     SECONDMATE_RESERVATION_PRESERVE=1
@@ -1221,17 +1262,20 @@ spawn_endpoint_receipt_publish() {  # <phase> [worktree]
 }
 
 spawn_endpoint_receipt_load() {
-  local receipt=$SPAWN_ENDPOINT_RECEIPT canonical links bytes target worktree details endpoint_state
-  [ -f "$receipt" ] && [ ! -L "$receipt" ] || {
+  local receipt=$SPAWN_ENDPOINT_RECEIPT canonical receipt_snapshot target worktree details
+  local base state_inode
+  base=$(basename -- "$receipt") || return 1
+  state_inode=$(spawn_file_inode_identity "$STATE") || return 1
+  spawn_endpoint_receipt_commitment_load "$state_inode" "$base" || {
     echo "error: spawn endpoint receipt is unsafe: $receipt" >&2
     return 1
   }
-  links=$(spawn_file_link_count "$receipt") || return 1
-  [ "$links" = 1 ] || { echo "error: spawn endpoint receipt is hardlinked: $receipt" >&2; return 1; }
-  bytes=$(LC_ALL=C wc -c < "$receipt" | tr -d ' ')
-  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$bytes" -le 65536 ] || { echo "error: spawn endpoint receipt is oversized: $receipt" >&2; return 1; }
-  canonical=$(jq -e -S -c -s \
+  receipt_snapshot=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+    "$STATE" "$state_inode" "$base" \
+    "$SPAWN_ENDPOINT_ENTRY_STATE" "$SPAWN_ENDPOINT_ENTRY_DIGEST") || return 1
+  [ "${#receipt_snapshot}" -le 65535 ] \
+    || { echo "error: spawn endpoint receipt is oversized: $receipt" >&2; return 1; }
+  canonical=$(printf '%s\n' "$receipt_snapshot" | jq -e -S -c -s \
     --arg home "$SPAWN_IDENTITY_HOME" --arg home_id "$SPAWN_IDENTITY_HOME_ID" --arg task "$ID" \
     --arg transaction "$SPAWN_DISPATCH_TRANSACTION" \
     --arg instructions_sha256 "$LAUNCH_BRIEF_HASH" --arg backend "$BACKEND" \
@@ -1270,11 +1314,11 @@ spawn_endpoint_receipt_load() {
                ($backend == "zellij" or $backend == "cmux")
              else true end)
       ) | $r
-    ' "$receipt" 2>/dev/null) || {
+    ' 2>/dev/null) || {
       echo "error: spawn endpoint receipt is malformed or mismatched: $receipt" >&2
       return 1
     }
-  printf '%s\n' "$canonical" | cmp -s "$receipt" - || {
+  [ "$canonical" = "$receipt_snapshot" ] || {
     echo "error: spawn endpoint receipt is not canonical: $receipt" >&2
     return 1
   }

@@ -434,7 +434,7 @@ test_non_tmux_submission_operation_survives_caller_interruption() {
 }
 
 test_non_tmux_submission_distinguishes_dead_presend_operation() {
-  local evidence="$TMP_ROOT/non-tmux-dead-presend" dead_pid out
+  local evidence="$TMP_ROOT/non-tmux-dead-presend" failed_evidence dead_pid out
   (exit 0) &
   dead_pid=$!
   wait "$dead_pid" 2>/dev/null || true
@@ -571,8 +571,8 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${evidence}.entering" \
       fm_backend_herdr_prompt_receipt_state session-a:pane-a durable-presend
   ) || fail "Herdr accepted prompt sequence could not be reconciled"
-  [ "$out" = accepted ] \
-    || fail "Herdr accepted prompt sequence recovered as '$out'"
+  [ "$out" = unknown ] \
+    || fail "an unrelated Herdr state transition recovered as '$out' instead of unknown"
   printf '7\n' > "$TMP_ROOT/herdr-sequence"
   out=$(
     # shellcheck source=bin/fm-backend.sh disable=SC1091
@@ -589,7 +589,35 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
       FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${evidence}.entering" \
       fm_backend_herdr_prompt_receipt_state session-a:pane-a durable-presend
   ) || fail "Herdr pre-send prompt sequence could not be reconciled"
-  [ "$out" = unsent ] || fail "Herdr pre-send prompt sequence recovered as '$out'"
+  [ "$out" = unknown ] || fail "Herdr pre-send prompt sequence recovered as '$out'"
+  failed_evidence="$TMP_ROOT/herdr-failed-prompt"
+  out=$(
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$ROOT/bin/fm-backend.sh"
+    fm_backend_source herdr || exit 1
+    fm_backend_herdr_parse_target() {
+      FM_BACKEND_HERDR_SESSION=session-a
+      FM_BACKEND_HERDR_PANE=pane-a
+    }
+    fm_backend_herdr_target_ready() { return 0; }
+    fm_backend_herdr_cli() {
+      case "$*" in
+        *" agent get "*)
+          printf '%s\n' '{"result":{"agent":{"agent_status":"idle","state_change_seq":7}}}'
+          ;;
+        *" pane report-metadata "*) return 0 ;;
+        *" agent prompt "*) return 1 ;;
+      esac
+    }
+    FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE="${failed_evidence}.entering" \
+      FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE="$failed_evidence" \
+      FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=failed-prompt \
+      fm_backend_herdr_send_text_submit target brief 1 0 0 label
+  ) || fail "failed Herdr prompt could not be classified"
+  [ "$out" = pending-unproven ] \
+    || fail "failed Herdr prompt was classified as '$out' instead of pending-unproven"
+  assert_absent "$failed_evidence" "failed Herdr prompt published false acceptance evidence"
+  assert_present "${failed_evidence}.entering" "failed Herdr prompt lost ambiguous delivery evidence"
   pass "Herdr submission fails closed without durable server acceptance"
 }
 

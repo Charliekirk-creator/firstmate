@@ -255,10 +255,6 @@ done
 
 mkdir -p "$FM_HOME/data"
 DEST_CREATED=0
-if [ ! -f "$DEST" ]; then
-  printf '## In flight\n\n## Queued\n\n## Done\n' > "$DEST"
-  DEST_CREATED=1
-fi
 TO_MOVE=()
 ALREADY=()
 for key in "${KEYS[@]}"; do
@@ -269,8 +265,34 @@ for key in "${KEYS[@]}"; do
   fi
 done
 
+for key in "${KEYS[@]}"; do
+  TARGET_RECEIPT="$FM_HOME/data/$key/work-identity-handoff-target.json"
+  [ -f "$TARGET_RECEIPT" ] && [ ! -L "$TARGET_RECEIPT" ] \
+    || die "exact destination backlog receipt is absent for $key"
+  TARGET_TRANSFER=$(jq -e -S -c '.transfer' "$TARGET_RECEIPT" 2>/dev/null) \
+    || die "exact destination backlog receipt is malformed for $key"
+  if backlog_key_section "$DEST" "$key" >/dev/null 2>&1; then
+    COMMITTED_BACKLOG=$DEST
+  else
+    COMMITTED_BACKLOG=$DELIVERED
+  fi
+  EXPECTED_TASK_HASH=$(printf '%s' "$TARGET_TRANSFER" \
+    | jq -er '.backlog.task_sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))' 2>/dev/null) \
+    || die "exact destination backlog commitment is malformed for $key"
+  OBSERVED_TASK_HASH=$(backlog_task_sha256 "$COMMITTED_BACKLOG" "$key") \
+    || die "exact destination backlog item is absent or not Queued for $key"
+  [ "$OBSERVED_TASK_HASH" = "$EXPECTED_TASK_HASH" ] \
+    || die "exact destination backlog commitment is stale or mismatched for $key"
+  printf '%s\n' "$TARGET_TRANSFER" | handoff_backlog_transition prepare "$key" \
+    || die "exact destination backlog receipt was refused before batch move for $key"
+done
+
 if [ "${#TO_MOVE[@]}" -gt 0 ]; then
   fm_tasks_axi_compatible || die "a compatible tasks-axi is required for atomic backlog receipt; run bin/fm-bootstrap.sh for the required version"
+  if [ ! -f "$DEST" ]; then
+    printf '## In flight\n\n## Queued\n\n## Done\n' > "$DEST"
+    DEST_CREATED=1
+  fi
   if ! MOVE_OUT=$(run_move "${TO_MOVE[@]}" 2>&1); then
     recovered=0
     for lock in "$DELIVERED.lock" "$DEST.lock"; do

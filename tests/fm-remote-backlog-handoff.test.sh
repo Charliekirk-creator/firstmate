@@ -53,7 +53,7 @@ printf 'fixture\n' > "$REMOTE_ROOT/AGENTS.md"
 cp "$ROOT/bin/fm-remote-entrypoint.sh" "$ROOT/bin/fm-remote-job-lib.sh" \
   "$ROOT/bin/fm-remote-job-worker.sh" "$ROOT/bin/fm-remote-file.sh" \
   "$ROOT/bin/fm-backlog-receive.sh" "$ROOT/bin/fm-tasks-axi-lib.sh" \
-  "$ROOT/bin/fm-work-identity.sh" "$ROOT/bin/fm-pr-lib.sh" \
+  "$ROOT/bin/fm-work-identity.sh" "$ROOT/bin/fm-work-identity-fs.py" "$ROOT/bin/fm-pr-lib.sh" \
   "$ROOT/bin/fm-wake-lib.sh" "$REMOTE_ROOT/bin/"
 ln -s "$(command -v tasks-axi)" "$REMOTE_ROOT/bin/tasks-axi"
 ln -s "$(command -v node)" "$REMOTE_ROOT/bin/node"
@@ -222,6 +222,51 @@ $1
 ## Done
 EOF
 }
+
+receiver_preflight_refuses_changed_commitment() {
+  local preflight_task preflight_task_hash preflight_transfer preflight_bytes preflight_hash rc=0
+  preflight_task=receipt-preflight-race
+  write_backlog '- [ ] receipt-preflight-race - original committed row (repo: alpha)'
+  printf '%s\n' '- [ ] receipt-preflight-race - original committed row (repo: alpha)' \
+    > "$TMP_ROOT/preflight-original-row"
+  preflight_task_hash=$(sha256_file "$TMP_ROOT/preflight-original-row")
+  preflight_transfer=$(FM_HOME="$PARENT" "$ROOT/bin/fm-work-identity.sh" \
+    handoff-prepare "$preflight_task" --to-home "$REMOTE" --to-home-id secondmate:ios \
+      --backlog-sha256 "$preflight_task_hash")
+  printf '%s\n' "$preflight_transfer" | FM_HOME="$REMOTE" \
+    "$REMOTE_ROOT/bin/fm-work-identity.sh" handoff-stage "$preflight_task" --file - >/dev/null
+  printf '%s\n' "$preflight_transfer" | FM_HOME="$REMOTE" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+    "$REMOTE_ROOT/bin/fm-backlog-receive.sh" --prepare-handoff "$preflight_task" >/dev/null
+  cat > "$TMP_ROOT/preflight-delivery.md" <<'EOF'
+## In flight
+
+## Queued
+- [ ] receipt-preflight-race - changed after target reservation (repo: alpha)
+
+## Done
+EOF
+  preflight_bytes=$(LC_ALL=C wc -c < "$TMP_ROOT/preflight-delivery.md" | tr -d ' ')
+  preflight_hash=$(sha256_file "$TMP_ROOT/preflight-delivery.md")
+  FM_HOME="$REMOTE" "$REMOTE_ROOT/bin/fm-remote-file.sh" \
+    put state/handoff/preflight.outbox.md 1048576 "$preflight_bytes" "$preflight_hash" 1 \
+    < "$TMP_ROOT/preflight-delivery.md" >/dev/null
+  FM_HOME="$REMOTE" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+    "$REMOTE_ROOT/bin/fm-backlog-receive.sh" state/handoff/preflight.outbox.md \
+      "$preflight_bytes" "$preflight_hash" 1 > "$TMP_ROOT/preflight-receive.out" 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "receiver accepted a backlog row changed after target reservation"
+  if [ -e "$REMOTE/data/backlog.md" ]; then
+    assert_no_grep "$preflight_task" "$REMOTE/data/backlog.md" \
+      "receiver moved a row before validating its exact target commitment"
+  fi
+  assert_present "$REMOTE/state/handoff/preflight.outbox.md" \
+    "receiver discarded a refused delivery scratch record"
+  pass "receiver validates every target commitment before batch move"
+}
+
+if [ "${FM_TEST_ONLY:-}" = receiver-preflight ]; then
+  receiver_preflight_refuses_changed_commitment
+  exit 0
+fi
 
 # Completion can become unknown after the remote atomic move. The local outbox
 # remains the backlog recovery record alongside the source identity prepare.
@@ -413,6 +458,8 @@ jq -e '.state == "completed" and .transfer.target.home_id == "secondmate:ios"' \
   "$PARENT/data/linked-remote/work-identity-handoff-source.json" >/dev/null \
   || fail "remote handoff did not retain a completed source ownership tombstone"
 pass "remote handoff commits an exact destination identity and source tombstone"
+
+receiver_preflight_refuses_changed_commitment
 
 recovered_task=receipt-recovery-a
 conflicting_task=receipt-recovery-b

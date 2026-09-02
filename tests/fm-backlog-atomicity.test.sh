@@ -271,23 +271,36 @@ SH
 }
 
 fail_launch_submitted_publish_once() {  # <case-dir> <receipt>
-  local case_dir=$1 receipt=$2 real
-  real=$(command -v mv)
-  cat > "$case_dir/fakebin/mv" <<SH
+  local case_dir=$1 receipt=$2 receipt_base real
+  receipt_base=$(basename -- "$receipt")
+  real=$(command -v python3)
+  cat > "$case_dir/fakebin/python3" <<SH
 #!/usr/bin/env bash
-last=
-for arg in "\$@"; do last=\$arg; done
-if [ "\$last" = "$receipt" ] && [ ! -e "$case_dir/submitted-publish-failed" ]; then
-  for arg in "\$@"; do
-    if [ -f "\$arg" ] && jq -e '.phase == "launch-submitted"' "\$arg" >/dev/null 2>&1; then
-      : > "$case_dir/submitted-publish-failed"
-      exit 1
-    fi
-  done
+if [ "\${2:-}" = replace ] && [ "\${5:-}" = "$receipt_base" ] \
+   && [ ! -e "$case_dir/submitted-publish-failed" ] \
+   && jq -e '.phase == "launch-submitted"' "\${6:-}" >/dev/null 2>&1; then
+  : > "$case_dir/submitted-publish-failed"
+  exit 1
 fi
 exec "$real" "\$@"
 SH
-  chmod +x "$case_dir/fakebin/mv"
+  chmod +x "$case_dir/fakebin/python3"
+}
+
+race_endpoint_receipt_publish() {  # <case-dir> <receipt> <no-clobber|replace>
+  local case_dir=$1 receipt=$2 operation=$3 receipt_base real
+  receipt_base=$(basename -- "$receipt")
+  real=$(command -v python3)
+  cat > "$case_dir/fakebin/python3" <<SH
+#!/usr/bin/env bash
+if [ "\${2:-}" = "$operation" ] && [ "\${5:-}" = "$receipt_base" ] \
+   && [ ! -e "$case_dir/endpoint-raced" ]; then
+  : > "$case_dir/endpoint-raced"
+  printf '%s\n' competing-endpoint-receipt > "$receipt"
+fi
+exec "$real" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/python3"
 }
 
 restore_tasks_axi() {  # <case-dir>
@@ -904,6 +917,29 @@ test_dispatch_refuses_to_commit_without_a_published_record() {
   [ "$(row_state "$case_dir" "$id")" = queued ] \
     || fail "failed publication moved the backlog row"
   pass "dispatch cannot commit without a verified task-record publication"
+}
+
+test_endpoint_receipt_publication_refuses_concurrent_state() {
+  local operation case_dir home id receipt out rc
+  for operation in no-clobber replace; do
+    id="atomic-endpoint-$operation-b4"
+    case_dir=$(make_home "endpoint-$operation" "$id")
+    home=$(home_of "$case_dir")
+    receipt="$home/state/$id.spawn-endpoint.json"
+    add_item "$case_dir" "$id"
+    race_endpoint_receipt_publish "$case_dir" "$receipt" "$operation"
+
+    rc=0
+    out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+    [ "$rc" -ne 0 ] || fail "$operation endpoint publication overwrote concurrent state"
+    [ "$(cat "$receipt")" = competing-endpoint-receipt ] \
+      || fail "$operation endpoint publication changed the competing receipt"
+    assert_absent "$home/state/$id.meta" \
+      "$operation endpoint publication committed task metadata"
+    [ "$(row_state "$case_dir" "$id")" = queued ] \
+      || fail "$operation endpoint publication changed the backlog row: $out"
+  done
+  pass "endpoint receipt publication is no-clobber and revision-conditional"
 }
 
 test_dispatch_preserves_an_accepted_launch_when_the_transition_fails() {
@@ -2487,6 +2523,11 @@ test_a_persistent_secondmate_is_never_a_backlog_item() {
   pass "dispatching a persistent secondmate needs no backlog item"
 }
 
+if [ "${FM_TEST_ONLY:-}" = endpoint-receipt-publication ]; then
+  test_endpoint_receipt_publication_refuses_concurrent_state
+  exit 0
+fi
+
 test_dispatch_moves_the_item_in_flight_in_the_same_run
 test_dispatch_refuses_a_pending_authoritative_close
 test_dispatch_refuses_a_held_row_before_creating_resources
@@ -2505,6 +2546,7 @@ test_dispatch_refuses_an_id_this_home_has_no_item_for
 test_dispatch_reports_a_backlog_read_failure
 test_dispatch_refuses_a_closed_item
 test_dispatch_refuses_to_commit_without_a_published_record
+test_endpoint_receipt_publication_refuses_concurrent_state
 test_dispatch_preserves_an_accepted_launch_when_the_transition_fails
 test_dispatch_reports_an_incomplete_record_rollback
 test_dispatch_reports_an_incomplete_busy_rollback
