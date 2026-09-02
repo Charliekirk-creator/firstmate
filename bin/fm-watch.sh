@@ -292,6 +292,9 @@ hash_pane() {
 }
 
 PANE_MARKER_PI_FORMAT=pi-footer-clock-v1
+PANE_MARKER_MIGRATION_FORMAT=pi-footer-clock-migration-v1
+PANE_MARKER_MIGRATION_HASH=
+PANE_MARKER_MIGRATION_STALE=
 
 pane_marker_hash() {  # <harness>, pane bytes on stdin
   normalize_pane_for_marker_hash "$1" | hash_pane
@@ -361,8 +364,59 @@ legacy_pane_marker_matches() {  # <harness> <legacy-hash>, pane bytes on stdin
   return "$matched"
 }
 
+pane_marker_migration_publish() {  # <journal-file> <normalized-hash> <carry|clear>
+  local journal=$1 marker_hash=$2 stale_mode=$3 tmp
+  [[ $marker_hash =~ ^[0-9a-f]{32}$ ]] || return 1
+  case "$stale_mode" in carry|clear) ;; *) return 1 ;; esac
+  tmp=$(umask 077; mktemp "$journal.tmp.XXXXXX") || return 1
+  if ! printf '%s\n%s\n%s\n' "$PANE_MARKER_MIGRATION_FORMAT" "$marker_hash" "$stale_mode" > "$tmp" \
+    || ! mv -f "$tmp" "$journal"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+pane_marker_migration_read() {  # <journal-file>
+  local journal=$1 version marker_hash stale_mode extra
+  PANE_MARKER_MIGRATION_HASH=
+  PANE_MARKER_MIGRATION_STALE=
+  [ -f "$journal" ] && [ ! -L "$journal" ] || return 1
+  {
+    IFS= read -r version \
+      && IFS= read -r marker_hash \
+      && IFS= read -r stale_mode \
+      && ! IFS= read -r extra
+  } < "$journal" || return 1
+  [ "$version" = "$PANE_MARKER_MIGRATION_FORMAT" ] || return 1
+  [[ $marker_hash =~ ^[0-9a-f]{32}$ ]] || return 1
+  case "$stale_mode" in carry|clear) ;; *) return 1 ;; esac
+  PANE_MARKER_MIGRATION_HASH=$marker_hash
+  PANE_MARKER_MIGRATION_STALE=$stale_mode
+}
+
+pane_marker_migration_complete() {  # <journal> <hash> <count> <stale> <since> <escalations> <format> <key>
+  local journal=$1 hash_file=$2 count_file=$3 stale_file=$4 since_file=$5
+  local escalation_file=$6 format_file=$7 key=$8
+  pane_marker_migration_read "$journal" || return 1
+  printf '%s' "$PANE_MARKER_MIGRATION_HASH" > "$hash_file" || return 1
+  printf '0\n' > "$count_file" || return 1
+  case "$PANE_MARKER_MIGRATION_STALE" in
+    carry)
+      printf '%s' "$PANE_MARKER_MIGRATION_HASH" > "$stale_file" || return 1
+      ;;
+    clear)
+      rm -f "$stale_file" "$since_file" "$escalation_file" || return 1
+      clear_write_tracking "$key" || return 1
+      ;;
+  esac
+  printf '%s' "$PANE_MARKER_PI_FORMAT" > "$format_file" || return 1
+  rm -f "$journal"
+}
+
 pane_marker_format_current() {  # <harness> <window-key>
   local harness=$1 key=$2 format_file="$STATE/.pane-hash-format-$2"
+  local journal_file="$STATE/.pane-hash-migration-$2"
+  [ ! -e "$journal_file" ] && [ ! -L "$journal_file" ] || return 1
   case "$harness" in
     pi|pi-signed) [ "$(cat "$format_file" 2>/dev/null || true)" = "$PANE_MARKER_PI_FORMAT" ] ;;
     *)            [ ! -e "$format_file" ] && [ ! -L "$format_file" ] ;;
@@ -1883,23 +1937,58 @@ EOF
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
     formatf="$STATE/.pane-hash-format-$key"
-    prev=$(cat "$hf" 2>/dev/null || true)
+    migrationf="$STATE/.pane-hash-migration-$key"
+    if [ -e "$migrationf" ] || [ -L "$migrationf" ]; then
+      pane_marker_migration_complete "$migrationf" "$hf" "$cf" "$sf" "$ssf" "$ewf" \
+        "$formatf" "$key" || continue
+      prev=$(cat "$hf" 2>/dev/null || true)
+      [ "$h" != "$prev" ] || continue
+    else
+      prev=$(cat "$hf" 2>/dev/null || true)
+    fi
     if ! pane_marker_format_current "$harness" "$key"; then
-      stale_hash=$(cat "$sf" 2>/dev/null || true)
-      printf '%s' "$h" > "$hf" || continue
-      echo 0 > "$cf" || continue
-      if [ -n "$prev" ] && [ "$stale_hash" = "$prev" ] \
-        && printf '%s' "$tail40" | legacy_pane_marker_matches "$harness" "$prev"; then
-        printf '%s' "$h" > "$sf" || continue
-      else
-        rm -f "$sf" "$ssf" "$ewf" || continue
-        clear_write_tracking "$key"
-      fi
+      marker_format_only=1
       case "$harness" in
-        pi|pi-signed) printf '%s' "$PANE_MARKER_PI_FORMAT" > "$formatf" || continue ;;
-        *)            rm -f "$formatf" || continue ;;
+        pi|pi-signed)
+          if [ "$(printf '%s' "$tail40" | hash_pane)" = "$h" ]; then
+            printf '%s' "$PANE_MARKER_PI_FORMAT" > "$formatf" || continue
+            marker_format_only=0
+          fi
+          ;;
       esac
-      continue
+      if [ "$marker_format_only" -ne 0 ]; then
+        stale_hash=$(cat "$sf" 2>/dev/null || true)
+        stale_mode=clear
+        if [ -n "$prev" ] && [ -n "$stale_hash" ]; then
+          if [ "$stale_hash" = "$prev" ] \
+            && { [ "$prev" = "$h" ] \
+              || printf '%s' "$tail40" | legacy_pane_marker_matches "$harness" "$prev"; }; then
+            stale_mode=carry
+          elif [ "$prev" = "$h" ] \
+            && printf '%s' "$tail40" | legacy_pane_marker_matches "$harness" "$stale_hash"; then
+            stale_mode=carry
+          fi
+        fi
+        case "$harness" in
+          pi|pi-signed)
+            pane_marker_migration_publish "$migrationf" "$h" "$stale_mode" || continue
+            pane_marker_migration_complete "$migrationf" "$hf" "$cf" "$sf" "$ssf" "$ewf" \
+              "$formatf" "$key" || continue
+            ;;
+          *)
+            printf '%s' "$h" > "$hf" || continue
+            echo 0 > "$cf" || continue
+            if [ "$stale_mode" = carry ]; then
+              printf '%s' "$h" > "$sf" || continue
+            else
+              rm -f "$sf" "$ssf" "$ewf" || continue
+              clear_write_tracking "$key"
+            fi
+            rm -f "$formatf" || continue
+            ;;
+        esac
+        continue
+      fi
     fi
     # Busy match: a backend's native semantic state when available (herdr), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified
@@ -2023,7 +2112,10 @@ EOF
         # then route it through busy_turn_bound_check, which hands the crossed
         # bound to the same wedge timer unless the crew declared the wait itself.
         paused_bound=1
-        if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
+        if [ "$n" -lt 2 ] && [ "$busy_now" -ne 0 ] \
+          && [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ]; then
+          :
+        elif [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
           busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf" && paused_bound=0
         else
           rm -f "$ssf" "$ewf"

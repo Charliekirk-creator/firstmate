@@ -1039,6 +1039,164 @@ EOF
   pass "legacy Pi hashes fail closed then migrate without duplicate stale wakes"
 }
 
+test_pi_hash_migration_recovers_every_write_boundary() {
+  local harness scenario dir state fakebin out capture_file window key old_pane normalized_pane
+  local old_hash normalized_hash journalf formatf pid i count recovered
+  old_pane=$(cat <<'EOF'
+completed transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:03  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+)
+  normalized_pane=$(cat <<'EOF'
+completed transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  <clock>  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+)
+  old_hash=$(hash_text "$old_pane")
+  normalized_hash=$(hash_text "$normalized_pane")
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · idle Pi fixture'
+
+  for harness in pi pi-signed; do
+    for scenario in journal-published journal-hash journal-count journal-stale journal-format legacy-hash legacy-count legacy-stale; do
+      dir=$(make_case "${harness}-migration-$scenario"); state="$dir/state"; fakebin="$dir/fakebin"
+      out="$dir/watch.out"; capture_file="$dir/pane.txt"
+      window="test:fm-${harness}-migration-$scenario"
+      key=$(printf '%s' "$window" | tr ':/.' '___')
+      journalf="$state/.pane-hash-migration-$key"
+      formatf="$state/.pane-hash-format-$key"
+      cat > "$capture_file" <<'EOF'
+completed transcript
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:04  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+      printf 'window=%s\nkind=ship\nharness=%s\n' "$window" "$harness" > "$state/migration.meta"
+      printf '%s' "$old_hash" > "$state/.hash-$key"
+      printf '2\n' > "$state/.count-$key"
+      printf '%s' "$old_hash" > "$state/.stale-$key"
+      date +%s > "$state/.stale-since-$key"
+      printf '3\n' > "$state/.wedge-escalations-$key"
+      case "$scenario" in
+        journal-published) ;;
+        journal-hash|legacy-hash)
+          printf '%s' "$normalized_hash" > "$state/.hash-$key"
+          ;;
+        journal-count|legacy-count)
+          printf '%s' "$normalized_hash" > "$state/.hash-$key"
+          printf '0\n' > "$state/.count-$key"
+          ;;
+        journal-stale|legacy-stale)
+          printf '%s' "$normalized_hash" > "$state/.hash-$key"
+          printf '0\n' > "$state/.count-$key"
+          printf '%s' "$normalized_hash" > "$state/.stale-$key"
+          ;;
+        journal-format)
+          printf '%s' "$normalized_hash" > "$state/.hash-$key"
+          printf '0\n' > "$state/.count-$key"
+          printf '%s' "$normalized_hash" > "$state/.stale-$key"
+          printf 'pi-footer-clock-v1' > "$formatf"
+          ;;
+      esac
+      case "$scenario" in
+        journal-*)
+          printf 'pi-footer-clock-migration-v1\n%s\ncarry\n' "$normalized_hash" > "$journalf"
+          ;;
+      esac
+
+      PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+        FM_CONFIG_OVERRIDE="$(churn_config "$dir" off)" \
+        FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+        FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=0 \
+        FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+      pid=$!
+      i=0
+      recovered=0
+      while [ "$i" -lt 150 ]; do
+        kill -0 "$pid" 2>/dev/null \
+          || { reap "$pid"; fail "$harness $scenario restart emitted a duplicate stale notification: $(cat "$out")"; }
+        count=$(cat "$state/.count-$key" 2>/dev/null || true)
+        if [ ! -e "$journalf" ] \
+          && [ "$(cat "$formatf" 2>/dev/null || true)" = pi-footer-clock-v1 ]; then
+          case "$count" in
+            ''|*[!0-9]*) ;;
+            *) if [ "$count" -ge 3 ]; then recovered=1; break; fi ;;
+          esac
+        fi
+        sleep 0.1
+        i=$((i + 1))
+      done
+      [ "$recovered" -eq 1 ] \
+        || { reap "$pid"; fail "$harness $scenario restart did not complete marker migration"; }
+      [ ! -s "$out" ] \
+        || { reap "$pid"; fail "$harness $scenario restart printed a duplicate wake: $(cat "$out")"; }
+      [ "$(cat "$state/.hash-$key" 2>/dev/null || true)" = "$normalized_hash" ] \
+        || { reap "$pid"; fail "$harness $scenario restart lost its normalized baseline"; }
+      [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$normalized_hash" ] \
+        || { reap "$pid"; fail "$harness $scenario restart cleared its proven stale classification"; }
+      [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || true)" = 3 ] \
+        || { reap "$pid"; fail "$harness $scenario restart lost its wedge state"; }
+      reap "$pid"
+    done
+  done
+  unset FM_FAKE_CREW_STATE
+  pass "Pi marker migration survives restarts at every write boundary"
+}
+
+test_pi_hash_migration_restart_preserves_new_progress() {
+  local dir state fakebin out capture_file window key target_pane target_hash journalf pid
+  dir=$(make_case pi-migration-restart-progress); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-pi-migration-restart-progress"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  journalf="$state/.pane-hash-migration-$key"
+  target_pane=$(cat <<'EOF'
+completed transcript
+first progress
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  <clock>  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+)
+  target_hash=$(hash_text "$target_pane")
+  cat > "$capture_file" <<'EOF'
+completed transcript
+first progress
+second progress after interruption
+────────────────────────
+gigachad:~/work
+main  ctx:0%  0  Sol 5.6 (272k context)  10:05  · compact in 94%
+▶▶ agent ready · high thinking
+EOF
+  printf 'window=%s\nkind=ship\nharness=pi\n' "$window" > "$state/migration-progress.meta"
+  printf '%s' "$target_hash" > "$state/.hash-$key"
+  printf '0\n' > "$state/.count-$key"
+  printf 'pi-footer-clock-v1' > "$state/.pane-hash-format-$key"
+  printf 'pi-footer-clock-migration-v1\n%s\nclear\n' "$target_hash" > "$journalf"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · idle Pi fixture'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_CONFIG_OVERRIDE="$(churn_config "$dir" off)" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 150 \
+    || { reap "$pid"; fail "progress rendered during Pi migration recovery did not become observable"; }
+  grep -Fx "stale: $window" "$out" >/dev/null \
+    || fail "progress rendered during Pi migration recovery did not surface when stale"
+  [ ! -e "$journalf" ] || fail "completed Pi migration recovery retained its journal"
+  unset FM_FAKE_CREW_STATE
+  pass "Pi migration recovery preserves progress rendered during interruption"
+}
+
 test_pi_legacy_hash_migration_preserves_unseen_progress() {
   local dir state fakebin out capture_file old_capture window key old_pane old_hash formatf pid
   dir=$(make_case pi-legacy-hash-unseen-progress); state="$dir/state"; fakebin="$dir/fakebin"
@@ -4207,6 +4365,8 @@ test_turn_ended_churning_pane_absorbed
 test_turn_ended_pi_clock_tick_is_not_churn
 test_turn_ended_pi_capture_uses_snapshot_harness
 test_turn_ended_pi_legacy_hash_migrates_without_false_progress
+test_pi_hash_migration_recovers_every_write_boundary
+test_pi_hash_migration_restart_preserves_new_progress
 test_pi_legacy_hash_migration_preserves_unseen_progress
 test_turn_ended_churn_resets_prior_stale_classification
 test_turn_ended_churn_resets_wedge_state_before_stale_poll
