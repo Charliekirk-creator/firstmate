@@ -319,6 +319,30 @@ SH
   chmod +x "$case_dir/fakebin/python3"
 }
 
+interrupt_endpoint_receipt_retirement() {  # <case-dir> <receipt>
+  local case_dir=$1 receipt=$2 receipt_base
+  receipt_base=$(basename -- "$receipt")
+  cat > "$case_dir/fakebin/python3" <<SH
+#!/usr/bin/env bash
+if [ "\${2:-}" = remove ] && [ "\${5:-}" = "$receipt_base" ] \
+   && [ ! -e "$case_dir/endpoint-retirement-interrupted" ]; then
+  : > "$case_dir/endpoint-retirement-interrupted"
+  retired=".$receipt_base.remove-retired.0123456789abcdef0123456789abcdef"
+  journal=".$receipt_base.remove-journal"
+  printf 'v1\\n%s\\n%s\\t%s\\n' "\$retired" "\${6}" "\${7}" \
+    > "$case_dir/home/state/\$journal"
+  mv -- "$receipt" "$case_dir/home/state/\$retired"
+  exit 1
+fi
+exec "$(command -v python3)" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/python3"
+}
+
+restore_python() {  # <case-dir>
+  rm -f -- "$1/fakebin/python3"
+}
+
 restore_tasks_axi() {  # <case-dir>
   rm -f -- "$1/fakebin/tasks-axi"
 }
@@ -978,6 +1002,43 @@ test_endpoint_receipt_retirement_refuses_concurrent_state() {
   [ "$(row_state "$case_dir" "$id")" = in_flight ] \
     || fail "endpoint retirement race did not preserve the committed backlog state"
   pass "endpoint receipt retirement is revision-conditional"
+}
+
+test_endpoint_retirement_interruption_recovers_committed_spawn() {
+  local case_dir home id receipt journal retired out rc=0 spawn_gen
+  id=atomic-endpoint-retire-interrupted-b4
+  case_dir=$(make_home endpoint-retirement-interrupted "$id")
+  home=$(home_of "$case_dir")
+  receipt="$home/state/$id.spawn-endpoint.json"
+  journal="$home/state/.$id.spawn-endpoint.json.remove-journal"
+  retired="$home/state/.$id.spawn-endpoint.json.remove-retired.0123456789abcdef0123456789abcdef"
+  add_item "$case_dir" "$id"
+  interrupt_endpoint_receipt_retirement "$case_dir" "$receipt"
+
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -ne 0 ] || fail "interrupted endpoint retirement was reported as success"
+  assert_contains "$out" "accepted launch receipt could not be retired" \
+    "interrupted endpoint retirement was not surfaced"
+  assert_absent "$receipt" "interrupted endpoint retirement restored a committed receipt"
+  assert_present "$journal" "interrupted endpoint retirement retained no recovery journal"
+  assert_present "$retired" "interrupted endpoint retirement retained no pinned receipt"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "interrupted endpoint retirement lost the committed backlog state"
+  spawn_gen=$(sed -n 's/^spawn_gen=//p' "$home/state/$id.meta")
+
+  restore_python "$case_dir"
+  rc=0
+  out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
+  [ "$rc" -eq 0 ] || fail "interrupted endpoint retirement did not reconcile: $out"
+  assert_contains "$out" "spawned $id" "committed spawn retry did not report its exact result"
+  [ "$(sed -n 's/^spawn_gen=//p' "$home/state/$id.meta")" = "$spawn_gen" ] \
+    || fail "committed spawn retry published a new worker incarnation"
+  assert_absent "$receipt" "committed spawn retry recreated its retired endpoint receipt"
+  assert_absent "$journal" "committed spawn retry retained its removal journal"
+  assert_absent "$retired" "committed spawn retry retained its pinned receipt"
+  [ "$(row_state "$case_dir" "$id")" = in_flight ] \
+    || fail "committed spawn retry changed the backlog state"
+  pass "interrupted endpoint retirement reconciles the committed spawn"
 }
 
 test_dispatch_preserves_an_accepted_launch_when_the_transition_fails() {
@@ -2564,6 +2625,7 @@ test_a_persistent_secondmate_is_never_a_backlog_item() {
 if [ "${FM_TEST_ONLY:-}" = endpoint-receipt-publication ]; then
   test_endpoint_receipt_publication_refuses_concurrent_state
   test_endpoint_receipt_retirement_refuses_concurrent_state
+  test_endpoint_retirement_interruption_recovers_committed_spawn
   exit 0
 fi
 
@@ -2587,6 +2649,7 @@ test_dispatch_refuses_a_closed_item
 test_dispatch_refuses_to_commit_without_a_published_record
 test_endpoint_receipt_publication_refuses_concurrent_state
 test_endpoint_receipt_retirement_refuses_concurrent_state
+test_endpoint_retirement_interruption_recovers_committed_spawn
 test_dispatch_preserves_an_accepted_launch_when_the_transition_fails
 test_dispatch_reports_an_incomplete_record_rollback
 test_dispatch_reports_an_incomplete_busy_rollback

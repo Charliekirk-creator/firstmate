@@ -113,9 +113,15 @@ def snapshot_path(path, maximum):
         os.close(parent_fd)
 
 
-def copy_to_new(source, directory_fd, name):
+def copy_to_new(source, directory_fd, name, expected_state, expected_digest):
+    if not valid_regular_commitment(expected_state, expected_digest):
+        fail("publication source commitment is malformed")
     source_fd, source_info = open_source(source)
     source_state = state_from_info(source_info)
+    if source_state != expected_state:
+        os.close(source_fd)
+        fail(f"publication source changed before copying: {source}")
+    expected_size = committed_entry_size(expected_state)
     source_digest = hashlib.sha256()
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -124,33 +130,42 @@ def copy_to_new(source, directory_fd, name):
     except OSError as exc:
         os.close(source_fd)
         raise exc
+    copied = False
     try:
+        total = 0
         while True:
-            chunk = os.read(source_fd, 131072)
+            chunk = os.read(source_fd, min(131072, expected_size - total + 1))
             if not chunk:
                 break
+            total += len(chunk)
+            if total > expected_size:
+                fail(f"publication source changed during copying: {source}")
             source_digest.update(chunk)
             view = memoryview(chunk)
             while view:
                 written = os.write(target_fd, view)
                 view = view[written:]
-        if state_from_info(os.fstat(source_fd)) != source_state:
+        if total != expected_size or source_digest.hexdigest() != expected_digest \
+                or state_from_info(os.fstat(source_fd)) != expected_state:
             fail(f"publication source changed during copying: {source}")
         try:
             current = os.stat(source, follow_symlinks=False)
         except FileNotFoundError:
             fail(f"publication source changed during copying: {source}")
-        if state_from_info(current) != source_state:
+        if state_from_info(current) != expected_state:
             fail(f"publication source changed during copying: {source}")
         os.fchmod(target_fd, stat.S_IMODE(source_info.st_mode))
         os.fsync(target_fd)
         target_info = os.fstat(target_fd)
-        if target_info.st_size != source_info.st_size:
+        if target_info.st_size != expected_size:
             fail(f"publication candidate does not match its source: {name}")
+        copied = True
         return source_state, source_digest.hexdigest()
     finally:
         os.close(target_fd)
         os.close(source_fd)
+        if not copied:
+            remove(directory_fd, name)
 
 
 def remove(directory_fd, name):
@@ -239,6 +254,37 @@ def committed_entry_size(expected_state):
             or any(not field.isdigit() for field in fields[1:]):
         fail("owned destination size commitment is malformed")
     return int(fields[5])
+
+
+def describe_source(path, maximum):
+    source_fd, source_info = open_source(path)
+    expected_state = state_from_info(source_info)
+    if source_info.st_size > maximum:
+        os.close(source_fd)
+        fail(f"publication source exceeds {maximum} bytes: {path}")
+    expected_size = source_info.st_size
+    digest = hashlib.sha256()
+    try:
+        total = 0
+        while True:
+            chunk = os.read(source_fd, min(131072, expected_size - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > expected_size:
+                fail(f"publication source changed during commitment: {path}")
+            digest.update(chunk)
+        if total != expected_size or state_from_info(os.fstat(source_fd)) != expected_state:
+            fail(f"publication source changed during commitment: {path}")
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            fail(f"publication source changed during commitment: {path}")
+        if state_from_info(current) != expected_state:
+            fail(f"publication source changed during commitment: {path}")
+        print(f"{expected_state}\t{digest.hexdigest()}")
+    finally:
+        os.close(source_fd)
 
 
 def exact_entry_matches(directory_fd, name, expected_state, expected_digest):
@@ -1014,7 +1060,9 @@ def recover_replace(directory_fd, name):
             os.close(journal_fd)
 
 
-def replace_entry(directory_fd, name, source, expected_state, expected_digest):
+def replace_entry(
+        directory_fd, name, source, expected_state, expected_digest,
+        expected_source_state, expected_source_digest):
     recover_replace(directory_fd, name)
     if entry_state(directory_fd, name) != expected_state:
         fail(f"owned destination changed before publication: {name}")
@@ -1026,7 +1074,9 @@ def replace_entry(directory_fd, name, source, expected_state, expected_digest):
     stage = f".{name}.replace-candidate"
     previous = f".{name}.replace-previous"
     journal = f".{name}.replace-journal"
-    source_state, source_digest = copy_to_new(source, directory_fd, stage)
+    source_state, source_digest = copy_to_new(
+        source, directory_fd, stage, expected_source_state, expected_source_digest
+    )
     candidate_state = raw_entry_state(directory_fd, stage)
     if not candidate_state.startswith("regular:"):
         fail(f"owned replacement candidate is unsafe: {stage}")
@@ -1530,6 +1580,15 @@ def lock_release(directory_fd, name, pid, token):
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "describe-source":
+        try:
+            maximum = int(sys.argv[3])
+        except ValueError:
+            fail("publication source maximum size is malformed")
+        if maximum < 0:
+            fail("publication source maximum size is malformed")
+        describe_source(sys.argv[2], maximum)
+        return
     if len(sys.argv) == 4 and sys.argv[1] == "snapshot-path":
         try:
             maximum = int(sys.argv[3])
@@ -1634,11 +1693,11 @@ def main():
             finally:
                 os.close(mutex_fd)
         elif command in ("replace", "replace-if-peer"):
-            if command == "replace" and len(sys.argv) != 8:
-                fail("replace requires a source and exact destination identity")
-            if command == "replace-if-peer" and len(sys.argv) != 13:
-                fail("replace-if-peer requires source, destination identity, and exact peer identity")
-            source, expected_state, expected_digest = sys.argv[5:8]
+            if command == "replace" and len(sys.argv) != 10:
+                fail("replace requires exact source and destination identities")
+            if command == "replace-if-peer" and len(sys.argv) != 15:
+                fail("replace-if-peer requires exact source, destination, and peer identities")
+            source, expected_state, expected_digest, expected_source_state, expected_source_digest = sys.argv[5:10]
             if expected_state == "absent":
                 if expected_digest != "-":
                     fail("absent replacement destination has a digest")
@@ -1650,7 +1709,7 @@ def main():
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 if command == "replace-if-peer":
-                    peer_directory, peer_inode, peer_name, peer_state, peer_digest = sys.argv[8:13]
+                    peer_directory, peer_inode, peer_name, peer_state, peer_digest = sys.argv[10:15]
                     if not valid_name(peer_name) or len(peer_digest) != 64 \
                             or any(char not in "0123456789abcdef" for char in peer_digest):
                         fail("replacement peer identity is malformed")
@@ -1663,7 +1722,10 @@ def main():
                         fail(f"owned replacement peer changed before publication: {peer_name}")
                 recover_no_clobber(directory_fd, name)
                 recover_remove(directory_fd, name)
-                replace_entry(directory_fd, name, source, expected_state, expected_digest)
+                replace_entry(
+                    directory_fd, name, source, expected_state, expected_digest,
+                    expected_source_state, expected_source_digest
+                )
                 if command == "replace-if-peer" \
                         and not exact_entry_matches(peer_fd, peer_name, peer_state, peer_digest):
                     fail(f"owned replacement peer changed during publication: {peer_name}")
@@ -1674,26 +1736,18 @@ def main():
                     os.close(peer_fd)
                 os.close(mutex_fd)
         elif command == "no-clobber":
-            if len(sys.argv) != 7:
-                fail("no-clobber requires a source and staging name")
-            source, staging = sys.argv[5:7]
+            if len(sys.argv) != 9:
+                fail("no-clobber requires a staging name and exact source identity")
+            source, staging, expected_source_state, expected_source_digest = sys.argv[5:9]
+            if not valid_regular_commitment(expected_source_state, expected_source_digest):
+                fail("publication source commitment is malformed")
             if not valid_name(staging) or not allowed_no_clobber_staging(name, staging):
                 fail("unsafe publication staging name")
             mutex_fd = operation_lock(directory_fd, name)
             try:
                 recover_replace(directory_fd, name)
                 recover_remove(directory_fd, name)
-                source_fd, source_info = open_source(source)
-                try:
-                    source_digest = hashlib.sha256()
-                    while True:
-                        chunk = os.read(source_fd, 131072)
-                        if not chunk:
-                            break
-                        source_digest.update(chunk)
-                    source_digest = source_digest.hexdigest()
-                finally:
-                    os.close(source_fd)
+                source_digest = expected_source_digest
                 if recover_no_clobber(
                         directory_fd, name, staging, source_digest,
                         conflict_is_error=True):
@@ -1725,7 +1779,13 @@ def main():
                         raise SystemExit(2)
                     candidate = f".{staging}.copy-candidate.{secrets.token_hex(16)}"
                     try:
-                        copy_to_new(source, directory_fd, candidate)
+                        copied_state, copied_digest = copy_to_new(
+                            source, directory_fd, candidate,
+                            expected_source_state, expected_source_digest
+                        )
+                        if copied_state != expected_source_state \
+                                or copied_digest != expected_source_digest:
+                            fail("publication candidate does not match its source commitment")
                         atomic_rename(directory_fd, candidate, staging, False)
                     finally:
                         remove(directory_fd, candidate)

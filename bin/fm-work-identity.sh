@@ -430,13 +430,20 @@ owned_atomic_replace() {  # <source> <target> <label>
 
 owned_atomic_replace_expected() {  # <source> <target> <label> <validated-state> <validated-digest>
   local source=$1 target=$2 label=$3 destination_state=$4 destination_digest=$5 parent expected base
+  local source_details source_state source_digest
   [ -n "$destination_state" ] && [ -n "$destination_digest" ] \
     || die "$label has no validated destination identity"
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
+  source_details=$(python3 "$FS_OWNER" describe-source "$source" "$MAX_BYTES") \
+    || die "$label publication source is unsafe: $source"
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  [ "$source_state" != "$source_details" ] \
+    || die "$label publication source identity is malformed: $source"
   python3 "$FS_OWNER" replace "$parent" "$expected" "$base" "$source" \
-    "$destination_state" "$destination_digest" \
+    "$destination_state" "$destination_digest" "$source_state" "$source_digest" \
     || die "cannot publish $label: $target"
   rm -f -- "$source" || die "cannot retire $label publication source"
   [ "${TMP:-}" != "$source" ] || TMP=
@@ -485,12 +492,20 @@ owned_remove_staging() {  # <target> <label>
 
 publish_no_clobber() {  # <source> <target> <label>; 2 means target already exists
   local source=$1 target=$2 label=$3 parent expected base staging rc
+  local source_details source_state source_digest
   IFS=$'\t' read -r parent expected < <(owned_parent_details "$target") \
     || die "$label target parent is not owned: $target"
   base=$(basename -- "$target") || die "cannot resolve $label target name"
   staging="${base}.publishing"
+  source_details=$(python3 "$FS_OWNER" describe-source "$source" "$MAX_BYTES") \
+    || die "$label publication source is unsafe: $source"
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  [ "$source_state" != "$source_details" ] \
+    || die "$label publication source identity is malformed: $source"
   rc=0
-  if python3 "$FS_OWNER" no-clobber "$parent" "$expected" "$base" "$source" "$staging"; then
+  if python3 "$FS_OWNER" no-clobber "$parent" "$expected" "$base" "$source" "$staging" \
+      "$source_state" "$source_digest"; then
     rc=0
   else
     rc=$?

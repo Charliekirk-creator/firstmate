@@ -775,6 +775,7 @@ SPAWN_ENDPOINT_WAS_SUBMITTED=0
 SPAWN_ENDPOINT_PHASE=
 SPAWN_ENDPOINT_ENTRY_STATE=
 SPAWN_ENDPOINT_ENTRY_DIGEST=
+SPAWN_ENDPOINT_RETIREMENT_RECOVERED=0
 SPAWN_LAUNCH_PREPARED_RECOVERY=0
 SPAWN_LAUNCH_SUBMITTED_RECOVERY=0
 SPAWN_KIMI_DELIVERY_RECOVERY=0
@@ -1206,6 +1207,7 @@ spawn_endpoint_receipt_retire() {
 
 spawn_endpoint_receipt_publish() {  # <phase> [worktree]
   local phase=$1 worktree=${2:-} details payload payload_digest tmp base state_inode rc=0
+  local source_details source_state source_digest
   case "$phase" in endpoint-creating|endpoint-created|worktree-unsent|worktree-requesting|worktree-requested|worktree-retryable|worktree-acquired|worktree-ready|launch-prepared|launch-submitted) ;; *) return 1 ;; esac
   case "$BACKEND" in
     tmux)
@@ -1255,15 +1257,23 @@ spawn_endpoint_receipt_publish() {  # <phase> [worktree]
   }
   base=$(basename -- "$SPAWN_ENDPOINT_RECEIPT") || { rm -f -- "$tmp"; return 1; }
   state_inode=$(spawn_file_inode_identity "$STATE") || { rm -f -- "$tmp"; return 1; }
+  source_details=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-source "$tmp" 65536) \
+    || { rm -f -- "$tmp"; return 1; }
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  [ "$source_state" != "$source_details" ] && [ "$source_digest" = "$payload_digest" ] \
+    || { rm -f -- "$tmp"; return 1; }
   if [ -z "$SPAWN_ENDPOINT_PHASE" ]; then
     python3 "$SCRIPT_DIR/fm-work-identity-fs.py" no-clobber \
-      "$STATE" "$state_inode" "$base" "$tmp" "${base}.publishing" >/dev/null || rc=$?
+      "$STATE" "$state_inode" "$base" "$tmp" "${base}.publishing" \
+      "$source_state" "$source_digest" >/dev/null || rc=$?
   else
     [ -n "$SPAWN_ENDPOINT_ENTRY_STATE" ] && [ -n "$SPAWN_ENDPOINT_ENTRY_DIGEST" ] \
       || { rm -f -- "$tmp"; return 1; }
     python3 "$SCRIPT_DIR/fm-work-identity-fs.py" replace \
       "$STATE" "$state_inode" "$base" "$tmp" \
-      "$SPAWN_ENDPOINT_ENTRY_STATE" "$SPAWN_ENDPOINT_ENTRY_DIGEST" >/dev/null || rc=$?
+      "$SPAWN_ENDPOINT_ENTRY_STATE" "$SPAWN_ENDPOINT_ENTRY_DIGEST" \
+      "$source_state" "$source_digest" >/dev/null || rc=$?
   fi
   rm -f -- "$tmp" || return 1
   [ "$rc" -eq 0 ] || return "$rc"
@@ -2961,6 +2971,21 @@ BRIEF_SNAPSHOT="$STATE/$ID.launch-brief.md"
 SPAWN_ENDPOINT_RECEIPT="$STATE/$ID.spawn-endpoint.json"
 SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT="$STATE/$ID.harness-wiring-provisional.json"
 [ "$BACKEND" != orca ] || SPAWN_ORCA_OPERATION="$STATE/$ID.spawn-orca-operation"
+SPAWN_ENDPOINT_BASE=$(basename -- "$SPAWN_ENDPOINT_RECEIPT") || exit 1
+SPAWN_STATE_INODE=$(spawn_file_inode_identity "$STATE") || exit 1
+SPAWN_ENDPOINT_REMOVAL_JOURNAL="$STATE/.$SPAWN_ENDPOINT_BASE.remove-journal"
+SPAWN_ENDPOINT_REMOVAL_PENDING=0
+if [ -e "$SPAWN_ENDPOINT_REMOVAL_JOURNAL" ] || [ -L "$SPAWN_ENDPOINT_REMOVAL_JOURNAL" ]; then
+  SPAWN_ENDPOINT_REMOVAL_PENDING=1
+fi
+SPAWN_ENDPOINT_RAW_STATE=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-raw \
+  "$STATE" "$SPAWN_STATE_INODE" "$SPAWN_ENDPOINT_BASE") || {
+  echo "error: spawn endpoint receipt recovery is unsafe for $ID" >&2
+  exit 1
+}
+if [ "$SPAWN_ENDPOINT_REMOVAL_PENDING" -eq 1 ] && [ "$SPAWN_ENDPOINT_RAW_STATE" = absent ]; then
+  SPAWN_ENDPOINT_RETIREMENT_RECOVERED=1
+fi
 if [ -e "$BRIEF_SNAPSHOT" ] || [ -L "$BRIEF_SNAPSHOT" ]; then
   [ -f "$BRIEF_SNAPSHOT" ] && [ ! -L "$BRIEF_SNAPSHOT" ] \
     || { echo "error: launch brief snapshot path is unsafe: $BRIEF_SNAPSHOT" >&2; exit 1; }
@@ -2987,8 +3012,7 @@ LAUNCH_BRIEF_HASH=
 SPAWN_DISPATCH_TRANSACTION="spawn:${BASHPID:-$$}:$(date +%s):$RANDOM"
 WORK_IDENTITY_ARGS=(dispatch-prepare "$ID" --brief "$SPAWN_BRIEF_TMP" \
   --instructions-path "$BRIEF_SNAPSHOT" --transaction "$SPAWN_DISPATCH_TRANSACTION")
-if [ "$RELAUNCH" -eq 0 ] \
-   && { [ -e "$SPAWN_ENDPOINT_RECEIPT" ] || [ -L "$SPAWN_ENDPOINT_RECEIPT" ]; }; then
+if [ "$RELAUNCH" -eq 0 ]; then
   WORK_IDENTITY_ARGS+=(--resume)
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -3089,7 +3113,7 @@ spawn_provisional_harness_wiring_receipt_load() {
 
 spawn_provisional_harness_wiring_receipt_publish() {  # <harness> <auth-path>
   local harness=$1 auth_path=$2 payload tmp receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT
-  local base state_inode rc=0
+  local base state_inode rc=0 source_details source_state source_digest
   fm_control_harness_turnend_auth_record_valid "$harness" "" "$auth_path" || return 1
   payload=$(jq -n -S -c \
     --arg schema fm-spawn-harness-wiring.v1 \
@@ -3107,8 +3131,15 @@ spawn_provisional_harness_wiring_receipt_publish() {  # <harness> <auth-path>
   }
   base=$(basename -- "$receipt") || { rm -f -- "$tmp"; return 1; }
   state_inode=$(spawn_file_inode_identity "$STATE") || { rm -f -- "$tmp"; return 1; }
+  source_details=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-source "$tmp" 4096) \
+    || { rm -f -- "$tmp"; return 1; }
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  [ "$source_state" != "$source_details" ] \
+    || { rm -f -- "$tmp"; return 1; }
   python3 "$SCRIPT_DIR/fm-work-identity-fs.py" no-clobber \
-    "$STATE" "$state_inode" "$base" "$tmp" "${base}.publishing" || rc=$?
+    "$STATE" "$state_inode" "$base" "$tmp" "${base}.publishing" \
+    "$source_state" "$source_digest" || rc=$?
   rm -f -- "$tmp" || return 1
   [ "$rc" -eq 0 ]
 }
@@ -3697,6 +3728,46 @@ fi
 if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
   echo "error: task $ID has a pending authoritative backlog close at $STATE/$ID.backlog-close; finish or repair that close before dispatching a new worker" >&2
   exit 1
+fi
+if [ "$RELAUNCH" -eq 0 ] && [ -z "$SPAWN_ENDPOINT_PHASE" ] \
+   && spawn_metadata_transaction_published \
+   && { [ "$SPAWN_ENDPOINT_RETIREMENT_RECOVERED" -eq 1 ] \
+     || { [ "$BACKLOG_TRANSITION" -eq 1 ] \
+       && [ "$BACKLOG_ROW_STATE" = "in_flight no no" ]; }; }; then
+  fm_backend_validate_task_endpoint "$STATE/$ID.meta" "$ID" || exit 1
+  [ "$FM_BACKEND_VALIDATED_BACKEND" = "$BACKEND" ] \
+    && [ "$(fm_meta_get "$STATE/$ID.meta" kind)" = "$KIND" ] \
+    && [ "$(fm_meta_get "$STATE/$ID.meta" project)" = "$PROJ_ABS" ] \
+    && [ "$(fm_meta_get "$STATE/$ID.meta" harness)" = "$HARNESS" ] || {
+      echo "error: committed spawn metadata is mismatched for exact retry of $ID" >&2
+      exit 1
+    }
+  T=$FM_BACKEND_VALIDATED_TARGET
+  WT=$(fm_meta_get "$STATE/$ID.meta" worktree)
+  spawn_endpoint_worktree_binding_valid || {
+    echo "error: committed spawn worktree is invalid or cross-project for $ID: $WT" >&2
+    exit 1
+  }
+  if [ "$KIND" != scout ]; then
+    [ "$(fm_meta_get "$STATE/$ID.meta" mode)" = "$MODE" ] \
+      && [ "$(fm_meta_get "$STATE/$ID.meta" yolo)" = "$YOLO" ] || {
+        echo "error: committed spawn delivery contract is mismatched for exact retry of $ID" >&2
+        exit 1
+      }
+  fi
+  fm_backend_target_exists "$BACKEND" "$T" "$W" || {
+    echo "error: committed spawn endpoint is unavailable for $ID; refusing duplicate launch" >&2
+    exit 1
+  }
+  spawn_launch_request_paths || exit 1
+  spawn_launch_request_cleanup \
+    || echo "warning: committed launch request journal could not be retired for $ID" >&2
+  SPAWN_DISPATCH_PENDING=0
+  SECONDMATE_RESERVATION_PENDING=0
+  SPAWN_DELIVERY=
+  [ -z "$MODE" ] || SPAWN_DELIVERY=" mode=$MODE yolo=$YOLO"
+  echo "spawned $ID harness=$HARNESS kind=$KIND$SPAWN_DELIVERY window=$T worktree=$WT"
+  exit 0
 fi
 
 W="fm-$ID"

@@ -540,7 +540,7 @@ test_no_clobber_publications_recover_after_interruption() {
 }
 
 test_no_clobber_conflict_retires_owned_transaction() {
-  local dir inode source staging target pin journal digest rc=0
+  local dir inode source staging target pin journal digest source_details source_state rc=0
   dir=$(make_home publication-conflict)
   inode=$(python3 - "$dir" <<'PY'
 import os, sys
@@ -556,11 +556,15 @@ PY
   printf 'candidate\n' > "$source"
   cp "$source" "$dir/$staging"
   ln "$dir/$staging" "$pin"
-  digest=$(sha256_file_for_test "$source")
+  source_details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-source "$source" 1024) \
+    || fail "could not capture no-clobber source commitment"
+  source_state=${source_details%%$'\t'*}
+  digest=${source_details#*$'\t'}
   printf 'v1\n%s\n%s\n%s\n' "$staging" "${pin##*/}" "$digest" > "$journal"
   printf 'concurrent destination\n' > "$target"
   python3 "$ROOT/bin/fm-work-identity-fs.py" no-clobber \
-    "$dir" "$inode" record "$source" "$staging" >/dev/null 2>&1 || rc=$?
+    "$dir" "$inode" record "$source" "$staging" "$source_state" "$digest" \
+    >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || fail "no-clobber conflict returned $rc instead of target-exists"
   [ "$(cat "$target")" = "concurrent destination" ] \
     || fail "no-clobber conflict changed the concurrent destination"
@@ -572,7 +576,8 @@ PY
     "$staging" "${pin##*/}" "$digest" > "$journal"
   rc=0
   python3 "$ROOT/bin/fm-work-identity-fs.py" no-clobber \
-    "$dir" "$inode" record "$source" "$staging" >/dev/null 2>&1 || rc=$?
+    "$dir" "$inode" record "$source" "$staging" "$source_state" "$digest" \
+    >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || fail "completed conflict cleanup returned $rc instead of target-exists"
   assert_absent "$journal" "completed conflict cleanup retained its journal"
   [ "$(cat "$target")" = "concurrent destination" ] \
@@ -582,7 +587,8 @@ PY
     "$staging" "${pin##*/}" "$digest" > "$journal"
   rc=0
   python3 "$ROOT/bin/fm-work-identity-fs.py" no-clobber \
-    "$dir" "$inode" record "$source" "$staging" >/dev/null 2>&1 || rc=$?
+    "$dir" "$inode" record "$source" "$staging" "$source_state" "$digest" \
+    >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || fail "interrupted conflict cleanup returned $rc instead of target-exists"
   assert_absent "$journal" "interrupted conflict cleanup retained its journal"
   [ "$(cat "$target")" = "concurrent destination" ] \
@@ -651,7 +657,7 @@ SH
 }
 
 test_owned_replace_refuses_changed_unsafe_destination() {
-  local home parent inode source target sink details expected digest out rc=0
+  local home parent inode source target sink details expected digest source_details source_state source_digest out rc=0
   home=$(make_home replace-destination-race)
   parent="$home/state"
   source="$home/replacement"
@@ -666,10 +672,15 @@ test_owned_replace_refuses_changed_unsafe_destination() {
     || fail "could not capture owned destination identity"
   expected=${details%%$'\t'*}
   digest=${details#*$'\t'}
+  source_details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-source "$source" 1024) \
+    || fail "could not capture replacement source commitment"
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
   rm -f "$target"
   ln -s "$sink" "$target"
   out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" replace \
-    "$parent" "$inode" authoritative "$source" "$expected" "$digest" 2>&1) || rc=$?
+    "$parent" "$inode" authoritative "$source" "$expected" "$digest" \
+    "$source_state" "$source_digest" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "changed symlink destination was replaced"
   [ "$(cat "$sink")" = unchanged ] || fail "replace wrote through a changed destination symlink"
   [ "$(cat "$source")" = replacement ] || fail "refused replace changed its publication source"
@@ -711,7 +722,7 @@ test_owned_replace_refuses_changed_unsafe_destination() {
 }
 
 test_owned_replace_refuses_a_changing_source() {
-  local home parent inode source target details state digest hook out rc=0
+  local home parent inode source target details state digest source_details source_state source_digest hook out rc=0
   home=$(make_home owned-replace-source-race)
   parent="$home/state"
   source="$home/replacement"
@@ -724,6 +735,25 @@ test_owned_replace_refuses_a_changing_source() {
     "$parent" "$inode" authoritative) || fail "could not capture replacement destination"
   state=${details%%$'\t'*}
   digest=${details#*$'\t'}
+  source_details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-source "$source" 1024) \
+    || fail "could not capture changing source commitment"
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  printf 'changed before open\n' > "$source"
+  out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" replace \
+    "$parent" "$inode" authoritative "$source" "$state" "$digest" \
+    "$source_state" "$source_digest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "owned replacement accepted a source changed before open"
+  [ "$(cat "$target")" = original ] \
+    || fail "pre-open source mutation partially replaced the authoritative destination"
+  assert_contains "$out" "publication source changed before copying" \
+    "owned replacement did not identify its pre-open source mutation"
+  printf 'replacement\n' > "$source"
+  source_details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-source "$source" 1024) \
+    || fail "could not recapture changing source commitment"
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  rc=0
   mkdir -p "$hook"
   cat > "$hook/sitecustomize.py" <<'PY'
 import os
@@ -751,13 +781,38 @@ os.read = raced_read
 PY
   out=$(PYTHONPATH="$hook" FM_TEST_CHANGE_SOURCE="$source" \
     python3 "$ROOT/bin/fm-work-identity-fs.py" replace \
-    "$parent" "$inode" authoritative "$source" "$state" "$digest" 2>&1) || rc=$?
+    "$parent" "$inode" authoritative "$source" "$state" "$digest" \
+    "$source_state" "$source_digest" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "owned replacement accepted a changing source"
   [ "$(cat "$target")" = original ] \
     || fail "changing source partially replaced the authoritative destination"
   assert_contains "$out" "publication source changed during copying" \
     "owned replacement did not identify its changing source"
-  pass "owned replacement pins its source through copying"
+  pass "owned replacement pins its source before and through copying"
+}
+
+test_no_clobber_refuses_a_preopen_source_mutation() {
+  local home inode source target staging source_details source_state source_digest out rc=0
+  home=$(make_home no-clobber-source-race)
+  source="$home/source"
+  target="$home/record"
+  staging=record.publishing
+  printf 'candidate\n' > "$source"
+  inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$home")
+  source_details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-source "$source" 1024) \
+    || fail "could not capture no-clobber source commitment"
+  source_state=${source_details%%$'\t'*}
+  source_digest=${source_details#*$'\t'}
+  printf 'changed before publication\n' > "$source"
+  out=$(python3 "$ROOT/bin/fm-work-identity-fs.py" no-clobber \
+    "$home" "$inode" record "$source" "$staging" \
+    "$source_state" "$source_digest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "no-clobber accepted a source changed before open"
+  assert_absent "$target" "no-clobber published a source outside its caller commitment"
+  assert_absent "$home/$staging" "no-clobber retained a candidate from a changed source"
+  assert_contains "$out" "publication source changed before copying" \
+    "no-clobber did not identify its pre-open source mutation"
+  pass "no-clobber verifies its caller source commitment"
 }
 
 test_owned_removal_bounds_digest_after_concurrent_growth() {
@@ -3213,6 +3268,7 @@ case "${FM_TEST_ONLY:-}" in
     ;;
   owned-replace-source)
     test_owned_replace_refuses_a_changing_source
+    test_no_clobber_refuses_a_preopen_source_mutation
     exit 0
     ;;
 esac
@@ -3229,6 +3285,7 @@ test_no_clobber_journal_rejects_unrelated_staging
 test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
 test_owned_replace_refuses_a_changing_source
+test_no_clobber_refuses_a_preopen_source_mutation
 test_owned_removal_bounds_digest_after_concurrent_growth
 test_owned_snapshot_binds_validated_entry
 test_identity_lock_refuses_replaced_storage_parent

@@ -188,6 +188,55 @@ write_meta() {
     "spawn_gen=teardown-test-task-x1"
 }
 
+write_spawn_endpoint_receipt() {  # <case-dir> <transaction>
+  local case_dir=$1 transaction=$2 home receipt
+  home=$(cd "$case_dir" && pwd -P)
+  receipt="$case_dir/state/task-x1.spawn-endpoint.json"
+  jq -n -S -c \
+    --arg home "$home" --arg transaction "$transaction" \
+    --arg project "$case_dir/project" --arg worktree "$case_dir/wt" '
+      {schema:"fm-spawn-endpoint.v1",phase:"launch-submitted",
+       binding:{home:$home,home_id:"main",task_id:"task-x1"},
+       transaction_id:$transaction,
+       instructions_sha256:"0000000000000000000000000000000000000000000000000000000000000000",
+       backend:"tmux",kind:"ship",project:$project,
+       endpoint:{label:"fm-task-x1",target:"firstmate:fm-task-x1",
+         details:{session:"firstmate",window_id:"firstmate:fm-task-x1"}},
+       worktree:$worktree}
+    ' > "$receipt" || fail "could not create endpoint receipt fixture"
+  chmod 600 "$receipt"
+}
+
+track_endpoint_teardown_resource_actions() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+: > "$case_dir/backend-resource-action"
+exit 0
+SH
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+: > "$case_dir/local-copy-resource-action"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux" "$case_dir/fakebin/treehouse"
+}
+
+race_teardown_endpoint_retirement() {  # <case-dir> <receipt>
+  local case_dir=$1 receipt=$2 real
+  real=$(command -v python3)
+  cat > "$case_dir/fakebin/python3" <<SH
+#!/usr/bin/env bash
+if [ "\${2:-}" = remove ] && [ "\${5:-}" = "$(basename -- "$receipt")" ] \
+   && [ ! -e "$case_dir/endpoint-retirement-raced" ]; then
+  : > "$case_dir/endpoint-retirement-raced"
+  printf '%s\\n' competing-endpoint-receipt > "$receipt"
+fi
+exec "$real" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/python3"
+}
+
 configure_completed_dispatch() {
   local case_dir task=task-x1 launch transaction binding hash
   case_dir=$(cd "$1" && pwd -P)
@@ -645,6 +694,58 @@ SH
   assert_absent "$case_dir/treehouse.log" \
     "malformed dispatch receipt allowed worktree return before refusal"
   pass "teardown preflights dispatch ownership before destructive cleanup"
+}
+
+test_teardown_refuses_malformed_endpoint_receipt_before_cleanup() {
+  local case_dir receipt rc=0
+  case_dir=$(make_case malformed-endpoint-receipt)
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' 'work_identity_dispatch_transaction=malformed-endpoint-tx' \
+    >> "$case_dir/state/task-x1.meta"
+  receipt="$case_dir/state/task-x1.spawn-endpoint.json"
+  printf '%s\n' malformed > "$receipt"
+  track_endpoint_teardown_resource_actions "$case_dir"
+
+  FM_HOME="$case_dir" FM_TEARDOWN_GUARD_DONE=1 run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "malformed endpoint receipt allowed teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "spawn endpoint receipt is unsafe, malformed, or mismatched" \
+    "teardown did not identify the malformed endpoint receipt"
+  assert_present "$receipt" "malformed endpoint receipt was deleted"
+  assert_present "$case_dir/state/task-x1.meta" "malformed endpoint receipt allowed metadata cleanup"
+  assert_absent "$case_dir/backend-resource-action" \
+    "malformed endpoint receipt allowed backend cleanup"
+  assert_absent "$case_dir/local-copy-resource-action" \
+    "malformed endpoint receipt allowed worktree cleanup"
+  pass "teardown refuses malformed endpoint receipts before cleanup"
+}
+
+test_teardown_refuses_concurrent_endpoint_replacement() {
+  local case_dir receipt transaction rc=0
+  case_dir=$(make_case raced-endpoint-retirement)
+  write_meta "$case_dir" local-only ship
+  transaction=raced-endpoint-retirement-tx
+  printf 'work_identity_dispatch_transaction=%s\n' "$transaction" \
+    >> "$case_dir/state/task-x1.meta"
+  receipt="$case_dir/state/task-x1.spawn-endpoint.json"
+  write_spawn_endpoint_receipt "$case_dir" "$transaction"
+  track_endpoint_teardown_resource_actions "$case_dir"
+  race_teardown_endpoint_retirement "$case_dir" "$receipt"
+
+  FM_HOME="$case_dir" FM_TEARDOWN_GUARD_DONE=1 run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "concurrent endpoint replacement allowed teardown"
+  [ "$(cat "$receipt")" = competing-endpoint-receipt ] \
+    || fail "teardown changed the concurrent endpoint replacement"
+  assert_contains "$(cat "$case_dir/stderr")" "spawn endpoint receipt changed before teardown" \
+    "teardown did not identify the concurrent endpoint replacement"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "concurrent endpoint replacement allowed metadata cleanup"
+  assert_absent "$case_dir/backend-resource-action" \
+    "concurrent endpoint replacement allowed backend cleanup"
+  assert_absent "$case_dir/local-copy-resource-action" \
+    "concurrent endpoint replacement allowed worktree cleanup"
+  pass "teardown retires endpoint receipts conditionally before cleanup"
 }
 
 test_dispatch_receipt_commits_only_after_successful_teardown() {
@@ -2868,11 +2969,15 @@ case "${FM_TEST_ONLY:-}" in
     ;;
   dispatch-retirement)
     test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+    test_teardown_refuses_malformed_endpoint_receipt_before_cleanup
+    test_teardown_refuses_concurrent_endpoint_replacement
     test_dispatch_receipt_commits_only_after_successful_teardown
     exit 0
     ;;
   review-fixes)
     test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+    test_teardown_refuses_malformed_endpoint_receipt_before_cleanup
+    test_teardown_refuses_concurrent_endpoint_replacement
     test_forced_secondmate_herdr_child_preflight_refuses_before_changes
     test_forced_secondmate_teardown_refuses_pre_metadata_dispatch_receipt
     test_forced_secondmate_teardown_accepts_completed_receipt_only_home
@@ -2884,6 +2989,8 @@ esac
 
 test_local_only_fork_remote_allows
 test_malformed_dispatch_receipt_refuses_before_teardown_side_effects
+test_teardown_refuses_malformed_endpoint_receipt_before_cleanup
+test_teardown_refuses_concurrent_endpoint_replacement
 test_dispatch_receipt_commits_only_after_successful_teardown
 test_teardown_closes_the_backlog_item_itself
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator

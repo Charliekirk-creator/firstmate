@@ -891,6 +891,112 @@ BACKEND=$FM_BACKEND_VALIDATED_BACKEND
 T=$FM_BACKEND_VALIDATED_TARGET
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
+TEARDOWN_ENDPOINT_RECEIPT="$STATE/$ID.spawn-endpoint.json"
+TEARDOWN_ENDPOINT_ENTRY_STATE=absent
+TEARDOWN_ENDPOINT_ENTRY_DIGEST=-
+teardown_endpoint_receipt_preflight() {
+  local receipt=$TEARDOWN_ENDPOINT_RECEIPT base state_inode state kind dev inode mode links bytes mtime ctime extra
+  local details snapshot canonical transaction home_real home_id marker_id
+  base=$(basename -- "$receipt") || return 1
+  state_inode=$(teardown_directory_identity "$STATE") || return 1
+  state=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe \
+    "$STATE" "$state_inode" "$base") || return 1
+  [ "$state" != absent ] || return 0
+  IFS=: read -r kind dev inode mode links bytes mtime ctime extra <<EOF
+$state
+EOF
+  [ -z "$extra" ] && [ "$kind" = regular ] || return 1
+  case "$bytes" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$bytes" -le 65536 ] || return 1
+  details=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-digest \
+    "$STATE" "$state_inode" "$base" "$bytes") || return 1
+  TEARDOWN_ENDPOINT_ENTRY_STATE=${details%%$'\t'*}
+  TEARDOWN_ENDPOINT_ENTRY_DIGEST=${details#*$'\t'}
+  [ "$TEARDOWN_ENDPOINT_ENTRY_STATE" = "$state" ] \
+    && [ "$TEARDOWN_ENDPOINT_ENTRY_DIGEST" != "$details" ] || return 1
+  snapshot=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" snapshot \
+    "$STATE" "$state_inode" "$base" \
+    "$TEARDOWN_ENDPOINT_ENTRY_STATE" "$TEARDOWN_ENDPOINT_ENTRY_DIGEST") || return 1
+  home_real=$(CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) || return 1
+  if [ -e "$home_real/$SUB_HOME_MARKER" ] || [ -L "$home_real/$SUB_HOME_MARKER" ]; then
+    [ -f "$home_real/$SUB_HOME_MARKER" ] && [ ! -L "$home_real/$SUB_HOME_MARKER" ] || return 1
+    marker_id=$(cat "$home_real/$SUB_HOME_MARKER" 2>/dev/null) || return 1
+    printf '%s\n' "$marker_id" | cmp -s "$home_real/$SUB_HOME_MARKER" - || return 1
+    fm_task_id_path_safe "$marker_id" || return 1
+    home_id="secondmate:$marker_id"
+  else
+    home_id=main
+  fi
+  transaction=$(fm_meta_get "$META" work_identity_dispatch_transaction)
+  [ -n "$transaction" ] || return 1
+  canonical=$(printf '%s\n' "$snapshot" | jq -e -S -c -s \
+    --arg home "$home_real" --arg home_id "$home_id" --arg task "$ID" \
+    --arg transaction "$transaction" --arg backend "$BACKEND" --arg kind "$TEARDOWN_META_KIND" \
+    --arg project "$PROJ" --arg label "fm-$ID" --arg target "$T" --arg worktree "$WT" '
+      def exact($keys): (keys | sort) == ($keys | sort);
+      select(length == 1) | .[0] | . as $r | select(
+        type == "object"
+        and exact(["schema","phase","binding","transaction_id","instructions_sha256","backend","kind","project","endpoint","worktree"])
+        and .schema == "fm-spawn-endpoint.v1"
+        and (.phase == "endpoint-creating" or .phase == "endpoint-created"
+          or .phase == "worktree-unsent" or .phase == "worktree-requesting"
+          or .phase == "worktree-requested" or .phase == "worktree-retryable"
+          or .phase == "worktree-acquired" or .phase == "worktree-ready"
+          or .phase == "launch-prepared" or .phase == "launch-submitted")
+        and .binding == {home:$home,home_id:$home_id,task_id:$task}
+        and .transaction_id == $transaction
+        and (.instructions_sha256 | type) == "string"
+        and (.instructions_sha256 | test("^[0-9a-f]{64}$"))
+        and .backend == $backend and .kind == $kind and .project == $project
+        and (.endpoint | type) == "object" and exact(["label","target","details"])
+        and .endpoint.label == $label and (.endpoint.details | type) == "object"
+        and (if $backend == "tmux" then
+               (.endpoint.details | exact(["session","window_id"]))
+               and (.endpoint.details.session | type) == "string"
+               and (.endpoint.details.window_id | type) == "string"
+             elif $backend == "herdr" then
+               (.endpoint.details | exact(["session","workspace_id","tab_id","pane_id"]))
+               and all(.endpoint.details[]; type == "string")
+             elif $backend == "zellij" then
+               (.endpoint.details | exact(["session","tab_id","pane_id"]))
+               and all(.endpoint.details[]; type == "string")
+             elif $backend == "cmux" then
+               (.endpoint.details | exact(["workspace_id","surface_id"]))
+               and all(.endpoint.details[]; type == "string")
+             elif $backend == "orca" then
+               (.endpoint.details | exact(["worktree_id","terminal"]))
+               and all(.endpoint.details[]; type == "string")
+             else false end)
+        and (if .phase == "endpoint-creating" then (.endpoint.target == null or .endpoint.target == $target)
+             else .endpoint.target == $target end)
+        and (if .phase == "worktree-ready" or .phase == "worktree-acquired"
+               or .phase == "launch-prepared" or .phase == "launch-submitted"
+             then .worktree == $worktree and ($worktree | length) > 0
+             elif .phase == "endpoint-creating" or .phase == "worktree-retryable"
+             then .worktree == null
+             else (.worktree == null or .worktree == $worktree) end)
+      ) | $r
+    ' 2>/dev/null) || return 1
+  [ "$canonical" = "$snapshot" ]
+}
+teardown_endpoint_receipt_retire() {
+  local base state_inode live_state
+  base=$(basename -- "$TEARDOWN_ENDPOINT_RECEIPT") || return 1
+  state_inode=$(teardown_directory_identity "$STATE") || return 1
+  if [ "$TEARDOWN_ENDPOINT_ENTRY_STATE" = absent ]; then
+    live_state=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-raw \
+      "$STATE" "$state_inode" "$base") || return 1
+    [ "$live_state" = absent ]
+    return
+  fi
+  python3 "$SCRIPT_DIR/fm-work-identity-fs.py" remove \
+    "$STATE" "$state_inode" "$base" \
+    "$TEARDOWN_ENDPOINT_ENTRY_STATE" "$TEARDOWN_ENDPOINT_ENTRY_DIGEST" >/dev/null
+}
+teardown_endpoint_receipt_preflight || {
+  echo "error: spawn endpoint receipt is unsafe, malformed, or mismatched for $ID; nothing was changed" >&2
+  exit 1
+}
 T_ORCA=
 [ "$BACKEND" != orca ] || T_ORCA=$T
 if [ "${FM_TEARDOWN_GUARD_DONE:-0}" != 1 ]; then
@@ -3016,6 +3122,10 @@ if [ "$BACKEND" = herdr ]; then
 fi
 
 teardown_validate_dispatch_authorizations || exit 1
+teardown_endpoint_receipt_retire || {
+  echo "error: spawn endpoint receipt changed before teardown; nothing was changed" >&2
+  exit 1
+}
 
 BACKLOG_CLOSED=0
 BACKLOG_SKIP_REASON=
@@ -3204,7 +3314,6 @@ rm -f "$STATE/$ID.turn-ended" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
   "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-session" \
-  "$STATE/$ID.spawn-endpoint.json" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note" \
   "$STATE/$ID.reconcile-nudged"
