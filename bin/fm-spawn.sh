@@ -771,12 +771,10 @@ SPAWN_ENDPOINT_RECEIPT=
 SPAWN_ENDPOINT_RECOVERED=0
 SPAWN_ENDPOINT_CREATING_RECOVERY=0
 SPAWN_ENDPOINT_MISSING=0
-SPAWN_ENDPOINT_WAS_SUBMITTED=0
 SPAWN_ENDPOINT_PHASE=
 SPAWN_ENDPOINT_ENTRY_STATE=
 SPAWN_ENDPOINT_ENTRY_DIGEST=
 SPAWN_ENDPOINT_RETIREMENT_RECOVERED=0
-SPAWN_LAUNCH_PREPARED_RECOVERY=0
 SPAWN_LAUNCH_SUBMITTED_RECOVERY=0
 SPAWN_KIMI_DELIVERY_RECOVERY=0
 SPAWN_METADATA_RECOVERY=0
@@ -1172,10 +1170,10 @@ spawn_launch_delivery_wait() {
 }
 
 spawn_endpoint_receipt_commitment_load() {  # <state-inode> <base>
-  local state_inode=$1 base=$2 state kind dev inode mode links bytes mtime ctime extra commitment
+  local state_inode=$1 base=$2 state kind _dev inode mode links bytes _mtime _ctime extra commitment
   state=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe \
     "$STATE" "$state_inode" "$base") || return 1
-  IFS=: read -r kind dev inode mode links bytes mtime ctime extra <<EOF
+  IFS=: read -r kind _dev inode mode links bytes _mtime _ctime extra <<EOF
 $state
 EOF
   [ -z "$extra" ] && [ "$kind" = regular ] || return 1
@@ -1251,10 +1249,10 @@ spawn_endpoint_receipt_publish() {  # <phase> [worktree]
       worktree:(if $worktree == "" then null else $worktree end)}') || return 1
   payload_digest=$(printf '%s\n' "$payload" | spawn_sha256_stream) || return 1
   tmp=$(umask 077; mktemp "$STATE/.$ID.spawn-endpoint.XXXXXX") || return 1
-  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" || {
+  if ! printf '%s\n' "$payload" > "$tmp" || ! chmod 600 "$tmp"; then
     rm -f -- "$tmp"
     return 1
-  }
+  fi
   base=$(basename -- "$SPAWN_ENDPOINT_RECEIPT") || { rm -f -- "$tmp"; return 1; }
   state_inode=$(spawn_file_inode_identity "$STATE") || { rm -f -- "$tmp"; return 1; }
   source_details=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-source "$tmp" 65536) \
@@ -1347,7 +1345,6 @@ spawn_endpoint_receipt_load() {
     return 1
   }
   SPAWN_ENDPOINT_PHASE=$(printf '%s' "$canonical" | jq -r '.phase') || return 1
-  [ "$SPAWN_ENDPOINT_PHASE" != launch-submitted ] || SPAWN_ENDPOINT_WAS_SUBMITTED=1
   if [ "$KIND" = secondmate ] && [ "$SECONDMATE_RESERVATION_PENDING" -eq 1 ]; then
     SECONDMATE_RESERVATION_PRESERVE=1
   fi
@@ -1483,10 +1480,10 @@ spawn_orca_operation_publish() {  # <result|failure> <payload>
     *) return 1 ;;
   esac
   tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.${kind}.XXXXXX") || return 1
-  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" || {
+  if ! printf '%s\n' "$payload" > "$tmp" || ! chmod 600 "$tmp"; then
     rm -f -- "$tmp"
     return 1
-  }
+  fi
   fm_backend_orca_no_clobber_publish "$tmp" "$target" || rc=$?
   case "$rc" in
     0) return 0 ;;
@@ -1501,7 +1498,7 @@ spawn_orca_operation_publish() {  # <result|failure> <payload>
 }
 
 spawn_orca_operation_helper() {
-  local claim_tmp claim_rc create_response terminal_response raw rc wt_id= wt_path= terminal= payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation orca_name orca_name_digest
+  local claim_tmp claim_rc create_response terminal_response raw rc wt_id='' wt_path='' terminal='' payload rest wt_real wt_top wt_top_real proj_real failure_reason=creation orca_name orca_name_digest
   set +e
   claim_tmp=$(umask 077; mktemp "$SPAWN_ORCA_OPERATION/.claim.XXXXXX") || exit 1
   printf '%s\n' "${BASHPID:-$$}" > "$claim_tmp" || { rm -f -- "$claim_tmp"; exit 1; }
@@ -2334,7 +2331,7 @@ shell_quote() {
 }
 
 render_launch() {
-  local template=$1 output= prefix rest token marker replacement
+  local template=$1 output='' prefix rest token marker replacement
   while [[ "$template" == *"__"* ]]; do
     prefix=${template%%__*}
     rest=${template#*__}
@@ -2515,7 +2512,7 @@ case "$ARG3" in
 esac
 
 if [ "$KIND" = secondmate ] && [ "$RAW_LAUNCH" -eq 1 ]; then
-  if [[ "$LAUNCH" == *[';&|<>`']* || "$LAUNCH" == *'$('* \
+  if [[ "$LAUNCH" == *[';&|<>`']* || "$LAUNCH" == *"\$("* \
     || "$LAUNCH" == *$'\n'* || "$LAUNCH" == *$'\r'* ]]; then
     echo "error: a local secondmate raw launch must be one simple executable command; shell pipelines, compounds, substitutions, and redirections cannot prove the persistent process boundary" >&2
     exit 1
@@ -3125,10 +3122,10 @@ spawn_provisional_harness_wiring_receipt_publish() {  # <harness> <auth-path>
       transaction_id:$transaction,harness:$harness,kind:$kind,
       worktree:$worktree,auth_path:$auth_path}') || return 1
   tmp=$(umask 077; mktemp "$STATE/.$ID.harness-wiring-provisional.XXXXXX") || return 1
-  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" || {
+  if ! printf '%s\n' "$payload" > "$tmp" || ! chmod 600 "$tmp"; then
     rm -f -- "$tmp"
     return 1
-  }
+  fi
   base=$(basename -- "$receipt") || { rm -f -- "$tmp"; return 1; }
   state_inode=$(spawn_file_inode_identity "$STATE") || { rm -f -- "$tmp"; return 1; }
   source_details=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-source "$tmp" 4096) \
@@ -3276,7 +3273,7 @@ spawn_terminal_launch_reset() {
 }
 
 spawn_missing_endpoint_compensate() {
-  local busy_gen= guard_state
+  local busy_gen='' guard_state
   guard_state=$(spawn_launch_guard_state) || return 1
   case "$guard_state" in absent|exited|abandoned) ;; *) return 1 ;; esac
   if spawn_metadata_transaction_published; then
@@ -4349,7 +4346,7 @@ spawn_send_key() {  # <target> <key>
 spawn_session_backend_worktree_acquire() {
   local old_request=0 owner_state result_rc reconcile_rc round=0 helper_pid start_wait
   local poll_max=${FM_SPAWN_WORKTREE_POLLS:-60} poll_interval=${FM_SPAWN_WORKTREE_INTERVAL:-1}
-  local seen= cd_command
+  local seen='' cd_command
   WORKTREE_REQUEST_DIGEST=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || return 1
   WORKTREE_REQUEST_MARKER="$STATE/.$ID.worktree-request.$WORKTREE_REQUEST_DIGEST"
   WORKTREE_REQUEST_ACK="$WORKTREE_REQUEST_MARKER.send"
@@ -5507,7 +5504,6 @@ EOF
       # task's token pointer and the token resolves through Firstmate's private
       # registry. The installer above owns the format-preserving config edit and
       # the always-zero, silent hook script.
-      KIMI_AUTH_DIR="$HOME/.kimi-code/fm-turn-end.d"
       auth_file=$HARNESS_TURNEND_AUTH_PATH
       fm_control_harness_turnend_auth_record_valid \
         kimi "${auth_file##*/}" "$auth_file" || exit 1

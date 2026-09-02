@@ -386,7 +386,7 @@ SH
 test_manifest_capture_rejects_same_size_rewrite() {
   local home task manifest replacement fakebin real_jq out rc=0
   home=$(make_home manifest-capture)
-  task=manifest-capture-worker
+  task='manifest-capture-worker'
   manifest="$home/manifest.json"
   replacement="$home/replacement.json"
   make_manifest "$home" "$task" "$manifest"
@@ -1184,6 +1184,8 @@ test_dispatch_retire_run_authorizes_task_set() {
   pass "dispatch retirement authorizes complete task sets without nested locks"
 }
 
+# Nested shell code intentionally expands only in the invoked shell.
+# shellcheck disable=SC2016
 test_dispatch_retire_run_refuses_invalid_set_without_quarantine() {
   local home task launch transaction binding hash marker out rc=0
   local -a cleanup_paths=()
@@ -1229,6 +1231,8 @@ test_dispatch_retire_run_refuses_invalid_set_without_quarantine() {
   pass "dispatch retirement validates a complete set before quarantine"
 }
 
+# Nested shell code intentionally expands only in the invoked shell.
+# shellcheck disable=SC2016
 test_dispatch_retire_run_accepts_whole_home_removal() {
   local home task launch transaction binding hash marker rc=0
   home=$(make_home dispatch-retire-whole-home)
@@ -1278,6 +1282,8 @@ test_dispatch_retire_run_accepts_whole_home_removal() {
   pass "dispatch retirement refuses journal-only state without finalization proof"
 }
 
+# Nested shell code intentionally expands only in the invoked shell.
+# shellcheck disable=SC2016
 test_dispatch_retire_run_recovers_completed_command() {
   local home task launch transaction binding hash owner owner_id journal marker command rc=0
   local quarantine quarantine_name retired remove_journal quarantine_state quarantine_digest
@@ -1350,6 +1356,8 @@ PY
   pass "dispatch retirement finalizes a durably completed command once"
 }
 
+# Nested shell code intentionally expands only in the invoked shell.
+# shellcheck disable=SC2016
 test_dispatch_retire_run_refuses_changed_record_without_partial_retirement() {
   local home task launch transaction binding hash marker out rc=0
   home=$(make_home dispatch-retire-record-change)
@@ -1389,6 +1397,8 @@ test_dispatch_retire_run_refuses_changed_record_without_partial_retirement() {
   pass "dispatch retirement validates all final records before retiring any"
 }
 
+# Nested shell code intentionally expands only in the invoked shell.
+# shellcheck disable=SC2016
 test_dispatch_retire_run_preserves_failed_siblings() {
   local home task launch transaction binding hash owner owner_id journal command rc=0
   home=$(make_home dispatch-retire-partial-set)
@@ -1435,6 +1445,8 @@ test_dispatch_retire_run_preserves_failed_siblings() {
   pass "partial dispatch retirement finalizes only completed children"
 }
 
+# Nested shell code intentionally expands only in the invoked shell.
+# shellcheck disable=SC2016
 test_dispatch_retire_run_rejects_duplicate_tasks() {
   local home marker out rc=0
   home=$(make_home dispatch-retire-duplicate)
@@ -1532,7 +1544,7 @@ test_spawn_recovers_creation_intent_after_endpoint_side_effect() {
 test_spawn_resumes_unsent_worktree_request() {
   local home task project wt fakebin manifest out rc=0 creates
   home=$(make_home worktree-request-recovery)
-  task=worktree-request-recovery
+  task='worktree-request-recovery'
   project="$home/project"
   wt="$home/worker-copy"
   manifest="$home/manifest.json"
@@ -1569,7 +1581,7 @@ test_spawn_resumes_unsent_worktree_request() {
 test_spawn_does_not_resend_inflight_worktree_request() {
   local home task project wt fakebin manifest out rc=0 sends
   home=$(make_home worktree-request-inflight)
-  task=worktree-request-inflight
+  task='worktree-request-inflight'
   project="$home/project"
   wt="$home/worker-copy"
   manifest="$home/manifest.json"
@@ -1875,11 +1887,11 @@ SH
 test_replacement_dispatch_recovers_prior_retirement() {
   local home task launch old_transaction old_binding old_hash old_candidate draft transaction binding hash candidate fakebin real_python out rc=0
   home=$(make_home replacement-prior-recovery)
-  task=replacement-prior-recovery
+  task='replacement-prior-recovery'
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
     || fail "could not scaffold replacement dispatch recovery fixture"
   launch="$home/state/$task.launch-brief.md"
-  old_transaction=replacement-prior-original
+  old_transaction='replacement-prior-original'
   old_binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
     --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
     --transaction "$old_transaction") || fail "could not prepare original dispatch"
@@ -1899,7 +1911,7 @@ test_replacement_dispatch_recovers_prior_retirement() {
   cp "$launch" "$draft"
   chmod 600 "$draft"
   printf '\nContinue the replacement.\n' >> "$draft"
-  transaction=replacement-prior-next
+  transaction='replacement-prior-next'
   binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
     --brief "$draft" --instructions-path "$launch" --transaction "$transaction" \
     --meta "$home/state/$task.meta" --prior-brief "$launch") \
@@ -1946,11 +1958,11 @@ SH
 test_replacement_dispatch_resumes_before_metadata_publication() {
   local home task launch original_tx original_binding original_hash original_candidate draft replacement_tx replacement_binding replacement_hash retry candidate
   home=$(make_home replacement-pre-metadata-recovery)
-  task=replacement-pre-metadata-recovery
+  task='replacement-pre-metadata-recovery'
   FM_HOME="$home" "$BRIEF" "$task" firstmate --mode no-mistakes >/dev/null \
     || fail "could not scaffold interrupted replacement fixture"
   launch="$home/state/$task.launch-brief.md"
-  original_tx=replacement-pre-metadata-original
+  original_tx='replacement-pre-metadata-original'
   original_binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
     --brief "$home/data/$task/brief.md" --instructions-path "$launch" \
     --transaction "$original_tx") || fail "could not prepare original dispatch"
@@ -1970,7 +1982,7 @@ test_replacement_dispatch_resumes_before_metadata_publication() {
   cp "$launch" "$draft"
   chmod 600 "$draft"
   printf '\nResume this replacement exactly.\n' >> "$draft"
-  replacement_tx=replacement-pre-metadata-next
+  replacement_tx='replacement-pre-metadata-next'
   replacement_binding=$(FM_HOME="$home" "$WORK_IDENTITY" dispatch-prepare "$task" \
     --brief "$draft" --instructions-path "$launch" --transaction "$replacement_tx" \
     --meta "$home/state/$task.meta" --prior-brief "$launch") \
@@ -2697,9 +2709,9 @@ test_handoff_preparation_is_durable_and_rollback_safe() {
   printf 'transaction\n' > "$mate/.fm-secondmate-home"
   printf -- '- transaction - transaction domain (home: %s; scope: exact work; projects: firstmate; added 2026-08-14)\n' \
     "$mate" > "$parent/data/secondmates.md"
-  task_a=transaction-a
-  task_b=transaction-b
-  task_c=transaction-c
+  task_a='transaction-a'
+  task_b='transaction-b'
+  task_c='transaction-c'
   for task in "$task_a" "$task_b" "$task_c"; do
     manifest="$parent/$task.json"
     make_manifest "$parent" "$task" "$manifest"
@@ -2985,7 +2997,7 @@ test_secondmate_deadlines_are_isolated_per_home() {
   parent=$(make_home isolated-deadline-parent)
   slow="$TMP_ROOT/isolated-deadline-slow"
   healthy="$TMP_ROOT/isolated-deadline-healthy"
-  task=healthy-delegated-child
+  task='healthy-delegated-child'
   mkdir -p "$slow/data" "$slow/state" "$slow/config" "$slow/projects" \
     "$healthy/data" "$healthy/state" "$healthy/config" "$healthy/projects"
   printf 'a-slow\n' > "$slow/.fm-secondmate-home"

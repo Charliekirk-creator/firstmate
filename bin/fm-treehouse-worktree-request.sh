@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# This owner is both executed by spawn and sourced when callers need its final cwd.
+# shellcheck disable=SC2317
 # Internal owner of one durable Treehouse lease request for fm-spawn.sh.
 #
 # The caller supplies an unused absolute private marker directory and a validated

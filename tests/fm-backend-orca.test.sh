@@ -1015,7 +1015,7 @@ test_spawn_recovers_orca_terminal_response_after_creator_crash() {
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca \
     >"$out_file" 2>&1 &
   spawn_pid=$!
-  for i in $(seq 1 200); do
+  for ((i=0; i < 200; i++)); do
     [ ! -f "$CASE_DIR/terminal-returned" ] || break
     sleep 0.02
   done

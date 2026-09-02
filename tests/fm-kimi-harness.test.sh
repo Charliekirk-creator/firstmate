@@ -392,6 +392,8 @@ test_non_tmux_definitive_submit_failure_is_retryable() {
   pass "non-tmux definitive send failures remain retryable"
 }
 
+# Background ownership and recovery intentionally share inherited evidence paths.
+# shellcheck disable=SC2031
 test_non_tmux_submission_operation_survives_caller_interruption() {
   local evidence="$TMP_ROOT/non-tmux-durable-attempt" invoked="$TMP_ROOT/non-tmux-durable-invoked"
   local release="$TMP_ROOT/non-tmux-durable-release" caller out i=0
@@ -433,6 +435,8 @@ test_non_tmux_submission_operation_survives_caller_interruption() {
   pass "non-tmux submission survives interruption through backend-owned evidence"
 }
 
+# Command substitutions intentionally inject backend callbacks resolved after sourcing.
+# shellcheck disable=SC2031,SC2034,SC2100,SC2329
 test_non_tmux_submission_distinguishes_dead_presend_operation() {
   local evidence="$TMP_ROOT/non-tmux-dead-presend" failed_evidence dead_pid out
   (exit 0) &
@@ -521,7 +525,7 @@ test_non_tmux_submission_distinguishes_dead_presend_operation() {
     }
     fm_backend_herdr_target_ready() { return 0; }
     fm_backend_herdr_cli() {
-      local arg previous= token_value=
+      local arg previous='' token_value=''
       printf '%s\n' "$*" >> "$TMP_ROOT/herdr-prompt.log"
       case "$*" in
         *" agent get "*)

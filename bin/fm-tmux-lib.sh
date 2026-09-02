@@ -293,10 +293,10 @@ fm_tmux_send_literal_with_evidence() {
   fi
   [ -n "$token" ] || return 1
   tmp="${path}.tmp.${BASHPID:-$$}"
-  (umask 077; printf '%s\n' "$token" > "$tmp") && chmod 600 "$tmp" || {
+  if ! (umask 077; printf '%s\n' "$token" > "$tmp") || ! chmod 600 "$tmp"; then
     rm -f -- "$tmp"
     return 1
-  }
+  fi
   command="mv -- $(fm_tmux_literal_quote "$tmp") $(fm_tmux_literal_quote "$path")"
   tmux send-keys -t "$target" -l "$text" \; run-shell "$command" 2>/dev/null || rc=$?
   [ "$rc" -eq 0 ] || rm -f -- "$tmp"

@@ -2621,11 +2621,11 @@ EOF
     "$FM_BACKEND_HERDR_PANE" --source firstmate-kimi-submit \
     --token "fm_kimi_submit=$token:$sequence" >/dev/null 2>&1 || return 1
   tmp="${baseline_file}.tmp.${BASHPID:-$$}"
-  (umask 077; printf '%s\t%s\n' "$token" "$sequence" > "$tmp") \
-    && chmod 600 "$tmp" && mv -- "$tmp" "$baseline_file" || {
-      rm -f -- "$tmp"
-      return 1
-    }
+  if ! (umask 077; printf '%s\t%s\n' "$token" "$sequence" > "$tmp") \
+    || ! chmod 600 "$tmp" || ! mv -- "$tmp" "$baseline_file"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 fm_backend_herdr_prompt_receipt_clear() {  # <target>

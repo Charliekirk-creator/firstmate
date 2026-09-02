@@ -372,8 +372,11 @@ seed_backlog_scaffold() { # <path> <parent-inode> [report-created]
     target=$base
     staging=".${target}.scaffold-publishing"
     tmp=$(umask 077; mktemp './.backlog-scaffold.XXXXXX') || exit 1
-    printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
-      && chmod 600 "$tmp" || { rm -f -- "$tmp"; exit 1; }
+    if ! printf '## In flight\n\n## Queued\n\n## Done\n' > "$tmp" \
+      || ! chmod 600 "$tmp"; then
+      rm -f -- "$tmp"
+      exit 1
+    fi
     source_details=$(python3 "$FS_OWNER" describe-source "$tmp" 1024) \
       || { rm -f -- "$tmp"; exit 1; }
     source_state=${source_details%%$'\t'*}
@@ -880,8 +883,8 @@ task_sets_match() { # <expected-array-name> <actual-array-name>
   local expected_name=$1 actual_name=$2 task
   local -a expected actual
   case "$expected_name:$actual_name" in *[!A-Za-z0-9_:]*) return 1 ;; esac
-  eval "expected=(\"\${$expected_name[@]}\")"
-  eval "actual=(\"\${$actual_name[@]}\")"
+  eval "expected=(\"\${${expected_name}[@]}\")"
+  eval "actual=(\"\${${actual_name}[@]}\")"
   [ "${#expected[@]}" -eq "${#actual[@]}" ] || return 1
   for task in "${expected[@]}"; do
     task_array_contains "$task" "${actual[@]}" || return 1
@@ -1246,12 +1249,12 @@ remote_deliver_outbox() { # <secondmate-id> <outbox-path>
   bytes=$(LC_ALL=C wc -c < "$snapshot" | tr -d ' ')
   hash=$(sha256_file "$snapshot") || { rm -f -- "$snapshot"; return 1; }
   [ "$hash" = "$ACTIVE_OUTBOX_HASH" ] || { rm -f -- "$snapshot"; return 1; }
-  load_tasks_axi_queued_ids "$snapshot" \
-    && task_sets_match HANDOFF_IDENTITY_TASKS TASKS_AXI_BACKLOG_IDS || {
+  if ! load_tasks_axi_queued_ids "$snapshot" \
+    || ! task_sets_match HANDOFF_IDENTITY_TASKS TASKS_AXI_BACKLOG_IDS; then
     rm -f -- "$snapshot"
     echo "error: pending outbox snapshot does not match its prepared identity set: $outbox" >&2
     return 1
-  }
+  fi
   i=0
   while [ "$i" -lt "${#HANDOFF_IDENTITY_TASKS[@]}" ]; do
     task=${HANDOFF_IDENTITY_TASKS[$i]}
@@ -1318,12 +1321,12 @@ finish_remote_handoff() { # <secondmate-id> <outbox-path>
     echo "error: remote backlog and identity are durable at $id; outbox preserved at $outbox for wake retry" >&2
     return 1
   fi
-  [ "$ACTIVE_OUTBOX_PATH" = "$outbox" ] \
-    && remove_owned_backlog_file "$outbox" "$ACTIVE_OUTBOX_PARENT_INODE" \
-      "$ACTIVE_OUTBOX_FILE_INODE" "$ACTIVE_OUTBOX_HASH" || {
+  if [ "$ACTIVE_OUTBOX_PATH" != "$outbox" ] \
+    || ! remove_owned_backlog_file "$outbox" "$ACTIVE_OUTBOX_PARENT_INODE" \
+      "$ACTIVE_OUTBOX_FILE_INODE" "$ACTIVE_OUTBOX_HASH"; then
     echo "error: remote receipt, identity commit, and receiver wake were confirmed but local outbox cleanup failed safely: $outbox" >&2
     return 1
-  }
+  fi
   rm -f -- "$marker" || {
     echo "error: remote outbox cleanup succeeded but confirmed receiver wake state could not be cleared: $marker" >&2
     return 1
@@ -1602,18 +1605,20 @@ remote_handoff() { # <secondmate-id> <keys...>
       fi
       return 1
     fi
-    parse_tasks_axi_move_result "$mv_out" \
-      && task_sets_match RESOLVED_MOVE_KEYS PARSED_MOVE_KEYS || {
+    if ! parse_tasks_axi_move_result "$mv_out" \
+      || ! task_sets_match RESOLVED_MOVE_KEYS PARSED_MOVE_KEYS; then
       echo "error: tasks-axi moved a different set than its prepared transaction; outbox preserved at $outbox" >&2
       return 1
-    }
+    fi
   fi
+  # Read indirectly by task_sets_match after its array-name validation.
+  # shellcheck disable=SC2034
   DELIVERY_KEYS=("${delivery_keys[@]}")
-  load_tasks_axi_queued_ids "$outbox" \
-    && task_sets_match DELIVERY_KEYS TASKS_AXI_BACKLOG_IDS || {
+  if ! load_tasks_axi_queued_ids "$outbox" \
+    || ! task_sets_match DELIVERY_KEYS TASKS_AXI_BACKLOG_IDS; then
     echo "error: pending outbox changed outside the prepared identity set; outbox preserved at $outbox" >&2
     return 1
-  }
+  fi
   # A hard local kill can land tasks-axi's target persist before its source
   # persist. The outbox is already authoritative in that state, so converge by
   # deleting only duplicates that tasks-axi itself confirms are dependency-safe.
@@ -1964,11 +1969,11 @@ if ! MV_OUT=$(tasks-axi mv "${RESOLVED_MOVE_KEYS[@]}" --file "$MAIN_BACKLOG" --t
   fi
   exit 1
 fi
-parse_tasks_axi_move_result "$MV_OUT" \
-  && task_sets_match RESOLVED_MOVE_KEYS PARSED_MOVE_KEYS || {
+if ! parse_tasks_axi_move_result "$MV_OUT" \
+  || ! task_sets_match RESOLVED_MOVE_KEYS PARSED_MOVE_KEYS; then
   echo "error: tasks-axi moved a different set than its prepared transaction; identity preparation is preserved for recovery." >&2
   exit 1
-}
+fi
 complete_local_handoff_backlog_receipts "$SUB_HOME" || {
   echo "error: moved destination row does not match its exact handoff receipt." >&2
   exit 1

@@ -152,11 +152,9 @@ CONTRACT_INPUT_TMP=
 VALIDATION_TMP=
 MANIFEST_CAPTURE_TMP=
 MANIFEST_CAPTURE_SOURCE=
-MANIFEST_CAPTURE_IDENTITY=
 SIDECAR_SNAPSHOT_TMP=
 META_CAPTURE_TMP=
 META_CAPTURE_SOURCE=
-META_CAPTURE_IDENTITY=
 META_CAPTURE_PARENT=
 META_CAPTURE_PARENT_ID=
 META_CAPTURE_BASE=
@@ -763,8 +761,9 @@ validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; set
     before=$(file_identity "$path") || die "cannot inspect work identity record: $path"
     cp -- "$path" "$SIDECAR_SNAPSHOT_TMP" || die "cannot capture work identity record: $path"
     after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
-    [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
-      || die "work identity record changed while it was captured: $path"
+    if [ "$before" != "$after" ] || ! cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP"; then
+      die "work identity record changed while it was captured: $path"
+    fi
   fi
   safe_regular_file "$SIDECAR_SNAPSHOT_TMP" "captured work identity record"
   canonical=$(canonicalize_manifest "$SIDECAR_SNAPSHOT_TMP" "$task" "$expected_home" "$expected_home_id")
@@ -782,8 +781,9 @@ validate_sidecar() {  # <path> <task-id> [expected-home] [expected-home-id]; set
       || die "work identity record changed while it was validated: $path"
   else
     after=$(file_identity "$path") || die "cannot reinspect work identity record: $path"
-    [ "$before" = "$after" ] && cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP" \
-      || die "work identity record changed while it was validated: $path"
+    if [ "$before" != "$after" ] || ! cmp -s "$path" "$SIDECAR_SNAPSHOT_TMP"; then
+      die "work identity record changed while it was validated: $path"
+    fi
   fi
   rm -f -- "$SIDECAR_SNAPSHOT_TMP"
   SIDECAR_SNAPSHOT_TMP=
@@ -838,7 +838,6 @@ finish_metadata_capture() {  # <meta>
   rm -f -- "$META_CAPTURE_TMP"
   META_CAPTURE_TMP=
   META_CAPTURE_SOURCE=
-  META_CAPTURE_IDENTITY=
   META_CAPTURE_PARENT=
   META_CAPTURE_PARENT_ID=
   META_CAPTURE_BASE=
@@ -1510,7 +1509,6 @@ read_dispatch_state() {  # <task-id>
     || die "work identity dispatch transaction is malformed"
   dispatch_instructions_path_valid "$DISPATCH_INSTRUCTIONS" \
     || die "work identity dispatch instructions path is unsafe"
-  DISPATCH_CANONICAL=$wrapper
 }
 
 write_dispatch_state() {  # <prepared|completed> <task> <transaction> <path> <brief-sha> <linked|unlinked> <identity-sha> <replacement> <previous-transaction> <previous-sha>
@@ -1564,7 +1562,7 @@ retire_dispatch_prior_locked() {
 }
 
 validate_completed_dispatch() {  # <task-id> [meta]
-  local task=$1 meta=${2:-$STATE_REAL/$1.meta} projection meta_arg= owned=0
+  local task=$1 meta=${2:-$STATE_REAL/$1.meta} projection meta_arg='' owned=0
   [ "$DISPATCH_STATUS" = completed ] || die "work identity dispatch is incomplete for task $task"
   validate_dispatch_prior_locked
   if [ -e "$meta" ] || [ -L "$meta" ]; then
@@ -2198,7 +2196,7 @@ capture_identity_projection_locked() {  # <task-id> [brief] [meta] [meta-brief-p
 }
 
 project_identity() {  # <task-id> [brief] [meta]
-  local task=$1 brief=${2:-} meta=${3:-} meta_brief_path= recorded_brief= rc=0 meta_captured=0
+  local task=$1 brief=${2:-} meta=${3:-} meta_brief_path='' recorded_brief='' rc=0 meta_captured=0
   identity_lock_acquire "$task"
   if [ -n "$meta" ]; then
     capture_metadata "$meta"
@@ -2483,8 +2481,8 @@ emit_dispatch_binding() {  # <transaction> <projection>
 
 dispatch_prepare() {  # <task-id> <brief-draft> <instructions-path> <transaction> [meta] [prior-brief] [resume]
   local task=$1 brief=$2 instructions_path=$3 transaction=$4 meta=${5:-} prior_brief=${6:-} resume=${7:-false}
-  local projection previous_hash= previous_transaction= identity_status identity_sha
-  local existing_status= existing_path= existing_sha= recovery_meta recovery_transaction
+  local projection previous_hash='' previous_transaction='' identity_status identity_sha
+  local existing_status='' existing_path='' existing_sha='' recovery_meta recovery_transaction
   dispatch_transaction_valid "$transaction" || die "dispatch transaction is malformed"
   safe_regular_file "$brief" "dispatch instruction draft"
   dispatch_instructions_path_valid "$instructions_path" || die "dispatch instructions path is unsafe"
@@ -2684,7 +2682,7 @@ dispatch_commit() {  # <task-id> <brief> <meta> <transaction>
 }
 
 dispatch_abort() {  # <task-id> <transaction>; 4 means committed, 5 means published metadata requires reconciliation
-  local task=$1 transaction=$2 meta="$STATE_REAL/$1.meta" recorded_hash= rc=0 current_hash
+  local task=$1 transaction=$2 meta="$STATE_REAL/$1.meta" recorded_hash='' rc=0 current_hash
   local removal_state removal_digest
   identity_mutation_lock_acquire "$task"
   if [ ! -e "$DISPATCH_STATE" ] && [ ! -L "$DISPATCH_STATE" ]; then return 0; fi
@@ -2758,7 +2756,6 @@ metadata_publish_unlinked() {  # <task-id> <candidate>
   captured=$META_CAPTURE_TMP
   META_CAPTURE_TMP=
   META_CAPTURE_SOURCE=
-  META_CAPTURE_IDENTITY=
   META_CAPTURE_PARENT=
   META_CAPTURE_PARENT_ID=
   META_CAPTURE_BASE=
@@ -2848,7 +2845,7 @@ dispatch_teardown_finalize_locked() {
 }
 
 dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [args...]
-  local task rc meta launch authorization authorizations= whole_home=0 owner_pid=${BASHPID:-$$}
+  local task rc meta launch authorization authorizations='' whole_home=0 owner_pid=${BASHPID:-$$}
   local receipt_parent receipt_parent_id receipt_name quarantine_name receipt_state receipt_digest index rollback
   local metadata_state metadata_digest launch_state launch_digest
   local batch_token seen_tasks=" $1 " recovery_state any_completed=0 partial_completion=0
@@ -2983,8 +2980,8 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     fi
     receipt_state=$DISPATCH_TEARDOWN_QUARANTINE_STATE
     receipt_digest=$DISPATCH_TEARDOWN_QUARANTINE_DIGEST
-    receipt_states[$index]=$receipt_state
-    receipt_digests[$index]=$receipt_digest
+    receipt_states[index]=$receipt_state
+    receipt_digests[index]=$receipt_digest
     quarantined+=("$index")
     identity_lock_release
   done
@@ -3012,16 +3009,16 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
         < <(owned_removal_expectation \
           "$STATE_REAL/.$task.meta.teardown-quarantine" "task dispatch metadata quarantine") \
         || die "cannot bind quarantined task dispatch metadata"
-      metadata_states[$index]=$metadata_state
-      metadata_digests[$index]=$metadata_digest
+      metadata_states[index]=$metadata_state
+      metadata_digests[index]=$metadata_digest
     fi
     if [ "${launch_states[$index]}" != absent ]; then
       IFS=$'\t' read -r launch_state launch_digest \
         < <(owned_removal_expectation \
           "$STATE_REAL/.$task.launch-brief.md.teardown-quarantine" "task dispatch instructions quarantine") \
         || die "cannot bind quarantined task dispatch instructions"
-      launch_states[$index]=$launch_state
-      launch_digests[$index]=$launch_digest
+      launch_states[index]=$launch_state
+      launch_digests[index]=$launch_digest
     fi
     authorization=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$STATE_REAL" "$STATE_DIR_ID" "$task" \
@@ -3068,7 +3065,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
       command-completed|finalizing|quarantined) ;;
       *) die "completed dispatch retirement has a malformed transaction state" ;;
     esac
-    recovery_states[$index]=$recovery_state
+    recovery_states[index]=$recovery_state
     identity_lock_release
   done
   if [ "$rc" -ne 0 ]; then
@@ -3091,7 +3088,7 @@ dispatch_retire_run() {  # <task-id> [task-id...] [--whole-home] -- <command> [a
     task=${tasks[$index]}
     identity_lock_acquire "$task"
     dispatch_teardown_complete_locked "$batch_token"
-    recovery_states[$index]=command-completed
+    recovery_states[index]=command-completed
     identity_lock_release
   done
   for index in "${!tasks[@]}"; do
@@ -3316,7 +3313,6 @@ case "$COMMAND" in
     rm -f -- "$MANIFEST_CAPTURE_TMP"
     MANIFEST_CAPTURE_TMP=
     MANIFEST_CAPTURE_SOURCE=
-    MANIFEST_CAPTURE_IDENTITY=
     META="$STATE_REAL/$TASK.meta"
     if [ -e "$SIDECAR" ] || [ -L "$SIDECAR" ]; then
       validate_sidecar "$SIDECAR" "$TASK"

@@ -760,7 +760,7 @@ fm_backend_send_text_submit_journaled() {  # <evidence-file> <token> <backend> <
   local tmp worker_pid owner_value owner_pid result_token evidence_token verdict
   shift 2
   if [ "$backend" = tmux ]; then
-    FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE= \
+    FM_BACKEND_SUBMIT_ENTERING_EVIDENCE_FILE='' \
       FM_BACKEND_SUBMIT_TYPED_EVIDENCE_FILE=$evidence \
       FM_BACKEND_SUBMIT_TYPED_EVIDENCE_TOKEN=$token \
       fm_backend_send_text_submit "$@"

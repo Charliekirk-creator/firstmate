@@ -1978,7 +1978,7 @@ configure_secondmate_with_receipt_only_child() {  # <case-dir> <prepared|complet
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$child" firstmate --mode no-mistakes >/dev/null \
     || fail "receipt-only fixture could not create a child brief"
   launch="$home/state/$child.launch-brief.md"
-  transaction=receipt-only-transaction
+  transaction='receipt-only-transaction'
   binding=$(FM_HOME="$home" "$ROOT/bin/fm-work-identity.sh" dispatch-prepare "$child" \
     --brief "$home/data/$child/brief.md" --instructions-path "$launch" \
     --transaction "$transaction") || fail "receipt-only fixture could not prepare dispatch"
@@ -2030,18 +2030,22 @@ test_forced_secondmate_teardown_accepts_completed_receipt_only_home() {
 }
 
 test_forced_secondmate_teardown_revalidates_authorized_receipt() {
-  local case_dir home receipt replacement rc=0
+  local case_dir home receipt replacement root work_identity rc=0
   case_dir=$(make_case receipt-authorization-change)
   write_meta "$case_dir" local-only secondmate
   configure_secondmate_with_receipt_only_child "$case_dir" completed
   home="$case_dir/secondmate-home"
   receipt="$home/data/receipt-only-child/work-identity-dispatch.json"
   replacement="$case_dir/replacement-dispatch.json"
+  root=$ROOT
+  work_identity="$root/bin/fm-work-identity.sh"
   printf '%s\n' '{}' > "$replacement"
-  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+  # The single-quoted command is evaluated by the nested shell with these variables.
+  # shellcheck disable=SC2016
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
     RECEIPT="$receipt" REPLACEMENT="$replacement" CASE_DIR="$case_dir" \
-    ROOT="$ROOT" TEARDOWN="$TEARDOWN" \
-    "$ROOT/bin/fm-work-identity.sh" dispatch-retire-run receipt-only-child --whole-home -- \
+    ROOT="$root" TEARDOWN="$TEARDOWN" \
+    "$work_identity" dispatch-retire-run receipt-only-child --whole-home -- \
     bash -c '
       rm -f -- "$RECEIPT"
       ln -s -- "$REPLACEMENT" "$RECEIPT"

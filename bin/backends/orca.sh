@@ -426,10 +426,10 @@ fm_backend_orca_operation_scalar_read() {  # <path>
 fm_backend_orca_operation_scalar_publish() {  # <path> <value>
   local path=$1 value=$2 tmp rc=0 existing
   tmp=$(umask 077; mktemp "${path}.XXXXXX") || return 1
-  printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" || {
+  if ! printf '%s\n' "$value" > "$tmp" || ! chmod 600 "$tmp"; then
     rm -f -- "$tmp"
     return 1
-  }
+  fi
   fm_backend_orca_no_clobber_publish "$tmp" "$path" || rc=$?
   case "$rc" in
     0) return 0 ;;
@@ -518,12 +518,12 @@ fm_backend_orca_terminal_create_durable() {  # <worktree-id> <title> <response-p
     else
       (umask 077; set -C; : > "$candidate") || return 1
       (
+        local start_wait=0
         trap '' HUP INT
-        i=0
         publish_pending=0
         while [ ! -e "$start_file" ] && [ ! -L "$start_file" ]; do
-          i=$((i + 1))
-          [ "$i" -lt 1500 ] || exit 124
+          start_wait=$((start_wait + 1))
+          [ "$start_wait" -lt 1500 ] || exit 124
           sleep 0.02
         done
         fm_backend_orca_operation_scalar_read "$start_file" >/dev/null || exit 1

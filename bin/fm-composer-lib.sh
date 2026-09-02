@@ -161,11 +161,11 @@ fm_backend_submit_unsent_verdict() {
     return 0
   }
   if [ -e "$entering" ] || [ -L "$entering" ]; then
-    [ -f "$entering" ] && [ ! -L "$entering" ] \
-      && printf '%s\n' "$token" | cmp -s "$entering" - || {
-        printf 'pending-unproven'
-        return 0
-      }
+    if [ ! -f "$entering" ] || [ -L "$entering" ] \
+      || ! printf '%s\n' "$token" | cmp -s "$entering" -; then
+      printf 'pending-unproven'
+      return 0
+    fi
     rm -f -- "$entering" || {
       printf 'pending-unproven'
       return 0

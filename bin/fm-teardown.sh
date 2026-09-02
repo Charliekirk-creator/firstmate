@@ -202,7 +202,6 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 TEARDOWN_ORIGINAL_ARGS=("$@")
 TEARDOWN_DISPATCH_AUTH_PID=
 TEARDOWN_DISPATCH_META_PATH=
-TEARDOWN_DISPATCH_LAUNCH_PATH=
 teardown_pid_is_ancestor() {
   local wanted=$1 current=$$ parent
   case "$wanted" in ''|*[!0-9]*) return 1 ;; esac
@@ -279,7 +278,6 @@ teardown_dispatch_authorized() {
       "$auth_launch_state" "$auth_launch_digest" || continue
     TEARDOWN_DISPATCH_AUTH_PID=$auth_pid
     TEARDOWN_DISPATCH_META_PATH="$auth_state/.$auth_meta_name.teardown-quarantine"
-    TEARDOWN_DISPATCH_LAUNCH_PATH="$auth_state/.$auth_launch_name.teardown-quarantine"
     return 0
   done <<< "$FM_TEARDOWN_DISPATCH_AUTHORIZATIONS"
   return 1
@@ -386,7 +384,7 @@ DESCENDANT_TASK_METAS=()
 DESCENDANT_TASK_KINDS=()
 DESCENDANT_TASK_HOMES=()
 teardown_release_locks() {
-  local status=$? i
+  local status=${1:-0} i
   if declare -F teardown_release_herdr_locks >/dev/null 2>&1; then
     teardown_release_herdr_locks || true
   fi
@@ -417,7 +415,7 @@ teardown_release_locks() {
   fm_lease_guard_release || true
   return "$status"
 }
-trap teardown_release_locks EXIT
+trap 'teardown_release_locks "$?"' EXIT
 fm_lock_try_acquire "$CONTROL_LOCK" || {
   echo "error: another lifecycle action is already running for task $ID; nothing was changed" >&2
   exit 1
@@ -895,14 +893,14 @@ TEARDOWN_ENDPOINT_RECEIPT="$STATE/$ID.spawn-endpoint.json"
 TEARDOWN_ENDPOINT_ENTRY_STATE=absent
 TEARDOWN_ENDPOINT_ENTRY_DIGEST=-
 teardown_endpoint_receipt_preflight() {
-  local receipt=$TEARDOWN_ENDPOINT_RECEIPT base state_inode state kind dev inode mode links bytes mtime ctime extra
+  local receipt=$TEARDOWN_ENDPOINT_RECEIPT base state_inode state kind _dev inode mode links bytes mtime _ctime extra
   local details snapshot canonical transaction home_real home_id marker_id
   base=$(basename -- "$receipt") || return 1
   state_inode=$(teardown_directory_identity "$STATE") || return 1
   state=$(python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe \
     "$STATE" "$state_inode" "$base") || return 1
   [ "$state" != absent ] || return 0
-  IFS=: read -r kind dev inode mode links bytes mtime ctime extra <<EOF
+  IFS=: read -r kind _dev inode mode links bytes mtime _ctime extra <<EOF
 $state
 EOF
   [ -z "$extra" ] && [ "$kind" = regular ] || return 1
@@ -1209,7 +1207,7 @@ fi
 # owned by bin/fm-control-lib.sh, so teardown and the control plane's relaunch
 # retire the same artifact rather than each carrying its own copy of the path.
 remove_grok_turnend_auth() {
-  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness= state_real
+  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path='' recorded_harness='' state_real
   token_path=$(fm_control_harness_turnend_token_path grok "$state_dir" "$id") || return 1
   if [ -n "$token_path" ] && [ -f "$token_path" ]; then
     IFS= read -r token < "$token_path" || [ -n "$token" ] || return 1
@@ -1233,7 +1231,7 @@ remove_grok_turnend_auth() {
 }
 
 remove_kimi_turnend_auth() {
-  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path= recorded_harness= state_real
+  local state_dir=$1 id=$2 meta=${3:-} token_path token='' path recorded_path='' recorded_harness='' state_real
   token_path=$(fm_control_harness_turnend_token_path kimi "$state_dir" "$id") || return 1
   if [ -n "$token_path" ] && [ -f "$token_path" ]; then
     IFS= read -r token < "$token_path" || [ -n "$token" ] || return 1
@@ -2568,7 +2566,7 @@ collect_descendant_task_locks() {
         [ -n "$child_home" ] || child_home=$child_wt
       fi
     else
-      child_kind=receipt-only
+      child_kind='receipt-only'
     fi
     DESCENDANT_TASK_STATES+=("$sub_state")
     DESCENDANT_TASK_IDS+=("$child_id")
@@ -2617,12 +2615,12 @@ preflight_descendant_task_locks() {
     DESCENDANT_LOCK_PATHS+=("$meta_lock")
     if [ "${DESCENDANT_TASK_KINDS[$i]}" = receipt-only ]; then
       receipt="${state%/state}/data/$task_id/work-identity-dispatch.json"
-      [ ! -e "$meta" ] && [ ! -L "$meta" ] \
+      if ! { [ ! -e "$meta" ] && [ ! -L "$meta" ] \
         && teardown_dispatch_evidence_exists "${state%/state}/data" "$task_id" \
-        && teardown_dispatch_authorized "$state" "$task_id" || {
-          echo "REFUSED: receipt-only descendant task $task_id changed while forced teardown acquired its locks; forced teardown changed nothing" >&2
-          return 1
-        }
+        && teardown_dispatch_authorized "$state" "$task_id"; }; then
+        echo "REFUSED: receipt-only descendant task $task_id changed while forced teardown acquired its locks; forced teardown changed nothing" >&2
+        return 1
+      fi
       continue
     fi
     [ -f "$meta" ] || {
