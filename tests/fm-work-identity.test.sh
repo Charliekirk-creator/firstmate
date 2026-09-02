@@ -710,6 +710,54 @@ test_owned_replace_refuses_changed_unsafe_destination() {
   pass "owned replacement and removal refuse changed destinations"
 }
 
+test_owned_removal_bounds_digest_after_concurrent_growth() {
+  local home parent inode target details state digest hook out rc=0
+  home=$(make_home owned-removal-growth)
+  parent="$home/state"
+  target="$parent/authoritative"
+  hook="$home/python-hook"
+  printf 'original\n' > "$target"
+  inode=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$parent")
+  details=$(python3 "$ROOT/bin/fm-work-identity-fs.py" describe-digest \
+    "$parent" "$inode" authoritative) || fail "could not capture owned removal commitment"
+  state=${details%%$'\t'*}
+  digest=${details#*$'\t'}
+  mkdir -p "$hook"
+  cat > "$hook/sitecustomize.py" <<'PY'
+import os
+
+_target = os.environ["FM_TEST_GROW_ON_READ"]
+_target_info = os.stat(_target, follow_symlinks=False)
+_real_read = os.read
+_grew = False
+
+
+def raced_read(fd, count):
+    global _grew
+    info = os.fstat(fd)
+    if not _grew and (info.st_dev, info.st_ino) == (_target_info.st_dev, _target_info.st_ino):
+        _grew = True
+        append_fd = os.open(_target, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(append_fd, b"growth\n")
+        finally:
+            os.close(append_fd)
+    return _real_read(fd, count)
+
+
+os.read = raced_read
+PY
+  out=$(PYTHONPATH="$hook" FM_TEST_GROW_ON_READ="$target" \
+    python3 "$ROOT/bin/fm-work-identity-fs.py" remove \
+    "$parent" "$inode" authoritative "$state" "$digest" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "owned removal accepted a file that grew during digest"
+  assert_contains "$out" "destination size does not match expected size" \
+    "owned removal did not enforce its committed size during digest"
+  [ "$(cat "$target")" = $'original\ngrowth' ] \
+    || fail "bounded removal changed the concurrently grown destination"
+  pass "owned removal bounds digest reads after concurrent growth"
+}
+
 test_owned_snapshot_binds_validated_entry() {
   local home parent inode target details state digest output out rc=0
   home=$(make_home owned-snapshot)
@@ -3076,6 +3124,7 @@ EOF
 case "${FM_TEST_ONLY:-}" in
   owned-removal)
     test_owned_replace_refuses_changed_unsafe_destination
+    test_owned_removal_bounds_digest_after_concurrent_growth
     exit 0
     ;;
   owned-snapshot)
@@ -3125,6 +3174,7 @@ test_no_clobber_conflict_retires_owned_transaction
 test_no_clobber_journal_rejects_unrelated_staging
 test_no_clobber_publication_does_not_follow_raced_target
 test_owned_replace_refuses_changed_unsafe_destination
+test_owned_removal_bounds_digest_after_concurrent_growth
 test_owned_snapshot_binds_validated_entry
 test_identity_lock_refuses_replaced_storage_parent
 test_identity_lock_refuses_unsafe_lock_entry_without_waiting

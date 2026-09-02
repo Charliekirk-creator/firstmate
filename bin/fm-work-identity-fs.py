@@ -182,14 +182,18 @@ def entry_digest(directory_fd, name, allowed_links=(1,), expected_size=None):
         digest = hashlib.sha256()
         total = 0
         while True:
-            chunk = os.read(fd, 131072)
+            read_size = 131072
+            if expected_size is not None:
+                read_size = min(read_size, expected_size - total + 1)
+            chunk = os.read(fd, read_size)
             if not chunk:
                 break
             total += len(chunk)
             if expected_size is not None and total > expected_size:
                 fail(f"owned destination size does not match expected size: {name}")
             digest.update(chunk)
-        if expected_size is not None and total != expected_size:
+        if expected_size is not None \
+                and (total != expected_size or os.fstat(fd).st_size != expected_size):
             fail(f"owned destination size does not match expected size: {name}")
         return digest.hexdigest()
     finally:
@@ -212,6 +216,14 @@ def state_from_info(info):
         str(info.st_mtime_ns),
         str(info.st_ctime_ns),
     ])
+
+
+def committed_entry_size(expected_state):
+    fields = expected_state.split(":")
+    if len(fields) != 8 or fields[0] not in ("regular", "unsafe") \
+            or any(not field.isdigit() for field in fields[1:]):
+        fail("owned destination size commitment is malformed")
+    return int(fields[5])
 
 
 def exact_entry_matches(directory_fd, name, expected_state, expected_digest):
@@ -334,8 +346,11 @@ def publish_remove_journal(directory_fd, journal, retired, expected_state, expec
 
 def retired_entry_matches(directory_fd, retired, expected_state, expected_digest):
     expected_links = int(expected_state.split(":")[4])
+    expected_size = committed_entry_size(expected_state)
     return state_matches(raw_entry_state(directory_fd, retired), expected_state) \
-        and entry_digest(directory_fd, retired, (expected_links,)) == expected_digest
+        and entry_digest(
+            directory_fd, retired, (expected_links,), expected_size
+        ) == expected_digest
 
 
 def recover_remove(directory_fd, name):
@@ -375,7 +390,10 @@ def remove_entry(directory_fd, name, expected_state, expected_digest, allow_hard
     expected_links = int(expected_state.split(":")[4])
     if expected_links != 1 and not allow_hardlink:
         fail(f"owned destination entry is unsafe: {name}")
-    if entry_digest(directory_fd, name, (expected_links,)) != expected_digest:
+    expected_size = committed_entry_size(expected_state)
+    if entry_digest(
+            directory_fd, name, (expected_links,), expected_size
+    ) != expected_digest:
         fail(f"owned destination content changed before removal: {name}")
     retired = f".{name}.remove-retired.{secrets.token_hex(16)}"
     journal = f".{name}.remove-journal"
