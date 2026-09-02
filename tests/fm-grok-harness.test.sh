@@ -106,6 +106,7 @@ SH
 
 test_grok_crash_recovers_provisional_authorization() {
   local rec case_dir home proj wt fakebin grok_home id out status=0 real_chmod marker old_auth auth_count
+  local endpoint endpoint_original endpoint_tmp receipt journal digest meta transaction dispatch launch_hash launch_path
   rec=$(make_spawn_case crash-wiring)
   IFS='|' read -r case_dir home proj wt fakebin grok_home id <<EOF
 $rec
@@ -137,6 +138,63 @@ SH
     "interrupted Grok wiring lost its durable receipt"
   old_auth=$(find "$grok_home/hooks/fm-turn-end.d" -type f -name 'fm.*' -print -quit)
   [ -n "$old_auth" ] || fail "interrupted Grok wiring did not reach authorization creation"
+  endpoint="$home/state/$id.spawn-endpoint.json"
+  receipt="$home/state/$id.harness-wiring-provisional.json"
+  endpoint_original=$(cat "$endpoint")
+  journal="$home/state/.$id.harness-wiring-provisional.json.no-clobber-journal"
+  digest=$(shasum -a 256 "$receipt" | awk '{print $1}')
+  printf 'v2\n%s\n%s\n%s\npublishing\n' \
+    "$id.harness-wiring-provisional.json.publishing" \
+    ".$id.harness-wiring-provisional.json.no-clobber-pin.0123456789abcdef" \
+    "$digest" > "$journal"
+  endpoint_tmp="$home/state/.$id.endpoint-invalid"
+  printf '%s\n' "$endpoint_original" | jq -S -c '.endpoint.details.session = ""' > "$endpoint_tmp"
+  mv "$endpoint_tmp" "$endpoint"
+  status=0
+  out=$(run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "semantically invalid endpoint details unexpectedly recovered"
+  assert_present "$old_auth" "invalid endpoint details removed provisional authorization"
+  assert_present "$receipt" "invalid endpoint details retired provisional receipt"
+  assert_present "$journal" "invalid endpoint details mutated provisional publication recovery"
+
+  printf '%s\n' "$endpoint_original" | jq -S -c --arg worktree "$case_dir" \
+    '.worktree = $worktree' > "$endpoint_tmp"
+  mv "$endpoint_tmp" "$endpoint"
+  status=0
+  out=$(run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "non-worktree endpoint binding unexpectedly recovered"
+  assert_contains "$out" "recorded spawn worktree is invalid or cross-project" \
+    "non-worktree endpoint refusal did not reach exact binding validation"
+  assert_present "$old_auth" "invalid worktree binding removed provisional authorization"
+  assert_present "$receipt" "invalid worktree binding retired provisional receipt"
+  assert_present "$journal" "invalid worktree binding mutated provisional publication recovery"
+
+  printf '%s\n' "$endpoint_original" > "$endpoint_tmp"
+  mv "$endpoint_tmp" "$endpoint"
+  meta="$home/state/$id.meta"
+  dispatch="$home/data/$id/work-identity-dispatch.json"
+  cp "$dispatch" "$case_dir/dispatch-before-unsafe-meta"
+  transaction=$(jq -r '.transaction_id' "$receipt")
+  launch_hash=$(jq -r '.instructions.sha256' "$dispatch")
+  launch_path=$(jq -r '.instructions.path' "$dispatch")
+  {
+    printf 'work_identity_dispatch_transaction=%s\n' "$transaction"
+    printf 'launch_brief=%s\n' "$launch_path"
+    printf 'launch_brief_sha256=%s\n' "$launch_hash"
+    printf 'work_identity_schema=fm-work-identity.v1\n'
+    printf 'work_identity_status=unlinked\n'
+  } > "$meta"
+  status=0
+  out=$(FM_FAKE_DUPLICATE_WINDOW="fm-$id" FM_FAKE_TMUX_CURRENT_COMMAND=bash \
+    run_grok_spawn "$home" "$proj" "$wt" "$fakebin" "$grok_home" "$id") || status=$?
+  [ "$status" -ne 0 ] || fail "mismatched task metadata unexpectedly recovered provisional wiring"
+  assert_contains "$out" "published task metadata is unsafe or mismatched" \
+    "mismatched metadata was treated as absent"
+  assert_present "$old_auth" "mismatched metadata removed provisional authorization"
+  assert_present "$receipt" "mismatched metadata retired provisional receipt"
+  assert_absent "$journal" "validated endpoint did not recover interrupted receipt publication"
+  rm "$meta"
+  cp "$case_dir/dispatch-before-unsafe-meta" "$dispatch"
 
   {
     cat <<'SH'
@@ -193,6 +251,40 @@ SH
   assert_contains "$out" "could not journal provisional grok wiring" \
     "concurrent provisional receipt was not refused"
   pass "grok provisional receipt publication is no-clobber"
+}
+
+test_grok_authorization_removal_is_inode_conditional() {
+  local case_dir root auth expected fakebin real_python out status=0
+  case_dir="$TMP_ROOT/auth-remove-race"
+  mkdir -p "$case_dir"
+  case_dir=$(cd "$case_dir" && pwd -P)
+  root="$case_dir/grok/hooks/fm-turn-end.d"
+  auth="$root/fm.0123456789ab"
+  expected="$case_dir/state/task.turn-ended"
+  fakebin="$case_dir/fakebin"
+  real_python=$(command -v python3)
+  mkdir -p "$root" "$fakebin"
+  printf '%s\n' "$expected" > "$auth"
+  cat > "$fakebin/python3" <<SH
+#!/usr/bin/env bash
+set -u
+if [ "\${2:-}" = describe-digest ]; then
+  "$real_python" "\$@" || exit \$?
+  mv "$auth" "$auth.original"
+  printf '%s\\n' competing-authorization > "$auth"
+  exit 0
+fi
+exec "$real_python" "\$@"
+SH
+  chmod +x "$fakebin/python3"
+  out=$(PATH="$fakebin:$PATH" bash -c \
+    '. "$1"; fm_control_harness_turnend_auth_remove_exact grok "" "$2" "$3"' \
+    _ "$ROOT/bin/fm-control-lib.sh" "$auth" "$expected" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "authorization replacement race unexpectedly removed a competing record"
+  [ "$(cat "$auth")" = competing-authorization ] \
+    || fail "conditional authorization removal changed the competing record"
+  assert_present "$auth.original" "authorization race lost the originally validated inode"
+  pass "grok authorization removal is conditional on exact inode"
 }
 
 test_grok_recovery_refuses_changed_authorization() {
@@ -289,6 +381,7 @@ case "${FM_TEST_ONLY:-}" in
     test_grok_crash_recovers_provisional_authorization
     test_grok_provisional_receipt_refuses_concurrent_record
     test_grok_recovery_refuses_changed_authorization
+    test_grok_authorization_removal_is_inode_conditional
     exit 0
     ;;
   wiring-cleanup-recovery)
@@ -296,6 +389,7 @@ case "${FM_TEST_ONLY:-}" in
     test_grok_crash_recovers_provisional_authorization
     test_grok_provisional_receipt_refuses_concurrent_record
     test_grok_recovery_refuses_changed_authorization
+    test_grok_authorization_removal_is_inode_conditional
     test_grok_teardown_removes_pointer_and_token
     exit 0
     ;;
@@ -306,5 +400,6 @@ test_grok_fresh_abort_retires_provisional_wiring
 test_grok_crash_recovers_provisional_authorization
 test_grok_provisional_receipt_refuses_concurrent_record
 test_grok_recovery_refuses_changed_authorization
+test_grok_authorization_removal_is_inode_conditional
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder

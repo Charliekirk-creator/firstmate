@@ -273,21 +273,41 @@ fm_control_harness_turnend_auth_path() {  # <harness> <token>
 }
 
 fm_control_harness_turnend_auth_remove_exact() {  # <harness> <token> <absolute-path> <expected-target>
-  local harness=${1-} token=${2-} path=${3-} expected=${4-} links owner current_uid
+  local harness=${1-} token=${2-} path=${3-} expected=${4-}
+  local root name root_inode raw details entry_state entry_digest expected_digest fs_owner owner current_uid
   fm_control_harness_turnend_auth_record_valid "$harness" "$token" "$path" || return 1
-  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
-    return 0
-  fi
-  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  root=${path%/*}
+  name=${path##*/}
   if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
-    links=$(stat -f '%l' "$path" 2>/dev/null) || return 1
+    root_inode=$(stat -f '%d:%i' "$root" 2>/dev/null) || return 1
+  else
+    root_inode=$(stat -c '%d:%i' "$root" 2>/dev/null) || return 1
+  fi
+  fs_owner=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-work-identity-fs.py \
+    || return 1
+  raw=$(python3 "$fs_owner" describe-raw "$root" "$root_inode" "$name") \
+    || return 1
+  [ "$raw" != absent ] || return 0
+  current_uid=$(id -u) || return 1
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
     owner=$(stat -f '%u' "$path" 2>/dev/null) || return 1
   else
-    links=$(stat -c '%h' "$path" 2>/dev/null) || return 1
     owner=$(stat -c '%u' "$path" 2>/dev/null) || return 1
   fi
-  current_uid=$(id -u) || return 1
-  [ "$links" = 1 ] && [ "$owner" = "$current_uid" ] || return 1
-  printf '%s\n' "$expected" | cmp -s "$path" - || return 1
-  rm -f -- "$path"
+  [ "$owner" = "$current_uid" ] || return 1
+  details=$(python3 "$fs_owner" describe-digest "$root" "$root_inode" "$name") \
+    || return 1
+  entry_state=${details%%$'\t'*}
+  entry_digest=${details#*$'\t'}
+  [ "$entry_state" != "$details" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    expected_digest=$(printf '%s\n' "$expected" | shasum -a 256 | awk '{print $1}') \
+      || return 1
+  else
+    expected_digest=$(printf '%s\n' "$expected" | sha256sum | awk '{print $1}') \
+      || return 1
+  fi
+  [ "$entry_digest" = "$expected_digest" ] || return 1
+  python3 "$fs_owner" remove "$root" "$root_inode" "$name" \
+    "$entry_state" "$entry_digest"
 }

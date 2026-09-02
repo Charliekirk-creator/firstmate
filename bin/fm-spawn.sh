@@ -838,6 +838,14 @@ spawn_file_link_count() {
   fi
 }
 
+spawn_file_inode_identity() {
+  if [ "$(uname 2>/dev/null || true)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
 spawn_launch_request_paths() {
   local digest
   digest=$(printf '%s' "$SPAWN_DISPATCH_TRANSACTION" | spawn_sha256_stream) || return 1
@@ -1284,39 +1292,6 @@ spawn_endpoint_receipt_load() {
   details=$(printf '%s' "$canonical" | jq -c '.endpoint.details') || return 1
   T=$target
   WT=$worktree
-  if [ "$KIND" != secondmate ]; then
-    spawn_provisional_harness_wiring_recover || return 1
-  fi
-  if ! fm_backend_target_exists "$BACKEND" "$target" "$W"; then
-    endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
-    if [ "$endpoint_state" = missing ]; then
-      case "$SPAWN_ENDPOINT_PHASE" in
-        launch-prepared|launch-submitted) SPAWN_ENDPOINT_MISSING=1 ;;
-        *)
-          echo "error: recorded spawn endpoint is gone for $ID: $target" >&2
-          return 2
-          ;;
-      esac
-    else
-      echo "error: recorded spawn endpoint is unavailable for $ID: $target" >&2
-      return 1
-    fi
-  fi
-  if [ "$BACKEND" = tmux ] || [ "$BACKEND" = herdr ]; then
-    endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
-    case "$SPAWN_ENDPOINT_PHASE:$endpoint_state" in
-      launch-prepared:*) ;;
-      launch-submitted:*) SPAWN_LAUNCH_SUBMITTED_RECOVERY=1 ;;
-      worktree-requesting:dead|worktree-requesting:ambiguous|worktree-requested:dead|worktree-requested:ambiguous) ;;
-      *:dead) ;;
-      *)
-        echo "error: recorded spawn endpoint is not safely recoverable for $ID: $target ($endpoint_state)" >&2
-        return 1
-        ;;
-    esac
-  elif [ "$SPAWN_ENDPOINT_PHASE" = launch-submitted ]; then
-    SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
-  fi
   case "$BACKEND" in
     tmux)
       printf '%s' "$details" | jq -e '(keys | sort) == (["session","window_id"] | sort)' >/dev/null \
@@ -1361,8 +1336,64 @@ spawn_endpoint_receipt_load() {
       [ "$T" = "$ORCA_TERMINAL" ] || return 1
       WT_TARGET=$T
       ;;
+    *) return 1 ;;
   esac
+  if [ -n "$WT" ]; then
+    spawn_endpoint_worktree_binding_valid || {
+      echo "error: recorded spawn worktree is invalid or cross-project for $ID: $WT" >&2
+      return 1
+    }
+  fi
+  if [ "$KIND" != secondmate ]; then
+    spawn_provisional_harness_wiring_recover || return 1
+  fi
+  if ! fm_backend_target_exists "$BACKEND" "$target" "$W"; then
+    endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
+    if [ "$endpoint_state" = missing ]; then
+      case "$SPAWN_ENDPOINT_PHASE" in
+        launch-prepared|launch-submitted) SPAWN_ENDPOINT_MISSING=1 ;;
+        *)
+          echo "error: recorded spawn endpoint is gone for $ID: $target" >&2
+          return 2
+          ;;
+      esac
+    else
+      echo "error: recorded spawn endpoint is unavailable for $ID: $target" >&2
+      return 1
+    fi
+  fi
+  if [ "$BACKEND" = tmux ] || [ "$BACKEND" = herdr ]; then
+    endpoint_state=$(fm_backend_agent_state "$BACKEND" "$target")
+    case "$SPAWN_ENDPOINT_PHASE:$endpoint_state" in
+      launch-prepared:*) ;;
+      launch-submitted:*) SPAWN_LAUNCH_SUBMITTED_RECOVERY=1 ;;
+      worktree-requesting:dead|worktree-requesting:ambiguous|worktree-requested:dead|worktree-requested:ambiguous) ;;
+      *:dead) ;;
+      *)
+        echo "error: recorded spawn endpoint is not safely recoverable for $ID: $target ($endpoint_state)" >&2
+        return 1
+        ;;
+    esac
+  elif [ "$SPAWN_ENDPOINT_PHASE" = launch-submitted ]; then
+    SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
+  fi
   SPAWN_ENDPOINT_RECOVERED=1
+}
+
+spawn_endpoint_worktree_binding_valid() {
+  local wt_real project_real wt_top wt_top_real wt_common project_common
+  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || return 1
+  project_real=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || return 1
+  if [ "$KIND" = secondmate ]; then
+    [ "$wt_real" = "$project_real" ]
+    return
+  fi
+  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null) || return 1
+  wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P) || return 1
+  [ "$wt_real" = "$wt_top_real" ] && [ "$wt_real" != "$project_real" ] || return 1
+  wt_common=$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  project_common=$(git -C "$PROJ_ABS" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  [ "$wt_common" = "$project_common" ]
 }
 
 spawn_orca_operation_prepare() {
@@ -2957,8 +2988,17 @@ fm_operational_input_construct launch-brief "$SPAWN_BRIEF_BODY" SPAWN_BRIEF_INPU
   || { echo "error: could not encode captured launch brief" >&2; exit 1; }
 unset SPAWN_BRIEF_BODY
 W="fm-$ID"
+spawn_provisional_harness_wiring_receipt_publication_recover() {
+  local receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT base state_inode
+  base=$(basename -- "$receipt") || return 1
+  state_inode=$(spawn_file_inode_identity "$STATE") || return 1
+  python3 "$SCRIPT_DIR/fm-work-identity-fs.py" describe-raw \
+    "$STATE" "$state_inode" "$base" >/dev/null
+}
+
 spawn_provisional_harness_wiring_receipt_load() {
   local receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT canonical links bytes
+  spawn_provisional_harness_wiring_receipt_publication_recover || return 1
   [ -f "$receipt" ] && [ ! -L "$receipt" ] || return 1
   links=$(spawn_file_link_count "$receipt") || return 1
   [ "$links" = 1 ] || return 1
@@ -2991,7 +3031,7 @@ spawn_provisional_harness_wiring_receipt_load() {
 
 spawn_provisional_harness_wiring_receipt_publish() {  # <harness> <auth-path>
   local harness=$1 auth_path=$2 payload tmp receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT
-  [ ! -e "$receipt" ] && [ ! -L "$receipt" ] || return 1
+  local base state_inode rc=0
   fm_control_harness_turnend_auth_record_valid "$harness" "" "$auth_path" || return 1
   payload=$(jq -n -S -c \
     --arg schema fm-spawn-harness-wiring.v1 \
@@ -3003,9 +3043,16 @@ spawn_provisional_harness_wiring_receipt_publish() {  # <harness> <auth-path>
       transaction_id:$transaction,harness:$harness,kind:$kind,
       worktree:$worktree,auth_path:$auth_path}') || return 1
   tmp=$(umask 077; mktemp "$STATE/.$ID.harness-wiring-provisional.XXXXXX") || return 1
-  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" \
-    && ln -- "$tmp" "$receipt" && rm -f -- "$tmp" \
-    || { rm -f -- "$tmp"; return 1; }
+  printf '%s\n' "$payload" > "$tmp" && chmod 600 "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  base=$(basename -- "$receipt") || { rm -f -- "$tmp"; return 1; }
+  state_inode=$(spawn_file_inode_identity "$STATE") || { rm -f -- "$tmp"; return 1; }
+  python3 "$SCRIPT_DIR/fm-work-identity-fs.py" no-clobber \
+    "$STATE" "$state_inode" "$base" "$tmp" "${base}.publishing" || rc=$?
+  rm -f -- "$tmp" || return 1
+  [ "$rc" -eq 0 ]
 }
 
 spawn_provisional_harness_wiring_receipt_retire() {
@@ -3017,41 +3064,60 @@ spawn_provisional_harness_wiring_receipt_retire() {
 
 spawn_provisional_harness_wiring_metadata_matches_receipt() {
   local meta="$STATE/$ID.meta" family
+  if [ ! -e "$meta" ] && [ ! -L "$meta" ]; then
+    return 2
+  fi
   [ -f "$meta" ] && [ ! -L "$meta" ] \
     && [ "$(spawn_file_link_count "$meta")" = 1 ] || return 1
-  [ "$(fm_meta_get "$meta" work_identity_dispatch_transaction)" = "$SPAWN_PROVISIONAL_RECEIPT_TRANSACTION" ] \
+  fm_backend_validate_task_endpoint "$meta" "$ID" >/dev/null 2>&1 || return 1
+  [ "$FM_BACKEND_VALIDATED_BACKEND" = "$BACKEND" ] \
+    && [ "$FM_BACKEND_VALIDATED_TARGET" = "$T" ] || return 1
+  [ "$(fm_backend_meta_exact_value "$meta" work_identity_dispatch_transaction)" = "$SPAWN_PROVISIONAL_RECEIPT_TRANSACTION" ] \
     || return 1
-  family=$(fm_control_harness_family "$(fm_meta_get "$meta" harness)") || return 1
+  family=$(fm_control_harness_family "$(fm_backend_meta_exact_value "$meta" harness)") || return 1
   [ "$family" = "$SPAWN_PROVISIONAL_RECEIPT_HARNESS" ] \
-    && [ "$(fm_meta_get "$meta" kind)" = "$KIND" ] \
-    && [ "$(fm_meta_get "$meta" worktree)" = "$WT" ] \
-    && [ "$(fm_meta_get "$meta" harness_turnend_auth_path)" = "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" ]
+    && [ "$(fm_backend_meta_exact_value "$meta" kind)" = "$KIND" ] \
+    && [ "$(fm_backend_meta_exact_value "$meta" project)" = "$PROJ_ABS" ] \
+    && [ "$(fm_backend_meta_exact_value "$meta" worktree)" = "$WT" ] \
+    && [ "$(fm_backend_meta_exact_value "$meta" harness_turnend_auth_path)" = "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" ]
 }
 
 spawn_provisional_harness_wiring_recover() {
-  local receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT
+  local receipt=$SPAWN_PROVISIONAL_HARNESS_WIRING_RECEIPT metadata_rc=0
+  spawn_provisional_harness_wiring_receipt_publication_recover || {
+    echo "error: provisional harness wiring publication is unsafe: $receipt" >&2
+    return 1
+  }
   [ ! -e "$receipt" ] && [ ! -L "$receipt" ] && return 0
   spawn_provisional_harness_wiring_receipt_load || {
     echo "error: provisional harness wiring receipt is unsafe or mismatched: $receipt" >&2
     return 1
   }
-  if spawn_provisional_harness_wiring_metadata_matches_receipt; then
-    if [ "$SPAWN_PROVISIONAL_RECEIPT_TRANSACTION" != "$SPAWN_DISPATCH_TRANSACTION" ]; then
-      [ "$RELAUNCH" -eq 1 ] || {
-        echo "error: published harness wiring transaction is mismatched for $ID" >&2
+  spawn_provisional_harness_wiring_metadata_matches_receipt || metadata_rc=$?
+  case "$metadata_rc" in
+    0)
+      if [ "$SPAWN_PROVISIONAL_RECEIPT_TRANSACTION" != "$SPAWN_DISPATCH_TRANSACTION" ]; then
+        [ "$RELAUNCH" -eq 1 ] || {
+          echo "error: published harness wiring transaction is mismatched for $ID" >&2
+          return 1
+        }
+      else
+        SPAWN_METADATA_RECOVERY=1
+      fi
+      ;;
+    2)
+      clear_relaunch_harness_wiring \
+        "$SPAWN_PROVISIONAL_RECEIPT_HARNESS" "$WT" "$STATE" "$ID" \
+        "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" || {
+        echo "error: provisional harness authorization is unsafe or mismatched: $SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" >&2
         return 1
       }
-    else
-      SPAWN_METADATA_RECOVERY=1
-    fi
-  else
-    clear_relaunch_harness_wiring \
-      "$SPAWN_PROVISIONAL_RECEIPT_HARNESS" "$WT" "$STATE" "$ID" \
-      "$SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" || {
-      echo "error: provisional harness authorization is unsafe or mismatched: $SPAWN_PROVISIONAL_RECEIPT_AUTH_PATH" >&2
+      ;;
+    *)
+      echo "error: published task metadata is unsafe or mismatched for provisional harness wiring: $STATE/$ID.meta" >&2
       return 1
-    }
-  fi
+      ;;
+  esac
   rm -f -- "$receipt"
 }
 
