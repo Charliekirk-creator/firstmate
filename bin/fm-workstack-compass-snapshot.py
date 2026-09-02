@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import errno
 import fnmatch
 import hashlib
@@ -85,6 +86,8 @@ READER_STAGING_TIMEOUT_SECONDS = 60
 MODEL_TIMEOUT_SECONDS = 10
 MAX_MODEL_RESPONSE_BYTES = 64 * 1024
 MAX_MODEL_SNAPSHOT_BYTES = 16 * 1024 * 1024
+MAX_SUBPROCESS_MEMORY_BYTES = 256 * 1024 * 1024
+MAX_SUBPROCESS_GROUP_PROCESSES = 512
 REQUIRED_SCHEMA_VERSION = "workstack-compass.snapshot.v1"
 EVIDENCE_VERSION = "firstmate.workstack-compass-evidence.v1"
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
@@ -105,6 +108,30 @@ class ProducerError(RuntimeError):
 
 class SourceChanged(ProducerError):
     """One observed source changed before the observation completed."""
+
+
+class RusageInfoV2(ctypes.Structure):
+    _fields_ = [
+        ("ri_uuid", ctypes.c_uint8 * 16),
+        ("ri_user_time", ctypes.c_uint64),
+        ("ri_system_time", ctypes.c_uint64),
+        ("ri_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_interrupt_wkups", ctypes.c_uint64),
+        ("ri_pageins", ctypes.c_uint64),
+        ("ri_wired_size", ctypes.c_uint64),
+        ("ri_resident_size", ctypes.c_uint64),
+        ("ri_phys_footprint", ctypes.c_uint64),
+        ("ri_proc_start_abstime", ctypes.c_uint64),
+        ("ri_proc_exit_abstime", ctypes.c_uint64),
+        ("ri_child_user_time", ctypes.c_uint64),
+        ("ri_child_system_time", ctypes.c_uint64),
+        ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_child_interrupt_wkups", ctypes.c_uint64),
+        ("ri_child_pageins", ctypes.c_uint64),
+        ("ri_child_elapsed_abstime", ctypes.c_uint64),
+        ("ri_diskio_bytesread", ctypes.c_uint64),
+        ("ri_diskio_byteswritten", ctypes.c_uint64),
+    ]
 
 
 @dataclass(frozen=True)
@@ -882,6 +909,59 @@ def prepare_output(
     return output, parent_descriptor
 
 
+_LIBPROC: Any | None = None
+
+
+def libproc() -> Any:
+    global _LIBPROC
+    if _LIBPROC is None:
+        try:
+            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            library.proc_listpgrppids.argtypes = (
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            )
+            library.proc_listpgrppids.restype = ctypes.c_int
+            library.proc_pid_rusage.argtypes = (
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(RusageInfoV2),
+            )
+            library.proc_pid_rusage.restype = ctypes.c_int
+        except (AttributeError, OSError) as exc:
+            raise ProducerError("a supported subprocess memory boundary is unavailable") from exc
+        _LIBPROC = library
+    return _LIBPROC
+
+
+def process_group_footprint(process_group: int) -> int | None:
+    library = libproc()
+    identifiers = (ctypes.c_int * MAX_SUBPROCESS_GROUP_PROCESSES)()
+    size = ctypes.sizeof(identifiers)
+    count = library.proc_listpgrppids(process_group, identifiers, size)
+    if count < 0 or count >= MAX_SUBPROCESS_GROUP_PROCESSES:
+        return None
+    total = 0
+    for process_id in identifiers[:count]:
+        if process_id <= 0:
+            continue
+        usage = RusageInfoV2()
+        if library.proc_pid_rusage(process_id, 2, ctypes.byref(usage)) == 0:
+            total += usage.ri_phys_footprint
+    return total
+
+
+def paused_subprocess_argv(argv: Sequence[str]) -> list[str]:
+    return [
+        "/bin/sh",
+        "-c",
+        'kill -STOP $$ || exit 70; exec "$@"',
+        "fm-memory-boundary",
+        *argv,
+    ]
+
+
 def run_bounded(
     argv: Sequence[str],
     env: Mapping[str, str],
@@ -893,9 +973,10 @@ def run_bounded(
     discard_stderr: bool = False,
     cwd: Path | None = None,
 ) -> bytes:
+    libproc()
     try:
         process = subprocess.Popen(
-            list(argv),
+            paused_subprocess_argv(argv),
             stdin=subprocess.PIPE if input_payload is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL if discard_stderr else subprocess.STDOUT,
@@ -910,6 +991,9 @@ def run_bounded(
     chunks: list[bytes] = []
     total = 0
     oversized = False
+    memory_refused = False
+    memory_ready = threading.Event()
+    memory_stop = threading.Event()
 
     def kill_reader() -> None:
         try:
@@ -919,6 +1003,28 @@ def run_bounded(
                 process.kill()
             except OSError:
                 pass
+
+    def watch_memory() -> None:
+        nonlocal memory_refused
+        memory_ready.set()
+        while not memory_stop.is_set():
+            try:
+                os.kill(process.pid, signal.SIGCONT)
+            except OSError:
+                if process.poll() is not None:
+                    return
+            footprint = process_group_footprint(process.pid)
+            if footprint is None:
+                if process.poll() is None:
+                    memory_refused = True
+                    kill_reader()
+                return
+            if footprint > MAX_SUBPROCESS_MEMORY_BYTES:
+                memory_refused = True
+                kill_reader()
+                return
+            if process.poll() is not None or memory_stop.wait(0.005):
+                return
 
     def drain() -> None:
         nonlocal total, oversized
@@ -937,6 +1043,11 @@ def run_bounded(
                 kill_reader()
                 return
 
+    memory_watcher = threading.Thread(
+        target=watch_memory,
+        name="workstack-source-memory-boundary",
+        daemon=True,
+    )
     reader = threading.Thread(target=drain, name="workstack-source-reader", daemon=True)
 
     def supply_input() -> None:
@@ -949,6 +1060,21 @@ def run_bounded(
             pass
 
     writer = threading.Thread(target=supply_input, name="workstack-source-input", daemon=True)
+    memory_watcher.start()
+    if not memory_ready.wait(timeout=1):
+        kill_reader()
+        process.wait()
+        memory_stop.set()
+        memory_watcher.join(timeout=1)
+        raise ProducerError("authoritative local reader memory boundary failed")
+    try:
+        os.kill(process.pid, signal.SIGCONT)
+    except OSError as exc:
+        kill_reader()
+        process.wait()
+        memory_stop.set()
+        memory_watcher.join(timeout=1)
+        raise ProducerError("authoritative local reader memory boundary failed") from exc
     reader.start()
     writer.start()
     try:
@@ -956,16 +1082,22 @@ def run_bounded(
     except subprocess.TimeoutExpired as exc:
         kill_reader()
         process.wait()
+        memory_stop.set()
+        memory_watcher.join(timeout=1)
         reader.join(timeout=1)
         writer.join(timeout=1)
         raise ProducerError("authoritative local reader exceeded its time bound") from exc
+    memory_stop.set()
+    memory_watcher.join(timeout=1)
     reader.join(timeout=1)
     writer.join(timeout=1)
     if process.stdout is not None:
         process.stdout.close()
-    if reader.is_alive() or writer.is_alive():
+    if memory_watcher.is_alive() or reader.is_alive() or writer.is_alive():
         kill_reader()
         raise ProducerError("authoritative local reader did not close its bounded streams")
+    if memory_refused:
+        raise ProducerError("authoritative local reader exceeded its memory bound")
     if oversized:
         raise ProducerError("authoritative local reader exceeded its output bound")
     if return_code != 0:

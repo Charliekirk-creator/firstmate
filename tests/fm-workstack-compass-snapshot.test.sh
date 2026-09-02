@@ -678,6 +678,52 @@ test_executable_model_is_confined_and_copy_isolated() {
   pass "executable model has no network, write, environment, or mutation authority"
 }
 
+test_model_and_backlog_reader_memory_exhaustion_refuse() {
+  local world snapshot before fakebin
+  world=$(make_world subprocess-memory-bound)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  run_world "$world" >/dev/null || fail "memory-bound baseline generation failed"
+  before=$(shasum -a 256 "$snapshot" | awk '{print $1}')
+
+  python3 - "$world/app/src/workstack_compass/model.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+probe = '''memory_exhaustion_probe = bytearray(320 * 1024 * 1024)
+for memory_offset in range(0, len(memory_exhaustion_probe), 4096):
+    memory_exhaustion_probe[memory_offset] = 1
+
+'''
+path.write_text(probe + text)
+PY
+  run_failure "model contract is unsupported" run_world "$world"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "model memory exhaustion replaced the prior complete snapshot"
+
+  write_fake_model "$world/app"
+  fakebin="$world/fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/bin/bash
+printf -v memory_exhaustion_probe '%*s' 335544320 '' || exit 73
+printf '%s\n' 'count: 0'
+printf '%s\n' 'tasks: 0 tasks in this backlog'
+printf '%s\n' 'help[0]:'
+SH
+  chmod 0755 "$fakebin/tasks-axi"
+  run_failure "captured backlog reader failed" env \
+    PATH="$fakebin:/usr/bin:/bin" FM_HOME="$world/home" "$PRODUCER" \
+      --workstack-root "$world/app" \
+      --project-root "gl-data-team-tickets=$world/tickets" \
+      --project-root "data-team-management=$world/dtm" \
+      --project-root "alpha=$world/alpha"
+  [ "$(shasum -a 256 "$snapshot" | awk '{print $1}')" = "$before" ] \
+    || fail "backlog reader memory exhaustion replaced the prior complete snapshot"
+  pass "model and backlog reader memory exhaustion fail within a shared bound"
+}
+
 test_output_parent_relocation_refuses_without_source_write() {
   local world private relocated producer_pid rc
   world=$(make_world output-parent-relocation)
@@ -1585,6 +1631,7 @@ test_atomic_replacement_and_model_rejection
 test_unsafe_outputs_and_sources_refuse
 test_nonexecutable_launcher_refuses_before_publication
 test_executable_model_is_confined_and_copy_isolated
+test_model_and_backlog_reader_memory_exhaustion_refuse
 test_output_parent_relocation_refuses_without_source_write
 test_default_parent_relocation_refuses_before_creation
 test_publication_authority_relocation_cannot_write_source
