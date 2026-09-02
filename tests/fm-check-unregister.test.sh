@@ -10,6 +10,7 @@ UNREGISTER="$ROOT/bin/fm-check-unregister.sh"
 REGISTER="$ROOT/bin/fm-check-register.sh"
 TMP_ROOT=$(fm_test_tmproot fm-check-unregister)
 REAL_RM=$(command -v rm)
+REAL_STAT=$(command -v stat)
 
 make_home() {
   local name=$1 home
@@ -193,6 +194,52 @@ test_unsafe_hardlink_or_symlink_is_refused() {
   pass "hard-linked or symlinked artifacts are refused and left in place"
 }
 
+test_state_directory_replacement_cannot_redirect_removal() {
+  local home outside held marker fakebin out err status
+  home=$(make_home state-race)
+  outside="$home/outside-state"
+  held="$home/original-state"
+  marker="$home/race-triggered"
+  fakebin=$(fm_fakebin "$home")
+  out="$home/out.txt"
+  err="$home/err.txt"
+  mkdir -p "$outside"
+  write_registered_check "$home" raced
+  cp "$home/state/raced.check.sh" "$outside/raced.check.sh"
+  cp "$home/state/raced.check-trust" "$outside/raced.check-trust"
+
+  cat > "$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+last=${!#}
+case "$last" in
+  "$FM_RACE_STATE/raced.check.sh"|raced.check.sh)
+    if [ ! -e "$FM_RACE_MARKER" ]; then
+      mv -- "$FM_RACE_STATE" "$FM_RACE_HELD" || exit 90
+      ln -s -- "$FM_RACE_OUTSIDE" "$FM_RACE_STATE" || exit 91
+      : > "$FM_RACE_MARKER"
+    fi
+    ;;
+esac
+exec "$FM_REAL_STAT" "$@"
+SH
+  chmod +x "$fakebin/stat"
+
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_REAL_STAT="$REAL_STAT" \
+    FM_RACE_STATE="$home/state" FM_RACE_HELD="$held" \
+    FM_RACE_OUTSIDE="$outside" FM_RACE_MARKER="$marker" \
+    "$UNREGISTER" raced >"$out" 2>"$err" || status=$?
+  expect_code 0 "$status" "unregister during state directory replacement"
+  assert_present "$marker" "state replacement race was not exercised"
+  assert_absent "$held/raced.check.sh" "anchored removal left the original check"
+  assert_absent "$held/raced.check-trust" "anchored removal left the original trust binding"
+  assert_present "$outside/raced.check.sh" "state replacement redirected check removal"
+  assert_present "$outside/raced.check-trust" "state replacement redirected trust removal"
+
+  pass "state directory replacement cannot redirect custom check removal"
+}
+
 test_empty_id_and_empty_state_refuse_without_stray_rm
 test_happy_path_removes_only_check_and_trust
 test_unsafe_hardlink_or_symlink_is_refused
+test_state_directory_replacement_cannot_redirect_removal

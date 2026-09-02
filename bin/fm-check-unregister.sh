@@ -28,25 +28,41 @@ if [ -z "${STATE-}" ] || [ ! -d "${STATE-}" ] || [ -L "${STATE-}" ]; then
   exit 1
 fi
 
-CHECK="$STATE/$ID.check.sh"
-TRUST="$STATE/$ID.check-trust"
 STATE_DEVICE=$(fm_pr_file_device "$STATE") || {
   echo "error: state directory is unavailable" >&2
   exit 1
 }
-
-for artifact in "$CHECK" "$TRUST"; do
-  [ -e "$artifact" ] || [ -L "$artifact" ] || continue
-  if [ ! -f "$artifact" ] || [ -L "$artifact" ] \
-    || [ "$(fm_pr_file_device "$artifact")" != "$STATE_DEVICE" ] \
-    || [ "$(fm_pr_file_link_count "$artifact")" != 1 ]; then
-    echo "error: custom check is unsafe to remove" >&2
-    exit 1
-  fi
-done
-
-rm -f -- "$CHECK" "$TRUST" || {
-  echo "error: custom check could not be removed" >&2
+STATE_INODE=$(fm_pr_file_inode "$STATE") || {
+  echo "error: state directory is unavailable" >&2
   exit 1
 }
+
+(
+  CDPATH='' cd -P -- "$STATE" 2>/dev/null || {
+    echo "error: state directory is unavailable" >&2
+    exit 1
+  }
+  if [ "$(fm_pr_file_device .)" != "$STATE_DEVICE" ] \
+    || [ "$(fm_pr_file_inode .)" != "$STATE_INODE" ]; then
+    echo "error: state directory is unavailable" >&2
+    exit 1
+  fi
+
+  CHECK="$ID.check.sh"
+  TRUST="$ID.check-trust"
+  for artifact in "$CHECK" "$TRUST"; do
+    [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+    if [ ! -f "$artifact" ] || [ -L "$artifact" ] \
+      || [ "$(fm_pr_file_device "$artifact")" != "$STATE_DEVICE" ] \
+      || [ "$(fm_pr_file_link_count "$artifact")" != 1 ]; then
+      echo "error: custom check is unsafe to remove" >&2
+      exit 1
+    fi
+  done
+
+  rm -f -- "$CHECK" "$TRUST" || {
+    echo "error: custom check could not be removed" >&2
+    exit 1
+  }
+) || exit $?
 printf 'unregistered: state/%s.check.sh\n' "$ID"
