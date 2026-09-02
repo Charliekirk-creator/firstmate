@@ -1590,6 +1590,30 @@ test_source_change_during_observation_refuses() {
   pass "the final pre-commit proof preserves the prior raced snapshot"
 }
 
+test_unsupported_local_sandbox_refuses() {
+  local world snapshot
+  world=$(make_world unsupported-local-sandbox)
+  snapshot="$world/home/data/workstack-compass/snapshot.json"
+  run_failure "a supported network-free executable-model sandbox is unavailable" \
+    run_world "$world"
+  [ ! -e "$snapshot" ] \
+    || fail "an unsupported host published a snapshot without the required sandbox"
+  pass "unsupported hosts refuse without publishing a snapshot"
+}
+
+local_sandbox_supported() {
+  python3 - <<'PY'
+from pathlib import Path
+import sys
+
+raise SystemExit(
+    0
+    if sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file()
+    else 1
+)
+PY
+}
+
 test_private_application_model_integration() {
   local app=${FM_WORKSTACK_COMPASS_TEST_APP:-} approved_root world snapshot
   if [ -z "$app" ]; then
@@ -1623,6 +1647,11 @@ if snapshot.integrity_issues():
 PY
   pass "private Workstack executable model validates the sanitized generated snapshot"
 }
+
+if ! local_sandbox_supported; then
+  test_unsupported_local_sandbox_refuses
+  exit 0
+fi
 
 test_successful_truthful_projection
 test_existing_validator_only_model_interface
