@@ -19,6 +19,25 @@ Untracked files and directories whose names begin with `scratchpad` are also git
 The producing PR and Relay helpers own the fields they append, `bin/fm-classify-lib.sh` owns status-event vocabulary, and `bin/fm-crew-state.sh` owns current-state reconciliation.
 Wake, watcher, away-mode, and Relay-specific state mechanics remain with their named scripts and reference sections rather than being duplicated into one exhaustive state tree here.
 
+### Workstack Compass private snapshot
+
+Workstack Compass stays on its sanitized demonstration input until an operator supplies one upstream-owned snapshot.
+Generate and validate the local snapshot with the Firstmate producer, binding only the registered project roots whose local evidence should be observed:
+
+```sh
+FM_HOME=/path/to/firstmate /path/to/firstmate/bin/fm-workstack-compass-snapshot.py \
+  --workstack-root /path/to/workstack-compass \
+  --project-root data-team-management=/path/to/data-team-management \
+  --project-root gl-data-team-tickets=/path/to/gl-data-team-tickets
+```
+
+The command defaults to the gitignored, captain-private `$FM_HOME/data/workstack-compass/snapshot.json`, projects sanitized Firstmate evidence through its shipped adapter, validates the complete candidate through the supplied model's existing `snapshot_from_mapping` interface, replaces the file atomically at mode `0600`, and prints the exact `./bin/workstack-compass --snapshot ...` launch command without running it.
+It is local-only and network-free, does not discover project roots, and never launches or controls a worker, acknowledges fleet activity, changes a source, opens a remote connection, or publishes data.
+The producer currently requires the built-in macOS `sandbox-exec` boundary and refuses when its confined subprocess and publication boundary is unavailable.
+Pass another `--project-root NAME=PATH` only when `NAME` is already an exact entry in this home's `data/projects.md`; omit a root to keep that project's upstream detail visibly unavailable rather than allowing a path or repository guess.
+Use `--output` only for another path inside an owner-private subdirectory below this home's `data/` directory.
+The producer's header and `--help` own exact bounds, validation, path-safety, and replacement mechanics, while [architecture.md](architecture.md#workstack-compass-upstream-projection) owns the stable evidence boundary.
+
 `bin/fm-session-start.sh`'s header is the single owner of session-start ordering, composed commands, digest contents, and the digest's startup mechanism.
 `bin/fm-startup-network.sh`'s header owns the deferred network stage that keeps every external-network call off that digest's blocking path, including its state files and the safety argument for running them later.
 `docs/sessionstart-nudge.md` owns the native session-open adapter tiers that run or nudge the digest command, and the source routing between them.
@@ -378,7 +397,7 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
 It installs automatically supported tools only after you say go; manual-only tools remain for you to install from the printed instructions.
 Required tools come in two parts: a universal toolchain every home needs regardless of backend, and a per-backend delta that follows the runtime backend actually resolved for this home.
-The universal toolchain is node, git, gh with GitHub auth via `gh auth login`, no-mistakes v1.46.0 or newer, compatible gh-axi, chrome-devtools-axi, compatible lavish-axi, compatible tasks-axi per "Backlog backend" above, and compatible quota-axi.
+The universal toolchain is node, git, gh with GitHub auth via `gh auth login`, no-mistakes v1.60.2 or newer, compatible gh-axi, chrome-devtools-axi, compatible lavish-axi, compatible tasks-axi per "Backlog backend" above, and compatible quota-axi.
 [`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh) owns the axi-family floor policy and the gh-axi and lavish-axi floors, while [`bin/fm-tasks-axi-lib.sh`](../bin/fm-tasks-axi-lib.sh) and [`bin/fm-quota-axi-lib.sh`](../bin/fm-quota-axi-lib.sh) hold their own tools' floor constants.
 This section is the single owner of that universal toolchain list; backend guides' prerequisites point here and add only their backend-specific tools.
 In that list, no-mistakes runs the validation pipeline, gh-axi, chrome-devtools-axi, and lavish-axi cover GitHub, browser, and rich-review operations, and tasks-axi plus quota-axi back backlog mutations and quota-aware array dispatch.

@@ -98,6 +98,21 @@ The snapshot strips control sequences, retains only capture metadata and literal
 The default path remains local-only; live GitHub enrichment exists only behind the bearings `--include-prs` opt-in.
 Optional Relay integrates with the watcher only after explicit opt-in; [configuration.md](configuration.md#relay-env) owns its generated-artifact and dispatch mechanics.
 
+## Workstack Compass upstream projection
+
+`bin/fm-workstack-compass-snapshot.py` is an operator-invoked, source-read-only projection boundary rather than another fleet registry or execution authority.
+The Workstack Compass executable model under the explicitly supplied application root remains the sole snapshot-schema owner. Firstmate's shipped adapter projects its own sanitized evidence into a candidate for the model's existing `snapshot_from_mapping` interface, without copying the model's validation implementation; the model validates every complete candidate before publication through a bounded subprocess with a sanitized environment, no network or write authority, and a copy-isolated candidate.
+The producer reads one active `FM_HOME`, uses the existing Firstmate project registry and a stdin-only, network- and write-denied `tasks-axi` subprocess for exact local identities, and accepts project evidence only through explicit `NAME=PATH` bindings whose names already exist in that registry.
+A supplied path, repository resemblance, title, source prose, or status prose never establishes a relation.
+Firstmate task metadata contributes a worker incarnation only when its existing generation identity is exact, while project membership is added only through the same task identity's exact backlog repository field and registered project identity.
+The producer does not invoke Firstmate's general current-state reader because that reader may inspect task worktrees, local endpoint backends, or remote-worker routes outside this projection's approved roots; worker current state therefore stays unavailable at this boundary.
+The current bounded Firstmate records do not authoritatively publish worker liveness proof, context duration, typed plan and stage hierarchy, commands, delivery or acceptance relations, or retained decision history for this interface, so those surfaces remain partial or unavailable instead of being reconstructed.
+Data Team Management's local board configuration can identify its board source exactly, but the default network-free path has no current typed board-row export; the Data Team Tickets artifact repository likewise publishes no typed plan-to-stage lifecycle contract.
+Both therefore remain honest partial sources until their respective owners publish those missing interfaces.
+The snapshot contains projected identities and fixed provenance or availability explanations only, never source rows, copied status, credentials, transcripts, environment values, private source paths, or local session URLs.
+Publication is one bounded, validated, mode-`0600` atomic replacement below the active home's gitignored `data/` directory; the producer refuses source races and unsafe source or destination filesystem shapes without changing the last complete file.
+[Configuration](configuration.md#workstack-compass-private-snapshot) owns the operator setup, and the producer header plus `--help` own exact mechanics.
+
 At session start, `bin/fm-session-start.sh` emits exactly one primary-harness supervision block rendered by `bin/fm-supervision-instructions.sh` from `docs/supervision-protocols/`.
 That block owns the live wait shape for the running primary harness: Claude's Stop `asyncRewake` hook owns tokenless re-arm cycles, Cursor's stop hook parks on the watcher, Grok uses background-notify cycles, Codex uses bounded foreground checkpoints, Pi and pi-signed use the same two tracked primary extensions, and OpenCode uses its TUI plugin.
 `bin/fm-watch-arm.sh` remains the verified arm wrapper for protocols that call it; it forks the watcher as a tracked child, verifies it is genuinely alive with a fresh liveness beacon, and prints an honest `started`, `attached`, or nonzero `FAILED` status.
