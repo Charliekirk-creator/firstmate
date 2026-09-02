@@ -1,0 +1,20 @@
+ok - confined put rejects incomplete and superseded payload generations
+ok - confined put rejects directory replacement without external writes
+ok - ambiguous receipt leaves one durable outbox and no duplicate dispatchable source
+ok - new remote handoff preserves identities for every pending outbox row
+ok - dropped transfer recovery removes exact interrupted source duplicates
+ok - pending handoff recovery refuses symlinked and hardlinked records
+ok - concurrent handoffs serialize staging through confirmed cleanup
+ok - remote handoff reserves target identity before moving source backlog rows
+ok - remote handoff commits an exact destination identity and source tombstone
+ok - receiver validates every target commitment before batch move
+ok - receiver validates the complete identity batch before reservation
+ok - mixed remote recovery completes source ownership from the target receipt
+ok - receiver removes one proven dead stale lock and retries once
+ok - offline target reservation preserves recovery without source backlog mutation
+ok - remote handoff wakes its supported endpoint or remains loudly recoverable
+ok - fresh remote work gets a new wake after confirmed cleanup recovery
+ok - route classification serializes with retirement before staging
+ok - remote same-ID outbox rows require exact source content
+ok - unconfigured bootstrap has no remote handoff behavior
+ALL TESTS PASSED

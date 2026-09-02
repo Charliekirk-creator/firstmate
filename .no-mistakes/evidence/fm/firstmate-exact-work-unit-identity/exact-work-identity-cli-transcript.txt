@@ -1,0 +1,90 @@
+$ fm-work-identity.sh record exact-worker --file exact-worker.json
+recorded fm-work-identity.v1 task=exact-worker sha256=330adf14232462422321fba191885b2f2162a57bbbf975c59769240293af9db8
+
+$ fm-work-identity.sh record exact-worker --file exact-worker.json  # idempotent retry
+recorded fm-work-identity.v1 task=exact-worker sha256=330adf14232462422321fba191885b2f2162a57bbbf975c59769240293af9db8 (unchanged)
+
+$ fm-work-identity.sh verify exact-worker | jq <identity projection>
+{
+  "schema": "fm-work-identity.v1",
+  "status": "linked",
+  "binding": {
+    "home": "/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-identity-evidence.r8r4DW",
+    "home_id": "main",
+    "task_id": "exact-worker"
+  },
+  "initiative": {
+    "id": "wa-project-42",
+    "kind": "project",
+    "label": "Roadmap Accuracy",
+    "namespace": "work-aligner"
+  },
+  "plan_id": {
+    "id": "wa-plan-2026-q3",
+    "kind": "plan",
+    "label": "Identity Plan",
+    "namespace": "work-aligner"
+  },
+  "stage": {
+    "id": "implementation",
+    "kind": "stage",
+    "label": "Implementation",
+    "namespace": "work-aligner"
+  },
+  "work_units": [
+    {
+      "id": "wu-exact-intake",
+      "kind": "work-unit",
+      "label": "Exact Intake",
+      "namespace": "work-aligner"
+    },
+    {
+      "id": "local-fleet-projection",
+      "kind": "work-unit",
+      "label": "Fleet Projection",
+      "namespace": "firstmate"
+    }
+  ],
+  "sources": [
+    {
+      "id": "dtm-project-17",
+      "kind": "project",
+      "label": "Delivery Tracking",
+      "namespace": "dtm"
+    },
+    {
+      "id": "DTM-431",
+      "kind": "issue",
+      "label": "Worker Relation Gap",
+      "namespace": "dtm"
+    },
+    {
+      "id": "DTT-88",
+      "kind": "ticket",
+      "label": "Dashboard Tracking",
+      "namespace": "data-team-ticket"
+    }
+  ],
+  "sha256": "330adf14232462422321fba191885b2f2162a57bbbf975c59769240293af9db8"
+}
+
+$ fm-work-identity.sh verify legacy-task-with-no-record | jq <link status>
+{
+  "status": "unlinked",
+  "reason": "legacy-no-record",
+  "binding": {
+    "home": "/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-identity-evidence.r8r4DW",
+    "home_id": "main",
+    "task_id": "legacy-task-with-no-record"
+  },
+  "work_units": [],
+  "sources": []
+}
+
+$ malformed v2 manifest is refused without publication
+exit=1
+error: manifest does not satisfy fm-work-identity.v1
+published_sidecar=no
+
+$ runtime state remains untouched by intake and reads
+state_entries=0

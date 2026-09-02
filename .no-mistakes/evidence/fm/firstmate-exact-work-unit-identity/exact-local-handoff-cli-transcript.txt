@@ -1,0 +1,115 @@
+$ fm-work-identity.sh record linked-evidence-worker --file manifest.json
+recorded fm-work-identity.v1 task=linked-evidence-worker sha256=8c0516da1ce377d99437482592dbd9097970b25ee8e80b32847edef706df32db
+
+$ fm-backlog-handoff.sh planning linked-evidence-worker
+handed off 1 item(s) to planning: linked-evidence-worker
+  into /private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-handoff-evidence.jzr4Jq/planning/data/backlog.md
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no watcher has a fresh beacon (last beat: never, grace 300s).
+●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the requested message WILL still be sent.
+●  repair a missing or failed watcher cycle with the Pi tool fm_watch_arm_pi, or restart Pi with -e /Users/gigachad/.no-mistakes/worktrees/9fe8f75cf8ab/01M1DA7VXNBCBKYDA1ZT4ZFD8X/.pi/extensions/fm-primary-turnend-guard.ts -e /Users/gigachad/.no-mistakes/worktrees/9fe8f75cf8ab/01M1DA7VXNBCBKYDA1ZT4ZFD8X/.pi/extensions/fm-primary-pi-watch.ts if the extensions are not loaded.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+$ destination: fm-work-identity.sh verify linked-evidence-worker | jq <exact relation>
+{
+  "schema": "fm-work-identity.v1",
+  "status": "linked",
+  "binding": {
+    "home": "/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-handoff-evidence.jzr4Jq/planning",
+    "home_id": "secondmate:planning",
+    "task_id": "linked-evidence-worker"
+  },
+  "initiative": {
+    "id": "wa-project-42",
+    "kind": "project",
+    "label": "Roadmap Accuracy",
+    "namespace": "work-aligner"
+  },
+  "plan_id": {
+    "id": "wa-plan-2026-q3",
+    "kind": "plan",
+    "label": "Identity Plan",
+    "namespace": "work-aligner"
+  },
+  "stage": {
+    "id": "implementation",
+    "kind": "stage",
+    "label": "Implementation",
+    "namespace": "work-aligner"
+  },
+  "work_units": [
+    {
+      "id": "wu-exact-intake",
+      "kind": "work-unit",
+      "label": "Exact Intake",
+      "namespace": "work-aligner"
+    },
+    {
+      "id": "local-fleet-projection",
+      "kind": "work-unit",
+      "label": "Fleet Projection",
+      "namespace": "firstmate"
+    }
+  ],
+  "sources": [
+    {
+      "id": "dtm-project-17",
+      "kind": "project",
+      "label": "Delivery Tracking",
+      "namespace": "dtm"
+    },
+    {
+      "id": "DTM-431",
+      "kind": "issue",
+      "label": "Worker Relation Gap",
+      "namespace": "dtm"
+    },
+    {
+      "id": "DTT-88",
+      "kind": "ticket",
+      "label": "Dashboard Tracking",
+      "namespace": "data-team-ticket"
+    }
+  ],
+  "sha256": "e67de9eb32247dfe4f05b6dfecb8ee5fdb93aba25380e79876af4a26da3a05ee"
+}
+
+$ source ownership tombstone
+{
+  "role": "source",
+  "state": "completed",
+  "source": {
+    "home": "/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-handoff-evidence.jzr4Jq/main",
+    "home_id": "main",
+    "task_id": "linked-evidence-worker"
+  },
+  "target": {
+    "home": "/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-handoff-evidence.jzr4Jq/planning",
+    "home_id": "secondmate:planning",
+    "task_id": "linked-evidence-worker"
+  },
+  "identity_status": "linked"
+}
+
+$ destination ownership receipt
+{
+  "role": "target",
+  "state": "completed",
+  "source": {
+    "home": "/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-handoff-evidence.jzr4Jq/main",
+    "home_id": "main",
+    "task_id": "linked-evidence-worker"
+  },
+  "target": {
+    "home": "/private/var/folders/l9/13blqg851n3bj8p1b_3lxxk00000gn/T/fm-handoff-evidence.jzr4Jq/planning",
+    "home_id": "secondmate:planning",
+    "task_id": "linked-evidence-worker"
+  },
+  "identity_status": "linked"
+}
+
+$ exact backlog ownership after handoff
+source_count=0
+destination_count=1

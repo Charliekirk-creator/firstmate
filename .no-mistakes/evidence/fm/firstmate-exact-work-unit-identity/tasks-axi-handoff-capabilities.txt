@@ -1,0 +1,28 @@
+tasks-axi source commit: e2860a7f5d277e3ac61eccb3567c839e3d689192
+test-private executable: /Users/gigachad/.no-mistakes/worktrees/9fe8f75cf8ab/01M1DA7VXNBCBKYDA1ZT4ZFD8X/.no-mistakes-task-bin/tasks-axi
+
+$ tasks-axi capabilities --json
+{
+  "ok": true,
+  "action": "capabilities",
+  "schema_version": 1,
+  "capabilities": {
+    "backend": "markdown",
+    "deps": true,
+    "prune": true,
+    "comments": false,
+    "full_text_search": false,
+    "realtime_sync": false,
+    "custom_states": true,
+    "server_mints_ids": false,
+    "public_followups": true,
+    "owner_revisions": true,
+    "cas_move": true,
+    "handoff_revision_cas": {
+      "version": 1,
+      "digest": "sha256",
+      "move": true,
+      "peer_checked_remove": true
+    }
+  }
+}
