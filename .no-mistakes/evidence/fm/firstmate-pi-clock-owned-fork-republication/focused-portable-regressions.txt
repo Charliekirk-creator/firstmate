@@ -1,0 +1,9 @@
+ok - Pi clock-only turn-ends are not false churn while genuine pane progress remains observable
+ok - Pi churn hashing keeps the captured endpoint harness snapshot
+ok - legacy Pi hashes fail closed then migrate without duplicate stale wakes
+ok - Pi marker migration survives restarts at every write boundary
+ok - Pi migration recovery preserves progress rendered during interruption
+ok - legacy Pi migration preserves progress rendered after the old marker
+ok - Pi and pi-signed footer clock ticks dedupe without suppressing real pane changes or non-Pi timestamps
+ok - consecutive wedge escalations on the same pane accumulate and demand deep inspection at the threshold
+ok - a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated

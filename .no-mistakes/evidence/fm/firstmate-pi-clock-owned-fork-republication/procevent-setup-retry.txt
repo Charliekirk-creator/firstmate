@@ -1,0 +1,1 @@
+ok - a captured process-event result wakes a healthy watcher proactively, with no manual drain
