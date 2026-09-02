@@ -1113,8 +1113,12 @@ spawn_launch_request_start() {  # <command>
   (trap - EXIT; trap '' HUP INT TERM; spawn_launch_request_helper "$command") \
     </dev/null >/dev/null 2>&1 &
   helper_pid=$!
-  while [ ! -e "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ] \
-    && kill -0 "$helper_pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+  while kill -0 "$helper_pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+    if [ -d "$SPAWN_LAUNCH_REQUEST" ] && [ ! -L "$SPAWN_LAUNCH_REQUEST" ] \
+       && { [ -e "$SPAWN_LAUNCH_REQUEST/attempted" ] \
+         || [ -L "$SPAWN_LAUNCH_REQUEST/attempted" ]; }; then
+      break
+    fi
     sleep 0.01
     i=$((i + 1))
   done
@@ -1152,8 +1156,8 @@ spawn_launch_acceptance_wait() {
   while [ "$i" -lt "$max" ]; do
     state=$(spawn_launch_request_state) || return 1
     case "$state" in
-      accepted|executed|launch-exited) return 0 ;;
-      failed|attempted-dead|launch-abandoned|launch-failed) return 2 ;;
+      accepted|executed) return 0 ;;
+      launch-exited|failed|attempted-dead|launch-abandoned|launch-failed) return 2 ;;
     esac
     i=$((i + 1))
     [ "$i" -ge "$max" ] || sleep "$interval"
@@ -3305,6 +3309,24 @@ spawn_missing_endpoint_compensate() {
   SPAWN_FRESH_COMMIT_PENDING=0
 }
 
+spawn_exited_launch_compensate() {
+  local endpoint_state
+  if [ "$SPAWN_ENDPOINT_MISSING" -ne 1 ]; then
+    fm_backend_kill "$BACKEND" "$T" "${ZELLIJ_TAB_ID:-}" "$W" || return 1
+    case "$BACKEND" in
+      tmux|herdr)
+        endpoint_state=$(fm_backend_agent_state "$BACKEND" "$T")
+        [ "$endpoint_state" = missing ] || return 1
+        ;;
+      *)
+        ! fm_backend_target_exists "$BACKEND" "$T" "$W" || return 1
+        ;;
+    esac
+    SPAWN_ENDPOINT_MISSING=1
+  fi
+  spawn_missing_endpoint_compensate
+}
+
 if [ "$RELAUNCH" -eq 0 ] \
    && { [ -e "$SPAWN_ENDPOINT_RECEIPT" ] || [ -L "$SPAWN_ENDPOINT_RECEIPT" ]; }; then
   endpoint_receipt_rc=0
@@ -3334,29 +3356,12 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_ENDPOINT_PHASE" = launch-prepared ]; then
       SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
       ;;
     launch-exited)
-      if [ "$KIND" != secondmate ]; then
-        spawn_metadata_transaction_published || {
-          echo "error: accepted launch has no exact published metadata for $ID" >&2
-          exit 1
-        }
-        SPAWN_METADATA_RECOVERY=1
-        spawn_endpoint_receipt_publish launch-submitted "$WT" || {
-          echo "error: accepted launch could not be journaled for $ID" >&2
-          exit 1
-        }
-        SPAWN_LAUNCH_SUBMITTED_RECOVERY=1
-      else
-        if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
-          spawn_missing_endpoint_compensate
-        else
-          spawn_terminal_launch_reset
-        fi || {
-          echo "error: exited secondmate launch for $ID could not be compensated safely" >&2
-          exit 1
-        }
-        echo "error: persistent secondmate launch for $ID exited; its provisional publication was compensated - rerun spawn to retry" >&2
+      spawn_exited_launch_compensate || {
+        echo "error: exited launch for $ID could not be compensated safely" >&2
         exit 1
-      fi
+      }
+      echo "error: launch for $ID exited before commit; its provisional publication was compensated - rerun spawn to retry" >&2
+      exit 1
       ;;
     launch-failed)
       if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
@@ -3410,18 +3415,12 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$SPAWN_LAUNCH_SUBMITTED_RECOVERY" -eq 1 ]; then
   case "$launch_request_state" in
     accepted|executed) ;;
     launch-exited)
-      if [ "$KIND" = secondmate ]; then
-        if [ "$SPAWN_ENDPOINT_MISSING" -eq 1 ]; then
-          spawn_missing_endpoint_compensate
-        else
-          spawn_terminal_launch_reset
-        fi || {
-          echo "error: exited submitted secondmate launch for $ID could not be compensated safely" >&2
-          exit 1
-        }
-        echo "error: submitted persistent secondmate launch for $ID exited; its provisional publication was compensated - rerun spawn to retry" >&2
+      spawn_exited_launch_compensate || {
+        echo "error: exited submitted launch for $ID could not be compensated safely" >&2
         exit 1
-      fi
+      }
+      echo "error: submitted launch for $ID exited before commit; its provisional publication was compensated - rerun spawn to retry" >&2
+      exit 1
       ;;
     *)
       echo "error: submitted launch lacks exact backend acceptance for $ID" >&2
@@ -5833,15 +5832,61 @@ if [ "$RELAUNCH" -eq 0 ]; then
       echo "error: launch request owner could not be started for $ID" >&2
       exit 1
     }
-    spawn_launch_delivery_wait || {
-      echo "error: launch submission is incomplete or ambiguous; exact request evidence is preserved for $ID" >&2
+    launch_delivery_status=0
+    spawn_launch_delivery_wait || launch_delivery_status=$?
+    if [ "$launch_delivery_status" -ne 0 ]; then
+      launch_request_state=$(spawn_launch_request_state) || {
+        echo "error: launch request evidence is unsafe for $ID" >&2
+        exit 1
+      }
+      case "$launch_request_state" in
+        launch-exited)
+          spawn_exited_launch_compensate || {
+            echo "error: terminal launch for $ID could not be compensated safely" >&2
+            exit 1
+          }
+          echo "error: launch for $ID terminated before commit; its provisional publication was compensated - rerun spawn to retry" >&2
+          ;;
+        *)
+          echo "error: launch submission is incomplete or ambiguous; exact request evidence is preserved for $ID" >&2
+          ;;
+      esac
       exit 1
-    }
+    fi
     spawn_endpoint_receipt_publish launch-submitted "$WT" || {
       echo "error: launch was accepted, but its exact acceptance receipt could not be published for $ID" >&2
       exit 1
     }
   fi
+  launch_request_state=$(spawn_launch_request_state) || {
+    echo "error: accepted launch evidence is unsafe for $ID" >&2
+    exit 1
+  }
+  if [ "$launch_request_state" = accepted ]; then
+    # A transport receipt can race a short-lived child. Give its exact guard
+    # one poll interval to publish a terminal outcome before committing it as
+    # an active worker.
+    sleep "${FM_SPAWN_LAUNCH_INTERVAL:-0.1}"
+    launch_request_state=$(spawn_launch_request_state) || {
+      echo "error: accepted launch evidence is unsafe for $ID" >&2
+      exit 1
+    }
+  fi
+  case "$launch_request_state" in
+    accepted|executed) ;;
+    launch-exited)
+      spawn_exited_launch_compensate || {
+        echo "error: terminal accepted launch for $ID could not be compensated safely" >&2
+        exit 1
+      }
+      echo "error: launch for $ID terminated before commit; its provisional publication was compensated - rerun spawn to retry" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: accepted launch lacks exact backend acceptance for $ID" >&2
+      exit 1
+      ;;
+  esac
 else
   spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp" || {
     echo "error: relaunch environment could not be delivered for $ID" >&2

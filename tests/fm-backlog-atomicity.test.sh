@@ -210,6 +210,24 @@ SH
   chmod +x "$case_dir/fakebin/tmux"
 }
 
+restore_fresh_launch_delivery() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_command}"*) printf 'bash\n'; exit 0 ;;
+esac
+case "${1:-}" in
+  display-message) printf 'firstmate\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+  send-keys|has-session|new-session|new-window|kill-window|set-window-option) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+}
+
 execute_launch_then_exit() {  # <case-dir> <id>
   local case_dir=$1 id=$2
   cat > "$case_dir/fakebin/tmux" <<SH
@@ -268,23 +286,6 @@ esac
 exit 1
 SH
   chmod +x "$case_dir/fakebin/tmux"
-}
-
-fail_launch_submitted_publish_once() {  # <case-dir> <receipt>
-  local case_dir=$1 receipt=$2 receipt_base real
-  receipt_base=$(basename -- "$receipt")
-  real=$(command -v python3)
-  cat > "$case_dir/fakebin/python3" <<SH
-#!/usr/bin/env bash
-if [ "\${2:-}" = replace ] && [ "\${5:-}" = "$receipt_base" ] \
-   && [ ! -e "$case_dir/submitted-publish-failed" ] \
-   && jq -e '.phase == "launch-submitted"' "\${6:-}" >/dev/null 2>&1; then
-  : > "$case_dir/submitted-publish-failed"
-  exit 1
-fi
-exec "$real" "\$@"
-SH
-  chmod +x "$case_dir/fakebin/python3"
 }
 
 race_endpoint_receipt_publish() {  # <case-dir> <receipt> <no-clobber|replace>
@@ -1160,36 +1161,36 @@ test_dispatch_rolls_back_before_a_failed_launch_delivery() {
   pass "failed launch delivery stays queued and retries from exact evidence"
 }
 
-test_exited_launch_is_reconciled_without_replay() {
+test_exited_launch_never_commits_an_active_worker() {
   local case_dir home id out rc=0
   id=atomic-dispatch-exited-launch-b5
   case_dir=$(make_home dispatch-exited-launch "$id")
   home=$(home_of "$case_dir")
   add_item "$case_dir" "$id"
   execute_launch_then_exit "$case_dir" "$id"
-  fail_launch_submitted_publish_once "$case_dir" "$home/state/$id.spawn-endpoint.json"
 
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
-  [ "$rc" -ne 0 ] || fail "launch-submitted publication failure was reported as success"
-  assert_contains "$out" "exact acceptance receipt could not be published" \
-    "spawn did not report the interrupted acceptance publication"
+  [ "$rc" -ne 0 ] || fail "an exited launch was reported as an active spawn"
+  assert_contains "$out" "terminated before commit" \
+    "spawn did not report terminal launch compensation"
   [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
-    || fail "the interrupted launch did not execute exactly once"
-  assert_present "$home/state/$id.meta" \
-    "an executed launch lost its exact task metadata"
-  jq -e '.phase == "launch-prepared"' "$home/state/$id.spawn-endpoint.json" >/dev/null \
-    || fail "the interrupted launch lost its prepared acceptance boundary"
+    || fail "the exited launch did not execute exactly once"
+  [ "$(row_state "$case_dir" "$id")" = queued ] \
+    || fail "the exited launch moved its backlog row In flight"
+  assert_absent "$home/state/$id.meta" \
+    "the exited launch retained active task metadata"
+  assert_absent "$home/state/$id.spawn-endpoint.json" \
+    "the exited launch retained an endpoint receipt for a terminated worker"
 
+  restore_fresh_launch_delivery "$case_dir"
   rc=0
   out=$(run_ship_spawn "$case_dir" "$id") || rc=$?
-  [ "$rc" -eq 0 ] || fail "executed launch recovery did not reconcile: $out"
-  [ "$(wc -l < "$case_dir/launch-executions" | tr -d ' ')" = 1 ] \
-    || fail "executed launch recovery submitted the work again"
+  [ "$rc" -eq 0 ] || fail "fresh retry after exited launch compensation failed: $out"
   [ "$(row_state "$case_dir" "$id")" = in_flight ] \
-    || fail "executed launch recovery left the backlog row $(row_state "$case_dir" "$id")"
-  assert_absent "$home/state/$id.spawn-endpoint.json" \
-    "executed launch recovery retained its completed acceptance receipt"
-  pass "exited launches reconcile from execution evidence without replay"
+    || fail "fresh retry after exited launch compensation stayed queued"
+  assert_present "$home/state/$id.meta" \
+    "fresh retry after exited launch compensation published no active metadata"
+  pass "exited launches never commit an active worker"
 }
 
 test_failed_exited_launch_is_compensated_before_a_fresh_retry() {
@@ -2622,12 +2623,18 @@ test_a_persistent_secondmate_is_never_a_backlog_item() {
   pass "dispatching a persistent secondmate needs no backlog item"
 }
 
-if [ "${FM_TEST_ONLY:-}" = endpoint-receipt-publication ]; then
-  test_endpoint_receipt_publication_refuses_concurrent_state
-  test_endpoint_receipt_retirement_refuses_concurrent_state
-  test_endpoint_retirement_interruption_recovers_committed_spawn
-  exit 0
-fi
+case "${FM_TEST_ONLY:-}" in
+  endpoint-receipt-publication)
+    test_endpoint_receipt_publication_refuses_concurrent_state
+    test_endpoint_receipt_retirement_refuses_concurrent_state
+    test_endpoint_retirement_interruption_recovers_committed_spawn
+    exit 0
+    ;;
+  exited-launch)
+    test_exited_launch_never_commits_an_active_worker
+    exit 0
+    ;;
+esac
 
 test_dispatch_moves_the_item_in_flight_in_the_same_run
 test_dispatch_refuses_a_pending_authoritative_close
@@ -2654,7 +2661,7 @@ test_dispatch_preserves_an_accepted_launch_when_the_transition_fails
 test_dispatch_reports_an_incomplete_record_rollback
 test_dispatch_reports_an_incomplete_busy_rollback
 test_dispatch_rolls_back_before_a_failed_launch_delivery
-test_exited_launch_is_reconciled_without_replay
+test_exited_launch_never_commits_an_active_worker
 test_failed_exited_launch_is_compensated_before_a_fresh_retry
 test_missing_accepted_endpoint_compensates_before_backlog_commit
 test_dispatch_defers_interruption_across_backlog_commit
