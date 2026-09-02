@@ -588,7 +588,6 @@ tests/fm-sessionstart-hook-live-e2e.test.sh 21
 tests/fm-sessionstart-instruction-refresh-live-e2e.test.sh 21
 tests/fm-sessionstart-nudge.test.sh 26684
 tests/fm-shared-captain-inheritance.test.sh 10672
-tests/fm-spawn-common-dir.test.sh 1465
 tests/fm-spawn-dispatch-profile.test.sh 57765
 tests/fm-spawn-pool-base-freshen.test.sh 13257
 tests/fm-spawn-worktree-settle.test.sh 4828
