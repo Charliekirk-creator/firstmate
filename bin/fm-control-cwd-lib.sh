@@ -33,6 +33,7 @@ REPAIR_PROJECTION=none
 REPAIR_SEEN=
 REPAIR_SEEN_PANE=
 REPAIR_REFUSAL=
+REPAIR_BRIEF_OUTCOME=not-attempted
 REPAIR_EVIDENCE_ACTIVE=0
 
 repair_release_locks() {
@@ -49,7 +50,8 @@ repair_journal_lines() {
     "repair_old_shell_pid=$REPAIR_OLD_PID" "repair_old_outcome=$REPAIR_OLD_OUTCOME" \
     "repair_new_pane=$REPAIR_NEW_PANE" \
     "repair_published=$REPAIR_PUBLISHED" "repair_publication_attempted=$REPAIR_PUBLICATION_ATTEMPTED" \
-    "repair_projection=$REPAIR_PROJECTION" "repair_observed_pane=$REPAIR_SEEN_PANE"
+    "repair_projection=$REPAIR_PROJECTION" "repair_observed_pane=$REPAIR_SEEN_PANE" \
+    "repair_brief_outcome=$REPAIR_BRIEF_OUTCOME"
   # Live API output is untrusted, including control characters. JSON encoding
   # keeps an exact failed observation without injecting journal fields.
   printf 'repair_recorded_target_json=%s\n' "$(jq -cn --arg path "$REPAIR_TARGET_RECORDED" '$path')"
@@ -126,6 +128,8 @@ repair_prior_refusal_retryable() {
     && [ -z "$(fm_meta_get "$JOURNAL" repair_new_pane)" ] \
     && [ "$(fm_meta_get "$JOURNAL" repair_published)" = 0 ] \
     && [ "$(fm_meta_get "$JOURNAL" repair_publication_attempted)" = 0 ] \
+    && { [ "$(fm_meta_get "$JOURNAL" repair_brief_outcome)" = not-attempted ] \
+         || [ "$(fm_meta_get "$JOURNAL" repair_brief_outcome)" = unchanged ]; } \
     && [ "$(fm_meta_get "$JOURNAL" backend)" = "$BACKEND" ] \
     && [ "$(fm_meta_get "$JOURNAL" endpoint)" = "$T" ] \
     && [ "$(fm_meta_get "$JOURNAL" repair_session)" = "$(fm_meta_get "$META" herdr_session)" ] \

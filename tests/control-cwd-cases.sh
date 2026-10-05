@@ -403,6 +403,82 @@ test_cwd_repair_preallocation_refusals() {
   pass "cwd repair: pre-allocation refusals persist exact retryable evidence"
 }
 
+test_cwd_repair_note_failures() {
+  local mode dir out rc expected refusal
+  for mode in note-write brief-copy brief-append; do
+    dir=$(new_case "cwd-$mode" rcwd); cwd_case "$dir"
+    cp "$dir/fake/herdr-state" "$dir/herdr-before"
+    case "$mode" in
+      note-write)
+        mkdir "$dir/home/state/rcwd.control-relaunch.note"
+        expected="could not persist task rcwd's progress note"
+        out=$(cwd_control "$dir" --repair-cwd); rc=$?
+        ;;
+      brief-copy|brief-append)
+        cat > "$dir/fakebin/cp" <<'SH'
+#!/usr/bin/env bash
+if [ "${3:-}" = "$FM_FAKE_BRIEF_PRIOR" ]; then
+  case "$FM_FAKE_BRIEF_COPY_MODE" in
+    fail) exit 1 ;;
+    replace)
+      "$FM_REAL_CP" "$@" || exit $?
+      rm -f "$2" && mkdir "$2"
+      exit $?
+      ;;
+  esac
+fi
+exec "$FM_REAL_CP" "$@"
+SH
+        chmod +x "$dir/fakebin/cp"
+        if [ "$mode" = brief-copy ]; then
+          expected="could not preserve task rcwd's instructions before recording the progress note"
+          out=$(FM_REAL_CP="$(command -v cp)" FM_FAKE_BRIEF_COPY_MODE=fail \
+            FM_FAKE_BRIEF_PRIOR="$dir/home/state/rcwd.control-relaunch.brief-prior" \
+            cwd_control "$dir" --repair-cwd); rc=$?
+        else
+          expected="could not append the progress note to task rcwd's instructions"
+          out=$(FM_REAL_CP="$(command -v cp)" FM_FAKE_BRIEF_COPY_MODE=replace \
+            FM_FAKE_BRIEF_PRIOR="$dir/home/state/rcwd.control-relaunch.brief-prior" \
+            cwd_control "$dir" --repair-cwd); rc=$?
+        fi
+        ;;
+    esac
+    [ "$rc" -ne 0 ] || fail "$mode fault must refuse before allocation: $out"
+    assert_contains "$out" "$expected" "$mode refusal did not name the exact failure"
+    refusal=$(journal_field "$dir" rcwd repair_refusal_json | jq -er '.') || fail "$mode refusal was not valid JSON"
+    [ "$refusal" = "$expected" ] || fail "$mode refusal lost its exact reason"
+    cmp -s "$dir/meta-before" "$dir/home/state/rcwd.meta" || fail "$mode refusal changed metadata"
+    cmp -s "$dir/herdr-before" "$dir/fake/herdr-state" || fail "$mode refusal changed the endpoint"
+    [ "$(journal_field "$dir" rcwd repair_new_pane)" = '' ] || fail "$mode refusal claimed an allocation"
+    [ "$(journal_field "$dir" rcwd repair_published)" = 0 ] || fail "$mode refusal claimed publication"
+    if grep -q '"split"' "$dir/fake/herdr-log"; then fail "$mode refusal allocated a pane"; fi
+    if [ "$mode" = brief-append ]; then
+      [ "$(journal_field "$dir" rcwd repair_state)" = brief-mutation-unconfirmed ] || fail "$mode did not block ambiguous instruction mutation"
+      [ "$(journal_field "$dir" rcwd repair_brief_outcome)" = mutation-unconfirmed ] || fail "$mode claimed byte-preserved instructions"
+      [ "$(journal_field "$dir" rcwd rollback)" = brief-mutation-unconfirmed ] || fail "$mode lost its instruction outcome"
+      cp "$dir/home/state/rcwd.control-relaunch" "$dir/journal-before-ordinary"
+      out=$(cwd_control "$dir"); rc=$?
+      [ "$rc" -ne 0 ] || fail "$mode allowed ordinary relaunch over unresolved evidence"
+      assert_contains "$out" 'earlier repair remains' "$mode ordinary relaunch did not report unresolved evidence"
+      cmp -s "$dir/journal-before-ordinary" "$dir/home/state/rcwd.control-relaunch" || fail "$mode ordinary relaunch changed repair evidence"
+      cmp -s "$dir/meta-before" "$dir/home/state/rcwd.meta" || fail "$mode ordinary relaunch changed metadata"
+      [ -d "$dir/home/data/rcwd/brief.md" ] || fail "$mode ordinary relaunch changed the unconfirmed instruction state"
+    else
+      cwd_assert_preflight_evidence "$dir" "$expected"
+      [ "$(journal_field "$dir" rcwd repair_brief_outcome)" = unchanged ] || fail "$mode did not prove byte-identical instructions"
+      cmp -s "$dir/brief-before" "$dir/home/data/rcwd/brief.md" || fail "$mode changed instructions"
+      if [ "$mode" = note-write ]; then
+        rmdir "$dir/home/state/rcwd.control-relaunch.note"
+      else
+        rm -f "$dir/fakebin/cp"
+      fi
+      out=$(cwd_control "$dir" --repair-cwd); rc=$?
+      expect_code 0 "$rc" "$mode corrected explicit repair must remain retryable"$'\n'"$out"
+    fi
+  done
+  pass "cwd repair: note failures preserve exact instruction outcomes"
+}
+
 test_cwd_repair_rollback_and_guard() {
   local mode dir out rc
   for mode in wrong-cwd nonconsecutive read-fail control-cwd wrong-new-binding bad-split split-fail new-live new-process old-agent-race rollback-close-fail; do
@@ -612,6 +688,7 @@ test_cwd_repair_refusals
 test_cwd_repair_checkpoint_refusals
 test_cwd_repair_retries_resolved_preflight_refusal
 test_cwd_repair_preallocation_refusals
+test_cwd_repair_note_failures
 test_cwd_repair_rollback_and_guard
 test_cwd_repair_retirement_journal_failure
 test_cwd_repair_opt_in_and_path_bytes

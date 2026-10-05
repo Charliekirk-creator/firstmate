@@ -554,6 +554,7 @@ RELAUNCH_META_PUBLISHED=0
 RELAUNCH_AGENT_CONFIRMED=0
 RELAUNCH_TX=
 RELAUNCH_BRIEF=
+RELAUNCH_BRIEF_FINGERPRINT=
 PRIOR_HARNESS=$HARNESS
 PRIOR_RECORDED_HARNESS=$RECORDED_HARNESS
 CONFIG_HARNESS=
@@ -848,15 +849,55 @@ safe_checkpoint() {
 # actually reads. A secondmate's charter is a durable standing document and is
 # never rewritten: a secondmate reconciles its own home's records at startup,
 # so the note stays parent-side audit evidence.
+repair_note_refuse() {
+  local reason=$1 proof=$2 current_fingerprint=
+  if [ "$proof" = pristine ]; then
+    current_fingerprint=$(cksum < "$RELAUNCH_BRIEF" 2>/dev/null) || current_fingerprint=
+    if [ -n "$RELAUNCH_BRIEF_FINGERPRINT" ] \
+        && [ "$current_fingerprint" = "$RELAUNCH_BRIEF_FINGERPRINT" ]; then
+      REPAIR_BRIEF_OUTCOME=unchanged
+    else
+      REPAIR_BRIEF_OUTCOME=mutation-unconfirmed
+    fi
+  elif [ -f "$BRIEF_PRIOR" ] && cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
+    REPAIR_BRIEF_OUTCOME=unchanged
+  elif [ -f "$BRIEF_PRIOR" ] \
+      && cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" \
+      && cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
+    REPAIR_BRIEF_OUTCOME=unchanged
+  else
+    REPAIR_BRIEF_OUTCOME=mutation-unconfirmed
+  fi
+  RELAUNCH_ACTIVE=0
+  if [ "$REPAIR_BRIEF_OUTCOME" = unchanged ]; then
+    repair_refuse "$reason"
+  fi
+  REPAIR_REFUSAL=$reason
+  REPAIR_STATE=brief-mutation-unconfirmed
+  journal_write failed:checkpoint "${CHECKPOINT_LINES[@]}" "rollback=brief-mutation-unconfirmed" || true
+  die "cwd repair of $ID refused: $reason; instruction preservation is unconfirmed and requires reconciliation"
+}
+
 record_note() {
   local stamp
   [ -n "$NOTE" ] || return 0
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf '%s\n' "$NOTE" > "$NOTE_FILE"
+  if [ "$REPAIR_CWD" = 1 ]; then
+    RELAUNCH_BRIEF_FINGERPRINT=$(cksum < "$RELAUNCH_BRIEF" 2>/dev/null) \
+      || repair_note_refuse "could not fingerprint task $ID's instructions before recording the progress note" pristine
+    cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
+      || repair_note_refuse "could not preserve task $ID's instructions before recording the progress note" pristine
+    printf '%s\n' "$NOTE" > "$NOTE_FILE" \
+      || repair_note_refuse "could not persist task $ID's progress note" verify
+  else
+    printf '%s\n' "$NOTE" > "$NOTE_FILE"
+  fi
   case "$KIND" in
     ship|scout)
-      cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
-        || die "could not preserve task $ID's instructions before recording the progress note"
+      if [ "$REPAIR_CWD" = 0 ]; then
+        cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
+          || die "could not preserve task $ID's instructions before recording the progress note"
+      fi
       {
         echo
         echo "## Progress note ($stamp)"
@@ -869,8 +910,11 @@ record_note() {
         echo "$STATE/$ID.inbox/handled/. A steer sent before the relaunch survives there."
         echo
         printf '%s\n' "$NOTE"
-      } >> "$RELAUNCH_BRIEF" \
-        || die "could not append the progress note to task $ID's instructions"
+      } >> "$RELAUNCH_BRIEF" || {
+        [ "$REPAIR_CWD" = 0 ] \
+          && die "could not append the progress note to task $ID's instructions"
+        repair_note_refuse "could not append the progress note to task $ID's instructions" verify
+      }
       ;;
   esac
 }
@@ -919,7 +963,10 @@ do_relaunch() {
   fi
 
   record_note
-  journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"
+  if ! journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"; then
+    [ "$REPAIR_CWD" = 0 ] \
+      || repair_note_refuse "could not persist relaunch progress-note evidence" verify
+  fi
 
   if [ "$REPAIR_CWD" = 1 ]; then
     repair_replace
