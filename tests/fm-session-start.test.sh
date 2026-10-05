@@ -1810,6 +1810,44 @@ SH
   chmod +x "$fakebin/timeout"
 }
 
+test_summary_cannot_spend_the_startup_wake_budget() {
+  local rec root home fakebin out started elapsed
+  rec=$(new_world slow-summary)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf 'manual\n' > "$home/config/backlog-backend"
+  fm_write_meta "$home/state/slow.meta" "kind=ship" "worktree=$root" "harness=claude"
+  cat > "$fakebin/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'no-mistakes version v1.60.2\n'
+else
+  printf '%s\n' "$$" > "$FM_TEST_SUMMARY_PROBE"
+  sleep 60
+fi
+SH
+  chmod +x "$fakebin/no-mistakes"
+  append_wake "$home/state" check bounded-summary "new update during slow summary" \
+    || fail "could not seed startup update"
+  started=$(date +%s)
+  out=$(FM_TEST_SUMMARY_PROBE="$home/probe" FM_SESSION_START_TIMEOUT=30 \
+    FM_CREW_STATE_NM_TIMEOUT=60 FM_SNAPSHOT_CREW_STATE_TIMEOUT=60 \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  elapsed=$(( $(date +%s) - started ))
+  [ -s "$home/probe" ] || fail "slow producer fixture was never exercised"
+  assert_contains "$out" "new update during slow summary" "slow summary hid the queued update"
+  assert_contains "$out" "NEXT STEP" "slow summary truncated startup before completion"
+  assert_not_contains "$out" "STARTUP TRUNCATED - SESSION START HIT" "side-band summary spent the digest budget"
+  [ "$elapsed" -lt 30 ] || fail "startup took ${elapsed}s behind the optional summary"
+  grep -F '5-second deadline' "$home/state/.home-summary-refresh.log" >/dev/null \
+    || fail "startup did not use its own bounded publication allowance"
+  [ -s "$home/state/.wake-queue" ] || fail "startup consumed rather than presented the queued update"
+  pass "slow summary retains its failure record but startup delivers the update in ${elapsed}s"
+}
+
 test_runtime_bound_truncates_loudly_and_exits_zero() {
   local rec root home fakebin out status=0 stray mechanism
   rec=$(new_world runtime-bound)
@@ -2462,6 +2500,7 @@ EOF
   pass "session start rejects Pi loaded markers from previous sessions"
 }
 
+test_summary_cannot_spend_the_startup_wake_budget
 test_context_digest_absent_empty_present
 test_lock_refusal_read_only_path
 test_lock_write_failure_read_only_path

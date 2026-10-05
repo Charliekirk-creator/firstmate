@@ -167,8 +167,12 @@
 # local is not the same as bounded: tool version probes, the backlog listing,
 # and the per-task endpoint reads are all unbounded subprocesses. So the whole
 # digest still runs as ONE bounded child of this script
-# (FM_SESSION_START_TIMEOUT, default 120s). The deferred network stage
-# deliberately sits OUTSIDE that bound,
+# (FM_SESSION_START_TIMEOUT, default 120s). The optional home-summary refresh
+# uses at most FM_SESSION_START_HOME_SUMMARY_TIMEOUT (default 5s), capped by
+# FM_HOME_SUMMARY_TIMEOUT when smaller, and skips an already-busy publisher.
+# Its ordinary background watcher trigger retains the full refresh budget;
+# side-band publication must not consume half the startup budget before wakes.
+# The deferred network stage deliberately sits OUTSIDE that bound,
 # in its own process group under its own aggregate deadline, so a truncated
 # digest neither waits for it nor orphans it unbounded. The
 # child writes the digest straight to this script's stdout, so everything it
@@ -654,7 +658,13 @@ if [ "$READ_ONLY" -eq 0 ]; then
   # Publication is side-band and best-effort, so it can never change the
   # session-start result. A context re-emit is not another session start.
   if [ "$REEMIT" -eq 0 ]; then
-    "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
+    SUMMARY_BUDGET=${FM_SESSION_START_HOME_SUMMARY_TIMEOUT:-5}
+    case "$SUMMARY_BUDGET" in ''|*[!0-9]*|0) SUMMARY_BUDGET=5 ;; esac
+    REFRESH_BUDGET=${FM_HOME_SUMMARY_TIMEOUT:-60}
+    case "$REFRESH_BUDGET" in ''|*[!0-9]*|0) REFRESH_BUDGET=60 ;; esac
+    [ "$SUMMARY_BUDGET" -le "$REFRESH_BUDGET" ] || SUMMARY_BUDGET=$REFRESH_BUDGET
+    FM_HOME_SUMMARY_IF_IDLE=1 FM_HOME_SUMMARY_TIMEOUT="$SUMMARY_BUDGET" \
+      "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
   fi
   # Every network call this session start owes is launched HERE, detached and
   # bounded, so it runs concurrently with the whole digest below instead of in
