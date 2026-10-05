@@ -622,5 +622,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  markLoaded();
+  // Factory discovery also runs for `pi --help` without activating a session.
+  // Only session_start (or this session's arm tool) may publish owner evidence.
 }

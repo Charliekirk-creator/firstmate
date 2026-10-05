@@ -597,5 +597,6 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  markLoaded();
+  // Factory discovery is not session activation; see the watcher extension's
+  // owner-evidence boundary. A help-only child must not replace the live marker.
 }

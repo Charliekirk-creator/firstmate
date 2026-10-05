@@ -219,5 +219,104 @@ test_handling_successor_does_not_go_blind() {
   pass "a resurfacing handling successor stays alive and supervises instead of going blind"
 }
 
+# T3: finished pending-reply history must not turn an owned Pi arm into a
+# stale-beacon cycle that cannot deliver newly generated task updates.
+test_settled_history_delivers_to_pi_owner() {
+  local repo home plugin fakebin out status i corr
+  repo="$TMP_ROOT/t3-root"
+  home="$TMP_ROOT/t3-home"
+  fakebin="$TMP_ROOT/t3-fakebin"
+  mkdir -p "$repo/bin" "$home/state/pending-replies" "$home/config" "$fakebin"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  cat > "$repo/bin/fm-watch-arm.sh" <<SH
+#!/usr/bin/env bash
+export FM_ROOT_OVERRIDE="$ROOT"
+export PATH="$fakebin:\$PATH"
+exec "$ROOT/bin/fm-watch-arm.sh" "\$@"
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  for ((i = 0; i < 1046; i++)); do
+    printf -v corr '%016x' "$i"
+    printf 'corr_id=%s\ntask_id=history\nphase=resolved\nescalated_epoch=\nescalation_closed_epoch=\n' "$corr" \
+      > "$home/state/pending-replies/$corr"
+  done
+  : > "$home/state/fresh.meta"
+  : > "$home/state/home-summary.json"
+  out=$(
+    PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" \
+      FM_STATE_OVERRIDE="$home/state" PATH="$fakebin:$PATH" \
+      FM_TEST_ROOT="$ROOT" FM_POLL=1 FM_SIGNAL_GRACE=0 FM_GUARD_GRACE=15 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+      node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+let tool;
+const handlers = {};
+const prompts = [];
+const pi = {
+  on(name, handler) { handlers[name] = handler; },
+  registerCommand() {},
+  registerTool(candidate) { tool = candidate; },
+  sendUserMessage: async (message) => { prompts.push(String(message)); },
+};
+const state = `${process.env.FM_HOME}/state`;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const waitFor = async (predicate, label) => {
+  const deadline = Date.now() + 15000;
+  while (!predicate() && Date.now() < deadline) await delay(25);
+  if (!predicate()) throw new Error(`delivery deadline exceeded: ${label}; prompts=${prompts}`);
+};
+writeFileSync(`${state}/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+try {
+  const started = await tool.execute();
+  if (!started.details.ok) throw new Error(started.details.message);
+  await waitFor(() => existsSync(`${state}/.last-watcher-beat`), "first beat");
+  const redundant = await tool.execute();
+  if (!redundant.details.message.includes("already owns an arm child")) {
+    throw new Error(`arm ownership missing: ${redundant.details.message}`);
+  }
+  for (const token of ["fresh-history-update", "healthy-successor-update"]) {
+    const before = prompts.length;
+    const began = Date.now();
+    appendFileSync(`${state}/fresh.status`, `done: ${token}\n`);
+    await waitFor(() => prompts.slice(before).some((p) => p.includes("signal:") && p.includes("fresh.status")), token);
+    const queue = readFileSync(`${state}/.wake-queue`, "utf8");
+    if (!queue.includes("\tsignal\tfresh.status\t")) throw new Error(`missing durable wake: ${queue}`);
+    const guard = spawnSync(`${process.env.FM_TEST_ROOT}/bin/fm-turnend-guard.sh`, {
+      input: '{"stop_hook_active":false}', encoding: "utf8",
+    });
+    if (guard.status !== 0) throw new Error(`owner received wake without healthy successor: ${guard.stderr}`);
+    console.log(`${token}: delivered in ${Date.now() - began}ms to owner ${process.pid}`);
+    // The owning session acknowledges through the actual drain interface.
+    const drain = spawnSync(`${process.env.FM_TEST_ROOT}/bin/fm-wake-drain.sh`, { encoding: "utf8" });
+    if (drain.status !== 0) throw new Error(drain.stderr);
+    const ack = drain.stderr.match(/WAKE_ACK_REQUIRED: after handling completes run bin\/fm-wake-drain.sh --ack-through ([0-9]+) --recovery-generation ([A-Za-z0-9._-]+)/);
+    if (!ack) throw new Error(`missing generation-bound acknowledgement: ${drain.stdout} ${drain.stderr}`);
+    const acknowledged = spawnSync(`${process.env.FM_TEST_ROOT}/bin/fm-wake-drain.sh`,
+      ["--ack-through", ack[1], "--recovery-generation", ack[2]], { encoding: "utf8" });
+    if (acknowledged.status !== 0) throw new Error(acknowledged.stderr);
+  }
+} finally {
+  handlers.session_shutdown?.();
+  await waitFor(() => !existsSync(`${state}/.watch.lock/pid`), "owned child retirement");
+  await delay(250);
+}
+EOF
+  )
+  status=$?
+  [ "${FM_TEST_EVIDENCE:-0}" != 1 ] || printf '%s\n' "$out"
+  expect_code 0 "$status" "finished history must not block fresh update delivery to the owning Pi session: $out"
+  pass "Pi owned arm delivers two fresh updates through settled history and keeps a healthy successor"
+}
+
+test_settled_history_delivers_to_pi_owner
 test_handling_successor_does_not_go_blind
 test_unacknowledged_recovery_is_announced_once_per_generation
