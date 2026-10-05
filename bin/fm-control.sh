@@ -855,7 +855,7 @@ repair_note_refuse() {
   local reason=$1
   if [ -f "$BRIEF_PRIOR" ] && cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
     REPAIR_BRIEF_OUTCOME=unchanged
-  elif [ -f "$BRIEF_PRIOR" ]; then
+  elif [ "$REPAIR_BRIEF_BACKUP_VALID" = 1 ] && [ -f "$BRIEF_PRIOR" ]; then
     cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" || true
     if cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
       REPAIR_BRIEF_OUTCOME=unchanged
@@ -880,8 +880,12 @@ record_note() {
   [ -n "$NOTE" ] || return 0
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if [ "$REPAIR_CWD" = 1 ]; then
-    cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
-      || repair_note_refuse "could not preserve task $ID's instructions before recording the progress note"
+    if cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
+        && cmp -s "$RELAUNCH_BRIEF" "$BRIEF_PRIOR"; then
+      REPAIR_BRIEF_BACKUP_VALID=1
+    else
+      repair_note_refuse "could not preserve task $ID's instructions before recording the progress note"
+    fi
     printf '%s\n' "$NOTE" > "$NOTE_FILE" \
       || repair_note_refuse "could not persist task $ID's progress note"
   else

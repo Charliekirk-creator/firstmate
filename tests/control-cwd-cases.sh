@@ -414,7 +414,7 @@ test_cwd_repair_preallocation_refusals() {
 
 test_cwd_repair_note_failures() {
   local mode dir out rc expected refusal
-  for mode in note-write brief-copy brief-copy-after brief-append; do
+  for mode in note-write brief-copy brief-copy-partial brief-copy-after brief-append; do
     dir=$(new_case "cwd-$mode" rcwd); cwd_case "$dir"
     cp "$dir/fake/herdr-state" "$dir/herdr-before"
     case "$mode" in
@@ -423,12 +423,13 @@ test_cwd_repair_note_failures() {
         expected="could not persist task rcwd's progress note"
         out=$(cwd_control "$dir" --repair-cwd); rc=$?
         ;;
-      brief-copy|brief-copy-after|brief-append)
+      brief-copy|brief-copy-partial|brief-copy-after|brief-append)
         cat > "$dir/fakebin/cp" <<'SH'
 #!/usr/bin/env bash
 if [ "${3:-}" = "$FM_FAKE_BRIEF_PRIOR" ]; then
   case "$FM_FAKE_BRIEF_COPY_MODE" in
     fail) exit 1 ;;
+    partial) head -c 7 "$2" > "$3"; exit 1 ;;
     after) "$FM_REAL_CP" "$@"; exit 1 ;;
     replace)
       "$FM_REAL_CP" "$@" || exit $?
@@ -440,16 +441,35 @@ fi
 exec "$FM_REAL_CP" "$@"
 SH
         chmod +x "$dir/fakebin/cp"
-        if [ "$mode" = brief-copy ] || [ "$mode" = brief-copy-after ]; then
+        if [ "$mode" = brief-copy ] || [ "$mode" = brief-copy-partial ] || [ "$mode" = brief-copy-after ]; then
           expected="could not preserve task rcwd's instructions before recording the progress note"
-          if [ "$mode" = brief-copy ]; then copy_mode=fail; else copy_mode=after; fi
+          case "$mode" in
+            brief-copy) copy_mode=fail ;;
+            brief-copy-partial) copy_mode=partial ;;
+            *) copy_mode=after ;;
+          esac
           out=$(FM_REAL_CP="$(command -v cp)" FM_FAKE_BRIEF_COPY_MODE="$copy_mode" \
             FM_FAKE_BRIEF_PRIOR="$dir/home/state/rcwd.control-relaunch.brief-prior" \
             cwd_control "$dir" --repair-cwd); rc=$?
         else
+          cat > "$dir/fakebin/cmp" <<'SH'
+#!/usr/bin/env bash
+"$FM_REAL_CMP" "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$FM_FAKE_CMP_FIRED" ] \
+   && [ "${2:-}" = "$FM_FAKE_RELAUNCH_BRIEF" ] \
+   && [ "${3:-}" = "$FM_FAKE_BRIEF_PRIOR" ]; then
+  : > "$FM_FAKE_CMP_FIRED"
+  rm -f "$FM_FAKE_RELAUNCH_BRIEF" && mkdir "$FM_FAKE_RELAUNCH_BRIEF"
+fi
+exit "$rc"
+SH
+          chmod +x "$dir/fakebin/cmp"
           expected="could not append the progress note to task rcwd's instructions"
-          out=$(FM_REAL_CP="$(command -v cp)" FM_FAKE_BRIEF_COPY_MODE=replace \
+          out=$(FM_REAL_CP="$(command -v cp)" FM_FAKE_BRIEF_COPY_MODE=normal \
             FM_FAKE_BRIEF_PRIOR="$dir/home/state/rcwd.control-relaunch.brief-prior" \
+            FM_REAL_CMP="$(command -v cmp)" FM_FAKE_CMP_FIRED="$dir/fake/cmp-fired" \
+            FM_FAKE_RELAUNCH_BRIEF="$dir/home/data/rcwd/brief.md" \
             cwd_control "$dir" --repair-cwd); rc=$?
         fi
         ;;
@@ -463,7 +483,7 @@ SH
     [ "$(journal_field "$dir" rcwd repair_new_pane)" = '' ] || fail "$mode refusal claimed an allocation"
     [ "$(journal_field "$dir" rcwd repair_published)" = 0 ] || fail "$mode refusal claimed publication"
     if grep -q '"split"' "$dir/fake/herdr-log"; then fail "$mode refusal allocated a pane"; fi
-    if [ "$mode" = brief-append ] || [ "$mode" = brief-copy ]; then
+    if [ "$mode" = brief-append ] || [ "$mode" = brief-copy ] || [ "$mode" = brief-copy-partial ]; then
       [ "$(journal_field "$dir" rcwd repair_state)" = brief-mutation-unconfirmed ] || fail "$mode did not block ambiguous instruction mutation"
       [ "$(journal_field "$dir" rcwd repair_brief_outcome)" = mutation-unconfirmed ] || fail "$mode claimed byte-preserved instructions"
       [ "$(journal_field "$dir" rcwd rollback)" = brief-mutation-unconfirmed ] || fail "$mode lost its instruction outcome"
@@ -477,6 +497,10 @@ SH
         [ -d "$dir/home/data/rcwd/brief.md" ] || fail "$mode ordinary relaunch changed the unconfirmed instruction state"
       else
         cmp -s "$dir/brief-before" "$dir/home/data/rcwd/brief.md" || fail "$mode changed instructions despite an unavailable backup"
+        [ "$(journal_field "$dir" rcwd repair_brief_backup_valid)" = 0 ] || fail "$mode trusted a failed backup"
+        if [ "$mode" = brief-copy-partial ]; then
+          [ "$(wc -c < "$dir/home/state/rcwd.control-relaunch.brief-prior" | tr -d ' ')" = 7 ] || fail "$mode did not exercise a partial backup"
+        fi
       fi
     else
       cwd_assert_preflight_evidence "$dir" "$expected"

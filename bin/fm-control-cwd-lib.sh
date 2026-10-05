@@ -34,6 +34,7 @@ REPAIR_SEEN=
 REPAIR_SEEN_PANE=
 REPAIR_REFUSAL=
 REPAIR_BRIEF_OUTCOME=not-attempted
+REPAIR_BRIEF_BACKUP_VALID=0
 REPAIR_EVIDENCE_ACTIVE=0
 
 repair_release_locks() {
@@ -51,7 +52,8 @@ repair_journal_lines() {
     "repair_new_pane=$REPAIR_NEW_PANE" \
     "repair_published=$REPAIR_PUBLISHED" "repair_publication_attempted=$REPAIR_PUBLICATION_ATTEMPTED" \
     "repair_projection=$REPAIR_PROJECTION" "repair_observed_pane=$REPAIR_SEEN_PANE" \
-    "repair_brief_outcome=$REPAIR_BRIEF_OUTCOME"
+    "repair_brief_outcome=$REPAIR_BRIEF_OUTCOME" \
+    "repair_brief_backup_valid=$REPAIR_BRIEF_BACKUP_VALID"
   # Live API output is untrusted, including control characters. JSON encoding
   # keeps an exact failed observation without injecting journal fields.
   printf 'repair_recorded_target_json=%s\n' "$(jq -cn --arg path "$REPAIR_TARGET_RECORDED" '$path')"
@@ -370,7 +372,8 @@ repair_finish() {
 }
 
 repair_restore_prior_brief() {
-  [ -n "$RELAUNCH_BRIEF" ] && [ -f "$BRIEF_PRIOR" ] || return 1
+  [ "$REPAIR_BRIEF_BACKUP_VALID" = 1 ] \
+    && [ -n "$RELAUNCH_BRIEF" ] && [ -f "$BRIEF_PRIOR" ] || return 1
   cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" || true
   if cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
     REPAIR_BRIEF_OUTCOME=unchanged
