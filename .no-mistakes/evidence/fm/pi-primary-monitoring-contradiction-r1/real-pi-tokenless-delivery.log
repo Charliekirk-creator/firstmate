@@ -1,0 +1,11 @@
+REAL_PI_VERSION=0.87.1
+RPC_ARM_COMMAND=success
+OWNED_REARM_COMMAND=success
+HELP_ONLY_FACTORY_MARKERS=preserved
+SESSION_OWNER_MARKER=active-process
+fresh-history-update=delivered_to_tokenless_input_boundary_in_1.510s
+healthy-successor-update=delivered_to_tokenless_input_boundary_in_2.455s
+DURABLE_SIGNAL_ROWS_REMAINING_AFTER_GENERATION_ACK=0
+TOKENLESS_RECEIVER_DELIVERIES=2
+TURN_END_GUARD=success_after_each_delivery
+GENERATION_BOUND_ACK=success_after_each_delivery

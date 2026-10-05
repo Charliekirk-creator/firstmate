@@ -1,0 +1,10 @@
+fresh-history-update: delivered in 4362ms to isolated Pi owner
+healthy-successor-update: delivered in 4937ms to isolated Pi owner
+ok - Pi owned arm delivers two fresh updates through settled history and keeps a healthy successor
+T2_WATCH_OUTPUT=signal: <isolated-fixture>/state/crew.status
+T2_QUEUE_ROW=<fixture-epoch>	2	signal	crew.status	signal: <isolated-fixture>/state/crew.status
+ok - a resurfacing handling successor stays alive and supervises instead of going blind
+T1_MESSAGES=1
+T1_LOCK_OWNER=isolated-successor
+T1_MARKER=announced:downtime:seed.1.aaa
+ok - unacknowledged recovery is announced at most once per generation and the successor stays alive
