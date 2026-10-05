@@ -1207,7 +1207,7 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id> [interactive]
 # contract and the settle retry.
 fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id> [interactive]
   local session=$1 pane=$2 info shell_pid foreground_pgid count
-  local process_pid name argv0 shell_name rows stat ps_bin
+  local process_pid name argv0 shell_name rows stat ps_bin tty pgid tpgid stdin_path expected_tty lsof_bin
   info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
   printf '%s' "$info" | jq -e --arg pane "$pane" '
     .result.type == "pane_process_info"
@@ -1239,6 +1239,8 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id> [interactive]
   # Cwd repair may retire this shell, so require a known interactive invocation
   # rather than mistaking a sleeping shell script or -c command for a prompt.
   # Other callers retain the existing proof when the stricter mode is absent.
+  ps_bin=${FM_HERDR_PS_BIN:-ps}
+  command -v "$ps_bin" >/dev/null 2>&1 || return 1
   if [ "${3:-}" = interactive ]; then
     printf '%s' "$info" | jq -e --arg shell "$shell_name" '
       .result.process_info.foreground_processes[0].argv
@@ -1246,10 +1248,21 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id> [interactive]
       | select((.[0] | ltrimstr("-") | split("/") | last) == $shell)
       | all(.[1:][]; type == "string" and test("^(-[ilf]+|--login|--noprofile|--norc|--no-config)$"))
     ' >/dev/null 2>&1 || return 1
+    tty=$("$ps_bin" -p "$shell_pid" -o tty= 2>/dev/null | tr -d '[:space:]') || return 1
+    case "$tty" in ''|'?'|'??'|-) return 1 ;; esac
+    pgid=$("$ps_bin" -p "$shell_pid" -o pgid= 2>/dev/null | tr -d '[:space:]') || return 1
+    tpgid=$("$ps_bin" -p "$shell_pid" -o tpgid= 2>/dev/null | tr -d '[:space:]') || return 1
+    [ "$pgid" = "$shell_pid" ] && [ "$tpgid" = "$shell_pid" ] || return 1
+    lsof_bin=${FM_HERDR_LSOF_BIN:-lsof}
+    command -v "$lsof_bin" >/dev/null 2>&1 || return 1
+    stdin_path=$("$lsof_bin" -a -p "$shell_pid" -d 0 -Fn 2>/dev/null | awk '
+      /^n/ { count++; path=substr($0, 2) }
+      END { if (count == 1) print path; else exit 1 }
+    ') || return 1
+    case "$tty" in /dev/*) expected_tty=$tty ;; *) expected_tty=/dev/$tty ;; esac
+    [ "$stdin_path" = "$expected_tty" ] || return 1
   fi
 
-  ps_bin=${FM_HERDR_PS_BIN:-ps}
-  command -v "$ps_bin" >/dev/null 2>&1 || return 1
   rows=$("$ps_bin" -axo pid=,ppid= 2>/dev/null) || return 1
   printf '%s\n' "$rows" | awk -v shell="$shell_pid" '
     $1 == shell { found++ }

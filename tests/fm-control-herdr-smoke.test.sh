@@ -202,6 +202,31 @@ REPAIR_WS=$(printf '%s' "$REPAIR_RAW" | jq -r '.result.workspace.workspace_id')
 # input even if text is already buffered there.
 "$HERDR_LAB_HELPER" run "$SESSION" pane run "$REPAIR_PANE" 'exec /bin/bash --noprofile --norc -i' || fail "could not seed bare fixture shell"
 sleep 1
+fm_backend_herdr_pane_idle_shell_pid "$SESSION" "$REPAIR_PANE" interactive >/dev/null \
+  || fail "interactive Bash pane did not provide exact TTY ownership evidence"
+ZSH_RAW=$("$HERDR_LAB_HELPER" run "$SESSION" workspace create --label cwd-zsh-proof --cwd "$PROJ" --no-focus) \
+  || fail "could not create Zsh proof fixture"
+ZSH_PANE=$(printf '%s' "$ZSH_RAW" | jq -r '.result.root_pane.pane_id')
+"$HERDR_LAB_HELPER" run "$SESSION" pane run "$ZSH_PANE" 'exec /bin/zsh -f -i' || fail "could not seed Zsh proof fixture"
+sleep 1
+fm_backend_herdr_pane_idle_shell_pid "$SESSION" "$ZSH_PANE" interactive >/dev/null \
+  || fail "interactive Zsh pane did not provide exact TTY ownership evidence"
+"$HERDR_LAB_HELPER" run "$SESSION" pane close "$ZSH_PANE" || fail "could not close Zsh proof fixture"
+FIFO_PATH="$SCRATCH/noninteractive-shell.fifo"
+mkfifo "$FIFO_PATH" || fail "could not create FIFO proof fixture"
+exec 8<> "$FIFO_PATH"
+FIFO_RAW=$("$HERDR_LAB_HELPER" run "$SESSION" workspace create --label cwd-fifo-proof --cwd "$PROJ" --no-focus) \
+  || fail "could not create FIFO proof pane"
+FIFO_PANE=$(printf '%s' "$FIFO_RAW" | jq -r '.result.root_pane.pane_id')
+printf -v FIFO_COMMAND 'exec /bin/bash --noprofile --norc < %q' "$FIFO_PATH"
+"$HERDR_LAB_HELPER" run "$SESSION" pane run "$FIFO_PANE" "$FIFO_COMMAND" || fail "could not seed FIFO-blocked shell"
+sleep 1
+if fm_backend_herdr_pane_idle_shell_pid "$SESSION" "$FIFO_PANE" interactive >/dev/null 2>&1; then
+  fail "FIFO-blocked noninteractive Bash was accepted as an interactive pane shell"
+fi
+"$HERDR_LAB_HELPER" run "$SESSION" pane close "$FIFO_PANE" || fail "could not close FIFO proof fixture"
+exec 8>&-
+pass "real herdr: exact TTY proof accepts interactive Bash/Zsh and rejects FIFO stdin"
 printf -v OLD_BUFFER 'printf OLD-INPUT-MUST-NOT-RUN > %q; ' "$SCRATCH/old-input-ran"
 "$HERDR_LAB_HELPER" run "$SESSION" pane send-text "$REPAIR_PANE" "$OLD_BUFFER" || fail "could not buffer old fixture input"
 mkdir -p "$HOME_DIR/data/rsmoke"

@@ -23,17 +23,31 @@ PY
 case "$*" in
   '-axo pid=,ppid=') printf '44101 1\n44102 1\n' ;;
   *'-o stat=') printf 'Ss+\n' ;;
+  *'-o tty=') printf 'ttys001\n' ;;
+  *'-o pgid='|*'-o tpgid=')
+    while [ "$1" != -p ]; do shift; done
+    printf '%s\n' "$2"
+    ;;
   *) exit 1 ;;
 esac
 SH
-  chmod +x "$dir/fakebin/ps-herdr"
+  cat > "$dir/fakebin/lsof-herdr" <<'SH'
+#!/usr/bin/env bash
+case "${FM_FAKE_HERDR_LSOF_STDIN:-tty}" in
+  tty) printf 'p%s\nft0\nn/dev/ttys001\n' "$$" ;;
+  fifo) printf 'p%s\nft0\nn%s\n' "$$" "$FM_FAKE_HERDR_FIFO" ;;
+  missing) exit 1 ;;
+esac
+SH
+  chmod +x "$dir/fakebin/ps-herdr" "$dir/fakebin/lsof-herdr"
   cp "$dir/home/state/rcwd.meta" "$dir/meta-before"
   cp "$dir/home/data/rcwd/brief.md" "$dir/brief-before"
 }
 
 cwd_control() {
   local dir=$1; shift
-  FM_HERDR_PS_BIN="$dir/fakebin/ps-herdr" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+  FM_HERDR_PS_BIN="$dir/fakebin/ps-herdr" FM_HERDR_LSOF_BIN="$dir/fakebin/lsof-herdr" \
+    FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
     run_control "$dir" rcwd relaunch --note 'resume preserved task' "$@"
 }
 
@@ -142,9 +156,13 @@ PY
 
 test_cwd_repair_refusals() {
   local mode dir out rc refusal
-  for mode in live ambiguous foreground shell-script wrong-old-binding new-process; do
+  for mode in live ambiguous foreground shell-script fifo-stdin wrong-old-binding new-process; do
     dir=$(new_case "cwd-$mode" rcwd); cwd_case "$dir" "$mode"
-    out=$(cwd_control "$dir" --repair-cwd); rc=$?
+    if [ "$mode" = fifo-stdin ]; then
+      out=$(FM_FAKE_HERDR_LSOF_STDIN=fifo FM_FAKE_HERDR_FIFO="$dir/fake/shell-input" cwd_control "$dir" --repair-cwd); rc=$?
+    else
+      out=$(cwd_control "$dir" --repair-cwd); rc=$?
+    fi
     [ "$rc" -ne 0 ] || fail "unsafe $mode must refuse: $out"
     cwd_assert_preserved "$dir"
     case "$mode" in
