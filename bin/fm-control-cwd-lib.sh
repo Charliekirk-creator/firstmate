@@ -54,7 +54,7 @@ repair_refuse() {
   REPAIR_REFUSAL=$1
   if [ "$REPAIR_EVIDENCE_ACTIVE" = 1 ] && [ "$RELAUNCH_ACTIVE" = 0 ]; then
     REPAIR_STATE=refused
-    journal_write "failed:preflight" "${CHECKPOINT_LINES[@]}" "rollback=prior-binding-kept" || true
+    journal_write "failed:preflight" ${CHECKPOINT_LINES[@]+"${CHECKPOINT_LINES[@]}"} "rollback=prior-binding-kept" || true
   fi
   die "cwd repair of $ID refused: $1 (observed foreground_cwd=$(jq -cn --arg cwd "$REPAIR_SEEN" '$cwd'), recorded worktree='$WT', replacement-confirmed=$RELAUNCH_AGENT_CONFIRMED); no further launch authorized"
 }
@@ -134,16 +134,21 @@ repair_projection_check() {
   REPAIR_PROJECTION=pending
 }
 
-repair_preflight() {
-  local focus path
-  [ "$BACKEND" = herdr ] || repair_refuse "--repair-cwd supports Herdr only"
-  case "$KIND" in ship|scout) ;; *) repair_refuse "--repair-cwd supports ship/scout tasks only" ;; esac
+repair_begin() {
   REPAIR_SESSION=$(fm_meta_get "$META" herdr_session)
   REPAIR_WORKSPACE=$(fm_meta_get "$META" herdr_workspace_id)
   REPAIR_TAB=$(fm_meta_get "$META" herdr_tab_id)
   REPAIR_OLD_PANE=$(fm_meta_get "$META" herdr_pane_id)
+  # The recorded path is already in worktree=; repair_target stays empty until
+  # project validation resolves it. Do not claim a successful checkpoint yet.
   REPAIR_EVIDENCE_ACTIVE=1
-  journal_write preflight "${CHECKPOINT_LINES[@]}" || die "could not persist cwd repair preflight evidence"
+  journal_write preflight || die "could not persist cwd repair preflight evidence"
+  [ "$BACKEND" = herdr ] || repair_refuse "--repair-cwd supports Herdr only"
+  case "$KIND" in ship|scout) ;; *) repair_refuse "--repair-cwd supports ship/scout tasks only" ;; esac
+}
+
+repair_preflight() {
+  local focus path
   fm_backend_source herdr || repair_refuse "Herdr adapter unavailable"
   REPAIR_SESSION_LOCK=$(fm_backend_herdr_presentation_session_lock_path "$REPAIR_SESSION") || repair_refuse "session lock unavailable"
   fm_lock_try_acquire "$REPAIR_SESSION_LOCK" || repair_refuse "another session layout operation is active"

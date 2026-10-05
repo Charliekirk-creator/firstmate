@@ -72,10 +72,14 @@
 # unadopted sibling and restores instructions. After publication, failure keeps
 # the accurate new binding and progress note, never reverting to the wrong
 # pane. The transaction records source/target paths, both panes, publication,
-# presentation, and cleanup outcomes. An unresolved earlier repair refuses a
-# new attempt rather than losing its evidence or allocating another sibling.
+# presentation, and cleanup outcomes. Explicit repair records checkpoint and
+# preflight refusals before changing instructions or allocating a pane.
+# Every relaunch preserves unresolved earlier repair evidence by refusing a
+# new attempt. Only an explicit repair may retry a proven pre-allocation,
+# pre-publication refusal with the prior binding retained and no new pane.
 # No caller path, command, generic rebind, worktree allocation, or discard is
-# accepted. With this option absent, ordinary relaunch is unchanged.
+# accepted. With this option absent and no unresolved repair, ordinary
+# relaunch is unchanged.
 #
 # Teardown and discard are NOT verbs here and never will be. `exit` stops an
 # agent and preserves everything else; removing a worktree, killing an
@@ -738,6 +742,13 @@ resolve_relaunch_profile() {
   fi
 }
 
+checkpoint_refuse() {
+  # An explicit repair owns refusal evidence even before its worktree can be
+  # inspected. Ordinary relaunch keeps its original refusal behavior.
+  [ "$REPAIR_CWD" = 0 ] || repair_refuse "$1"
+  die "$1"
+}
+
 # safe_checkpoint: prove, before anything is stopped, that the work a relaunch
 # must preserve is actually there and recoverable afterwards. Fills
 # CHECKPOINT_LINES with the journal lines describing what it proved, and
@@ -746,30 +757,30 @@ CHECKPOINT_LINES=()
 safe_checkpoint() {
   local wt_real wt_top wt_top_real head head_ref head_ref_status status_output dirty children marker child_meta
   CHECKPOINT_LINES=()
-  [ -n "$WT" ] || die "task $ID has no recorded worktree; refusing to relaunch without a recorded local copy to preserve"
-  [ -d "$WT" ] || die "task $ID's recorded worktree $WT is missing; refusing to relaunch and lose track of its work"
-  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || die "task $ID's recorded worktree $WT cannot be resolved"
+  [ -n "$WT" ] || checkpoint_refuse "task $ID has no recorded worktree; refusing to relaunch without a recorded local copy to preserve"
+  [ -d "$WT" ] || checkpoint_refuse "task $ID's recorded worktree $WT is missing; refusing to relaunch and lose track of its work"
+  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || checkpoint_refuse "task $ID's recorded worktree $WT cannot be resolved"
   wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null) \
-    || die "task $ID's recorded worktree $WT is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
+    || checkpoint_refuse "task $ID's recorded worktree $WT is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
   wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P) || wt_top_real=$wt_top
   [ "$wt_real" = "$wt_top_real" ] \
-    || die "task $ID's recorded worktree $WT is not a worktree root (root is $wt_top); refusing to relaunch against an ambiguous checkout"
+    || checkpoint_refuse "task $ID's recorded worktree $WT is not a worktree root (root is $wt_top); refusing to relaunch against an ambiguous checkout"
   if head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null); then
     :
   elif head_ref=$(git -C "$WT" symbolic-ref -q HEAD 2>/dev/null); then
     if git -C "$WT" show-ref --verify --quiet "$head_ref" 2>/dev/null; then
-      die "task $ID's worktree HEAD exists but cannot be resolved; refusing to relaunch from an unreadable checkout"
+      checkpoint_refuse "task $ID's worktree HEAD exists but cannot be resolved; refusing to relaunch from an unreadable checkout"
     else
       head_ref_status=$?
       [ "$head_ref_status" -eq 1 ] \
-        || die "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+        || checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
       head=unborn
     fi
   else
-    die "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+    checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
   fi
   status_output=$(git -C "$WT" status --porcelain 2>/dev/null) \
-    || die "task $ID's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
+    || checkpoint_refuse "task $ID's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
   if [ -n "$status_output" ]; then
     dirty=yes
   else
@@ -868,6 +879,7 @@ do_relaunch() {
     note_line="note=none"
   fi
   relaunch_guard_prior_repair
+  [ "$REPAIR_CWD" = 0 ] || repair_begin
   safe_checkpoint
   [ "$REPAIR_CWD" = 0 ] || repair_preflight
   cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"

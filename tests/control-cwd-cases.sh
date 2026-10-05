@@ -15,6 +15,7 @@ meta.write_text(s)
 (p/'fake/herdr-state').write_text(json.dumps({'mode':sys.argv[2], 'primary':str(p/'proj'), 'target':str((p/'wt').resolve()), 'panes':{'w1:p1':{'cwd':str(p/'proj')}}}))
 (p/'fake/home-state').symlink_to(p/'home/state')
 PY
+  : > "$dir/fake/herdr-log"
   cp "$ROOT/tests/control-cwd-herdr.py" "$dir/fakebin/herdr"
   chmod +x "$dir/fakebin/herdr"
   cat > "$dir/fakebin/ps-herdr" <<'SH'
@@ -195,6 +196,98 @@ PY
     esac
   done
   pass "cwd repair: live, ambiguous, foreign, primary, missing, non-root, active and conflicting endpoints refuse"
+}
+
+test_cwd_repair_checkpoint_refusals() {
+  local mode dir out rc target expected head branch real_git worktree_top
+  real_git=$(command -v git)
+  for mode in missing nonroot invalid unreadable head status primary; do
+    if [ "$mode" = unreadable ] && [ "$(id -u)" = 0 ]; then
+      pass "skipped: directory permission denial requires a non-root test user; Git read failures remain covered"
+      continue
+    fi
+    dir=$(new_case "cwd-checkpoint-$mode" rcwd); cwd_case "$dir"
+    cp "$dir/home/state/rcwd.meta" "$dir/valid-meta"
+    printf 'unlanded progress\n' > "$dir/wt/progress"
+    git -C "$dir/wt" add progress
+    git -C "$dir/wt" commit -qm 'preserved checkpoint progress'
+    head=$(git -C "$dir/wt" rev-parse HEAD)
+    branch=$(git -C "$dir/wt" symbolic-ref HEAD)
+    worktree_top=$(git -C "$dir/wt" rev-parse --show-toplevel)
+    printf 'dirty progress\n' >> "$dir/wt/progress"
+    printf 'untracked progress\n' > "$dir/wt/scratch"
+    cp "$dir/wt/progress" "$dir/progress-before"
+    cp "$dir/wt/scratch" "$dir/scratch-before"
+    cp "$dir/fake/herdr-state" "$dir/herdr-before"
+    target="$dir/wt"
+    case "$mode" in
+      missing)
+        mv "$dir/wt" "$dir/held-wt"
+        expected="task rcwd's recorded worktree $target is missing; refusing to relaunch and lose track of its work"
+        ;;
+      nonroot)
+        mkdir "$dir/wt/sub"
+        target="$dir/wt/sub"
+        expected="task rcwd's recorded worktree $target is not a worktree root (root is $worktree_top); refusing to relaunch against an ambiguous checkout"
+        ;;
+      invalid)
+        mv "$dir/wt/.git" "$dir/held-git"
+        expected="task rcwd's recorded worktree $target is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
+        ;;
+      unreadable)
+        chmod 000 "$dir/wt"
+        expected="task rcwd's recorded worktree $target cannot be resolved"
+        ;;
+      head)
+        make_git_failure_stub "$dir"
+        expected="task rcwd's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+        ;;
+      status)
+        make_git_failure_stub "$dir"
+        expected="task rcwd's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
+        ;;
+      primary)
+        target="$dir/proj"
+        expected='recorded worktree is the primary project copy'
+        ;;
+    esac
+    python3 - "$dir/home/state/rcwd.meta" "$target" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+p.write_text('\n'.join('worktree=' + sys.argv[2] if x.startswith('worktree=') else x
+                       for x in p.read_text().splitlines()) + '\n')
+PY
+    cp "$dir/home/state/rcwd.meta" "$dir/meta-before"
+    out=$(FM_REAL_GIT="$real_git" FM_FAKE_GIT_FAILURE="$mode" cwd_control "$dir" --repair-cwd); rc=$?
+    # Restore only fixture filesystem perturbations before assertions/cleanup.
+    case "$mode" in
+      missing) mv "$dir/held-wt" "$dir/wt" ;;
+      invalid) mv "$dir/held-git" "$dir/wt/.git" ;;
+      unreadable) chmod 755 "$dir/wt" ;;
+    esac
+    expect_code 1 "$rc" "$mode checkpoint must refuse"$'\n'"$out"
+    assert_contains "$out" "$expected" "$mode checkpoint must name the exact failure"
+    cwd_assert_preserved "$dir"
+    cwd_assert_preflight_evidence "$dir" "$expected"
+    [ "$(journal_field "$dir" rcwd worktree)" = "$target" ] || fail "$mode lost the recorded path"
+    [ "$(journal_field "$dir" rcwd repair_new_pane)" = '' ] || fail "$mode claimed a new pane"
+    [ "$(journal_field "$dir" rcwd repair_published)" = 0 ] || fail "$mode claimed publication"
+    [ "$(journal_field "$dir" rcwd repair_publication_attempted)" = 0 ] || fail "$mode attempted publication"
+    cmp -s "$dir/herdr-before" "$dir/fake/herdr-state" || fail "$mode mutated the endpoint"
+    if grep -q '"split"' "$dir/fake/herdr-log"; then fail "$mode allocated a pane"; fi
+    [ "$(git -C "$dir/wt" rev-parse HEAD)" = "$head" ] || fail "$mode changed unlanded commits"
+    [ "$(git -C "$dir/wt" symbolic-ref HEAD)" = "$branch" ] || fail "$mode changed the branch"
+    cmp -s "$dir/progress-before" "$dir/wt/progress" || fail "$mode changed dirty work"
+    cmp -s "$dir/scratch-before" "$dir/wt/scratch" || fail "$mode changed untracked work"
+    cwd_assert_ordinary_relaunch_preserves_repair "$dir"
+    # Restore the recorded path and drop only the injected read failure.
+    cp "$dir/valid-meta" "$dir/home/state/rcwd.meta"
+    out=$(FM_REAL_GIT="$real_git" cwd_control "$dir" --repair-cwd); rc=$?
+    expect_code 0 "$rc" "$mode corrected explicit repair must remain retryable"$'\n'"$out"
+    [ "$(journal_field "$dir" rcwd repair_state)" = complete ] || fail "$mode retry did not complete"
+  done
+  pass "cwd repair: checkpoint refusals persist exact evidence, preserve all work, and permit corrected explicit retry"
 }
 
 test_cwd_repair_retries_resolved_preflight_refusal() {
@@ -396,6 +489,7 @@ SH
 test_cwd_repair_success_and_preservation
 test_cwd_repair_publication_and_concurrency
 test_cwd_repair_refusals
+test_cwd_repair_checkpoint_refusals
 test_cwd_repair_retries_resolved_preflight_refusal
 test_cwd_repair_rollback_and_guard
 test_cwd_repair_opt_in_and_path_bytes
