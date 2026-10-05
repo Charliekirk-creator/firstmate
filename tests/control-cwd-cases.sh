@@ -342,6 +342,48 @@ PY
   pass "cwd repair: resolved preflight refusal can be retried safely"
 }
 
+test_cwd_repair_preallocation_refusals() {
+  local mode dir out rc expected
+  for mode in note brief harness; do
+    dir=$(new_case "cwd-preallocation-$mode" rcwd); cwd_case "$dir"
+    cp "$dir/fake/herdr-state" "$dir/herdr-before"
+    case "$mode" in
+      note)
+        expected='relaunch of a ship task requires --note (or --note-file): the replacement worker inherits the local copy but none of the conversation, so it must be told what happened'
+        out=$(FM_HERDR_PS_BIN="$dir/fakebin/ps-herdr" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+          run_control "$dir" rcwd relaunch --repair-cwd); rc=$?
+        ;;
+      brief)
+        mv "$dir/home/data/rcwd/brief.md" "$dir/held-brief"
+        expected="task rcwd has no instructions at $dir/home/data/rcwd/brief.md; refusing to relaunch a worker with nothing to work from"
+        out=$(cwd_control "$dir" --repair-cwd); rc=$?
+        ;;
+      harness)
+        expected="'unverified-repair-harness' is not a verified harness; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
+        out=$(cwd_control "$dir" --repair-cwd --harness unverified-repair-harness); rc=$?
+        ;;
+    esac
+    [ "$rc" -ne 0 ] || fail "$mode pre-allocation failure must refuse: $out"
+    assert_contains "$out" "$expected" "$mode refusal did not name the exact failure"
+    cwd_assert_preflight_evidence "$dir" "$expected"
+    cmp -s "$dir/meta-before" "$dir/home/state/rcwd.meta" || fail "$mode refusal changed metadata"
+    cmp -s "$dir/herdr-before" "$dir/fake/herdr-state" || fail "$mode refusal changed the endpoint"
+    [ "$(journal_field "$dir" rcwd repair_new_pane)" = '' ] || fail "$mode refusal claimed an allocation"
+    [ "$(journal_field "$dir" rcwd repair_published)" = 0 ] || fail "$mode refusal claimed publication"
+    if grep -q '"split"' "$dir/fake/herdr-log"; then fail "$mode refusal allocated a pane"; fi
+    if [ "$mode" = brief ]; then
+      [ ! -e "$dir/home/data/rcwd/brief.md" ] || fail "missing brief refusal created instructions"
+      mv "$dir/held-brief" "$dir/home/data/rcwd/brief.md"
+    else
+      cmp -s "$dir/brief-before" "$dir/home/data/rcwd/brief.md" || fail "$mode refusal changed instructions"
+    fi
+    out=$(cwd_control "$dir" --repair-cwd); rc=$?
+    expect_code 0 "$rc" "$mode corrected explicit repair must remain retryable"$'\n'"$out"
+    [ "$(journal_field "$dir" rcwd repair_state)" = complete ] || fail "$mode retry did not complete"
+  done
+  pass "cwd repair: pre-allocation refusals persist exact retryable evidence"
+}
+
 test_cwd_repair_rollback_and_guard() {
   local mode dir out rc
   for mode in wrong-cwd nonconsecutive read-fail control-cwd wrong-new-binding bad-split split-fail new-live new-process old-agent-race rollback-close-fail; do
@@ -523,5 +565,6 @@ test_cwd_repair_publication_and_concurrency
 test_cwd_repair_refusals
 test_cwd_repair_checkpoint_refusals
 test_cwd_repair_retries_resolved_preflight_refusal
+test_cwd_repair_preallocation_refusals
 test_cwd_repair_rollback_and_guard
 test_cwd_repair_opt_in_and_path_bytes

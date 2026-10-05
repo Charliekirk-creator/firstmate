@@ -170,7 +170,7 @@ repair_begin() {
   else
     REPAIR_SOURCE_STATUS=unconfirmed
   fi
-  journal_write preflight || die "could not persist cwd repair path evidence"
+  journal_write preflight || repair_refuse "could not persist cwd repair path evidence"
 }
 
 repair_preflight() {

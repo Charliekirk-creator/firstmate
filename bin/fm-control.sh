@@ -378,9 +378,16 @@ wait_agent_state() {  # <timeout> <wanted>...
   return 1
 }
 
+relaunch_preflight_refuse() {
+  if [ "$REPAIR_CWD" = 1 ] && [ "${REPAIR_EVIDENCE_ACTIVE:-0}" = 1 ]; then
+    repair_refuse "$1"
+  fi
+  die "$1"
+}
+
 require_state_verified_backend() {  # <verb>
   fm_control_backend_state_verified "$BACKEND" && return 0
-  die "task $ID runs on the $BACKEND backend, which has no recovery-grade agent-state classifier, so '$1' cannot prove the agent actually stopped; refusing rather than reporting an unproven transition as done"
+  relaunch_preflight_refuse "task $ID runs on the $BACKEND backend, which has no recovery-grade agent-state classifier, so '$1' cannot prove the agent actually stopped; refusing rather than reporting an unproven transition as done"
 }
 
 # send_interrupt_keys: deliver the harness's interrupt key the verified number
@@ -677,7 +684,7 @@ resolve_relaunch_profile() {
   [ -n "$PRIOR_EFFORT" ] || PRIOR_EFFORT=default
   if [ "$HARNESS_SET" = 0 ] \
      && [ "$PRIOR_RECORDED_HARNESS" != "$PRIOR_HARNESS" ]; then
-    die "task $ID records harness '$PRIOR_RECORDED_HARNESS', whose original launch command cannot be reconstructed from its recorded basename; relaunching without --harness would substitute the canonical adapter '$PRIOR_HARNESS' for the command actually running. Pass an explicit --harness to choose the replacement runtime deliberately"
+    relaunch_preflight_refuse "task $ID records harness '$PRIOR_RECORDED_HARNESS', whose original launch command cannot be reconstructed from its recorded basename; relaunching without --harness would substitute the canonical adapter '$PRIOR_HARNESS' for the command actually running. Pass an explicit --harness to choose the replacement runtime deliberately"
   fi
   CONFIG_HARNESS=
   CONFIG_MODEL=
@@ -703,11 +710,11 @@ resolve_relaunch_profile() {
   fi
   if [ "$HARNESS_SET" = 1 ]; then
     fm_control_harness_supported "$NEW_HARNESS" \
-      || die "'$NEW_HARNESS' is not a verified harness; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
+      || relaunch_preflight_refuse "'$NEW_HARNESS' is not a verified harness; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
     TARGET_HARNESS=$NEW_HARNESS
   elif [ "$HARNESS_SET" = 0 ] && [ -n "$CONFIG_HARNESS" ]; then
     fm_control_harness_supported "$CONFIG_HARNESS" \
-      || die "the configured secondmate harness '$CONFIG_HARNESS' is not verified; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
+      || relaunch_preflight_refuse "the configured secondmate harness '$CONFIG_HARNESS' is not verified; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
     TARGET_HARNESS=$CONFIG_HARNESS
   else
     TARGET_HARNESS=$PRIOR_HARNESS
@@ -717,7 +724,7 @@ resolve_relaunch_profile() {
   # capability table here keeps that refusal on the pre-stop side of the
   # transaction, where nothing has changed yet.
   fm_control_harness_supports_kind "$TARGET_HARNESS" "$KIND" \
-    || die "'$TARGET_HARNESS' is not verified to run a $KIND task, so relaunching $ID onto it would stop the running agent for a launch that must be refused; choose an adapter verified for this kind"
+    || relaunch_preflight_refuse "'$TARGET_HARNESS' is not verified to run a $KIND task, so relaunching $ID onto it would stop the running agent for a launch that must be refused; choose an adapter verified for this kind"
   # A model or effort chosen for the previous harness does not transfer to a
   # different one, so an explicit harness change resets both axes unless the
   # caller names them too.
@@ -742,10 +749,7 @@ resolve_relaunch_profile() {
 }
 
 checkpoint_refuse() {
-  # An explicit repair owns refusal evidence even before its worktree can be
-  # inspected. Ordinary relaunch keeps its original refusal behavior.
-  [ "$REPAIR_CWD" = 0 ] || repair_refuse "$1"
-  die "$1"
+  relaunch_preflight_refuse "$1"
 }
 
 # safe_checkpoint: prove, before anything is stopped, that the work a relaunch
@@ -884,9 +888,9 @@ do_relaunch() {
     ship|scout)
       RELAUNCH_BRIEF="$DATA/$ID/brief.md"
       [ -f "$RELAUNCH_BRIEF" ] \
-        || die "task $ID has no instructions at $RELAUNCH_BRIEF; refusing to relaunch a worker with nothing to work from"
+        || relaunch_preflight_refuse "task $ID has no instructions at $RELAUNCH_BRIEF; refusing to relaunch a worker with nothing to work from"
       [ "$NOTE_SET" = 1 ] && [ -n "$NOTE" ] \
-        || die "relaunch of a $KIND task requires --note (or --note-file): the replacement worker inherits the local copy but none of the conversation, so it must be told what happened"
+        || relaunch_preflight_refuse "relaunch of a $KIND task requires --note (or --note-file): the replacement worker inherits the local copy but none of the conversation, so it must be told what happened"
       ;;
     secondmate)
       # The charter in the secondmate's own home is its instruction source and
@@ -894,7 +898,7 @@ do_relaunch() {
       RELAUNCH_BRIEF=
       ;;
     *)
-      die "task $ID records kind '$KIND', which has no defined relaunch shape"
+      relaunch_preflight_refuse "task $ID records kind '$KIND', which has no defined relaunch shape"
       ;;
   esac
 
@@ -905,9 +909,14 @@ do_relaunch() {
   fi
   safe_checkpoint
   [ "$REPAIR_CWD" = 0 ] || repair_preflight
-  cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"
+  cp -p "$META" "$META_PRIOR" || relaunch_preflight_refuse "could not preserve task $ID's durable record before relaunching"
   RELAUNCH_ACTIVE=1
-  journal_write checkpoint "${CHECKPOINT_LINES[@]}" "$note_line"
+  if ! journal_write checkpoint "${CHECKPOINT_LINES[@]}" "$note_line"; then
+    if [ "$REPAIR_CWD" = 1 ]; then
+      RELAUNCH_ACTIVE=0
+      repair_refuse "could not persist relaunch checkpoint evidence"
+    fi
+  fi
 
   record_note
   journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"
