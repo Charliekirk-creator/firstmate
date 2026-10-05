@@ -184,6 +184,30 @@ PY
   pass "cwd repair: live, ambiguous, foreign, primary, missing, non-root, active and conflicting endpoints refuse"
 }
 
+test_cwd_repair_retries_resolved_preflight_refusal() {
+  local dir out rc
+  dir=$(new_case cwd-refusal-retry rcwd); cwd_case "$dir"
+  python3 - "$dir/fake/herdr-state" <<'PY'
+import json,sys
+p=sys.argv[1]; s=json.load(open(p)); s['focus']='w1:t1'
+open(p,'w').write(json.dumps(s))
+PY
+  out=$(cwd_control "$dir" --repair-cwd); rc=$?
+  [ "$rc" -ne 0 ] || fail "active tab must refuse before retry: $out"
+  cwd_assert_preserved "$dir"
+  cwd_assert_preflight_evidence "$dir" 'task tab is active; focus another tab before repair'
+  python3 - "$dir/fake/herdr-state" <<'PY'
+import json,sys
+p=sys.argv[1]; s=json.load(open(p)); s['focus']='w0:t1'
+open(p,'w').write(json.dumps(s))
+PY
+  out=$(cwd_control "$dir" --repair-cwd); rc=$?
+  expect_code 0 "$rc" "resolved preflight refusal should be retryable"$'\n'"$out"
+  [ "$(meta_field "$dir" rcwd window)" = fm-lab-control:w1:p2 ] || fail "retry did not adopt the replacement pane"
+  [ "$(journal_field "$dir" rcwd repair_state)" = complete ] || fail "retry did not complete its repair journal"
+  pass "cwd repair: resolved preflight refusal can be retried safely"
+}
+
 test_cwd_repair_rollback_and_guard() {
   local mode dir out rc
   for mode in wrong-cwd nonconsecutive read-fail wrong-new-binding bad-split split-fail new-live new-process old-agent-race rollback-close-fail; do
@@ -258,10 +282,10 @@ PY
 }
 
 test_cwd_repair_publication_and_concurrency() {
-  local dir out rc mode control_pid writer_pid i
-  for mode in metadata post-rename presentation; do
+  local dir out rc mode control_pid writer_pid i expected
+  for mode in metadata post-rename presentation-old presentation-new presentation-unconfirmed; do
     dir=$(new_case "cwd-publish-$mode" rcwd); cwd_case "$dir"
-    [ "$mode" != presentation ] || cwd_projection "$dir"
+    case "$mode" in presentation-*) cwd_projection "$dir" ;; esac
     make_mv_failure_stub "$dir"
     if [ "$mode" = metadata ]; then
       out=$(FM_REAL_MV="$(command -v mv)" FM_FAKE_META_PUBLISH_MV_FAIL="$dir/home/state/rcwd.meta" cwd_control "$dir" --repair-cwd); rc=$?
@@ -285,14 +309,45 @@ SH
       cwd_assert_no_launch "$dir"
       if grep -q '"close"' "$dir/fake/herdr-log"; then fail "post-rename failure closed a published endpoint"; fi
     else
-      out=$(FM_REAL_MV="$(command -v mv)" FM_FAKE_META_PUBLISH_MV_FAIL="$dir/home/state/rcwd.herdr-presentation" cwd_control "$dir" --repair-cwd); rc=$?
-      [ "$rc" -ne 0 ] || fail "presentation publish must refuse"
-      [ "$(meta_field "$dir" rcwd window)" = fm-lab-control:w1:p2 ] || fail "presentation failure reverted accurate new binding"
-      [ "$(journal_field "$dir" rcwd repair_projection)" = pending ] || fail "presentation failure lost pending binding evidence"
+      case "$mode" in
+        presentation-old)
+          expected=pending
+          out=$(FM_REAL_MV="$(command -v mv)" FM_FAKE_META_PUBLISH_MV_FAIL="$dir/home/state/rcwd.herdr-presentation" cwd_control "$dir" --repair-cwd); rc=$?
+          ;;
+        presentation-new)
+          expected=rebound
+          cat > "$dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+"$FM_REAL_MV" "$@" || exit $?
+for path in "$@"; do
+  case "$path" in */rcwd.herdr-presentation) exit 1 ;; esac
+done
+SH
+          chmod +x "$dir/fakebin/mv"
+          out=$(FM_REAL_MV="$(command -v mv)" cwd_control "$dir" --repair-cwd); rc=$?
+          ;;
+        presentation-unconfirmed)
+          expected=unconfirmed
+          cat > "$dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+"$FM_REAL_MV" "$@" || exit $?
+for path in "$@"; do
+  case "$path" in
+    */rcwd.herdr-presentation) printf 'indeterminate\n' > "$path"; exit 1 ;;
+  esac
+done
+SH
+          chmod +x "$dir/fakebin/mv"
+          out=$(FM_REAL_MV="$(command -v mv)" cwd_control "$dir" --repair-cwd); rc=$?
+          ;;
+      esac
+      [ "$rc" -ne 0 ] || fail "$mode presentation publish must refuse"
+      [ "$(meta_field "$dir" rcwd window)" = fm-lab-control:w1:p2 ] || fail "$mode reverted accurate new binding"
+      [ "$(journal_field "$dir" rcwd repair_projection)" = "$expected" ] || fail "$mode lost exact durable presentation evidence"
       cwd_assert_no_launch "$dir"
       out=$(cwd_control "$dir" --repair-cwd); rc=$?
-      [ "$rc" -ne 0 ] || fail "unresolved repair must refuse another allocation"
-      assert_contains "$out" 'earlier repair remains' "retry must retain partial transaction evidence"
+      [ "$rc" -ne 0 ] || fail "unresolved $mode repair must refuse another allocation"
+      assert_contains "$out" 'earlier repair remains' "$mode retry must retain partial transaction evidence"
     fi
   done
   dir=$(new_case cwd-concurrent rcwd); cwd_case "$dir" split-wait
@@ -324,5 +379,6 @@ SH
 test_cwd_repair_success_and_preservation
 test_cwd_repair_publication_and_concurrency
 test_cwd_repair_refusals
+test_cwd_repair_retries_resolved_preflight_refusal
 test_cwd_repair_rollback_and_guard
 test_cwd_repair_opt_in_and_path_bytes

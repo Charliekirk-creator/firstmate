@@ -103,6 +103,14 @@ repair_project_check() {
   [ "$common" = "$target_common" ] || repair_refuse "recorded worktree belongs to a conflicting project family"
 }
 
+repair_prior_refusal_retryable() {
+  [ "$(fm_meta_get "$JOURNAL" phase)" = failed:preflight ] \
+    && [ "$(fm_meta_get "$JOURNAL" rollback)" = prior-binding-kept ] \
+    && [ -z "$(fm_meta_get "$JOURNAL" repair_new_pane)" ] \
+    && [ "$(fm_meta_get "$JOURNAL" repair_published)" = 0 ] \
+    && [ "$(fm_meta_get "$JOURNAL" repair_publication_attempted)" = 0 ]
+}
+
 repair_projection_check() {
   local journal="$STATE/$ID.herdr-presentation" home
   [ -e "$journal" ] || [ -L "$journal" ] || return 0
@@ -131,6 +139,8 @@ repair_preflight() {
     prior=$(fm_meta_get "$JOURNAL" repair_state)
     case "$prior" in
       ''|prepared|rolled-back|complete) ;;
+      refused) repair_prior_refusal_retryable \
+        || repair_refuse "an earlier repair remains $prior in $JOURNAL; reconcile its recorded panes before another attempt" ;;
       *) repair_refuse "an earlier repair remains $prior in $JOURNAL; reconcile its recorded panes before another attempt" ;;
     esac
   fi
@@ -198,6 +208,27 @@ repair_observe_publication() {
     esac
   fi
   REPAIR_STATE=publication-unconfirmed
+  return 1
+}
+
+repair_observe_projection() {
+  local journal="$STATE/$ID.herdr-presentation" home
+  home=$(CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) || {
+    REPAIR_PROJECTION=unconfirmed
+    return 1
+  }
+  if fm_backend_herdr_projection_journal_snapshot "$journal" "$ID" \
+      && [ "$FM_BACKEND_HERDR_JOURNAL_VERSION" = 2 ] \
+      && [ "$FM_BACKEND_HERDR_JOURNAL_HOME" = "$home" ] \
+      && [ "$FM_BACKEND_HERDR_JOURNAL_SESSION" = "$REPAIR_SESSION" ] \
+      && [ "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" = "$REPAIR_WORKSPACE" ] \
+      && [ "$FM_BACKEND_HERDR_JOURNAL_TAB_ID" = "$REPAIR_TAB" ]; then
+    case "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" in
+      "$REPAIR_OLD_PANE") REPAIR_PROJECTION=pending; return 0 ;;
+      "$REPAIR_NEW_PANE") REPAIR_PROJECTION=rebound; return 0 ;;
+    esac
+  fi
+  REPAIR_PROJECTION=unconfirmed
   return 1
 }
 
@@ -275,9 +306,11 @@ repair_replace() {
   [ "$REPAIR_PUBLISHED" = 1 ] || repair_refuse "endpoint publication did not adopt the replacement"
   journal_write repaired "${CHECKPOINT_LINES[@]}"
   if [ "$REPAIR_PROJECTION" = pending ]; then
-    fm_backend_herdr_projection_journal_replace_endpoint "$STATE/$ID.herdr-presentation" "$ID" \
-      "$REPAIR_TAB" "$REPAIR_OLD_PANE" "$REPAIR_TAB" "$REPAIR_NEW_PANE" \
-      || repair_refuse "new task binding published but presentation binding could not be advanced"
+    if ! fm_backend_herdr_projection_journal_replace_endpoint "$STATE/$ID.herdr-presentation" "$ID" \
+        "$REPAIR_TAB" "$REPAIR_OLD_PANE" "$REPAIR_TAB" "$REPAIR_NEW_PANE"; then
+      repair_observe_projection || true
+      repair_refuse "new task binding published but presentation binding could not be advanced"
+    fi
     REPAIR_PROJECTION=rebound
     journal_write repaired "${CHECKPOINT_LINES[@]}"
   fi
