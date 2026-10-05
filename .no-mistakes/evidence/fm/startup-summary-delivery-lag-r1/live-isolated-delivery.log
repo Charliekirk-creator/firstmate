@@ -1,0 +1,10 @@
+LIVE ISOLATED FIRSTMATE CLI EXERCISE
+fixture_population: registered_secondmates=13 metadata_records=53 status_lines=5300
+home_summary_elapsed_seconds: 9
+home_summary_counts: {"endpoints":53,"decisions_open":53}
+delivery_elapsed_seconds: 15
+presented_update: wake annotation: latest wake-EVENT observed at drain, not current state: mate-00.status: note: newly generated live-delivery-58255-1791189979
+presented_queue_row: 1791189979	1	signal	mate-00.status	signal: mate-00.status
+ack_contract: seq=1 generation=78564.1791189979.B5Xsxs
+post_ack_owner_queue_empty: yes
+sibling_queue_unchanged: yes

@@ -1,0 +1,55 @@
+## tests/fm-classify-corr-token.test.sh
+ok - a correlation token between the verb and the key breaks neither opening nor closing
+ok - the token is read through before the key, after it, doubled, bracketed, and unkeyed
+ok - the untokened opener/closer pair behaves exactly as before
+ok - prose, malformed, wrong-length and unknown name=value tokens stay non-transitions
+ok - a token-first line cannot impersonate any opening or closing verb
+ok - untokened captain-relevance, pause, terminal-verb and captain-held verdicts are unchanged
+ok - captain-relevance, terminal-verb, pause and captain-held all read through the token
+ok - the daemon and crew-state verb case arms read through the token
+ok - reading through the token does not weaken the reserved-key namespace rule
+ok - the cursor-backed fold and the whole-file fold agree on every correlated transition
+ok - a cursor persisted under the previous reading is discarded and refolded
+ok - both real correlation-token writers produce lines this classifier reads through
+## tests/fm-classify-decision-key.test.sh
+ok - a stated [key=X] opens X whether it precedes or follows the verb colon
+ok - a keyless needs-decision still opens and closes the default key
+ok - a resolution closes its decision regardless of either line's key position
+ok - blocked [key=X] opens X in both key positions
+ok - two colon-form keyed decisions never collapse into one shared bucket
+ok - a [key=x] mentioned mid-note is prose, never an opened or closed key
+ok - a malformed stated key is rejected in both positions, never folded as default
+ok - status_line_verb strips every bracket tag before the colon, in any order, and recovers the bare verb
+ok - a [corr=...] tag ahead of [key=...] no longer swallows the verb: opens and closes under the stated key
+ok - a [corr=...] tag with no stated key opens under 'default', exactly like a bare needs-decision line
+ok - a [key=x] tag alone (no corr tag) still opens x - no regression from the tag-stripping fix
+ok - blocked/resolved parse their bare verb with any bracket-tag order preceding the colon
+ok - the incremental fold matches the full fold across appends in both key positions
+ok - status_key_closing_verb separates resolution, durable transfer, and still-open
+ok - status_key_closing_verb reports the last real transition, in either key position
+## tests/fm-wake-drain-open-decisions-cursor.test.sh
+ok - a truncated/rewritten log falls back to a full re-fold instead of dropping or misreading the decision
+ok - a same-size file rotation (new inode) is detected and falls back to a full re-fold
+ok - a failed presentation read preserves status state for retry
+ok - a cursor-cache read failure refolds decisions without replaying handled unread status
+ok - a pre-fix cursor is rebuilt so a previously skipped corr-tagged decision surfaces
+ok - an old fold cache is rebuilt once before same-version incremental reads resume
+ok - a buried decision survives many growing drains with bounded read cost, and resolution durably clears it at bounded cost too
+## tests/fm-wake-drain-unread-status.test.sh
+ok - a note: answer buried under a later routine note: is surfaced with both lines
+ok - already-presented note: lines are not re-surfaced on the next drain
+ok - a brand-new note: after presentation is surfaced without replaying handled lines
+ok - a queued status signal annotates every unread note, not only the newest
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 1 --recovery-generation 8307.1791190077.wgmf4I
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 1 --recovery-generation 8307.1791190077.wgmf4I
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 1 --recovery-generation 8307.1791190077.wgmf4I
+ok - a pending-reply resolution buried under a later note surfaces once and closes OPEN DECISIONS
+ok - unread status over the former byte cap preserves every line
+ok - presentation cursor advances only through its captured endpoint
+ok - a reused task id starts its replacement status log unread at byte zero
+ok - fallback identity still presents and advances status state
+ok - snapshot failures are reported visibly
+ok - OPEN DECISIONS still folds needs-decision/blocked independently of unread notes
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 1 --recovery-generation 21103.1791190083.x01A72
+ok - an empty-queue drain preserves routine status for a later signal annotation
+ok - routine working/done lines still print nothing on an empty-queue drain
