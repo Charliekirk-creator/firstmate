@@ -2936,19 +2936,26 @@ test_current_path_reads_cwd() {
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_current_path default:w1:p2' "$ROOT" )
   [ "$out" = "/tmp/fake-worktree" ] || fail "current_path should read foreground_cwd (the live process), not the frozen creation-time cwd, got '$out'"
   assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''get'$'\x1f''w1:p2' "current_path did not call pane get"
-  pass "fm_backend_herdr_current_path: reads pane foreground_cwd (the live running process), not the frozen creation-time cwd"
+
+  dir="$TMP_ROOT/cwd-control"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  jq -cn --arg cwd $'/tmp/fake-worktree\n' '{result:{pane:{foreground_cwd:$cwd}}}' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_current_path default:w1:p2' "$ROOT")
+  [ -z "$out" ] || fail "current_path accepted a control byte as path data: '$out'"
+  pass "fm_backend_herdr_current_path: reads live cwd and rejects control bytes"
 }
 
 test_cwd_repair_requires_exact_live_pane_evidence() {
   local dir log resp fb out rc variant
-  for variant in exact wrong-pane wrong-tab wrong-workspace missing-path; do
+  for variant in exact wrong-pane wrong-tab wrong-workspace missing-path control-path; do
     dir="$TMP_ROOT/repair-cwd-$variant"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
     jq -cn --arg variant "$variant" '{result: {type: "pane_info", pane: {
       pane_id: (if $variant == "wrong-pane" then "w1:p9" else "w1:p2" end),
       tab_id: (if $variant == "wrong-tab" then "w1:t9" else "w1:t1" end),
       workspace_id: (if $variant == "wrong-workspace" then "w9" else "w1" end),
       cwd: "/creation-path",
-      foreground_cwd: (if $variant == "missing-path" then null else "/live-path" end)
+      foreground_cwd: (if $variant == "missing-path" then null elif $variant == "control-path" then "/live-path\n" else "/live-path" end)
     }}}' > "$resp/1.out"
     fb=$(make_herdr_fakebin "$dir")
     out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \

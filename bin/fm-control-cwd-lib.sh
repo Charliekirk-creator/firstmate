@@ -65,8 +65,11 @@ repair_read_path() { # <pane>
   REPAIR_SEEN_PANE=$1
   out=$(fm_backend_herdr_cwd_repair_pane "$REPAIR_SESSION" "$REPAIR_WORKSPACE" "$REPAIR_TAB" "$1") \
     || return 1
-  REPAIR_SEEN=$(printf '%s' "$out" | jq -er '.foreground_cwd | select(type == "string" and startswith("/"))') || return 1
-  case "$REPAIR_SEEN" in *[[:cntrl:]]*) return 1 ;; esac
+  REPAIR_SEEN=$(printf '%s' "$out" | jq -er '
+    .foreground_cwd
+    | select(type == "string" and startswith("/"))
+    | select(all(explode[]; . >= 32 and . != 127))
+  ') || return 1
 }
 
 repair_shell_pid() { # <pane>

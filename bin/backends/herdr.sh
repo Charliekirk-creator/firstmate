@@ -2538,7 +2538,7 @@ fm_backend_herdr_target_ready() {  # <target>
 fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+    | jq -r '.result.pane.foreground_cwd // empty | strings | select(all(explode[]; . >= 32 and . != 127))' 2>/dev/null
 }
 
 # Exact, read-only pane evidence for fm-control's cwd repair transaction.
@@ -2553,6 +2553,7 @@ fm_backend_herdr_cwd_repair_pane() { # <session> <workspace> <tab> <pane>
     | .result.pane
     | select(.pane_id == $pane and .workspace_id == $ws and .tab_id == $tab)
     | select((.foreground_cwd | type) == "string")
+    | select(.foreground_cwd | all(explode[]; . >= 32 and . != 127))
   ' 2>/dev/null); then
     printf '%s\n' "$pane"
     return 0

@@ -210,7 +210,7 @@ PY
 
 test_cwd_repair_rollback_and_guard() {
   local mode dir out rc
-  for mode in wrong-cwd nonconsecutive read-fail wrong-new-binding bad-split split-fail new-live new-process old-agent-race rollback-close-fail; do
+  for mode in wrong-cwd nonconsecutive read-fail control-cwd wrong-new-binding bad-split split-fail new-live new-process old-agent-race rollback-close-fail; do
     dir=$(new_case "cwd-$mode" rcwd); cwd_case "$dir" "$mode"
     out=$(cwd_control "$dir" --repair-cwd); rc=$?
     [ "$rc" -ne 0 ] || fail "$mode must refuse: $out"

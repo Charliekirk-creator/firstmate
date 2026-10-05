@@ -69,6 +69,8 @@ elif args[:2] == ['pane', 'get']:
             p['foreground_cwd'] = s['target'] if s['reads'] % 3 == 1 else s['primary']
         if mode == 'read-fail':
             sys.exit(1)
+        if mode == 'control-cwd':
+            p['foreground_cwd'] = s['target'] + '\n'
         if mode == 'wrong-new-binding':
             p['tab_id'] = 'w1:t9'
         if mode == 'guard-race' and 'window=fm-lab-control:w1:p2\n' in (root / 'home-state' / 'rcwd.meta').read_text():
