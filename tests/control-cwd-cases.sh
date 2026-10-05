@@ -67,6 +67,19 @@ cwd_assert_preflight_evidence() {
   [ "$(journal_field "$dir" rcwd rollback)" = prior-binding-kept ] || fail "preflight preservation outcome was not journaled"
 }
 
+cwd_assert_ordinary_relaunch_preserves_repair() {
+  local dir=$1 out rc
+  cp "$dir/home/state/rcwd.control-relaunch" "$dir/journal-before-ordinary"
+  cp "$dir/home/state/rcwd.meta" "$dir/meta-before-ordinary"
+  cp "$dir/home/data/rcwd/brief.md" "$dir/brief-before-ordinary"
+  out=$(cwd_control "$dir"); rc=$?
+  [ "$rc" -ne 0 ] || fail "ordinary relaunch overwrote an unresolved cwd repair"
+  assert_contains "$out" 'earlier repair remains' "ordinary relaunch did not report unresolved cwd repair evidence"
+  cmp -s "$dir/journal-before-ordinary" "$dir/home/state/rcwd.control-relaunch" || fail "ordinary relaunch changed cwd repair evidence"
+  cmp -s "$dir/meta-before-ordinary" "$dir/home/state/rcwd.meta" || fail "ordinary relaunch changed metadata during unresolved repair"
+  cmp -s "$dir/brief-before-ordinary" "$dir/home/data/rcwd/brief.md" || fail "ordinary relaunch changed instructions during unresolved repair"
+}
+
 cwd_projection() {
   local dir=$1
   # Real projection writer API, not a second hand-written record format.
@@ -196,6 +209,7 @@ PY
   [ "$rc" -ne 0 ] || fail "active tab must refuse before retry: $out"
   cwd_assert_preserved "$dir"
   cwd_assert_preflight_evidence "$dir" 'task tab is active; focus another tab before repair'
+  cwd_assert_ordinary_relaunch_preserves_repair "$dir"
   python3 - "$dir/fake/herdr-state" <<'PY'
 import json,sys
 p=sys.argv[1]; s=json.load(open(p)); s['focus']='w0:t1'
@@ -215,6 +229,7 @@ test_cwd_repair_rollback_and_guard() {
     out=$(cwd_control "$dir" --repair-cwd); rc=$?
     [ "$rc" -ne 0 ] || fail "$mode must refuse: $out"
     cwd_assert_preserved "$dir"
+    [ "$mode" != split-fail ] || cwd_assert_ordinary_relaunch_preserves_repair "$dir"
     if [ "$mode" = wrong-cwd ] || [ "$mode" = nonconsecutive ]; then
       assert_contains "$out" 'two consecutive' "$mode must fail directory verification"
       [ "$(journal_field "$dir" rcwd rollback)" = unadopted-pane-removed ] || fail "unadopted pane not rolled back"
@@ -307,6 +322,7 @@ SH
       [ "$(journal_field "$dir" rcwd repair_published)" = 1 ] || fail "journal failed to observe actual publication"
       [ "$(journal_field "$dir" rcwd rollback)" = new-binding-kept ] || fail "adopted pane was rolled back after rename"
       cwd_assert_no_launch "$dir"
+      cwd_assert_ordinary_relaunch_preserves_repair "$dir"
       if grep -q '"close"' "$dir/fake/herdr-log"; then fail "post-rename failure closed a published endpoint"; fi
     else
       case "$mode" in
@@ -345,6 +361,7 @@ SH
       [ "$(meta_field "$dir" rcwd window)" = fm-lab-control:w1:p2 ] || fail "$mode reverted accurate new binding"
       [ "$(journal_field "$dir" rcwd repair_projection)" = "$expected" ] || fail "$mode lost exact durable presentation evidence"
       cwd_assert_no_launch "$dir"
+      cwd_assert_ordinary_relaunch_preserves_repair "$dir"
       out=$(cwd_control "$dir" --repair-cwd); rc=$?
       [ "$rc" -ne 0 ] || fail "unresolved $mode repair must refuse another allocation"
       assert_contains "$out" 'earlier repair remains' "$mode retry must retain partial transaction evidence"

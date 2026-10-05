@@ -555,6 +555,24 @@ TARGET_HARNESS=$HARNESS
 TARGET_MODEL=
 TARGET_EFFORT=
 
+relaunch_guard_prior_repair() {
+  local prior
+  [ -e "$JOURNAL" ] || return 0
+  prior=$(fm_meta_get "$JOURNAL" repair_state)
+  [ -n "$prior" ] || return 0
+  case "$prior" in
+    complete|rolled-back) return 0 ;;
+    refused)
+      if [ "$REPAIR_CWD" = 1 ] \
+          && declare -F repair_prior_refusal_retryable >/dev/null 2>&1 \
+          && repair_prior_refusal_retryable; then
+        return 0
+      fi
+      ;;
+  esac
+  die "an earlier repair remains $prior in $JOURNAL; reconcile its recorded panes before relaunching"
+}
+
 journal_write() {  # <phase> [extra-line]...
   local phase=$1
   shift
@@ -849,6 +867,7 @@ do_relaunch() {
   else
     note_line="note=none"
   fi
+  relaunch_guard_prior_repair
   safe_checkpoint
   [ "$REPAIR_CWD" = 0 ] || repair_preflight
   cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"

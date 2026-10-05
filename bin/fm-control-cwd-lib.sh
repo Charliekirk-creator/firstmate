@@ -135,18 +135,9 @@ repair_projection_check() {
 }
 
 repair_preflight() {
-  local prior focus path
+  local focus path
   [ "$BACKEND" = herdr ] || repair_refuse "--repair-cwd supports Herdr only"
   case "$KIND" in ship|scout) ;; *) repair_refuse "--repair-cwd supports ship/scout tasks only" ;; esac
-  if [ -e "$JOURNAL" ]; then
-    prior=$(fm_meta_get "$JOURNAL" repair_state)
-    case "$prior" in
-      ''|prepared|rolled-back|complete) ;;
-      refused) repair_prior_refusal_retryable \
-        || repair_refuse "an earlier repair remains $prior in $JOURNAL; reconcile its recorded panes before another attempt" ;;
-      *) repair_refuse "an earlier repair remains $prior in $JOURNAL; reconcile its recorded panes before another attempt" ;;
-    esac
-  fi
   REPAIR_SESSION=$(fm_meta_get "$META" herdr_session)
   REPAIR_WORKSPACE=$(fm_meta_get "$META" herdr_workspace_id)
   REPAIR_TAB=$(fm_meta_get "$META" herdr_tab_id)
