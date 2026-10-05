@@ -15,7 +15,10 @@ REPAIR_META_LOCK=
 REPAIR_SESSION_LOCK=
 REPAIR_STATE=prepared
 REPAIR_SOURCE=
+REPAIR_SOURCE_STATUS=unobserved
 REPAIR_TARGET=
+REPAIR_TARGET_RECORDED=
+REPAIR_TARGET_STATUS=unchecked
 REPAIR_SESSION=
 REPAIR_WORKSPACE=
 REPAIR_TAB=
@@ -39,13 +42,17 @@ repair_release_locks() {
 
 repair_journal_lines() {
   printf '%s\n' "repair_state=$REPAIR_STATE" "repair_source=$REPAIR_SOURCE" \
-    "repair_target=$REPAIR_TARGET" "repair_old_pane=$REPAIR_OLD_PANE" \
+    "repair_source_status=$REPAIR_SOURCE_STATUS" \
+    "repair_target=$REPAIR_TARGET" "repair_target_status=$REPAIR_TARGET_STATUS" \
+    "repair_session=$REPAIR_SESSION" "repair_workspace=$REPAIR_WORKSPACE" \
+    "repair_tab=$REPAIR_TAB" "repair_old_pane=$REPAIR_OLD_PANE" \
     "repair_old_shell_pid=$REPAIR_OLD_PID" "repair_old_outcome=$REPAIR_OLD_OUTCOME" \
     "repair_new_pane=$REPAIR_NEW_PANE" \
     "repair_published=$REPAIR_PUBLISHED" "repair_publication_attempted=$REPAIR_PUBLICATION_ATTEMPTED" \
     "repair_projection=$REPAIR_PROJECTION" "repair_observed_pane=$REPAIR_SEEN_PANE"
   # Live API output is untrusted, including control characters. JSON encoding
   # keeps an exact failed observation without injecting journal fields.
+  printf 'repair_recorded_target_json=%s\n' "$(jq -cn --arg path "$REPAIR_TARGET_RECORDED" '$path')"
   printf 'repair_observed_json=%s\n' "$(jq -cn --arg cwd "$REPAIR_SEEN" '$cwd')"
   printf 'repair_refusal_json=%s\n' "$(jq -cn --arg reason "$REPAIR_REFUSAL" '$reason')"
 }
@@ -98,12 +105,19 @@ repair_project_check() {
   primary_top=$(CDPATH='' cd -- "$primary_top" && pwd -P) || repair_refuse "project root cannot be resolved"
   [ "$primary" = "$primary_top" ] || repair_refuse "project binding is not its Git root"
   REPAIR_TARGET=$(CDPATH='' cd -- "$WT" && pwd -P) || repair_refuse "worktree cannot be resolved"
-  [ "$REPAIR_TARGET" != "$primary" ] || repair_refuse "recorded worktree is the primary project copy"
+  if [ "$REPAIR_TARGET" = "$primary" ]; then
+    REPAIR_TARGET_STATUS=primary-copy
+    repair_refuse "recorded worktree is the primary project copy"
+  fi
   common=$(git -C "$primary" rev-parse --path-format=absolute --git-common-dir) || repair_refuse "project family cannot be read"
   target_common=$(git -C "$REPAIR_TARGET" rev-parse --path-format=absolute --git-common-dir) || repair_refuse "worktree family cannot be read"
   common=$(CDPATH='' cd -- "$common" && pwd -P) || repair_refuse "project family cannot be resolved"
   target_common=$(CDPATH='' cd -- "$target_common" && pwd -P) || repair_refuse "worktree family cannot be resolved"
-  [ "$common" = "$target_common" ] || repair_refuse "recorded worktree belongs to a conflicting project family"
+  if [ "$common" != "$target_common" ]; then
+    REPAIR_TARGET_STATUS=conflicting-project-family
+    repair_refuse "recorded worktree belongs to a conflicting project family"
+  fi
+  REPAIR_TARGET_STATUS=validated
 }
 
 repair_prior_refusal_retryable() {
@@ -111,7 +125,13 @@ repair_prior_refusal_retryable() {
     && [ "$(fm_meta_get "$JOURNAL" rollback)" = prior-binding-kept ] \
     && [ -z "$(fm_meta_get "$JOURNAL" repair_new_pane)" ] \
     && [ "$(fm_meta_get "$JOURNAL" repair_published)" = 0 ] \
-    && [ "$(fm_meta_get "$JOURNAL" repair_publication_attempted)" = 0 ]
+    && [ "$(fm_meta_get "$JOURNAL" repair_publication_attempted)" = 0 ] \
+    && [ "$(fm_meta_get "$JOURNAL" backend)" = "$BACKEND" ] \
+    && [ "$(fm_meta_get "$JOURNAL" endpoint)" = "$T" ] \
+    && [ "$(fm_meta_get "$JOURNAL" repair_session)" = "$(fm_meta_get "$META" herdr_session)" ] \
+    && [ "$(fm_meta_get "$JOURNAL" repair_workspace)" = "$(fm_meta_get "$META" herdr_workspace_id)" ] \
+    && [ "$(fm_meta_get "$JOURNAL" repair_tab)" = "$(fm_meta_get "$META" herdr_tab_id)" ] \
+    && [ "$(fm_meta_get "$JOURNAL" repair_old_pane)" = "$(fm_meta_get "$META" herdr_pane_id)" ]
 }
 
 repair_projection_check() {
@@ -139,12 +159,18 @@ repair_begin() {
   REPAIR_WORKSPACE=$(fm_meta_get "$META" herdr_workspace_id)
   REPAIR_TAB=$(fm_meta_get "$META" herdr_tab_id)
   REPAIR_OLD_PANE=$(fm_meta_get "$META" herdr_pane_id)
-  # The recorded path is already in worktree=; repair_target stays empty until
-  # project validation resolves it. Do not claim a successful checkpoint yet.
+  REPAIR_TARGET_RECORDED=$WT
   REPAIR_EVIDENCE_ACTIVE=1
   journal_write preflight || die "could not persist cwd repair preflight evidence"
   [ "$BACKEND" = herdr ] || repair_refuse "--repair-cwd supports Herdr only"
   case "$KIND" in ship|scout) ;; *) repair_refuse "--repair-cwd supports ship/scout tasks only" ;; esac
+  if fm_backend_source herdr && repair_read_path "$REPAIR_OLD_PANE"; then
+    REPAIR_SOURCE=$REPAIR_SEEN
+    REPAIR_SOURCE_STATUS=observed
+  else
+    REPAIR_SOURCE_STATUS=unconfirmed
+  fi
+  journal_write preflight || die "could not persist cwd repair path evidence"
 }
 
 repair_preflight() {
@@ -152,9 +178,10 @@ repair_preflight() {
   fm_backend_source herdr || repair_refuse "Herdr adapter unavailable"
   REPAIR_SESSION_LOCK=$(fm_backend_herdr_presentation_session_lock_path "$REPAIR_SESSION") || repair_refuse "session lock unavailable"
   fm_lock_try_acquire "$REPAIR_SESSION_LOCK" || repair_refuse "another session layout operation is active"
-  repair_project_check
   repair_read_path "$REPAIR_OLD_PANE" || repair_refuse "old pane identity or foreground path is ambiguous"
   REPAIR_SOURCE=$REPAIR_SEEN
+  REPAIR_SOURCE_STATUS=observed
+  repair_project_check
   path=$(CDPATH='' cd -- "$REPAIR_SOURCE" 2>/dev/null && pwd -P) || repair_refuse "old foreground path cannot be resolved"
   [ "$path" != "$REPAIR_TARGET" ] || repair_refuse "there is no foreground directory mismatch to repair"
   REPAIR_OLD_PID=$(repair_shell_pid "$REPAIR_OLD_PANE") || repair_refuse "old endpoint is not a positively agent-free lone idle shell"

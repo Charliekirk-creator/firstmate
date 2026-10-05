@@ -339,7 +339,6 @@ RECORDED_HARNESS=$(fm_meta_get "$META" harness)
 KIND=$(fm_meta_get "$META" kind)
 WT=$(fm_meta_get "$META" worktree)
 [ -n "$KIND" ] || KIND=ship
-[ "$REPAIR_CWD" = 0 ] || [ "$BACKEND" = herdr ] || die "--repair-cwd supports Herdr only"
 
 HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
   || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
@@ -757,35 +756,59 @@ CHECKPOINT_LINES=()
 safe_checkpoint() {
   local wt_real wt_top wt_top_real head head_ref head_ref_status status_output dirty children marker child_meta
   CHECKPOINT_LINES=()
-  [ -n "$WT" ] || checkpoint_refuse "task $ID has no recorded worktree; refusing to relaunch without a recorded local copy to preserve"
-  [ -d "$WT" ] || checkpoint_refuse "task $ID's recorded worktree $WT is missing; refusing to relaunch and lose track of its work"
-  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || checkpoint_refuse "task $ID's recorded worktree $WT cannot be resolved"
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null) \
-    || checkpoint_refuse "task $ID's recorded worktree $WT is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
+  if [ -z "$WT" ]; then
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=missing-record
+    checkpoint_refuse "task $ID has no recorded worktree; refusing to relaunch without a recorded local copy to preserve"
+  fi
+  if [ ! -d "$WT" ]; then
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=missing
+    checkpoint_refuse "task $ID's recorded worktree $WT is missing; refusing to relaunch and lose track of its work"
+  fi
+  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || {
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=unresolvable
+    checkpoint_refuse "task $ID's recorded worktree $WT cannot be resolved"
+  }
+  if [ "$REPAIR_CWD" = 1 ]; then
+    REPAIR_TARGET=$wt_real
+    REPAIR_TARGET_STATUS=resolved
+  fi
+  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null) || {
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=not-git-worktree
+    checkpoint_refuse "task $ID's recorded worktree $WT is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
+  }
   wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P) || wt_top_real=$wt_top
-  [ "$wt_real" = "$wt_top_real" ] \
-    || checkpoint_refuse "task $ID's recorded worktree $WT is not a worktree root (root is $wt_top); refusing to relaunch against an ambiguous checkout"
+  if [ "$wt_real" != "$wt_top_real" ]; then
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=not-worktree-root
+    checkpoint_refuse "task $ID's recorded worktree $WT is not a worktree root (root is $wt_top); refusing to relaunch against an ambiguous checkout"
+  fi
   if head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null); then
     :
   elif head_ref=$(git -C "$WT" symbolic-ref -q HEAD 2>/dev/null); then
     if git -C "$WT" show-ref --verify --quiet "$head_ref" 2>/dev/null; then
+      [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=head-unreadable
       checkpoint_refuse "task $ID's worktree HEAD exists but cannot be resolved; refusing to relaunch from an unreadable checkout"
     else
       head_ref_status=$?
-      [ "$head_ref_status" -eq 1 ] \
-        || checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+      if [ "$head_ref_status" -ne 1 ]; then
+        [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=head-unreadable
+        checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+      fi
       head=unborn
     fi
   else
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=head-unreadable
     checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
   fi
-  status_output=$(git -C "$WT" status --porcelain 2>/dev/null) \
-    || checkpoint_refuse "task $ID's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
+  status_output=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=status-unreadable
+    checkpoint_refuse "task $ID's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
+  }
   if [ -n "$status_output" ]; then
     dirty=yes
   else
     dirty=no
   fi
+  [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=checkpointed
   CHECKPOINT_LINES+=("worktree_head=$head" "worktree_dirty=$dirty")
   if [ "$KIND" = secondmate ]; then
     # A secondmate's own crewmates outlive its relaunch: they run in their own
@@ -852,6 +875,8 @@ do_relaunch() {
   local exit_result state note_line
   local -a spawn_args
 
+  relaunch_guard_prior_repair
+  [ "$REPAIR_CWD" = 0 ] || repair_begin
   require_state_verified_backend relaunch
   resolve_relaunch_profile
 
@@ -878,8 +903,6 @@ do_relaunch() {
   else
     note_line="note=none"
   fi
-  relaunch_guard_prior_repair
-  [ "$REPAIR_CWD" = 0 ] || repair_begin
   safe_checkpoint
   [ "$REPAIR_CWD" = 0 ] || repair_preflight
   cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"

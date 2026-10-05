@@ -199,7 +199,7 @@ PY
 }
 
 test_cwd_repair_checkpoint_refusals() {
-  local mode dir out rc target expected head branch real_git worktree_top
+  local mode dir out rc target expected target_status head branch real_git worktree_top
   real_git=$(command -v git)
   for mode in missing nonroot invalid unreadable head status primary; do
     if [ "$mode" = unreadable ] && [ "$(id -u)" = 0 ]; then
@@ -223,31 +223,38 @@ test_cwd_repair_checkpoint_refusals() {
     case "$mode" in
       missing)
         mv "$dir/wt" "$dir/held-wt"
+        target_status=missing
         expected="task rcwd's recorded worktree $target is missing; refusing to relaunch and lose track of its work"
         ;;
       nonroot)
         mkdir "$dir/wt/sub"
         target="$dir/wt/sub"
+        target_status=not-worktree-root
         expected="task rcwd's recorded worktree $target is not a worktree root (root is $worktree_top); refusing to relaunch against an ambiguous checkout"
         ;;
       invalid)
         mv "$dir/wt/.git" "$dir/held-git"
+        target_status=not-git-worktree
         expected="task rcwd's recorded worktree $target is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
         ;;
       unreadable)
         chmod 000 "$dir/wt"
+        target_status=unresolvable
         expected="task rcwd's recorded worktree $target cannot be resolved"
         ;;
       head)
         make_git_failure_stub "$dir"
+        target_status=head-unreadable
         expected="task rcwd's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
         ;;
       status)
         make_git_failure_stub "$dir"
+        target_status=status-unreadable
         expected="task rcwd's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
         ;;
       primary)
         target="$dir/proj"
+        target_status=primary-copy
         expected='recorded worktree is the primary project copy'
         ;;
     esac
@@ -271,6 +278,10 @@ PY
     cwd_assert_preserved "$dir"
     cwd_assert_preflight_evidence "$dir" "$expected"
     [ "$(journal_field "$dir" rcwd worktree)" = "$target" ] || fail "$mode lost the recorded path"
+    [ "$(journal_field "$dir" rcwd repair_recorded_target_json | jq -er '.')" = "$target" ] || fail "$mode lost the exact raw recorded target"
+    [ "$(journal_field "$dir" rcwd repair_target_status)" = "$target_status" ] || fail "$mode lost the exact target check outcome"
+    [ "$(journal_field "$dir" rcwd repair_source)" = "$dir/proj" ] || fail "$mode lost the observed source"
+    [ "$(journal_field "$dir" rcwd repair_source_status)" = observed ] || fail "$mode did not classify the observed source"
     [ "$(journal_field "$dir" rcwd repair_new_pane)" = '' ] || fail "$mode claimed a new pane"
     [ "$(journal_field "$dir" rcwd repair_published)" = 0 ] || fail "$mode claimed publication"
     [ "$(journal_field "$dir" rcwd repair_publication_attempted)" = 0 ] || fail "$mode attempted publication"
@@ -303,9 +314,25 @@ PY
   cwd_assert_preserved "$dir"
   cwd_assert_preflight_evidence "$dir" 'task tab is active; focus another tab before repair'
   cwd_assert_ordinary_relaunch_preserves_repair "$dir"
-  python3 - "$dir/fake/herdr-state" <<'PY'
+  cp "$dir/home/state/rcwd.control-relaunch" "$dir/refusal-journal"
+  python3 - "$dir/home/state/rcwd.meta" "$dir/fake/herdr-state" <<'PY'
 import json,sys
-p=sys.argv[1]; s=json.load(open(p)); s['focus']='w0:t1'
+from pathlib import Path
+meta=Path(sys.argv[1]); text=meta.read_text().replace('fm-lab-control:w1:p1', 'fm-lab-control:w1:p9').replace('herdr_pane_id=w1:p1', 'herdr_pane_id=w1:p9')
+meta.write_text(text)
+p=sys.argv[2]; s=json.load(open(p)); s['panes']['w1:p9']=s['panes'].pop('w1:p1'); s['focus']='w0:t1'
+open(p,'w').write(json.dumps(s))
+PY
+  out=$(cwd_control "$dir" --repair-cwd); rc=$?
+  [ "$rc" -ne 0 ] || fail "changed endpoint must not make an old refusal retryable"
+  assert_contains "$out" 'earlier repair remains' "changed endpoint must preserve prior refusal evidence"
+  cmp -s "$dir/refusal-journal" "$dir/home/state/rcwd.control-relaunch" || fail "changed endpoint overwrote prior refusal evidence"
+  python3 - "$dir/home/state/rcwd.meta" "$dir/fake/herdr-state" <<'PY'
+import json,sys
+from pathlib import Path
+meta=Path(sys.argv[1]); text=meta.read_text().replace('fm-lab-control:w1:p9', 'fm-lab-control:w1:p1').replace('herdr_pane_id=w1:p9', 'herdr_pane_id=w1:p1')
+meta.write_text(text)
+p=sys.argv[2]; s=json.load(open(p)); s['panes']['w1:p1']=s['panes'].pop('w1:p9')
 open(p,'w').write(json.dumps(s))
 PY
   out=$(cwd_control "$dir" --repair-cwd); rc=$?
@@ -375,6 +402,11 @@ PY
     [ "$rc" -ne 0 ] || fail "$backend must refuse cwd repair"
     assert_contains "$out" 'Herdr only' "unsupported backend should be explicit"
     cmp -s "$dir/meta-before" "$dir/home/state/rcwd.meta" || fail "$backend refusal changed metadata"
+    [ "$(journal_field "$dir" rcwd phase)" = failed:preflight ] || fail "$backend refusal was not durably journaled"
+    [ "$(journal_field "$dir" rcwd repair_state)" = refused ] || fail "$backend refusal lost its terminal state"
+    [ "$(journal_field "$dir" rcwd repair_recorded_target_json | jq -er '.')" = "$dir/wt" ] || fail "$backend refusal lost its recorded target"
+    [ "$(journal_field "$dir" rcwd rollback)" = prior-binding-kept ] || fail "$backend refusal did not preserve its binding"
+    if grep -q '"split"' "$dir/fake/herdr-log" 2>/dev/null; then fail "$backend refusal allocated a pane"; fi
   done
   dir=$(new_case cwd-quoted rcwd)
   # Shell-sensitive bytes remain one literal --cwd argument, never shell text.
