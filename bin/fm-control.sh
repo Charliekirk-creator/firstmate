@@ -340,12 +340,15 @@ KIND=$(fm_meta_get "$META" kind)
 WT=$(fm_meta_get "$META" worktree)
 [ -n "$KIND" ] || KIND=ship
 
-HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
-  || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
-fm_control_harness_supported "$HARNESS" \
-  || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
-
-fm_backend_validate "$BACKEND" || exit 1
+if [ "$REPAIR_CWD" = 1 ]; then
+  HARNESS=$RECORDED_HARNESS
+else
+  HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
+    || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+  fm_control_harness_supported "$HARNESS" \
+    || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+  fm_backend_validate "$BACKEND" || exit 1
+fi
 
 # --- shared helpers ---------------------------------------------------------
 
@@ -554,7 +557,6 @@ RELAUNCH_META_PUBLISHED=0
 RELAUNCH_AGENT_CONFIRMED=0
 RELAUNCH_TX=
 RELAUNCH_BRIEF=
-RELAUNCH_BRIEF_FINGERPRINT=
 PRIOR_HARNESS=$HARNESS
 PRIOR_RECORDED_HARNESS=$RECORDED_HARNESS
 CONFIG_HARNESS=
@@ -850,21 +852,16 @@ safe_checkpoint() {
 # never rewritten: a secondmate reconciles its own home's records at startup,
 # so the note stays parent-side audit evidence.
 repair_note_refuse() {
-  local reason=$1 proof=$2 current_fingerprint=
-  if [ "$proof" = pristine ]; then
-    current_fingerprint=$(cksum < "$RELAUNCH_BRIEF" 2>/dev/null) || current_fingerprint=
-    if [ -n "$RELAUNCH_BRIEF_FINGERPRINT" ] \
-        && [ "$current_fingerprint" = "$RELAUNCH_BRIEF_FINGERPRINT" ]; then
+  local reason=$1
+  if [ -f "$BRIEF_PRIOR" ] && cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
+    REPAIR_BRIEF_OUTCOME=unchanged
+  elif [ -f "$BRIEF_PRIOR" ]; then
+    cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" || true
+    if cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
       REPAIR_BRIEF_OUTCOME=unchanged
     else
       REPAIR_BRIEF_OUTCOME=mutation-unconfirmed
     fi
-  elif [ -f "$BRIEF_PRIOR" ] && cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
-    REPAIR_BRIEF_OUTCOME=unchanged
-  elif [ -f "$BRIEF_PRIOR" ] \
-      && cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" \
-      && cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
-    REPAIR_BRIEF_OUTCOME=unchanged
   else
     REPAIR_BRIEF_OUTCOME=mutation-unconfirmed
   fi
@@ -883,12 +880,10 @@ record_note() {
   [ -n "$NOTE" ] || return 0
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if [ "$REPAIR_CWD" = 1 ]; then
-    RELAUNCH_BRIEF_FINGERPRINT=$(cksum < "$RELAUNCH_BRIEF" 2>/dev/null) \
-      || repair_note_refuse "could not fingerprint task $ID's instructions before recording the progress note" pristine
     cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
-      || repair_note_refuse "could not preserve task $ID's instructions before recording the progress note" pristine
+      || repair_note_refuse "could not preserve task $ID's instructions before recording the progress note"
     printf '%s\n' "$NOTE" > "$NOTE_FILE" \
-      || repair_note_refuse "could not persist task $ID's progress note" verify
+      || repair_note_refuse "could not persist task $ID's progress note"
   else
     printf '%s\n' "$NOTE" > "$NOTE_FILE"
   fi
@@ -913,7 +908,7 @@ record_note() {
       } >> "$RELAUNCH_BRIEF" || {
         [ "$REPAIR_CWD" = 0 ] \
           && die "could not append the progress note to task $ID's instructions"
-        repair_note_refuse "could not append the progress note to task $ID's instructions" verify
+        repair_note_refuse "could not append the progress note to task $ID's instructions"
       }
       ;;
   esac
@@ -924,7 +919,15 @@ do_relaunch() {
   local -a spawn_args
 
   relaunch_guard_prior_repair
-  [ "$REPAIR_CWD" = 0 ] || repair_begin
+  if [ "$REPAIR_CWD" = 1 ]; then
+    repair_begin
+    HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
+      || repair_refuse "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+    fm_control_harness_supported "$HARNESS" \
+      || repair_refuse "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+    fm_backend_validate "$BACKEND" \
+      || repair_refuse "Herdr backend validation failed"
+  fi
   require_state_verified_backend relaunch
   resolve_relaunch_profile
 
@@ -965,7 +968,7 @@ do_relaunch() {
   record_note
   if ! journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"; then
     [ "$REPAIR_CWD" = 0 ] \
-      || repair_note_refuse "could not persist relaunch progress-note evidence" verify
+      || repair_note_refuse "could not persist relaunch progress-note evidence"
   fi
 
   if [ "$REPAIR_CWD" = 1 ]; then

@@ -100,6 +100,11 @@ elif args[:2] == ['pane', 'process-info']:
         processes[0]['argv'] = ['bash', '-c', 'read value']
     if mode == 'new-process':
         processes.append({'pid': 44103, 'name': 'sleep', 'argv0': 'sleep'})
+    if mode == 'retire-process-race' and pid == 'w1:p1' and s['panes'].get('w1:p2', {}).get('agent'):
+        s['retire_process_reads'] = s.get('retire_process_reads', 0) + 1
+        if s['retire_process_reads'] > 1:
+            processes.append({'pid': 44103, 'name': 'sleep', 'argv0': 'sleep'})
+        save()
     result('pane_process_info', process_info={'pane_id': pid, 'shell_pid': num,
         'foreground_process_group_id': num, 'foreground_processes': processes})
 elif args[:2] == ['pane', 'split']:

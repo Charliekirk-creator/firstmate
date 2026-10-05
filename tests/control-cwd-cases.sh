@@ -363,7 +363,7 @@ PY
 
 test_cwd_repair_preallocation_refusals() {
   local mode dir out rc expected
-  for mode in note brief harness; do
+  for mode in note brief harness recorded-harness; do
     dir=$(new_case "cwd-preallocation-$mode" rcwd); cwd_case "$dir"
     cp "$dir/fake/herdr-state" "$dir/herdr-before"
     case "$mode" in
@@ -381,6 +381,12 @@ test_cwd_repair_preallocation_refusals() {
         expected="'unverified-repair-harness' is not a verified harness; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
         out=$(cwd_control "$dir" --repair-cwd --harness unverified-repair-harness); rc=$?
         ;;
+      recorded-harness)
+        perl -pi -e 's/^harness=.*/harness=unverified-recorded-harness/' "$dir/home/state/rcwd.meta"
+        cp "$dir/home/state/rcwd.meta" "$dir/meta-before"
+        expected="task rcwd records harness 'unverified-recorded-harness', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+        out=$(cwd_control "$dir" --repair-cwd); rc=$?
+        ;;
     esac
     [ "$rc" -ne 0 ] || fail "$mode pre-allocation failure must refuse: $out"
     assert_contains "$out" "$expected" "$mode refusal did not name the exact failure"
@@ -396,6 +402,9 @@ test_cwd_repair_preallocation_refusals() {
     else
       cmp -s "$dir/brief-before" "$dir/home/data/rcwd/brief.md" || fail "$mode refusal changed instructions"
     fi
+    if [ "$mode" = recorded-harness ]; then
+      perl -pi -e 's/^harness=.*/harness=claude/' "$dir/home/state/rcwd.meta"
+    fi
     out=$(cwd_control "$dir" --repair-cwd); rc=$?
     expect_code 0 "$rc" "$mode corrected explicit repair must remain retryable"$'\n'"$out"
     [ "$(journal_field "$dir" rcwd repair_state)" = complete ] || fail "$mode retry did not complete"
@@ -405,7 +414,7 @@ test_cwd_repair_preallocation_refusals() {
 
 test_cwd_repair_note_failures() {
   local mode dir out rc expected refusal
-  for mode in note-write brief-copy brief-append; do
+  for mode in note-write brief-copy brief-copy-after brief-append; do
     dir=$(new_case "cwd-$mode" rcwd); cwd_case "$dir"
     cp "$dir/fake/herdr-state" "$dir/herdr-before"
     case "$mode" in
@@ -414,12 +423,13 @@ test_cwd_repair_note_failures() {
         expected="could not persist task rcwd's progress note"
         out=$(cwd_control "$dir" --repair-cwd); rc=$?
         ;;
-      brief-copy|brief-append)
+      brief-copy|brief-copy-after|brief-append)
         cat > "$dir/fakebin/cp" <<'SH'
 #!/usr/bin/env bash
 if [ "${3:-}" = "$FM_FAKE_BRIEF_PRIOR" ]; then
   case "$FM_FAKE_BRIEF_COPY_MODE" in
     fail) exit 1 ;;
+    after) "$FM_REAL_CP" "$@"; exit 1 ;;
     replace)
       "$FM_REAL_CP" "$@" || exit $?
       rm -f "$2" && mkdir "$2"
@@ -430,9 +440,10 @@ fi
 exec "$FM_REAL_CP" "$@"
 SH
         chmod +x "$dir/fakebin/cp"
-        if [ "$mode" = brief-copy ]; then
+        if [ "$mode" = brief-copy ] || [ "$mode" = brief-copy-after ]; then
           expected="could not preserve task rcwd's instructions before recording the progress note"
-          out=$(FM_REAL_CP="$(command -v cp)" FM_FAKE_BRIEF_COPY_MODE=fail \
+          if [ "$mode" = brief-copy ]; then copy_mode=fail; else copy_mode=after; fi
+          out=$(FM_REAL_CP="$(command -v cp)" FM_FAKE_BRIEF_COPY_MODE="$copy_mode" \
             FM_FAKE_BRIEF_PRIOR="$dir/home/state/rcwd.control-relaunch.brief-prior" \
             cwd_control "$dir" --repair-cwd); rc=$?
         else
@@ -452,7 +463,7 @@ SH
     [ "$(journal_field "$dir" rcwd repair_new_pane)" = '' ] || fail "$mode refusal claimed an allocation"
     [ "$(journal_field "$dir" rcwd repair_published)" = 0 ] || fail "$mode refusal claimed publication"
     if grep -q '"split"' "$dir/fake/herdr-log"; then fail "$mode refusal allocated a pane"; fi
-    if [ "$mode" = brief-append ]; then
+    if [ "$mode" = brief-append ] || [ "$mode" = brief-copy ]; then
       [ "$(journal_field "$dir" rcwd repair_state)" = brief-mutation-unconfirmed ] || fail "$mode did not block ambiguous instruction mutation"
       [ "$(journal_field "$dir" rcwd repair_brief_outcome)" = mutation-unconfirmed ] || fail "$mode claimed byte-preserved instructions"
       [ "$(journal_field "$dir" rcwd rollback)" = brief-mutation-unconfirmed ] || fail "$mode lost its instruction outcome"
@@ -462,7 +473,11 @@ SH
       assert_contains "$out" 'earlier repair remains' "$mode ordinary relaunch did not report unresolved evidence"
       cmp -s "$dir/journal-before-ordinary" "$dir/home/state/rcwd.control-relaunch" || fail "$mode ordinary relaunch changed repair evidence"
       cmp -s "$dir/meta-before" "$dir/home/state/rcwd.meta" || fail "$mode ordinary relaunch changed metadata"
-      [ -d "$dir/home/data/rcwd/brief.md" ] || fail "$mode ordinary relaunch changed the unconfirmed instruction state"
+      if [ "$mode" = brief-append ]; then
+        [ -d "$dir/home/data/rcwd/brief.md" ] || fail "$mode ordinary relaunch changed the unconfirmed instruction state"
+      else
+        cmp -s "$dir/brief-before" "$dir/home/data/rcwd/brief.md" || fail "$mode changed instructions despite an unavailable backup"
+      fi
     else
       cwd_assert_preflight_evidence "$dir" "$expected"
       [ "$(journal_field "$dir" rcwd repair_brief_outcome)" = unchanged ] || fail "$mode did not prove byte-identical instructions"
@@ -509,6 +524,54 @@ test_cwd_repair_rollback_and_guard() {
     cwd_assert_no_old_input "$dir"
   done
   pass "cwd repair: verification, publication, launch and cleanup failures preserve accurate partial outcomes"
+}
+
+test_cwd_repair_retirement_process_race() {
+  local dir out rc
+  dir=$(new_case cwd-retire-process-race rcwd); cwd_case "$dir" retire-process-race
+  out=$(cwd_control "$dir" --repair-cwd); rc=$?
+  [ "$rc" -ne 0 ] || fail "retirement process race must report failure: $out"
+  [ "$(meta_field "$dir" rcwd window)" = fm-lab-control:w1:p2 ] || fail "retirement process race lost the published binding"
+  [ "$(journal_field "$dir" rcwd rollback)" = new-binding-kept ] || fail "retirement process race did not preserve the new binding"
+  assert_contains "$out" 'focus-safe old-pane retirement failed' "retirement race did not refuse at the close boundary"
+  python3 - "$dir/fake/herdr-state" "$dir/fake/herdr-log" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1]))
+rows=[json.loads(x) for x in open(sys.argv[2])]
+assert 'w1:p1' in state['panes'], state
+assert not any(row[:3] == ['pane', 'close', 'w1:p1'] for row in rows), rows
+PY
+  expect_code 0 $? "retirement race must preserve the old pane"
+  pass "cwd repair: retirement close revalidates the exact shell"
+}
+
+test_cwd_repair_rollback_brief_restore_failure() {
+  local dir out rc
+  dir=$(new_case cwd-rollback-brief-failure rcwd); cwd_case "$dir" wrong-cwd
+  cat > "$dir/fakebin/cp" <<'SH'
+#!/usr/bin/env bash
+if [ "${2:-}" = "$FM_FAKE_BRIEF_PRIOR" ] && [ "${3:-}" = "$FM_FAKE_RELAUNCH_BRIEF" ]; then
+  exit 1
+fi
+exec "$FM_REAL_CP" "$@"
+SH
+  chmod +x "$dir/fakebin/cp"
+  out=$(FM_REAL_CP="$(command -v cp)" \
+    FM_FAKE_BRIEF_PRIOR="$dir/home/state/rcwd.control-relaunch.brief-prior" \
+    FM_FAKE_RELAUNCH_BRIEF="$dir/home/data/rcwd/brief.md" \
+    cwd_control "$dir" --repair-cwd); rc=$?
+  [ "$rc" -ne 0 ] || fail "brief restoration fault must report failure: $out"
+  [ "$(journal_field "$dir" rcwd repair_state)" = brief-mutation-unconfirmed ] || fail "brief restoration fault did not remain unresolved"
+  [ "$(journal_field "$dir" rcwd repair_brief_outcome)" = mutation-unconfirmed ] || fail "brief restoration fault claimed byte identity"
+  [ "$(journal_field "$dir" rcwd rollback)" = brief-mutation-unconfirmed ] || fail "brief restoration fault lost its primary outcome"
+  [ "$(journal_field "$dir" rcwd pane_rollback)" = unadopted-pane-removed ] || fail "brief restoration fault lost the pane outcome"
+  cmp -s "$dir/brief-before" "$dir/home/data/rcwd/brief.md" && fail "brief restoration fault claimed an unchanged brief fixture"
+  cp "$dir/home/state/rcwd.control-relaunch" "$dir/journal-before-ordinary"
+  out=$(cwd_control "$dir"); rc=$?
+  [ "$rc" -ne 0 ] || fail "brief restoration fault allowed ordinary relaunch"
+  assert_contains "$out" 'earlier repair remains' "brief restoration fault did not require reconciliation"
+  cmp -s "$dir/journal-before-ordinary" "$dir/home/state/rcwd.control-relaunch" || fail "ordinary relaunch overwrote brief restoration evidence"
+  pass "cwd repair: failed brief restoration remains unresolved"
 }
 
 test_cwd_repair_retirement_journal_failure() {
@@ -690,5 +753,7 @@ test_cwd_repair_retries_resolved_preflight_refusal
 test_cwd_repair_preallocation_refusals
 test_cwd_repair_note_failures
 test_cwd_repair_rollback_and_guard
+test_cwd_repair_retirement_process_race
+test_cwd_repair_rollback_brief_restore_failure
 test_cwd_repair_retirement_journal_failure
 test_cwd_repair_opt_in_and_path_bytes

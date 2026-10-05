@@ -216,10 +216,11 @@ repair_verify_new() {
 }
 
 repair_close_unadopted() {
+  local pid
   [ "$REPAIR_NEW_OWNED" = 1 ] || return 1
   fm_backend_herdr_cwd_repair_pane "$REPAIR_SESSION" "$REPAIR_WORKSPACE" "$REPAIR_TAB" "$REPAIR_NEW_PANE" >/dev/null || return 1
-  repair_shell_pid "$REPAIR_NEW_PANE" >/dev/null || return 1
-  fm_backend_herdr_projection_close_pane_focus_preserving "$REPAIR_SESSION" "$REPAIR_NEW_PANE" no-agent
+  pid=$(repair_shell_pid "$REPAIR_NEW_PANE") || return 1
+  fm_backend_herdr_projection_close_pane_focus_preserving "$REPAIR_SESSION" "$REPAIR_NEW_PANE" no-agent "$pid" interactive
 }
 
 # The metadata owner can report failure AFTER rename (for example when its
@@ -359,7 +360,7 @@ repair_finish() {
   pid=$(repair_shell_pid "$REPAIR_OLD_PANE") || repair_refuse "replacement is running but old pane has conflicting ownership; old pane retained"
   [ "$pid" = "$REPAIR_OLD_PID" ] || repair_refuse "replacement is running but old shell process changed; old pane retained"
   REPAIR_OLD_OUTCOME=retirement-unconfirmed
-  if fm_backend_herdr_projection_close_pane_focus_preserving "$REPAIR_SESSION" "$REPAIR_OLD_PANE" no-agent; then
+  if fm_backend_herdr_projection_close_pane_focus_preserving "$REPAIR_SESSION" "$REPAIR_OLD_PANE" no-agent "$REPAIR_OLD_PID" interactive; then
     REPAIR_OLD_OUTCOME=removed
   else
     [ "$(fm_backend_herdr_pane_agent_state "$REPAIR_SESSION" "$REPAIR_OLD_PANE")" != dead ] || REPAIR_OLD_OUTCOME=removed
@@ -368,8 +369,19 @@ repair_finish() {
   REPAIR_STATE=complete
 }
 
+repair_restore_prior_brief() {
+  [ -n "$RELAUNCH_BRIEF" ] && [ -f "$BRIEF_PRIOR" ] || return 1
+  cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" || true
+  if cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
+    REPAIR_BRIEF_OUTCOME=unchanged
+    return 0
+  fi
+  REPAIR_BRIEF_OUTCOME=mutation-unconfirmed
+  return 1
+}
+
 repair_rollback() {
-  local phase=$RELAUNCH_PHASE rollback
+  local phase=$RELAUNCH_PHASE rollback pane_rollback=none
   if [ "$REPAIR_PUBLICATION_ATTEMPTED" = 1 ] && [ "$REPAIR_PUBLISHED" = 0 ]; then
     repair_observe_publication || true
   fi
@@ -398,8 +410,14 @@ repair_rollback() {
     else
       REPAIR_STATE=rolled-back
     fi
-    [ ! -f "$BRIEF_PRIOR" ] || cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" || true
-    echo "error: cwd repair did not publish a new task binding; $rollback (new-pane=${REPAIR_NEW_PANE:-unconfirmed}); original instructions and work are preserved" >&2
+    pane_rollback=$rollback
+    if repair_restore_prior_brief; then
+      echo "error: cwd repair did not publish a new task binding; $rollback (new-pane=${REPAIR_NEW_PANE:-unconfirmed}); original instructions and work are preserved" >&2
+    else
+      REPAIR_STATE=brief-mutation-unconfirmed
+      rollback=brief-mutation-unconfirmed
+      echo "error: cwd repair did not publish a new task binding; pane outcome=$pane_rollback, but instruction restoration is unconfirmed and requires reconciliation" >&2
+    fi
   fi
-  journal_write "failed:$phase" "${CHECKPOINT_LINES[@]}" "rollback=$rollback" || true
+  journal_write "failed:$phase" "${CHECKPOINT_LINES[@]}" "rollback=$rollback" "pane_rollback=$pane_rollback" || true
 }
