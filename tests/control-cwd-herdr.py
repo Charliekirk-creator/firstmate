@@ -128,6 +128,12 @@ elif args[:2] == ['pane', 'split']:
     result('pane_info', pane=p)
 elif args[:2] == ['pane', 'close']:
     pid = args[2]
+    if pid == 'w1:p1':
+        journal = (root / 'home-state' / 'rcwd.control-relaunch').read_text()
+        phase = next(line.split('=', 1)[1] for line in journal.splitlines() if line.startswith('phase='))
+        (root / 'close-journal-phase').write_text(phase)
+        if phase != 'retiring':
+            sys.exit(1)
     if mode == 'cleanup-fail' or (mode == 'rollback-close-fail' and pid == 'w1:p2'):
         sys.exit(1)
     del s['panes'][pid]

@@ -213,6 +213,15 @@ if [ -n "${FM_FAKE_COMPLETE_JOURNAL_MV_FAIL:-}" ]; then
     fi
   done
 fi
+if [ -n "${FM_FAKE_RETIRING_JOURNAL_MV_FAIL_ONCE:-}" ] \
+   && [ ! -e "$FM_FAKE_RETIRING_JOURNAL_MV_FAIL_ONCE" ]; then
+  for path in "$@"; do
+    if [ -f "$path" ] && grep -Fqx 'phase=retiring' "$path"; then
+      : > "$FM_FAKE_RETIRING_JOURNAL_MV_FAIL_ONCE"
+      exit 1
+    fi
+  done
+fi
 if [ -n "${FM_FAKE_META_PUBLISH_MV_FAIL:-}" ]; then
   for path in "$@"; do
     [ "$path" != "$FM_FAKE_META_PUBLISH_MV_FAIL" ] || exit 1

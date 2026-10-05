@@ -347,7 +347,9 @@ repair_replace() {
 repair_finish() {
   local pid
   repair_tab_shape "$REPAIR_OLD_PANE" "$REPAIR_NEW_PANE" || repair_refuse "replacement is running but sibling ownership changed"
-  journal_write retiring "${CHECKPOINT_LINES[@]}"
+  if ! journal_write retiring "${CHECKPOINT_LINES[@]}"; then
+    repair_refuse "replacement is running but retirement evidence could not be persisted; old pane retained"
+  fi
   repair_read_path "$REPAIR_OLD_PANE" || repair_refuse "replacement is running but old pane identity cannot be confirmed for retirement"
   [ "$REPAIR_SEEN" = "$REPAIR_SOURCE" ] || repair_refuse "replacement is running but old pane directory changed; old pane retained"
   pid=$(repair_shell_pid "$REPAIR_OLD_PANE") || repair_refuse "replacement is running but old pane has conflicting ownership; old pane retained"

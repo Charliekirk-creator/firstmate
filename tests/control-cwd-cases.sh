@@ -136,6 +136,7 @@ assert close > launch
 assert s.get('focus','w0:t1') == 'w0:t1'
 PY
   expect_code 0 $? "old pane must retire after launch, preserving focus"
+  [ "$(cat "$dir/fake/close-journal-phase")" = retiring ] || fail "old pane retired before durable retiring evidence"
   pass "cwd repair: API-created sibling, ordinary guarded launch, projection and all work preserved"
 }
 
@@ -416,6 +417,33 @@ test_cwd_repair_rollback_and_guard() {
   pass "cwd repair: verification, publication, launch and cleanup failures preserve accurate partial outcomes"
 }
 
+test_cwd_repair_retirement_journal_failure() {
+  local dir out rc refusal
+  dir=$(new_case cwd-retiring-journal-failure rcwd); cwd_case "$dir"
+  make_mv_failure_stub "$dir"
+  out=$(FM_REAL_MV="$(command -v mv)" \
+    FM_FAKE_RETIRING_JOURNAL_MV_FAIL_ONCE="$dir/fake/retiring-journal-failed" \
+    cwd_control "$dir" --repair-cwd); rc=$?
+  [ "$rc" -ne 0 ] || fail "retiring journal failure must stop cleanup: $out"
+  [ -e "$dir/fake/retiring-journal-failed" ] || fail "retiring journal fault did not fire"
+  [ "$(meta_field "$dir" rcwd window)" = fm-lab-control:w1:p2 ] || fail "retiring journal failure lost the published binding"
+  [ "$(journal_field "$dir" rcwd phase)" = failed:launching ] || fail "retiring journal failure did not enter the transaction failure path"
+  [ "$(journal_field "$dir" rcwd rollback)" = new-binding-kept ] || fail "retiring journal failure did not preserve the new binding"
+  [ "$(journal_field "$dir" rcwd repair_old_outcome)" = retained ] || fail "retiring journal failure claimed the old pane changed"
+  refusal=$(journal_field "$dir" rcwd repair_refusal_json | jq -er '.') || fail "retiring journal refusal was not valid JSON"
+  [ "$refusal" = 'replacement is running but retirement evidence could not be persisted; old pane retained' ] || fail "retiring journal failure lost its exact outcome"
+  python3 - "$dir/fake/herdr-state" "$dir/fake/herdr-log" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1]))
+rows=[json.loads(x) for x in open(sys.argv[2])]
+assert set(state['panes']) == {'w1:p1', 'w1:p2'}, state
+assert not any(row[:3] == ['pane', 'close', 'w1:p1'] for row in rows), rows
+PY
+  expect_code 0 $? "retiring journal failure must preserve the old pane"
+  [ ! -e "$dir/fake/close-journal-phase" ] || fail "retiring journal failure attempted old-pane cleanup"
+  pass "cwd repair: retirement requires durable phase evidence"
+}
+
 test_cwd_repair_opt_in_and_path_bytes() {
   local dir out rc backend
   dir=$(new_case cwd-no-opt-in rcwd); cwd_case "$dir"
@@ -567,4 +595,5 @@ test_cwd_repair_checkpoint_refusals
 test_cwd_repair_retries_resolved_preflight_refusal
 test_cwd_repair_preallocation_refusals
 test_cwd_repair_rollback_and_guard
+test_cwd_repair_retirement_journal_failure
 test_cwd_repair_opt_in_and_path_bytes
