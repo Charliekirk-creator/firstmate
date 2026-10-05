@@ -57,6 +57,16 @@ cwd_assert_preserved() {
   cwd_assert_no_old_input "$dir"
 }
 
+cwd_assert_preflight_evidence() {
+  local dir=$1 expected=$2 refusal
+  [ "$(journal_field "$dir" rcwd phase)" = failed:preflight ] || fail "preflight refusal phase was not journaled"
+  [ "$(journal_field "$dir" rcwd repair_state)" = refused ] || fail "preflight refusal state was not journaled"
+  [ "$(journal_field "$dir" rcwd repair_old_pane)" = w1:p1 ] || fail "refused old pane was not journaled"
+  refusal=$(journal_field "$dir" rcwd repair_refusal_json | jq -er '.') || fail "preflight refusal evidence was not valid JSON"
+  [ "$refusal" = "$expected" ] || fail "preflight refusal recorded '$refusal', expected '$expected'"
+  [ "$(journal_field "$dir" rcwd rollback)" = prior-binding-kept ] || fail "preflight preservation outcome was not journaled"
+}
+
 cwd_projection() {
   local dir=$1
   # Real projection writer API, not a second hand-written record format.
@@ -116,12 +126,20 @@ PY
 }
 
 test_cwd_repair_refusals() {
-  local mode dir out rc
+  local mode dir out rc refusal
   for mode in live ambiguous foreground shell-script wrong-old-binding new-process; do
     dir=$(new_case "cwd-$mode" rcwd); cwd_case "$dir" "$mode"
     out=$(cwd_control "$dir" --repair-cwd); rc=$?
     [ "$rc" -ne 0 ] || fail "unsafe $mode must refuse: $out"
     cwd_assert_preserved "$dir"
+    case "$mode" in
+      wrong-old-binding) refusal='old pane identity or foreground path is ambiguous' ;;
+      *) refusal='old endpoint is not a positively agent-free lone idle shell' ;;
+    esac
+    cwd_assert_preflight_evidence "$dir" "$refusal"
+    [ "$(journal_field "$dir" rcwd repair_target)" = "$(cd "$dir/wt" && pwd -P)" ] || fail "$mode target was not journaled"
+    [ "$(journal_field "$dir" rcwd repair_source)" = "$dir/proj" ] || [ "$mode" = wrong-old-binding ] \
+      || fail "$mode observed source was not journaled"
     if grep -q '"split"' "$dir/fake/herdr-log"; then fail "$mode allocated a pane"; fi
   done
   for mode in missing nonroot primary family active extra-pane; do
@@ -150,6 +168,18 @@ PY
     [ "$rc" -ne 0 ] || fail "$mode must refuse: $out"
     cmp -s "$dir/meta-before" "$dir/home/state/rcwd.meta" || fail "$mode mutated metadata"
     cwd_assert_no_old_input "$dir"
+    case "$mode" in
+      primary) cwd_assert_preflight_evidence "$dir" 'recorded worktree is the primary project copy' ;;
+      family) cwd_assert_preflight_evidence "$dir" 'recorded worktree belongs to a conflicting project family' ;;
+      active) cwd_assert_preflight_evidence "$dir" 'task tab is active; focus another tab before repair' ;;
+      extra-pane) cwd_assert_preflight_evidence "$dir" 'task tab has ambiguous or additional panes' ;;
+    esac
+    case "$mode" in
+      active|extra-pane)
+        [ "$(journal_field "$dir" rcwd repair_source)" = "$dir/proj" ] || fail "$mode observed source was not journaled"
+        [ "$(journal_field "$dir" rcwd repair_target)" = "$(cd "$dir/wt" && pwd -P)" ] || fail "$mode target was not journaled"
+        ;;
+    esac
   done
   pass "cwd repair: live, ambiguous, foreign, primary, missing, non-root, active and conflicting endpoints refuse"
 }

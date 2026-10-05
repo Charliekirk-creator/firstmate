@@ -29,6 +29,8 @@ REPAIR_PUBLICATION_ATTEMPTED=0
 REPAIR_PROJECTION=none
 REPAIR_SEEN=
 REPAIR_SEEN_PANE=
+REPAIR_REFUSAL=
+REPAIR_EVIDENCE_ACTIVE=0
 
 repair_release_locks() {
   [ -z "$REPAIR_META_LOCK" ] || fm_lock_release "$REPAIR_META_LOCK"
@@ -45,9 +47,15 @@ repair_journal_lines() {
   # Live API output is untrusted, including control characters. JSON encoding
   # keeps an exact failed observation without injecting journal fields.
   printf 'repair_observed_json=%s\n' "$(jq -cn --arg cwd "$REPAIR_SEEN" '$cwd')"
+  printf 'repair_refusal_json=%s\n' "$(jq -cn --arg reason "$REPAIR_REFUSAL" '$reason')"
 }
 
 repair_refuse() {
+  REPAIR_REFUSAL=$1
+  if [ "$REPAIR_EVIDENCE_ACTIVE" = 1 ] && [ "$RELAUNCH_ACTIVE" = 0 ]; then
+    REPAIR_STATE=refused
+    journal_write "failed:preflight" "${CHECKPOINT_LINES[@]}" "rollback=prior-binding-kept" || true
+  fi
   die "cwd repair of $ID refused: $1 (observed foreground_cwd=$(jq -cn --arg cwd "$REPAIR_SEEN" '$cwd'), recorded worktree='$WT', replacement-confirmed=$RELAUNCH_AGENT_CONFIRMED); no further launch authorized"
 }
 
@@ -126,11 +134,13 @@ repair_preflight() {
       *) repair_refuse "an earlier repair remains $prior in $JOURNAL; reconcile its recorded panes before another attempt" ;;
     esac
   fi
-  fm_backend_source herdr || repair_refuse "Herdr adapter unavailable"
   REPAIR_SESSION=$(fm_meta_get "$META" herdr_session)
   REPAIR_WORKSPACE=$(fm_meta_get "$META" herdr_workspace_id)
   REPAIR_TAB=$(fm_meta_get "$META" herdr_tab_id)
   REPAIR_OLD_PANE=$(fm_meta_get "$META" herdr_pane_id)
+  REPAIR_EVIDENCE_ACTIVE=1
+  journal_write preflight "${CHECKPOINT_LINES[@]}" || die "could not persist cwd repair preflight evidence"
+  fm_backend_source herdr || repair_refuse "Herdr adapter unavailable"
   REPAIR_SESSION_LOCK=$(fm_backend_herdr_presentation_session_lock_path "$REPAIR_SESSION") || repair_refuse "session lock unavailable"
   fm_lock_try_acquire "$REPAIR_SESSION_LOCK" || repair_refuse "another session layout operation is active"
   repair_project_check
