@@ -5,7 +5,7 @@
 # Usage: fm-control.sh <task-id> interrupt
 #        fm-control.sh <task-id> exit
 #        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
-#                                         [--effort <level>]
+#                                         [--effort <level>] [--repair-cwd]
 #                                         (--note <text> | --note-file <path>)
 #
 # Why this exists, and how it differs from fm-send.sh. bin/fm-send.sh is the
@@ -50,6 +50,32 @@
 #              the prior durable record in place and reports the concrete
 #              state; it never leaves a half-transitioned task claiming to be
 #              running.
+#
+# --repair-cwd is an explicit Herdr-only exception to SAME endpoint, for ship
+# and scout tasks whose positively agent-free, lone idle shell is in the wrong
+# directory. It never types into or resets that shell: pending input and custom
+# traps cannot be proved safe. Instead it splits that exact pane, in its same
+# session/workspace/tab, with API --cwd set only to the validated recorded
+# worktree. The target must physically be a Git worktree root, share the
+# recorded project's Git family, and differ from the primary project copy.
+# Checkpointing, exact identity checks, and the existing control lock still
+# apply; a session layout lock spans replacement, launch, and retirement.
+# The task tab must not be active, so the focus-safe cleanup owner can preserve
+# the current tab. Any conflicting process, live agent, or ambiguity refuses.
+# The API-issued sibling must be new, exactly bound, agent-free, and have two
+# consecutive canonical foreground_cwd reads matching the target before its
+# binding is atomically published under the common metadata lock. Concurrent
+# unrelated metadata is preserved; a presentation restart binding is advanced
+# through its owner. fm-spawn --relaunch still independently checks isolation.
+# Only after the replacement is confirmed does exact focus-safe cleanup retire
+# the old agent-free pane. Before publication, failure removes only a proven
+# unadopted sibling and restores instructions. After publication, failure keeps
+# the accurate new binding and progress note, never reverting to the wrong
+# pane. The transaction records source/target paths, both panes, publication,
+# presentation, and cleanup outcomes. An unresolved earlier repair refuses a
+# new attempt rather than losing its evidence or allocating another sibling.
+# No caller path, command, generic rebind, worktree allocation, or discard is
+# accepted. With this option absent, ordinary relaunch is unchanged.
 #
 # Teardown and discard are NOT verbs here and never will be. `exit` stops an
 # agent and preserves everything else; removing a worktree, killing an
@@ -157,6 +183,9 @@ control_cleanup() {
      && declare -F relaunch_rollback >/dev/null 2>&1; then
     relaunch_rollback || true
   fi
+  if declare -F repair_release_locks >/dev/null 2>&1; then
+    repair_release_locks || true
+  fi
   if [ "$CONTROL_LOCK_HELD" = 1 ]; then
     CONTROL_LOCK_HELD=0
     fm_lock_release "$CONTROL_LOCK" || true
@@ -195,6 +224,7 @@ MODEL_SET=0
 EFFORT_SET=0
 NOTE=
 NOTE_SET=0
+REPAIR_CWD=0
 control_want_value=
 for control_arg in "$@"; do
   if [ -n "$control_want_value" ]; then
@@ -216,6 +246,7 @@ for control_arg in "$@"; do
     continue
   fi
   case "$control_arg" in
+    --repair-cwd) REPAIR_CWD=1 ;;
     --harness) control_want_value=harness ;;
     --harness=*) NEW_HARNESS=${control_arg#--harness=}; HARNESS_SET=1 ;;
     --model) control_want_value=model ;;
@@ -242,6 +273,7 @@ if [ "$VERB" != relaunch ]; then
   [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
     || die "--harness, --model, --effort, and --note apply to 'relaunch' only"
 fi
+[ "$REPAIR_CWD" = 0 ] || [ "$VERB" = relaunch ] || die "--repair-cwd applies to 'relaunch' only"
 [ "$HARNESS_SET" = 0 ] || [ -n "$NEW_HARNESS" ] || die "--harness requires a non-empty value"
 [ "$MODEL_SET" = 0 ] || [ -n "$NEW_MODEL" ] || die "--model requires a non-empty value"
 [ "$EFFORT_SET" = 0 ] || [ -n "$NEW_EFFORT" ] || die "--effort requires a non-empty value"
@@ -303,6 +335,7 @@ RECORDED_HARNESS=$(fm_meta_get "$META" harness)
 KIND=$(fm_meta_get "$META" kind)
 WT=$(fm_meta_get "$META" worktree)
 [ -n "$KIND" ] || KIND=ship
+[ "$REPAIR_CWD" = 0 ] || [ "$BACKEND" = herdr ] || die "--repair-cwd supports Herdr only"
 
 HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
   || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
@@ -540,6 +573,7 @@ journal_write() {  # <phase> [extra-line]...
     echo "to_harness=$TARGET_HARNESS"
     echo "to_model=$TARGET_MODEL"
     echo "to_effort=$TARGET_EFFORT"
+    [ "$REPAIR_CWD" = 0 ] || repair_journal_lines
     local line
     for line in "$@"; do
       echo "$line"
@@ -555,6 +589,10 @@ relaunch_rollback() {
   local state
   [ "$RELAUNCH_ACTIVE" = 1 ] || return 0
   [ "$RELAUNCH_PHASE" != complete ] || return 0
+  if [ "$REPAIR_CWD" = 1 ]; then
+    repair_rollback
+    return
+  fi
   RELAUNCH_ACTIVE=0
   case "$RELAUNCH_PHASE" in
     checkpoint|noted)
@@ -812,6 +850,7 @@ do_relaunch() {
     note_line="note=none"
   fi
   safe_checkpoint
+  [ "$REPAIR_CWD" = 0 ] || repair_preflight
   cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"
   RELAUNCH_ACTIVE=1
   journal_write checkpoint "${CHECKPOINT_LINES[@]}" "$note_line"
@@ -819,9 +858,14 @@ do_relaunch() {
   record_note
   journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"
 
-  journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"
-  exit_result=$(do_exit)
-  journal_write exited "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  if [ "$REPAIR_CWD" = 1 ]; then
+    repair_replace
+    exit_result=already-stopped
+  else
+    journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"
+    exit_result=$(do_exit)
+    journal_write exited "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  fi
 
   # The launch owner (fm-spawn --relaunch) clears the previous incarnation's
   # per-task harness wiring before arming the new one, so nothing to do here.
@@ -843,11 +887,17 @@ do_relaunch() {
     die "the replacement agent for $ID did not come up within ${LAUNCH_WAIT}s (endpoint reads '$state')"
   }
   RELAUNCH_AGENT_CONFIRMED=1
+  [ "$REPAIR_CWD" = 0 ] || repair_finish
 
   journal_write complete "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
   RELAUNCH_ACTIVE=0
   echo "relaunched $ID harness=$TARGET_HARNESS from=$PRIOR_RECORDED_HARNESS model=$TARGET_MODEL effort=$TARGET_EFFORT backend=$BACKEND endpoint=$T worktree=$WT"
 }
+
+if [ "$REPAIR_CWD" = 1 ]; then
+  # shellcheck source=bin/fm-control-cwd-lib.sh
+  . "$SCRIPT_DIR/fm-control-cwd-lib.sh"
+fi
 
 # --- verbs ------------------------------------------------------------------
 

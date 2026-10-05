@@ -2939,6 +2939,31 @@ test_current_path_reads_cwd() {
   pass "fm_backend_herdr_current_path: reads pane foreground_cwd (the live running process), not the frozen creation-time cwd"
 }
 
+test_cwd_repair_requires_exact_live_pane_evidence() {
+  local dir log resp fb out rc variant
+  for variant in exact wrong-pane wrong-tab wrong-workspace missing-path; do
+    dir="$TMP_ROOT/repair-cwd-$variant"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+    jq -cn --arg variant "$variant" '{result: {type: "pane_info", pane: {
+      pane_id: (if $variant == "wrong-pane" then "w1:p9" else "w1:p2" end),
+      tab_id: (if $variant == "wrong-tab" then "w1:t9" else "w1:t1" end),
+      workspace_id: (if $variant == "wrong-workspace" then "w9" else "w1" end),
+      cwd: "/creation-path",
+      foreground_cwd: (if $variant == "missing-path" then null else "/live-path" end)
+    }}}' > "$resp/1.out"
+    fb=$(make_herdr_fakebin "$dir")
+    out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_cwd_repair_pane fm-lab-repair w1 w1:t1 w1:p2' "$ROOT"); rc=$?
+    if [ "$variant" = exact ]; then
+      expect_code 0 "$rc" "exact cwd repair evidence must succeed"
+      [ "$(printf '%s' "$out" | jq -r '.foreground_cwd')" = /live-path ] || fail "repair evidence used creation cwd"
+    else
+      [ "$rc" -ne 0 ] || fail "$variant must not produce repair evidence"
+    fi
+    assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''get'$'\x1f''w1:p2' "repair evidence did not read exact pane"
+  done
+  pass "fm_backend_herdr_cwd_repair_pane: exact identity and live path only, no creation-cwd fallback"
+}
+
 # --- busy_state (semantic agent state) ---------------------------------------
 
 test_busy_state_working_maps_to_busy() {
@@ -4533,6 +4558,7 @@ test_capture_preserves_pane_read_failure
 test_send_key_normalizes_and_targets_pane
 test_kill_is_best_effort
 test_current_path_reads_cwd
+test_cwd_repair_requires_exact_live_pane_evidence
 test_busy_state_working_maps_to_busy
 test_busy_state_done_and_blocked_map_to_idle
 test_busy_state_unknown_on_no_agent

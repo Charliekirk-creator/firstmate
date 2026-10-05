@@ -1190,10 +1190,10 @@ fm_backend_herdr_pid_is_bare_shell() {  # <ps-bin> <pid>
 # fails every sample and still refuses.
 # This is the single owner of the idle-shell proof; the session-start
 # projection cleanup and every pane-death close path both rely on it.
-fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
+fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id> [interactive]
   local attempt=0 max_attempts=${FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS:-10}
   while :; do
-    if fm_backend_herdr_pane_idle_shell_sample "$1" "$2"; then
+    if fm_backend_herdr_pane_idle_shell_sample "$1" "$2" "${3:-}"; then
       return 0
     fi
     attempt=$((attempt + 1))
@@ -1205,7 +1205,7 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
 # fm_backend_herdr_pane_idle_shell_sample: one strict instantaneous
 # observation for fm_backend_herdr_pane_idle_shell_pid, which owns the proof
 # contract and the settle retry.
-fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
+fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id> [interactive]
   local session=$1 pane=$2 info shell_pid foreground_pgid count
   local process_pid name argv0 shell_name rows stat ps_bin
   info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
@@ -1236,6 +1236,17 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   argv0=${argv0##*/}
   [ "$argv0" = "$shell_name" ] || return 1
   case "$shell_name" in sh|bash|zsh|dash|ksh|fish) ;; *) return 1 ;; esac
+  # Cwd repair may retire this shell, so require a known interactive invocation
+  # rather than mistaking a sleeping shell script or -c command for a prompt.
+  # Other callers retain the existing proof when the stricter mode is absent.
+  if [ "${3:-}" = interactive ]; then
+    printf '%s' "$info" | jq -e --arg shell "$shell_name" '
+      .result.process_info.foreground_processes[0].argv
+      | select(type == "array" and length > 0)
+      | select((.[0] | ltrimstr("-") | split("/") | last) == $shell)
+      | all(.[1:][]; type == "string" and test("^(-[ilf]+|--login|--noprofile|--norc|--no-config)$"))
+    ' >/dev/null 2>&1 || return 1
+  fi
 
   ps_bin=${FM_HERDR_PS_BIN:-ps}
   command -v "$ps_bin" >/dev/null 2>&1 || return 1
@@ -2528,6 +2539,27 @@ fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
     | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+}
+
+# Exact, read-only pane evidence for fm-control's cwd repair transaction.
+# Unlike the compatibility current_path reader above, this refuses an echoed
+# identity mismatch or malformed live cwd rather than returning fallback data.
+# It never starts a server or interprets the pane-creation cwd as live state.
+fm_backend_herdr_cwd_repair_pane() { # <session> <workspace> <tab> <pane>
+  local out pane observed rc=0
+  out=$(fm_backend_herdr_cli "$1" pane get "$4" 2>/dev/null) || rc=$?
+  if [ "$rc" = 0 ] && pane=$(printf '%s' "$out" | jq -ec --arg ws "$2" --arg tab "$3" --arg pane "$4" '
+    select(.error == null and .result.type == "pane_info")
+    | .result.pane
+    | select(.pane_id == $pane and .workspace_id == $ws and .tab_id == $tab)
+    | select((.foreground_cwd | type) == "string")
+  ' 2>/dev/null); then
+    printf '%s\n' "$pane"
+    return 0
+  fi
+  observed=$(printf '%s' "$out" | jq -c '.result.pane // .error // null' 2>/dev/null) || observed=unreadable
+  printf 'error: Herdr pane evidence mismatch for %s:%s workspace=%s tab=%s; observed=%s\n' "$1" "$4" "$2" "$3" "$observed" >&2
+  return 1
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,

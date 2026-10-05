@@ -73,7 +73,11 @@ It is not deterministic across the verified adapters: codex and grok resume only
 
 Switching harness is therefore one ordinary relaunch rather than a separate mechanism.
 
-### Failure and rollback
+An explicit `relaunch --repair-cwd` can replace an agent-free Herdr pane whose directory has drifted, preserving the recorded isolated worktree rather than typing into an untrusted shell input buffer.
+The option's complete preconditions, sibling-pane transaction, publication and rollback rules, focus limits, and unresolved-repair refusal are owned by [`fm-control.sh --help`](../bin/fm-control.sh).
+Ordinary relaunch and the independent launch-time isolation guard remain unchanged.
+
+### Ordinary relaunch failure and rollback
 
 - A refusal **before** the agent is stopped leaves the durable record and the instructions byte-identical.
 - A launch failure **after** the agent is stopped restores the prior durable record, keeps the progress note so a later recovery still has it, marks the journal `failed:launching`, and reports plainly that no agent is running and where the work is preserved.
@@ -118,5 +122,5 @@ The empirical basis for each adapter's value is the `harness-adapters` skill's v
 ## Verification
 
 - `tests/fm-control.test.sh` - the adapter contract for every verified harness, the backend capability matrix, exact-id scoping, the closed verb list, the busy, idle, dead, and idempotent lifecycle cases, and marker non-regression, all against a stubbed session provider.
-- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals, and rollback after a failed launch.
+- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals, rollback after a failed launch, and explicit Herdr cwd-repair success, refusal, preservation, and partial outcomes.
 - `tests/fm-control-herdr-smoke.test.sh` - the second state-verified backend against the real herdr binary, on an isolated throwaway lab session.

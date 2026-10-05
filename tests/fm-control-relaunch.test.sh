@@ -1477,6 +1477,9 @@ test_relaunch_moves_a_drifted_item_back_in_flight() {
   pass "relaunch heals an item that drifted out of In flight while the task stayed live"
 }
 
+# Opt-in subset for iterating on the Herdr-only repair without the unrelated
+# adapter and backlog concurrency cases. The default always runs both sets.
+if [ "${FM_CONTROL_CWD_ONLY:-0}" != 1 ]; then
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
@@ -1528,3 +1531,7 @@ test_spawn_relaunch_refuses_an_unrecorded_task
 test_spawn_relaunch_refuses_a_pane_outside_the_worktree
 test_relaunch_reverifies_an_already_in_flight_item_instead_of_rewriting_it
 test_relaunch_moves_a_drifted_item_back_in_flight
+fi
+
+# shellcheck source=tests/control-cwd-cases.sh
+. "$ROOT/tests/control-cwd-cases.sh"
