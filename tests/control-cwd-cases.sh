@@ -263,7 +263,7 @@ test_cwd_repair_checkpoint_refusals() {
         ;;
       head)
         make_git_failure_stub "$dir"
-        target_status=head-unreadable
+        target_status='head-unreadable'
         expected="task rcwd's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
         ;;
       status)

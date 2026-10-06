@@ -110,7 +110,7 @@ repair_project_check() {
   [ "$primary" = "$primary_top" ] || repair_refuse "project binding is not its Git root"
   REPAIR_TARGET=$(CDPATH='' cd -- "$WT" && pwd -P) || repair_refuse "worktree cannot be resolved"
   if [ "$REPAIR_TARGET" = "$primary" ]; then
-    REPAIR_TARGET_STATUS=primary-copy
+    REPAIR_TARGET_STATUS='primary-copy'
     repair_refuse "recorded worktree is the primary project copy"
   fi
   common=$(git -C "$primary" rev-parse --path-format=absolute --git-common-dir) || repair_refuse "project family cannot be read"

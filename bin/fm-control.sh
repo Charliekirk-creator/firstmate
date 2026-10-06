@@ -799,22 +799,22 @@ safe_checkpoint() {
     :
   elif head_ref=$(git -C "$WT" symbolic-ref -q HEAD 2>/dev/null); then
     if git -C "$WT" show-ref --verify --quiet "$head_ref" 2>/dev/null; then
-      [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=head-unreadable
+      [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='head-unreadable'
       checkpoint_refuse "task $ID's worktree HEAD exists but cannot be resolved; refusing to relaunch from an unreadable checkout"
     else
       head_ref_status=$?
       if [ "$head_ref_status" -ne 1 ]; then
-        [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=head-unreadable
+        [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='head-unreadable'
         checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
       fi
       head=unborn
     fi
   else
-    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=head-unreadable
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='head-unreadable'
     checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
   fi
   status_output=$(git -C "$WT" status --porcelain 2>/dev/null) || {
-    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=status-unreadable
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='status-unreadable'
     checkpoint_refuse "task $ID's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
   }
   if [ -n "$status_output" ]; then
