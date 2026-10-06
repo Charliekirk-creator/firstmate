@@ -660,11 +660,14 @@ Polling remained active and is covered as the fallback for capability, connect, 
 
 ### Agent lifecycle control
 
-Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)), so its lifecycle gating is measured against the real binary; reverified 2026-08-08 on Herdr 0.8.0, and first measured 2026-08-02 on Herdr 0.7.5 with identical results:
+Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)).
+Its lifecycle gating and opt-in cwd-repair transaction were reverified on 2026-10-05 against Herdr 0.9.3, protocol 22:
 
 ```sh
-tests/fm-control-herdr-smoke.test.sh
+bash tests/fm-control-herdr-smoke.test.sh
 ```
+
+The run supplied `HERDR_LAB_HELPER` from the trusted Firstmate code root and a task-specific `HERDR_LAB_LABEL`; the suite generated the isolated session and all calls passed through that helper.
 
 Observed output:
 
@@ -674,10 +677,16 @@ ok - real herdr: interrupt refuses when herdr's own agent registry reports no ag
 ok - real herdr: interrupt delivers the harness's key and proves the agent survived it
 ok - real herdr: no control verb removed the endpoint or the task's local copy
 ok - real herdr: an agent that does not stop fails closed instead of being reported as stopped
+ok - real herdr: exact TTY proof accepts interactive Bash/Zsh and rejects FIFO stdin
+ok - real herdr: cwd repair splits in the recorded worktree, rebinds, launches and retires only the old pane
+ok - real herdr: repair preserves HEAD, untracked work and the independent launch directory guard
 ```
 
-The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so registering and not registering an agent on a plain shell pane exercises exactly the gate every lifecycle verb depends on, with no real agent launched.
-That command is the guard that refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
+The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies.
+A foreground fixture keeps synthetic registrations from being retired by shell integration at an idle prompt.
+The repair case launches a non-model stand-in through the real spawn owner, records its actual working directory, and registers it through the real Herdr API.
+No model invocation is needed to verify the endpoint transaction.
+That suite refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
 
 ### Away-mode transport
 

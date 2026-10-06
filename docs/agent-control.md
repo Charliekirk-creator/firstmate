@@ -32,7 +32,7 @@ A recorded `harness=` is not always an exact adapter name: a task launched from 
 | --- | --- | --- |
 | `interrupt` | Deliver the harness's verified interrupt sequence while leaving the agent running. | Delivery succeeds while the endpoint still exists and the agent is still alive where the backend can classify that; cancellation is confirmed only from an adapter-owned acknowledgement and otherwise reports `cancel=unconfirmed`. |
 | `exit` | Stop the agent, preserving the endpoint, the worktree, and every uncommitted change. | The backend's recovery-grade classifier reports the agent gone. Already-stopped is idempotent success. |
-| `relaunch` | Replace the running agent with a new one in the same endpoint and worktree, on the exact recorded adapter or an explicitly chosen harness, model, and effort. | The new agent is alive on the recorded endpoint, and the durable record names the harness that is actually running. |
+| `relaunch` | Replace the running agent in its recorded worktree, ordinarily in the same endpoint; explicit Herdr cwd repair may replace a drifted pane as documented below. | The new agent is alive on the durable recorded endpoint, and the durable record names the harness that is actually running. |
 
 An exit that delivers lifecycle input but cannot prove the agent stopped fails with `exit=unconfirmed`, reports the observed agent state and any interrupt cancellation claim, and never claims that nothing changed.
 Interrupt never rewrites busy state as proof of its own success.
@@ -54,6 +54,7 @@ It is not deterministic across the verified adapters: codex and grok resume only
 ## Transactional relaunch
 
 `relaunch` is the only verb that changes durable records, so it runs as a transaction with a journal at `state/<id>.control-relaunch`, the prior record preserved beside it, and a ship or scout's prior instructions preserved when a progress note is appended.
+Ordinary relaunch follows these steps:
 
 1. **Resolve the profile.**
    An explicit `--harness`, `--model`, or `--effort` wins.
@@ -73,7 +74,11 @@ It is not deterministic across the verified adapters: codex and grok resume only
 
 Switching harness is therefore one ordinary relaunch rather than a separate mechanism.
 
-### Failure and rollback
+An explicit `relaunch --repair-cwd` can replace an agent-free Herdr pane whose directory has drifted, preserving the recorded isolated worktree rather than typing into an untrusted shell input buffer.
+The option's complete preconditions, sibling-pane transaction, publication and rollback rules, focus limits, and unresolved-repair refusal are owned by [`fm-control.sh --help`](../bin/fm-control.sh).
+Ordinary relaunch and the independent launch-time isolation guard remain unchanged.
+
+### Ordinary relaunch failure and rollback
 
 - A refusal **before** the agent is stopped leaves the durable record and the instructions byte-identical.
 - A launch failure **after** the agent is stopped restores the prior durable record, keeps the progress note so a later recovery still has it, marks the journal `failed:launching`, and reports plainly that no agent is running and where the work is preserved.
@@ -118,5 +123,5 @@ The empirical basis for each adapter's value is the `harness-adapters` skill's v
 ## Verification
 
 - `tests/fm-control.test.sh` - the adapter contract for every verified harness, the backend capability matrix, exact-id scoping, the closed verb list, the busy, idle, dead, and idempotent lifecycle cases, and marker non-regression, all against a stubbed session provider.
-- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals, and rollback after a failed launch.
+- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals, rollback after a failed launch, and explicit Herdr cwd-repair success, refusal, preservation, and partial outcomes.
 - `tests/fm-control-herdr-smoke.test.sh` - the second state-verified backend against the real herdr binary, on an isolated throwaway lab session.

@@ -5,7 +5,7 @@
 # Usage: fm-control.sh <task-id> interrupt
 #        fm-control.sh <task-id> exit
 #        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
-#                                         [--effort <level>]
+#                                         [--effort <level>] [--repair-cwd]
 #                                         (--note <text> | --note-file <path>)
 #
 # Why this exists, and how it differs from fm-send.sh. bin/fm-send.sh is the
@@ -50,6 +50,43 @@
 #              the prior durable record in place and reports the concrete
 #              state; it never leaves a half-transitioned task claiming to be
 #              running.
+#
+# --repair-cwd is an explicit Herdr-only exception to SAME endpoint, for ship
+# and scout tasks whose positively agent-free, lone idle interactive shell is
+# in the wrong directory. Its stdin must be the pane TTY and it must own the
+# foreground process group. It never types into or resets that shell: pending
+# input and custom traps cannot be proved safe. Instead it splits that exact
+# pane, in its same session/workspace/tab, with API --cwd set only to the
+# validated recorded worktree. The target must physically be a Git worktree
+# root, share the recorded project's Git family, and differ from the primary
+# project copy.
+# Checkpointing, exact identity checks, and the existing control lock still
+# apply; a session layout lock spans replacement, launch, and retirement.
+# The task tab must not be active, so the focus-safe cleanup owner can preserve
+# the current tab. Any conflicting process, live agent, or ambiguity refuses.
+# The API-issued sibling must be new, exactly bound, agent-free, and have two
+# consecutive canonical foreground_cwd reads matching the target before its
+# binding is atomically published under the common metadata lock. Concurrent
+# unrelated metadata is preserved; a presentation restart binding is advanced
+# through its owner. fm-spawn --relaunch still independently checks isolation.
+# Only after the replacement is confirmed does exact focus-safe cleanup retire
+# the old agent-free pane, after revalidating that same interactive shell and
+# TTY ownership at the close boundary. Before publication, failure removes a
+# sibling only when its ownership is proven and claims instruction preservation
+# only after byte verification; ambiguous outcomes are retained for
+# reconciliation. After publication, failure keeps the accurate new binding
+# and progress note, never reverting to the wrong pane. The transaction records
+# source/target paths, both panes, publication, presentation, and cleanup
+# outcomes. Explicit repair records checkpoint and preflight refusals before
+# changing instructions or allocating a pane.
+# Every relaunch preserves unresolved earlier repair evidence by refusing a
+# new attempt. Only an explicit repair may retry a proven pre-allocation,
+# pre-publication refusal with no sibling, publication attempt, or instruction
+# mutation, and only while the full durable endpoint identity still exactly
+# matches the refused attempt.
+# No caller path, command, generic rebind, worktree allocation, or discard is
+# accepted. With this option absent and no unresolved repair, ordinary
+# relaunch is unchanged.
 #
 # Teardown and discard are NOT verbs here and never will be. `exit` stops an
 # agent and preserves everything else; removing a worktree, killing an
@@ -157,6 +194,9 @@ control_cleanup() {
      && declare -F relaunch_rollback >/dev/null 2>&1; then
     relaunch_rollback || true
   fi
+  if declare -F repair_release_locks >/dev/null 2>&1; then
+    repair_release_locks || true
+  fi
   if [ "$CONTROL_LOCK_HELD" = 1 ]; then
     CONTROL_LOCK_HELD=0
     fm_lock_release "$CONTROL_LOCK" || true
@@ -195,6 +235,7 @@ MODEL_SET=0
 EFFORT_SET=0
 NOTE=
 NOTE_SET=0
+REPAIR_CWD=0
 control_want_value=
 for control_arg in "$@"; do
   if [ -n "$control_want_value" ]; then
@@ -216,6 +257,7 @@ for control_arg in "$@"; do
     continue
   fi
   case "$control_arg" in
+    --repair-cwd) REPAIR_CWD=1 ;;
     --harness) control_want_value=harness ;;
     --harness=*) NEW_HARNESS=${control_arg#--harness=}; HARNESS_SET=1 ;;
     --model) control_want_value=model ;;
@@ -242,6 +284,7 @@ if [ "$VERB" != relaunch ]; then
   [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
     || die "--harness, --model, --effort, and --note apply to 'relaunch' only"
 fi
+[ "$REPAIR_CWD" = 0 ] || [ "$VERB" = relaunch ] || die "--repair-cwd applies to 'relaunch' only"
 [ "$HARNESS_SET" = 0 ] || [ -n "$NEW_HARNESS" ] || die "--harness requires a non-empty value"
 [ "$MODEL_SET" = 0 ] || [ -n "$NEW_MODEL" ] || die "--model requires a non-empty value"
 [ "$EFFORT_SET" = 0 ] || [ -n "$NEW_EFFORT" ] || die "--effort requires a non-empty value"
@@ -304,12 +347,15 @@ KIND=$(fm_meta_get "$META" kind)
 WT=$(fm_meta_get "$META" worktree)
 [ -n "$KIND" ] || KIND=ship
 
-HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
-  || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
-fm_control_harness_supported "$HARNESS" \
-  || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
-
-fm_backend_validate "$BACKEND" || exit 1
+if [ "$REPAIR_CWD" = 1 ]; then
+  HARNESS=$RECORDED_HARNESS
+else
+  HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
+    || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+  fm_control_harness_supported "$HARNESS" \
+    || die "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+  fm_backend_validate "$BACKEND" || exit 1
+fi
 
 # --- shared helpers ---------------------------------------------------------
 
@@ -342,9 +388,16 @@ wait_agent_state() {  # <timeout> <wanted>...
   return 1
 }
 
+relaunch_preflight_refuse() {
+  if [ "$REPAIR_CWD" = 1 ] && [ "${REPAIR_EVIDENCE_ACTIVE:-0}" = 1 ]; then
+    repair_refuse "$1"
+  fi
+  die "$1"
+}
+
 require_state_verified_backend() {  # <verb>
   fm_control_backend_state_verified "$BACKEND" && return 0
-  die "task $ID runs on the $BACKEND backend, which has no recovery-grade agent-state classifier, so '$1' cannot prove the agent actually stopped; refusing rather than reporting an unproven transition as done"
+  relaunch_preflight_refuse "task $ID runs on the $BACKEND backend, which has no recovery-grade agent-state classifier, so '$1' cannot prove the agent actually stopped; refusing rather than reporting an unproven transition as done"
 }
 
 # send_interrupt_keys: deliver the harness's interrupt key the verified number
@@ -522,6 +575,24 @@ TARGET_HARNESS=$HARNESS
 TARGET_MODEL=
 TARGET_EFFORT=
 
+relaunch_guard_prior_repair() {
+  local prior
+  [ -e "$JOURNAL" ] || return 0
+  prior=$(fm_meta_get "$JOURNAL" repair_state)
+  [ -n "$prior" ] || return 0
+  case "$prior" in
+    complete|rolled-back) return 0 ;;
+    refused)
+      if [ "$REPAIR_CWD" = 1 ] \
+          && declare -F repair_prior_refusal_retryable >/dev/null 2>&1 \
+          && repair_prior_refusal_retryable; then
+        return 0
+      fi
+      ;;
+  esac
+  die "an earlier repair remains $prior in $JOURNAL; reconcile its recorded panes before relaunching"
+}
+
 journal_write() {  # <phase> [extra-line]...
   local phase=$1
   shift
@@ -540,6 +611,7 @@ journal_write() {  # <phase> [extra-line]...
     echo "to_harness=$TARGET_HARNESS"
     echo "to_model=$TARGET_MODEL"
     echo "to_effort=$TARGET_EFFORT"
+    [ "$REPAIR_CWD" = 0 ] || repair_journal_lines
     local line
     for line in "$@"; do
       echo "$line"
@@ -555,6 +627,10 @@ relaunch_rollback() {
   local state
   [ "$RELAUNCH_ACTIVE" = 1 ] || return 0
   [ "$RELAUNCH_PHASE" != complete ] || return 0
+  if [ "$REPAIR_CWD" = 1 ]; then
+    repair_rollback
+    return
+  fi
   RELAUNCH_ACTIVE=0
   case "$RELAUNCH_PHASE" in
     checkpoint|noted)
@@ -618,7 +694,7 @@ resolve_relaunch_profile() {
   [ -n "$PRIOR_EFFORT" ] || PRIOR_EFFORT=default
   if [ "$HARNESS_SET" = 0 ] \
      && [ "$PRIOR_RECORDED_HARNESS" != "$PRIOR_HARNESS" ]; then
-    die "task $ID records harness '$PRIOR_RECORDED_HARNESS', whose original launch command cannot be reconstructed from its recorded basename; relaunching without --harness would substitute the canonical adapter '$PRIOR_HARNESS' for the command actually running. Pass an explicit --harness to choose the replacement runtime deliberately"
+    relaunch_preflight_refuse "task $ID records harness '$PRIOR_RECORDED_HARNESS', whose original launch command cannot be reconstructed from its recorded basename; relaunching without --harness would substitute the canonical adapter '$PRIOR_HARNESS' for the command actually running. Pass an explicit --harness to choose the replacement runtime deliberately"
   fi
   CONFIG_HARNESS=
   CONFIG_MODEL=
@@ -644,11 +720,11 @@ resolve_relaunch_profile() {
   fi
   if [ "$HARNESS_SET" = 1 ]; then
     fm_control_harness_supported "$NEW_HARNESS" \
-      || die "'$NEW_HARNESS' is not a verified harness; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
+      || relaunch_preflight_refuse "'$NEW_HARNESS' is not a verified harness; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
     TARGET_HARNESS=$NEW_HARNESS
   elif [ "$HARNESS_SET" = 0 ] && [ -n "$CONFIG_HARNESS" ]; then
     fm_control_harness_supported "$CONFIG_HARNESS" \
-      || die "the configured secondmate harness '$CONFIG_HARNESS' is not verified; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
+      || relaunch_preflight_refuse "the configured secondmate harness '$CONFIG_HARNESS' is not verified; fm-control refuses to relaunch onto an adapter with no verified control or launch mechanics"
     TARGET_HARNESS=$CONFIG_HARNESS
   else
     TARGET_HARNESS=$PRIOR_HARNESS
@@ -658,7 +734,7 @@ resolve_relaunch_profile() {
   # capability table here keeps that refusal on the pre-stop side of the
   # transaction, where nothing has changed yet.
   fm_control_harness_supports_kind "$TARGET_HARNESS" "$KIND" \
-    || die "'$TARGET_HARNESS' is not verified to run a $KIND task, so relaunching $ID onto it would stop the running agent for a launch that must be refused; choose an adapter verified for this kind"
+    || relaunch_preflight_refuse "'$TARGET_HARNESS' is not verified to run a $KIND task, so relaunching $ID onto it would stop the running agent for a launch that must be refused; choose an adapter verified for this kind"
   # A model or effort chosen for the previous harness does not transfer to a
   # different one, so an explicit harness change resets both axes unless the
   # caller names them too.
@@ -682,6 +758,10 @@ resolve_relaunch_profile() {
   fi
 }
 
+checkpoint_refuse() {
+  relaunch_preflight_refuse "$1"
+}
+
 # safe_checkpoint: prove, before anything is stopped, that the work a relaunch
 # must preserve is actually there and recoverable afterwards. Fills
 # CHECKPOINT_LINES with the journal lines describing what it proved, and
@@ -690,35 +770,59 @@ CHECKPOINT_LINES=()
 safe_checkpoint() {
   local wt_real wt_top wt_top_real head head_ref head_ref_status status_output dirty children marker child_meta
   CHECKPOINT_LINES=()
-  [ -n "$WT" ] || die "task $ID has no recorded worktree; refusing to relaunch without a recorded local copy to preserve"
-  [ -d "$WT" ] || die "task $ID's recorded worktree $WT is missing; refusing to relaunch and lose track of its work"
-  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || die "task $ID's recorded worktree $WT cannot be resolved"
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null) \
-    || die "task $ID's recorded worktree $WT is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
+  if [ -z "$WT" ]; then
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=missing-record
+    checkpoint_refuse "task $ID has no recorded worktree; refusing to relaunch without a recorded local copy to preserve"
+  fi
+  if [ ! -d "$WT" ]; then
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=missing
+    checkpoint_refuse "task $ID's recorded worktree $WT is missing; refusing to relaunch and lose track of its work"
+  fi
+  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || {
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=unresolvable
+    checkpoint_refuse "task $ID's recorded worktree $WT cannot be resolved"
+  }
+  if [ "$REPAIR_CWD" = 1 ]; then
+    REPAIR_TARGET=$wt_real
+    REPAIR_TARGET_STATUS=resolved
+  fi
+  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null) || {
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=not-git-worktree
+    checkpoint_refuse "task $ID's recorded worktree $WT is not a git worktree; refusing to relaunch without a checkout whose unlanded work can be accounted for"
+  }
   wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P) || wt_top_real=$wt_top
-  [ "$wt_real" = "$wt_top_real" ] \
-    || die "task $ID's recorded worktree $WT is not a worktree root (root is $wt_top); refusing to relaunch against an ambiguous checkout"
+  if [ "$wt_real" != "$wt_top_real" ]; then
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=not-worktree-root
+    checkpoint_refuse "task $ID's recorded worktree $WT is not a worktree root (root is $wt_top); refusing to relaunch against an ambiguous checkout"
+  fi
   if head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null); then
     :
   elif head_ref=$(git -C "$WT" symbolic-ref -q HEAD 2>/dev/null); then
     if git -C "$WT" show-ref --verify --quiet "$head_ref" 2>/dev/null; then
-      die "task $ID's worktree HEAD exists but cannot be resolved; refusing to relaunch from an unreadable checkout"
+      [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='head-unreadable'
+      checkpoint_refuse "task $ID's worktree HEAD exists but cannot be resolved; refusing to relaunch from an unreadable checkout"
     else
       head_ref_status=$?
-      [ "$head_ref_status" -eq 1 ] \
-        || die "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+      if [ "$head_ref_status" -ne 1 ]; then
+        [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='head-unreadable'
+        checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+      fi
       head=unborn
     fi
   else
-    die "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='head-unreadable'
+    checkpoint_refuse "task $ID's worktree HEAD cannot be inspected; refusing to relaunch from an unreadable checkout"
   fi
-  status_output=$(git -C "$WT" status --porcelain 2>/dev/null) \
-    || die "task $ID's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
+  status_output=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+    [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS='status-unreadable'
+    checkpoint_refuse "task $ID's worktree status cannot be inspected; refusing to relaunch without accounting for local changes"
+  }
   if [ -n "$status_output" ]; then
     dirty=yes
   else
     dirty=no
   fi
+  [ "$REPAIR_CWD" = 0 ] || REPAIR_TARGET_STATUS=checkpointed
   CHECKPOINT_LINES+=("worktree_head=$head" "worktree_dirty=$dirty")
   if [ "$KIND" = secondmate ]; then
     # A secondmate's own crewmates outlive its relaunch: they run in their own
@@ -754,15 +858,52 @@ safe_checkpoint() {
 # actually reads. A secondmate's charter is a durable standing document and is
 # never rewritten: a secondmate reconciles its own home's records at startup,
 # so the note stays parent-side audit evidence.
+repair_note_refuse() {
+  local reason=$1
+  if [ -f "$BRIEF_PRIOR" ] && cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
+    REPAIR_BRIEF_OUTCOME=unchanged
+  elif [ "$REPAIR_BRIEF_BACKUP_VALID" = 1 ] && [ -f "$BRIEF_PRIOR" ]; then
+    cp -p "$BRIEF_PRIOR" "$RELAUNCH_BRIEF" || true
+    if cmp -s "$BRIEF_PRIOR" "$RELAUNCH_BRIEF"; then
+      REPAIR_BRIEF_OUTCOME=unchanged
+    else
+      REPAIR_BRIEF_OUTCOME=mutation-unconfirmed
+    fi
+  else
+    REPAIR_BRIEF_OUTCOME=mutation-unconfirmed
+  fi
+  RELAUNCH_ACTIVE=0
+  if [ "$REPAIR_BRIEF_OUTCOME" = unchanged ]; then
+    repair_refuse "$reason"
+  fi
+  REPAIR_REFUSAL=$reason
+  REPAIR_STATE=brief-mutation-unconfirmed
+  journal_write failed:checkpoint "${CHECKPOINT_LINES[@]}" "rollback=brief-mutation-unconfirmed" || true
+  die "cwd repair of $ID refused: $reason; instruction preservation is unconfirmed and requires reconciliation"
+}
+
 record_note() {
   local stamp
   [ -n "$NOTE" ] || return 0
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf '%s\n' "$NOTE" > "$NOTE_FILE"
+  if [ "$REPAIR_CWD" = 1 ]; then
+    if cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
+        && cmp -s "$RELAUNCH_BRIEF" "$BRIEF_PRIOR"; then
+      REPAIR_BRIEF_BACKUP_VALID=1
+    else
+      repair_note_refuse "could not preserve task $ID's instructions before recording the progress note"
+    fi
+    printf '%s\n' "$NOTE" > "$NOTE_FILE" \
+      || repair_note_refuse "could not persist task $ID's progress note"
+  else
+    printf '%s\n' "$NOTE" > "$NOTE_FILE"
+  fi
   case "$KIND" in
     ship|scout)
-      cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
-        || die "could not preserve task $ID's instructions before recording the progress note"
+      if [ "$REPAIR_CWD" = 0 ]; then
+        cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
+          || die "could not preserve task $ID's instructions before recording the progress note"
+      fi
       {
         echo
         echo "## Progress note ($stamp)"
@@ -775,8 +916,11 @@ record_note() {
         echo "$STATE/$ID.inbox/handled/. A steer sent before the relaunch survives there."
         echo
         printf '%s\n' "$NOTE"
-      } >> "$RELAUNCH_BRIEF" \
-        || die "could not append the progress note to task $ID's instructions"
+      } >> "$RELAUNCH_BRIEF" || {
+        [ "$REPAIR_CWD" = 0 ] \
+          && die "could not append the progress note to task $ID's instructions"
+        repair_note_refuse "could not append the progress note to task $ID's instructions"
+      }
       ;;
   esac
 }
@@ -785,6 +929,16 @@ do_relaunch() {
   local exit_result state note_line
   local -a spawn_args
 
+  relaunch_guard_prior_repair
+  if [ "$REPAIR_CWD" = 1 ]; then
+    repair_begin
+    HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
+      || repair_refuse "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+    fm_control_harness_supported "$HARNESS" \
+      || repair_refuse "task $ID records harness '${RECORDED_HARNESS:-none}', which has no verified control mechanics; fm-control refuses to guess an interrupt key or exit command"
+    fm_backend_validate "$BACKEND" \
+      || repair_refuse "Herdr backend validation failed"
+  fi
   require_state_verified_backend relaunch
   resolve_relaunch_profile
 
@@ -792,9 +946,9 @@ do_relaunch() {
     ship|scout)
       RELAUNCH_BRIEF="$DATA/$ID/brief.md"
       [ -f "$RELAUNCH_BRIEF" ] \
-        || die "task $ID has no instructions at $RELAUNCH_BRIEF; refusing to relaunch a worker with nothing to work from"
+        || relaunch_preflight_refuse "task $ID has no instructions at $RELAUNCH_BRIEF; refusing to relaunch a worker with nothing to work from"
       [ "$NOTE_SET" = 1 ] && [ -n "$NOTE" ] \
-        || die "relaunch of a $KIND task requires --note (or --note-file): the replacement worker inherits the local copy but none of the conversation, so it must be told what happened"
+        || relaunch_preflight_refuse "relaunch of a $KIND task requires --note (or --note-file): the replacement worker inherits the local copy but none of the conversation, so it must be told what happened"
       ;;
     secondmate)
       # The charter in the secondmate's own home is its instruction source and
@@ -802,7 +956,7 @@ do_relaunch() {
       RELAUNCH_BRIEF=
       ;;
     *)
-      die "task $ID records kind '$KIND', which has no defined relaunch shape"
+      relaunch_preflight_refuse "task $ID records kind '$KIND', which has no defined relaunch shape"
       ;;
   esac
 
@@ -812,16 +966,30 @@ do_relaunch() {
     note_line="note=none"
   fi
   safe_checkpoint
-  cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"
+  [ "$REPAIR_CWD" = 0 ] || repair_preflight
+  cp -p "$META" "$META_PRIOR" || relaunch_preflight_refuse "could not preserve task $ID's durable record before relaunching"
   RELAUNCH_ACTIVE=1
-  journal_write checkpoint "${CHECKPOINT_LINES[@]}" "$note_line"
+  if ! journal_write checkpoint "${CHECKPOINT_LINES[@]}" "$note_line"; then
+    if [ "$REPAIR_CWD" = 1 ]; then
+      RELAUNCH_ACTIVE=0
+      repair_refuse "could not persist relaunch checkpoint evidence"
+    fi
+  fi
 
   record_note
-  journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"
+  if ! journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"; then
+    [ "$REPAIR_CWD" = 0 ] \
+      || repair_note_refuse "could not persist relaunch progress-note evidence"
+  fi
 
-  journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"
-  exit_result=$(do_exit)
-  journal_write exited "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  if [ "$REPAIR_CWD" = 1 ]; then
+    repair_replace
+    exit_result=already-stopped
+  else
+    journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"
+    exit_result=$(do_exit)
+    journal_write exited "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  fi
 
   # The launch owner (fm-spawn --relaunch) clears the previous incarnation's
   # per-task harness wiring before arming the new one, so nothing to do here.
@@ -843,11 +1011,17 @@ do_relaunch() {
     die "the replacement agent for $ID did not come up within ${LAUNCH_WAIT}s (endpoint reads '$state')"
   }
   RELAUNCH_AGENT_CONFIRMED=1
+  [ "$REPAIR_CWD" = 0 ] || repair_finish
 
   journal_write complete "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
   RELAUNCH_ACTIVE=0
   echo "relaunched $ID harness=$TARGET_HARNESS from=$PRIOR_RECORDED_HARNESS model=$TARGET_MODEL effort=$TARGET_EFFORT backend=$BACKEND endpoint=$T worktree=$WT"
 }
+
+if [ "$REPAIR_CWD" = 1 ]; then
+  # shellcheck source=bin/fm-control-cwd-lib.sh
+  . "$SCRIPT_DIR/fm-control-cwd-lib.sh"
+fi
 
 # --- verbs ------------------------------------------------------------------
 
