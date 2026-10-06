@@ -2804,6 +2804,51 @@ EOF
   pass "OpenCode healthy arm output does not suppress the turn-end guard"
 }
 
+test_pi_factory_discovery_preserves_session_owner_evidence() {
+  local repo home out status
+  repo="$TMP_ROOT/pi-factory-marker-root"
+  home="$TMP_ROOT/pi-factory-marker-home"
+  mkdir -p "$home/state"
+  install_pi_watch_extension_fixture "$repo"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$repo/.pi/extensions/"
+  out=$(PLUGIN_ROOT="$repo" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const state = `${process.env.FM_HOME}/state`;
+writeFileSync(`${state}/.lock`, `${process.pid}\n`);
+for (const [file, marker] of [
+  ["fm-primary-pi-watch.ts", ".pi-watch-extension-loaded"],
+  ["fm-primary-turnend-guard.ts", ".pi-turnend-extension-loaded"],
+]) {
+  const original = `already-active-build\n${process.pid}\n`;
+  writeFileSync(`${state}/${marker}`, original);
+  const handlers = {};
+  const pi = {
+    on(name, handler) { handlers[name] = handler; },
+    registerCommand() {}, registerTool() {},
+  };
+  const mod = await import(pathToFileURL(`${process.env.PLUGIN_ROOT}/.pi/extensions/${file}`).href);
+  mod.default(pi);
+  if (readFileSync(`${state}/${marker}`, "utf8") !== original) {
+    throw new Error(`${file}: factory-only discovery overwrote active session ownership`);
+  }
+  // Reload activates a session but does not launch native startup work.
+  await handlers.session_start({reason: "reload"}, {});
+  const loaded = readFileSync(`${state}/${marker}`, "utf8");
+  if (!loaded.startsWith("sha256:") || loaded.split("\n")[1] !== String(process.pid)) {
+    throw new Error(`${file}: session activation did not publish loaded-owner evidence: ${loaded}`);
+  }
+  await handlers.session_shutdown();
+}
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "Pi discovery must not claim an active session's extension markers: $out"
+  [ -z "$out" ] || fail "Pi factory marker test printed output: $out"
+  pass "Pi factory discovery preserves owner evidence; session activation publishes it"
+}
+
+test_pi_factory_discovery_preserves_session_owner_evidence
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop

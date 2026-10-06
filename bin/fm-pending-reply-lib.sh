@@ -1286,23 +1286,36 @@ fm_pending_reply_tick_one() {  # <state-dir> <corr_id> <busy_state> [secondmate-
 # state, and optional secondmate-home wrong-home path checks.
 fm_pending_reply_tick() {  # <state-dir>
   local state=$1 dir rec corr task_id phase delivered meta backend target label busy sm_home harness remote_host
-  local observation observation_task found i
+  local observation observation_task found i line escalated closed
   local -a observation_tasks=() observation_values=()
   dir=$(fm_pending_reply_dir "$state")
   [ -d "$dir" ] || return 0
   for rec in "$dir"/*; do
     [ -f "$rec" ] || continue
-    case "$(basename "$rec")" in
+    case "${rec##*/}" in
       .*) continue ;;
     esac
-    corr=$(fm_pending_reply_get "$rec" corr_id)
-    [ -n "$corr" ] || corr=$(basename "$rec")
-    task_id=$(fm_pending_reply_get "$rec" task_id)
-    phase=$(fm_pending_reply_get "$rec" phase)
+    # Read one snapshot with shell builtins. Finished history grows without a
+    # retention bound, so per-field pipelines and a close lock for every settled
+    # record can starve the watcher's next beacon and delay new wake delivery.
+    # Match fm_pending_reply_get's last-key-wins semantics; never source data.
+    corr='' task_id='' phase='' escalated='' closed=''
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        corr_id=*) corr=${line#*=} ;;
+        task_id=*) task_id=${line#*=} ;;
+        phase=*) phase=${line#*=} ;;
+        escalated_epoch=*) escalated=${line#*=} ;;
+        escalation_closed_epoch=*) closed=${line#*=} ;;
+      esac
+    done < "$rec"
+    [ -n "$corr" ] || corr=${rec##*/}
     if [ "$phase" = resolved ]; then
-      # Cheap no-op unless an escalation for this record is still open; this is
-      # the retry that makes the close converge after a transient write failure.
-      fm_pending_reply_close_escalation "$state" "$corr" || true
+      # A resolved record never reopens. Only an unclosed escalation still owes
+      # work; its existing locked owner re-reads and serializes the repair.
+      if [ -n "$escalated" ] && [ -z "$closed" ]; then
+        fm_pending_reply_close_escalation "$state" "$corr" || true
+      fi
       continue
     fi
     fm_pending_reply_reconcile_delivery "$state" "$corr" || true

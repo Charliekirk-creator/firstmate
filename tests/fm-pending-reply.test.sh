@@ -1250,8 +1250,54 @@ test_failed_send_discards_undelivered_expectation() {
   pass "failed transport discards undelivered expectation only"
 }
 
+# Settled history must not acquire close locks on every watcher poll. Keep a
+# real live lock on a never-escalated record: it cannot delay unrelated work.
+# An unresolved close still goes through the serialized retry owner.
+test_tick_skips_settled_history_but_retries_unclosed_escalation() {
+  local home state corr rec i rc=0 before after
+  home=$(setup_parent settled-history)
+  state="$home/state"
+  mkdir -p "$state/pending-replies"
+  for ((i = 0; i < 1046; i++)); do
+    printf -v corr '%016x' "$i"
+    printf 'corr_id=%s\ntask_id=history\nphase=resolved\nescalated_epoch=\nescalation_closed_epoch=\n' "$corr" \
+      > "$state/pending-replies/$corr"
+  done
+  # Duplicate keys and a final unterminated line must match the ordinary
+  # getter's last-key-wins behavior, not skip an outstanding close.
+  corr=ffffffffffffffff
+  rec="$state/pending-replies/$corr"
+  printf 'corr_id=%s\ntask_id=history\nrequest_summary=retry\nparent_status=%s/history.status\nphase=resolved\nescalated_epoch=1000\nescalation_closed_epoch=1001\nescalation_closed_epoch=' \
+    "$corr" "$state" > "$rec"
+  printf 'blocked [key=pending-reply-%s]: pending-reply-missed: task=history pending-reply-id=%s request=retry\n' \
+    "$corr" "$corr" > "$state/history.status"
+  # A settled escalated record must be just as inert as one that never escalated.
+  printf 'escalated_epoch=1000\nescalation_closed_epoch=1001\n' \
+    >> "$state/pending-replies/0000000000000001"
+  mkdir "$state/.pending-reply-0000000000000000.lock"
+  printf '%s\n' "$$" > "$state/.pending-reply-0000000000000000.lock/pid"
+  before=$(cksum "$state/pending-replies/0000000000000000")
+  # shellcheck source=bin/fm-timeout-lib.sh
+  . "$ROOT/bin/fm-timeout-lib.sh"
+  # shellcheck disable=SC2016 # Arguments expand in the bounded child shell.
+  fm_run_timed 15 env FM_HOME="$home" FM_STATE_OVERRIDE="$state" bash -c \
+    '. "$1"; fm_pending_reply_tick "$2"; fm_pending_reply_tick "$2"' \
+    _ "$ROOT/bin/fm-pending-reply-lib.sh" "$state" || rc=$?
+  expect_code 0 "$rc" "settled history must not starve polling on a terminal record's lock"
+  after=$(cksum "$state/pending-replies/0000000000000000")
+  [ "$before" = "$after" ] || fail "settled history was mutated"
+  [ -n "$(fm_pending_reply_get "$rec" escalation_closed_epoch)" ] \
+    || fail "resolved-but-unclosed escalation was skipped"
+  [ "$(grep -Fc "resolved [key=pending-reply-$corr]" "$state/history.status")" -eq 1 ] \
+    || fail "unclosed escalation was not repaired exactly once"
+  [ "$(cat "$state/.pending-reply-0000000000000000.lock/pid")" = "$$" ] \
+    || fail "settled history scan changed another owner's lock"
+  pass "settled history is lock-free; incomplete escalation closure still converges once"
+}
+
 # --- run --------------------------------------------------------------------
 
+test_tick_skips_settled_history_but_retries_unclosed_escalation
 test_normal_correlated_reply_resolves_once
 test_completed_turn_no_report_triggers_one_recovery
 test_recovery_attempt_is_never_reinjected
