@@ -1,0 +1,12 @@
+ok - cwd repair: API-created sibling, ordinary guarded launch, projection and all work preserved
+ok - cwd repair: atomic publication failures and a concurrent metadata writer preserve truthful ownership
+ok - cwd repair: live, ambiguous, foreign, primary, missing, non-root, active and conflicting endpoints refuse
+ok - cwd repair: checkpoint refusals persist exact evidence, preserve all work, and permit corrected explicit retry
+ok - cwd repair: resolved preflight refusal can be retried safely
+ok - cwd repair: pre-allocation refusals persist exact retryable evidence
+ok - cwd repair: note failures preserve exact instruction outcomes
+ok - cwd repair: verification, publication, launch and cleanup failures preserve accurate partial outcomes
+ok - cwd repair: retirement close revalidates the exact shell
+ok - cwd repair: failed brief restoration remains unresolved
+ok - cwd repair: retirement requires durable phase evidence
+ok - cwd repair: explicit opt-in, Herdr-only boundary and literal path arguments
