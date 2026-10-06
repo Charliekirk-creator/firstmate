@@ -238,6 +238,11 @@ printf '# Lab-only task.\n' > "$HOME_DIR/data/rsmoke/brief.md"
 } > "$HOME_DIR/state/rsmoke.meta"
 printf 'preserved\n' > "$WT/untracked-progress"
 HEAD_BEFORE=$(git -C "$WT" rev-parse HEAD)
+# Closing the temporary one-pane proof workspaces can make Herdr select the
+# neighboring repair tab. Put focus on the unrelated task tab explicitly so
+# this success case satisfies the repair contract's active-tab precondition.
+"$HERDR_LAB_HELPER" run "$SESSION" tab focus "$TAB_ID" >/dev/null \
+  || fail "could not focus the unrelated task tab before cwd repair"
 OUT=$(FM_HOME="$HOME_DIR" FM_SPAWN_NO_GUARD=1 FM_CONTROL_POLL=0.2 FM_CONTROL_LAUNCH_WAIT=10 \
   "$ROOT/bin/fm-control.sh" rsmoke relaunch --repair-cwd --note 'lab repair proof' 2>&1) || fail "real cwd repair refused: $OUT"
 NEW_PANE=$(fm_meta_get "$HOME_DIR/state/rsmoke.meta" herdr_pane_id)
