@@ -52,12 +52,14 @@
 #              running.
 #
 # --repair-cwd is an explicit Herdr-only exception to SAME endpoint, for ship
-# and scout tasks whose positively agent-free, lone idle shell is in the wrong
-# directory. It never types into or resets that shell: pending input and custom
-# traps cannot be proved safe. Instead it splits that exact pane, in its same
-# session/workspace/tab, with API --cwd set only to the validated recorded
-# worktree. The target must physically be a Git worktree root, share the
-# recorded project's Git family, and differ from the primary project copy.
+# and scout tasks whose positively agent-free, lone idle interactive shell is
+# in the wrong directory. Its stdin must be the pane TTY and it must own the
+# foreground process group. It never types into or resets that shell: pending
+# input and custom traps cannot be proved safe. Instead it splits that exact
+# pane, in its same session/workspace/tab, with API --cwd set only to the
+# validated recorded worktree. The target must physically be a Git worktree
+# root, share the recorded project's Git family, and differ from the primary
+# project copy.
 # Checkpointing, exact identity checks, and the existing control lock still
 # apply; a session layout lock spans replacement, launch, and retirement.
 # The task tab must not be active, so the focus-safe cleanup owner can preserve
@@ -68,15 +70,20 @@
 # unrelated metadata is preserved; a presentation restart binding is advanced
 # through its owner. fm-spawn --relaunch still independently checks isolation.
 # Only after the replacement is confirmed does exact focus-safe cleanup retire
-# the old agent-free pane. Before publication, failure removes only a proven
-# unadopted sibling and restores instructions. After publication, failure keeps
-# the accurate new binding and progress note, never reverting to the wrong
-# pane. The transaction records source/target paths, both panes, publication,
-# presentation, and cleanup outcomes. Explicit repair records checkpoint and
-# preflight refusals before changing instructions or allocating a pane.
+# the old agent-free pane, after revalidating that same interactive shell and
+# TTY ownership at the close boundary. Before publication, failure removes a
+# sibling only when its ownership is proven and claims instruction preservation
+# only after byte verification; ambiguous outcomes are retained for
+# reconciliation. After publication, failure keeps the accurate new binding
+# and progress note, never reverting to the wrong pane. The transaction records
+# source/target paths, both panes, publication, presentation, and cleanup
+# outcomes. Explicit repair records checkpoint and preflight refusals before
+# changing instructions or allocating a pane.
 # Every relaunch preserves unresolved earlier repair evidence by refusing a
 # new attempt. Only an explicit repair may retry a proven pre-allocation,
-# pre-publication refusal with the prior binding retained and no new pane.
+# pre-publication refusal with no sibling, publication attempt, or instruction
+# mutation, and only while the full durable endpoint identity still exactly
+# matches the refused attempt.
 # No caller path, command, generic rebind, worktree allocation, or discard is
 # accepted. With this option absent and no unresolved repair, ordinary
 # relaunch is unchanged.

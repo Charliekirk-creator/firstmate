@@ -677,6 +677,7 @@ ok - real herdr: interrupt refuses when herdr's own agent registry reports no ag
 ok - real herdr: interrupt delivers the harness's key and proves the agent survived it
 ok - real herdr: no control verb removed the endpoint or the task's local copy
 ok - real herdr: an agent that does not stop fails closed instead of being reported as stopped
+ok - real herdr: exact TTY proof accepts interactive Bash/Zsh and rejects FIFO stdin
 ok - real herdr: cwd repair splits in the recorded worktree, rebinds, launches and retires only the old pane
 ok - real herdr: repair preserves HEAD, untracked work and the independent launch directory guard
 ```
