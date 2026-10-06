@@ -273,8 +273,17 @@ _fm_classify_is_corr_token() {  # <word>
   return 1
 }
 
+# The variable form keeps per-line folds in-process. The printing interface
+# remains available to one-shot callers; both use the same parser.
 status_line_verb() {  # <status-line> -> leading verb word
+  local FM_STATUS_LINE_VERB
+  status_line_verb_var "$1"
+  printf '%s' "$FM_STATUS_LINE_VERB"
+}
+
+status_line_verb_var() {  # <status-line>; sets FM_STATUS_LINE_VERB
   local v=${1%%:*} out='' word
+  FM_STATUS_LINE_VERB=
   v=${v%%\[*}
   v=${v#"${v%%[![:space:]]*}"}
   v=${v%"${v##*[![:space:]]}"}
@@ -283,7 +292,7 @@ status_line_verb() {  # <status-line> -> leading verb word
   # line without one keeps its exact historical verb, spacing included.
   case "$v" in
     *corr=*) ;;
-    *) printf '%s' "$v"; return 0 ;;
+    *) FM_STATUS_LINE_VERB=$v; return 0 ;;
   esac
   # Retain the first word, then drop only recognised tokens from the remaining
   # whole words. Anything unrecognised stays, so prose still matches no verb.
@@ -298,7 +307,7 @@ status_line_verb() {  # <status-line> -> leading verb word
     _fm_classify_is_corr_token "$word" && continue
     out="$out $word"
   done
-  printf '%s' "$out"
+  FM_STATUS_LINE_VERB=$out
 }
 # 0 when a complete "[key=...]" token sits in the documented position before
 # the line's first colon (or anywhere on a line that has no colon at all).
@@ -419,7 +428,16 @@ _fm_decision_key_transition_allowed() {  # <key> <note>
 }
 
 _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb>
-  local open=$1 line=$2 resolve=$3 held=$4 verb key note
+  local FM_DECISION_OPEN
+  _fm_decision_fold_line_var "$@"
+  printf '%s' "$FM_DECISION_OPEN"
+}
+
+# Same transform, with an explicit result variable so whole-file and delta
+# loops need not fork a subshell for every ordinary history line.
+_fm_decision_fold_line_var() {  # same arguments; sets FM_DECISION_OPEN
+  local open=$1 line=$2 resolve=$3 held=$4 verb key note FM_STATUS_LINE_VERB
+  FM_DECISION_OPEN=$open
   # Blank-line guard. A `case` glob answers "does this line hold any non-space
   # character" in one pattern match; the equivalent ${line//[[:space:]]/} costs
   # tens of milliseconds per line under bash 3.2's global bracket-class
@@ -427,15 +445,21 @@ _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb
   # of ordinary width. Same verdict, bounded cost.
   case "$line" in
     *[![:space:]]*) ;;
-    *) printf '%s' "$open"; return 0 ;;
+    *) return 0 ;;
   esac
-  verb=$(status_line_verb "$line")
-  key=$(_fm_decision_key "$line") || { printf '%s' "$open"; return 0; }
-  _fm_decision_key_transition_allowed "$key" "$(status_line_note "$line")" \
-    || { printf '%s' "$open"; return 0; }
+  status_line_verb_var "$line"
+  verb=$FM_STATUS_LINE_VERB
+  # Ordinary history cannot change the open set. Do not parse its keys/notes:
+  # this fold is also used by the read-only home-summary producer on full logs.
+  case "$verb" in
+    needs-decision|blocked|"$resolve"|"$held") ;;
+    *) return 0 ;;
+  esac
+  key=$(_fm_decision_key "$line") || return 0
+  note=$(status_line_note "$line")
+  _fm_decision_key_transition_allowed "$key" "$note" || return 0
   case "$verb" in
     needs-decision|blocked)
-      note=$(status_line_note "$line")
       open=$(_fm_decision_drop "$open" "$key")
       [ -n "$open" ] && open="${open}"$'\n'
       open="${open}${key}"$'\t'"${verb}"$'\t'"${note}"$'\n'
@@ -445,7 +469,7 @@ _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb
       [ -n "$open" ] && open="${open}"$'\n'
       ;;
   esac
-  printf '%s' "$open"
+  FM_DECISION_OPEN=${open%$'\n'}
 }
 
 # Fold the WHOLE status stream into the set of decisions still open. Prints one
@@ -461,12 +485,13 @@ _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb
 # subprocess read, which exists for that function's much narrower payload-driven
 # path resolution rather than this directory-local glob.
 status_open_decisions() {  # <status-file>
-  local f=$1 line resolve held open=''
+  local f=$1 line resolve held open='' FM_DECISION_OPEN
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 0
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
   while IFS= read -r line || [ -n "$line" ]; do
-    open=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held")
+    _fm_decision_fold_line_var "$open" "$line" "$resolve" "$held"
+    open=$FM_DECISION_OPEN
   done < "$f"
   printf '%s' "$open"
 }
@@ -638,20 +663,23 @@ FM_OPEN_DECISIONS_FOLD_VERSION=5
 
 # Portable device:inode identity for the rotation/recreation check below.
 _fm_open_decisions_file_ident() {  # <file> -> strongest available identity
-  local f=$1 epoch birth ident
+  local f=$1 epoch birth ident fields device inode
   if [ -n "${FM_STATUS_IDENTITY_READER:-}" ]; then
     "$FM_STATUS_IDENTITY_READER" "$f"
     return
   fi
-  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
-    ident=$(LC_ALL=C stat -f '%d:%i' "$f" 2>/dev/null) || return 1
-    epoch=$(LC_ALL=C stat -f '%B' "$f" 2>/dev/null) || epoch=0
-    if [ "$epoch" != 0 ]; then birth=$(LC_ALL=C stat -f '%FB' "$f" 2>/dev/null) || birth=''; else birth=''; fi
-  else
-    ident=$(LC_ALL=C stat -c '%d:%i' "$f" 2>/dev/null) || return 1
-    epoch=$(LC_ALL=C stat -c '%W' "$f" 2>/dev/null) || epoch=0
-    if [ "$epoch" != 0 ]; then birth=$(LC_ALL=C stat -c '%w' "$f" 2>/dev/null) || birth=''; else birth=''; fi
-  fi
+  # One stat observation supplies the complete identity, rather than three
+  # separate stats plus uname for each cursor check. Preserve the persisted
+  # identity format, including birth-time precision and the weak fallback.
+  case "$OSTYPE" in
+    darwin*) fields=$(LC_ALL=C stat -f '%d:%i:%B:%FB' "$f" 2>/dev/null) || return 1 ;;
+    *) fields=$(LC_ALL=C stat -c '%d:%i:%W:%w' "$f" 2>/dev/null) || return 1 ;;
+  esac
+  device=${fields%%:*}; fields=${fields#*:}
+  inode=${fields%%:*}; fields=${fields#*:}
+  epoch=${fields%%:*}; birth=${fields#*:}
+  ident="$device:$inode"
+  [ "$epoch" != 0 ] || birth=''
   case "$ident$birth" in *$'\t'*|*$'\n'*|'') return 1 ;; esac
   if [ -n "$birth" ]; then printf 'strong:%s:%s' "$ident" "$birth"; else printf 'weak:%s' "$ident"; fi
 }
@@ -662,11 +690,10 @@ _fm_status_file_size() {  # <status-file>
     "$FM_STATUS_SIZE_READER" "$f"
     return
   fi
-  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
-    LC_ALL=C stat -f '%z' "$f" 2>/dev/null
-  else
-    LC_ALL=C stat -c '%s' "$f" 2>/dev/null
-  fi
+  case "$OSTYPE" in
+    darwin*) LC_ALL=C stat -f '%z' "$f" 2>/dev/null ;;
+    *) LC_ALL=C stat -c '%s' "$f" 2>/dev/null ;;
+  esac
 }
 
 # Private scratch path for a one-shot span read, alongside the status file the
@@ -700,7 +727,7 @@ _fm_status_read_span() {  # <status-file> <start-offset> <byte-length>
 status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
   local f=$1 captured_end=${2:-} cf offset ident open='' trusted_open='' cursor_data first rest offset_line ident_line
   local version='' size actual_size cur_ident resolve held chunk_file chunk_size line cursor_dirty=0
-  local target_cursor
+  local target_cursor FM_DECISION_OPEN
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 0
   cf=$(_fm_open_decisions_cursor_path "$f")
   offset=0
@@ -791,7 +818,8 @@ status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
     resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
     held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
     while IFS= read -r line || [ -n "$line" ]; do
-      open=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held")
+      _fm_decision_fold_line_var "$open" "$line" "$resolve" "$held"
+      open=$FM_DECISION_OPEN
     done < "$chunk_file"
     rm -f "$chunk_file"
     offset=$size
@@ -857,7 +885,7 @@ status_presentation_cursor_offset() {  # <status-file>
     [ -f "$manifest" ] && [ -r "$manifest" ] && [ ! -L "$manifest" ] || return 1
     data=$(LC_ALL=C command cat "$manifest" 2>/dev/null) || return 1
     offset=
-    while IFS=$(printf '\t') read -r row_task ident legacy extra; do
+    while IFS=$'\t' read -r row_task ident legacy extra; do
       [ -n "$row_task" ] || continue
       [ -z "$extra" ] || return 1
       case "$legacy" in ''|*[!0-9]*) return 1 ;; esac
@@ -1298,9 +1326,10 @@ status_new_lines_since_cursor() {  # <status-file> [<captured-end-offset>]
 # pending-reply resolution. Those lines never fold into OPEN DECISIONS, so the
 # drain's unread-status surface is their only guaranteed presentation.
 status_line_is_unread_surface() {  # <status-line>
-  local line=$1 verb key note resolve held prefix
+  local line=$1 verb key note resolve held prefix FM_STATUS_LINE_VERB
   [ -n "$line" ] || return 1
-  verb=$(status_line_verb "$line")
+  status_line_verb_var "$line"
+  verb=$FM_STATUS_LINE_VERB
   [ "$verb" = note ] && return 0
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}

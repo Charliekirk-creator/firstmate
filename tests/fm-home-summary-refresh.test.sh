@@ -562,6 +562,77 @@ jq -e --arg home "$COST_HOME" '
   || fail "the accumulated home published a ledger missing its open decision"
 pass "publication completes on a home carrying accumulated status history"
 
+# A home summary enumerates metadata, NOT just the secondmate registry. The
+# incident home had 13 registered mates but 53 records and thousands of ordinary
+# status lines. No endpoint or network delay is needed to expose this cost.
+POPULATION_HOME="$TMP_ROOT/population-home"
+python3 - "$POPULATION_HOME" <<'PY'
+from pathlib import Path
+import sys
+home = Path(sys.argv[1])
+for folder in ('state', 'data', 'config', 'projects'):
+    (home / folder).mkdir(parents=True, exist_ok=True)
+(home / 'config/backlog-backend').write_text('manual\n')
+(home / 'data/backlog.md').write_text('## In flight\n\n## Queued\n\n## Done\n')
+(home / 'data/secondmates.md').write_text(''.join(
+    f'- mate-{i:02} - fixture (home: {home}/absent-{i}; scope: fixture; projects: ; added 2026-10-05)\n'
+    for i in range(13)))
+for i in range(53):
+    task = f'mate-{i:02}' if i < 13 else f'worker-{i:02}'
+    kind = 'secondmate' if i < 13 else 'scout'
+    (home / f'state/{task}.meta').write_text(f'kind={kind}\nharness=pi\n')
+    (home / f'state/{task}.status').write_text(
+        'blocked [key=retained]: still needs a decision\n' +
+        ''.join(f'note: ordinary update {j} ' + 'x' * 340 + '\n' for j in range(100)))
+PY
+started=$(date +%s)
+PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$POPULATION_HOME" \
+  FM_HOME_SUMMARY_TIMEOUT=55 "$WRITER" \
+  || fail "53-record publication exceeded the incident deadline with no slow endpoints"
+elapsed=$(( $(date +%s) - started ))
+jq -e '.counts.endpoints == 53 and .counts.decisions_open == 53' \
+  "$POPULATION_HOME/state/home-summary.json" >/dev/null \
+  || fail "publication confused 13 registered secondmates with 53 metadata records or lost decisions"
+pass "53 records / 13 registered secondmates publish within 55s (${elapsed}s), retaining buried decisions"
+
+# Deliver a fresh update via the real queue, present it in the owning isolated
+# home, then acknowledge only its generation. A sibling home's queued update
+# must remain untouched. This tests delivery, not merely a running shell.
+SIBLING_HOME="$TMP_ROOT/delivery-sibling"
+mkdir -p "$SIBLING_HOME/state"
+nonce="delivery-$$-$(date +%s)"
+FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$SIBLING_HOME" bash -c '
+  . "$1/bin/fm-wake-lib.sh"
+  fm_wake_append check sibling "sibling update"
+' _ "$ROOT" || fail "could not seed sibling wake"
+cp "$SIBLING_HOME/state/.wake-queue" "$TMP_ROOT/sibling-before"
+started=$(date +%s)
+printf 'note: newly generated %s\n' "$nonce" >> "$POPULATION_HOME/state/mate-00.status"
+FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$POPULATION_HOME" bash -c '
+  . "$1/bin/fm-wake-lib.sh"
+  fm_wake_append signal mate-00.status "signal: mate-00.status"
+' _ "$ROOT" || fail "could not enqueue new update"
+PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$POPULATION_HOME" \
+  "$ROOT/bin/fm-wake-drain.sh" > "$TMP_ROOT/delivery.out" 2> "$TMP_ROOT/delivery.err" \
+  || fail "owning isolated session failed to present the queued update"
+elapsed=$(( $(date +%s) - started ))
+[ "$elapsed" -lt 55 ] || fail "fresh queued update took ${elapsed}s to reach its owning session"
+grep -F "newly generated $nonce" "$TMP_ROOT/delivery.out" >/dev/null \
+  || fail "fresh queued update never reached the owning session"
+grep -F $'signal\tmate-00.status\t' "$TMP_ROOT/delivery.out" >/dev/null \
+  || fail "presentation lost the authoritative queue row"
+[ -s "$POPULATION_HOME/state/.wake-queue" ] || fail "presentation prematurely consumed the wake"
+ack=$(awk '/WAKE_ACK_REQUIRED:/ {for (i=1;i<=NF;i++) if ($i == "--ack-through") print $(i+1),$(i+3)}' "$TMP_ROOT/delivery.err")
+read -r seq generation <<< "$ack"
+[ -n "${generation:-}" ] || fail "presentation omitted generation-bound acknowledgement"
+FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$POPULATION_HOME" \
+  "$ROOT/bin/fm-wake-drain.sh" --ack-through "$seq" --recovery-generation "$generation" \
+  || fail "delivered update could not be acknowledged"
+[ ! -s "$POPULATION_HOME/state/.wake-queue" ] || fail "acknowledged update remained queued"
+cmp -s "$TMP_ROOT/sibling-before" "$SIBLING_HOME/state/.wake-queue" \
+  || fail "owning session consumed its sibling's queue"
+pass "new update reached its owning session in ${elapsed}s, remained durable until ack, and left sibling untouched"
+
 # One unreachable home must not extend publication without limit. A remote
 # secondmate's current state is read over ssh, and ssh's own dead-peer detection
 # deliberately never kills a slow-but-alive remote command, so nothing under the
