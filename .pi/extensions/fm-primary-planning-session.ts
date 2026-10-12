@@ -88,11 +88,11 @@ export default function (pi: ExtensionAPI) {
   let clock: PlanningSessionClock | undefined;
   let ctx: ExtensionContext | undefined;
   let claim: (Claim & { leaf: string | null }) | undefined;
-  let responseClaim: (Claim & { leaf: string | null }) | undefined;
+  let settlement: { entryId: string; message: unknown } | undefined;
   let claimLatched = false;
-  let requestBoundary: string | undefined;
   let live = false;
   let wakeQueued = false;
+  let wakeDeferred = false;
   const key = `${root}\0${home}`;
   const revocations = processRevocations.get(key) ?? new Map();
   processRevocations.set(key, revocations);
@@ -100,12 +100,19 @@ export default function (pi: ExtensionAPI) {
     live = false;
     clock?.dispose();
     claim = undefined;
-    responseClaim = undefined;
+    settlement = undefined;
     claimLatched = false;
-    requestBoundary = undefined;
     wakeQueued = false;
+    wakeDeferred = false;
   } };
   const error = (problem: unknown) => ctx?.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");
+  const queueWake = (slots: number[]) => {
+    if (!live) return;
+    if (wakeQueued) { wakeDeferred = true; return; }
+    pi.sendMessage({ customType, content: instructions(slots), display: false },
+      { triggerTurn: true, deliverAs: "followUp" });
+    wakeQueued = true;
+  };
 
   const setup = (context: ExtensionContext) => {
     instances.get(key)?.dispose();
@@ -113,10 +120,10 @@ export default function (pi: ExtensionAPI) {
     ctx = context;
     live = main(context);
     claim = undefined;
-    responseClaim = undefined;
+    settlement = undefined;
     claimLatched = false;
-    requestBoundary = undefined;
     wakeQueued = false;
+    wakeDeferred = false;
     const sessionFile = context.sessionManager.getSessionFile();
     if (!sessionFile) return;
     const owner: Owner = { sessionId: context.sessionManager.getSessionId(),
@@ -131,13 +138,7 @@ export default function (pi: ExtensionAPI) {
         timer.unref();
         return () => clearTimeout(timer);
       },
-      wake(slots) {
-        if (!live || wakeQueued) return;
-        // Public native follow-up delivery queues while busy, never steering or aborting.
-        pi.sendMessage({ customType, content: instructions(slots), display: false },
-          { triggerTurn: true, deliverAs: "followUp" });
-        wakeQueued = true;
-      },
+      wake: queueWake,
       error,
     }, revocations);
     if (!live) { clock.ownershipLost(true); return; }
@@ -149,7 +150,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, context) => {
       try {
         if (!main(context)) {
-          clock?.ownershipLost();
+          clock?.ownershipLost(true);
           throw new Error("Planning slots require the lock-owning Main session with persistent history");
         }
         if (!live || !clock) setup(context);
@@ -177,89 +178,41 @@ export default function (pi: ExtensionAPI) {
     lifecycle.dispose();
     if (instances.get(key) === lifecycle) instances.delete(key);
   });
-  pi.on("before_agent_start", () => {
-    claim = undefined;
-    claimLatched = false;
-  });
   pi.on("context", (event, context) => {
-    const boundary = event.messages.findLast((message) => message.role === "custom" && message.customType === customType);
-    const boundaryKey = boundary ? JSON.stringify([boundary.timestamp, boundary.content]) : undefined;
-    if (boundaryKey && boundaryKey !== requestBoundary) {
-      requestBoundary = boundaryKey;
-      claim = undefined;
-      claimLatched = false;
-    }
     const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== customType);
-    const last = messages.at(-1);
-    if (claimLatched && last?.role === "assistant" && last.stopReason === "stop") {
-      claim = undefined;
-      claimLatched = false;
-    }
     try {
       if (!claimLatched) {
         claimLatched = true;
         const due = clock?.claim();
         if (due) claim = { ...due, leaf: context.sessionManager.getLeafId() };
       }
-      responseClaim = claim;
+      if (event.messages.some((message) => message.role === "custom" && message.customType === customType)) {
+        const pending = clock?.claim();
+        if (pending?.slots.some((slot) => !claim?.slots.includes(slot))) wakeDeferred = true;
+      }
       if (!claim) return { messages };
       return { messages: [...messages, { role: "custom" as const, customType, content: instructions(claim.slots),
         display: false, timestamp: Date.now() }] };
-    } catch (problem) {
-      responseClaim = undefined;
-      error(problem);
-      return { messages };
-    }
+    } catch (problem) { error(problem); return { messages }; }
   });
-  pi.on("turn_end", (event, context) => {
-    const snapshot = responseClaim;
-    const responseComplete = event.outcome === "completed" && event.message.role === "assistant" &&
-      event.message.stopReason === "stop";
-    if (responseComplete) {
-      claim = undefined;
-      claimLatched = false;
-    }
-    if (!snapshot || !live || !responseComplete) return;
-    if (!main(context)) {
-      try { clock?.ownershipLost(); } catch (problem) { error(problem); }
-      return;
-    }
-    try {
-      // Prove the actual entry is on disk and descends from this request's boundary.
-      const file = context.sessionManager.getSessionFile();
-      if (file !== snapshot.owner.sessionFile) return;
-      const stat = lstatSync(file!);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return;
-      const entries = readFileSync(file!, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
-      if (entries[0]?.type !== "session" || entries[0]?.id !== snapshot.owner.sessionId) return;
-      const byId = new Map(entries.filter((entry) => entry.type !== "session").map((entry) => [entry.id, entry]));
-      const entry = byId.get(event.messageEntryId);
-      if (entry?.type !== "message" || entry.message.role !== "assistant" ||
-          JSON.stringify(entry.message) !== JSON.stringify(event.message)) return;
-      let ancestor = entry.parentId;
-      const visited = new Set<string>();
-      while (ancestor !== null && ancestor !== snapshot.leaf && !visited.has(ancestor)) {
-        visited.add(ancestor);
-        ancestor = byId.get(ancestor)?.parentId;
-        if (ancestor === undefined) return;
-      }
-      if (ancestor !== snapshot.leaf || event.messageEntryId === snapshot.leaf) return;
-      const text = event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-      if (completePlanningTables(text)) clock?.deliver(snapshot, event.messageEntryId);
-    } catch (problem) { error(problem); }
+  pi.on("turn_end", (event) => {
+    settlement = event.outcome === "completed" && event.message.role === "assistant" && event.message.stopReason === "stop"
+      ? { entryId: event.messageEntryId, message: event.message } : undefined;
   });
   pi.on("agent_settled", () => {
-    const snapshot = responseClaim;
+    const snapshot = claim;
+    const accepted = settlement;
+    const deferred = wakeDeferred;
     try {
-      if (snapshot && live && ctx && main(ctx)) {
+      if (snapshot && live && ctx && !main(ctx)) clock?.ownershipLost(true);
+      if (snapshot && accepted && live && ctx && main(ctx)) {
         const file = ctx.sessionManager.getSessionFile();
-        const entryId = ctx.sessionManager.getLeafId();
-        if (file === snapshot.owner.sessionFile && entryId) {
-          const stat = lstatSync(file);
+        if (file === snapshot.owner.sessionFile) {
+          const stat = lstatSync(file!);
           if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1) {
-            const entries = readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+            const entries = readFileSync(file!, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
             const byId = new Map(entries.filter((entry) => entry.type !== "session").map((entry) => [entry.id, entry]));
-            const entry = byId.get(entryId);
+            const entry = byId.get(accepted.entryId);
             let ancestor = entry?.parentId;
             const visited = new Set<string>();
             while (ancestor !== null && ancestor !== snapshot.leaf && !visited.has(ancestor)) {
@@ -267,20 +220,28 @@ export default function (pi: ExtensionAPI) {
               ancestor = byId.get(ancestor)?.parentId;
               if (ancestor === undefined) break;
             }
-            const text = entry?.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "stop"
+            const text = entry?.type === "message" && entry.message.role === "assistant"
               ? entry.message.content.filter((part: { type: string }) => part.type === "text")
                 .map((part: { text: string }) => part.text).join("\n") : "";
             if (entries[0]?.type === "session" && entries[0]?.id === snapshot.owner.sessionId &&
-                ancestor === snapshot.leaf && entryId !== snapshot.leaf && completePlanningTables(text)) {
-              clock?.deliver(snapshot, entryId);
+                entry?.type === "message" && JSON.stringify(entry.message) === JSON.stringify(accepted.message) &&
+                ancestor === snapshot.leaf && accepted.entryId !== snapshot.leaf && completePlanningTables(text)) {
+              clock?.deliver(snapshot, accepted.entryId);
             }
           }
         }
       }
     } catch (problem) { error(problem); }
     claim = undefined;
-    responseClaim = undefined;
+    settlement = undefined;
     claimLatched = false;
     wakeQueued = false;
+    wakeDeferred = false;
+    if (deferred) {
+      try {
+        const pending = clock?.claim();
+        if (pending) queueWake(pending.slots);
+      } catch (problem) { error(problem); }
+    }
   });
 }

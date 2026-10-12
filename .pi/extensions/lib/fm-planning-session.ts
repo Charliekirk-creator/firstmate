@@ -21,7 +21,7 @@ export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && 
 export const ownerKey = (owner: Owner): string => JSON.stringify([
   owner.sessionId, owner.sessionFile, owner.pid, owner.processStart,
 ]);
-export type Revocations = Map<string, Owner>;
+export type Revocations = Map<string, { owner: Owner; reason: "ownership-lost" | "ledger-failure" }>;
 
 export function parseFirstSlot(value: string): number {
   if (!/^\d{4}-\d\d-\d\dT\d\d:(00|30):00\+08:00$/.test(value)) {
@@ -111,6 +111,7 @@ export class PlanningSessionClock {
   private revocations: Revocations;
   private cancel?: () => void;
   private active = false;
+  private ownsSchedule = false;
   constructor(owner: Owner, store: Store, io: ClockIO, revocations: Revocations = new Map()) {
     this.owner = owner;
     this.store = store;
@@ -124,11 +125,12 @@ export class PlanningSessionClock {
     if (!state) throw new Error("Planning ownership revocation is unresolved without its ledger");
     const key = ownerKey(state.owner);
     const revoked = this.revocations.get(key);
-    if (!revoked || !sameOwner(revoked, state.owner)) {
-      throw new Error("Planning ownership revocation does not match the ledger owner");
+    if (!revoked || !sameOwner(revoked.owner, state.owner)) {
+      throw new Error("Planning terminal stop does not match the ledger owner");
     }
-    if (!state.stopped) this.store.write({ ...state, stopped: "ownership-lost" });
+    if (!state.stopped) this.store.write({ ...state, stopped: revoked.reason });
     this.revocations.delete(key);
+    if (sameOwner(state.owner, this.owner)) this.ownsSchedule = false;
     return sameOwner(state.owner, this.owner);
   }
   private ownedState(): SlotState | undefined {
@@ -136,15 +138,22 @@ export class PlanningSessionClock {
     return state && sameOwner(state.owner, this.owner) ? state : undefined;
   }
   ownershipLost(force = false): void {
-    if (!this.active) {
+    if (!this.active && !this.ownsSchedule) {
       if (!force) return;
       if (this.revocations.size) { this.reconcileRevocation(); return; }
       const state = this.ownedState();
       if (!state || state.stopped) return;
     }
     this.dispose();
-    this.revocations.set(ownerKey(this.owner), this.owner);
+    this.revocations.set(ownerKey(this.owner), { owner: this.owner, reason: "ownership-lost" });
     this.reconcileRevocation();
+  }
+  private failStopped(): void {
+    this.dispose();
+    const key = ownerKey(this.owner);
+    if (!this.revocations.has(key)) {
+      this.revocations.set(key, { owner: this.owner, reason: "ledger-failure" });
+    }
   }
   private current(): SlotState | undefined {
     if (this.reconcileRevocation()) return undefined;
@@ -171,6 +180,7 @@ export class PlanningSessionClock {
   resume(): void {
     this.dispose();
     if (!this.current()) return;
+    this.ownsSchedule = true;
     this.active = true;
     this.schedule();
   }
@@ -182,7 +192,10 @@ export class PlanningSessionClock {
   stop(reason: string): void {
     this.dispose();
     const state = this.current();
-    if (state) this.store.write({ ...state, stopped: reason });
+    if (state) {
+      this.store.write({ ...state, stopped: reason });
+      this.ownsSchedule = false;
+    }
   }
   private schedule(): void {
     if (!this.active) return;
@@ -191,7 +204,7 @@ export class PlanningSessionClock {
     const next = Math.max(state.firstSlot, state.through + HALF_HOUR);
     this.cancel = this.io.later(() => {
       this.cancel = undefined;
-      try { this.tick(); } catch (error) { this.dispose(); this.io.error(error); }
+      try { this.tick(); } catch (error) { this.failStopped(); this.io.error(error); }
     }, Math.min(2147483647, Math.max(1, next - this.io.now())));
   }
   private tick(): void {
@@ -206,7 +219,8 @@ export class PlanningSessionClock {
         result = this.io.wifi();
         if (this.io.now() - slot > OBSERVATION_WINDOW) result = "unobserved";
       }
-      if (!this.active || !this.io.valid()) { this.dispose(); return; }
+      if (!this.active) return;
+      if (!this.io.valid()) { this.ownershipLost(); return; }
       const due = result === "online" ? [...state.due, slot] : state.due;
       this.store.write({ ...state, through: slot, due, observation: { slot, result } });
       if (result === "unknown") this.io.error(new Error("Wi-Fi link could not be verified; this slot was skipped"));
@@ -224,15 +238,20 @@ export class PlanningSessionClock {
     return state?.due.length ? { owner: this.owner, slots: [...state.due] } : undefined;
   }
   deliver(claim: Claim, entryId: string): boolean {
-    const state = this.active ? this.current() : undefined;
-    if (!state || !sameOwner(claim.owner, this.owner) || !entryId || state.delivery?.entryId === entryId) return false;
-    const slots = claim.slots.filter((slot) => state.due.includes(slot));
-    if (!slots.length) return false;
-    const at = this.io.now();
-    if (slots.some((slot) => slot > at)) return false;
-    this.store.write({ ...state, due: state.due.filter((slot) => !slots.includes(slot)),
-      delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } });
-    return true;
+    try {
+      const state = this.active ? this.current() : undefined;
+      if (!state || !sameOwner(claim.owner, this.owner) || !entryId || state.delivery?.entryId === entryId) return false;
+      const slots = claim.slots.filter((slot) => state.due.includes(slot));
+      if (!slots.length) return false;
+      const at = this.io.now();
+      if (slots.some((slot) => slot > at)) return false;
+      this.store.write({ ...state, due: state.due.filter((slot) => !slots.includes(slot)),
+        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } });
+      return true;
+    } catch (error) {
+      this.failStopped();
+      throw error;
+    }
   }
 }
 

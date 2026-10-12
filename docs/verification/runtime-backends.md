@@ -1075,15 +1075,16 @@ ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit re
 ok - failed ownership revocation survives reload, retries durably and requires explicit restart
 ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused
 ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability
+ok - boundary and delivery write failures stop, retain due work and require explicit recovery
 ok - storage failure never wakes falsely, malformed state preserved, unsafe links refused, late activation does not backfill
 ok - real Pi 0.87.1 failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery
-ok - real Pi 0.87.1 busy response completes before one follow-up, canonical bytes unchanged, timer does not keep process alive
+ok - real Pi 0.87.1 busy response, one post-settlement follow-up, canonical bytes unchanged, timer does not keep process alive
 skip: tsc not found for Pi extension typecheck
 ```
 
-The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects rather than implementation-source text.
+The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects, terminal boundary/delivery write failures, due retention, and explicit recovery rather than implementation-source text.
 The real-SDK test uses a temporary primary repository, isolated Main home and agent directory, and an in-process fixture provider with networking denied.
-It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command, multi-call tool-loop context, response-persistence, failed ownership-revocation persistence, storage recovery, reload, explicit restart, and busy follow-up paths.
+It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command, multi-call tool and settlement-continuation context, response-persistence, failed ownership and delivery persistence, storage recovery, reload, explicit restart, and busy follow-up paths.
 Neither test activates a timer in the operator's Main or contacts a model provider.
 The strict typecheck skip is missing verification, not a passing type verdict; rerun it with an already available supported TypeScript compiler before relying on that evidence.
 

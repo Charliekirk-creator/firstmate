@@ -137,10 +137,41 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(wifiLink('Wi-Fi Power (en0): On\n', active.replace('RUNNING,', '')), false);
     console.log('ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability');
 
-    const failureStore = { read: () => ({ ...old, stopped: undefined }), write: () => { throw new Error('disk full'); } };
-    const failed = new PlanningSessionClock(owner, failureStore, io); now = old.through + HALF_HOUR - 1000;
+    let failureState = { ...old, stopped: undefined }, storageFails = true;
+    const failures = new Map();
+    const failureStore = { read: () => failureState, write: (state) => {
+      if (storageFails) throw new Error('disk full');
+      failureState = state;
+    } };
+    const failed = new PlanningSessionClock(owner, failureStore, io, failures); now = old.through + HALF_HOUR - 1000;
     failed.resume(); const wakeCount = wakes.length; wifi = 'online'; fire(old.through + HALF_HOUR);
     assert.equal(wakes.length, wakeCount); assert.equal(callback, undefined); assert.ok(errors.at(-1).includes('disk full'));
+    valid = false;
+    assert.throws(() => failed.ownershipLost(), /disk full/);
+    assert.equal(failures.get(JSON.stringify([owner.sessionId, owner.sessionFile, owner.pid, owner.processStart])).reason,
+      'ownership-lost');
+    valid = true; storageFails = false;
+    const failureReload = new PlanningSessionClock(owner, failureStore, io, failures);
+    failureReload.resume();
+    assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ownership-lost');
+    failureReload.start(first); failureReload.dispose();
+
+    failureState = { ...old, stopped: undefined, due: [old.through] };
+    storageFails = true;
+    const deliveryFailures = new Map();
+    const deliveryFailure = new PlanningSessionClock(owner, failureStore, io, deliveryFailures);
+    now = old.through + 1000; deliveryFailure.resume();
+    const failedClaim = deliveryFailure.claim();
+    assert.throws(() => deliveryFailure.deliver(failedClaim, 'failed-delivery'), /disk full/);
+    assert.equal(callback, undefined); assert.deepEqual(failureState.due, [old.through]);
+    const deliveryReload = new PlanningSessionClock(owner, failureStore, io, deliveryFailures);
+    assert.throws(() => deliveryReload.resume(), /disk full/);
+    assert.equal(callback, undefined);
+    storageFails = false; deliveryReload.resume();
+    assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ledger-failure');
+    deliveryReload.start(first); assert.ok(callback); deliveryReload.dispose();
+    console.log('ok - boundary and delivery write failures stop, retain due work and require explicit recovery');
+
     assert.throws(() => validateState({ ...old, due: [first, first] }), /Malformed/);
     assert.throws(() => validateState({ ...old, through: old.through + 1 }), /Malformed/);
     writeFileSync(join(lab, 'bad.json'), '{'); assert.throws(() => fileStore(join(lab, 'bad.json')).read());

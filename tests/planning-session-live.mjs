@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import http from 'node:http';
@@ -22,19 +22,29 @@ process.chdir(code);
 writeFileSync(`${home}/state/.lock`, String(process.pid));
 const canonical = `${home}/data/planning/planning.md`, canonicalBefore = readFileSync(canonical);
 const state = () => JSON.parse(readFileSync(ledger, 'utf8'));
-let output = 'Captain, partial response.', reason = 'stop', requests = 0, providerGate, entered;
-let savedPi, toolLoop = false, toolSlot;
+let output = 'Captain, partial response.', reason = 'stop', requests = 0, providerGate, entered, requestTarget, requestTargetReached;
+let savedPi, toolLoop = false, toolSlot, continueRun = false, continuationSlot;
 const contexts = [];
 const modelSpec = { id: 'offline', name: 'Offline fixture', reasoning: false, input: ['text'],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2048 };
 function fixture(pi) {
   savedPi = pi;
+  pi.on('agent_before_settle', () => {
+    if (!continueRun) return;
+    continueRun = false;
+    const current = state();
+    writeFileSync(ledger, JSON.stringify({ ...current, through: continuationSlot,
+      due: [...current.due, continuationSlot] }));
+    return { entries: [{ type: 'custom_message', customType: 'planning-fixture-continuation',
+      content: 'Continue fixture', display: false }], continue: true };
+  });
   pi.registerTool({ name: 'planning_fixture', label: 'Planning fixture', description: 'Continue the isolated slot fixture',
     parameters: Type.Object({}), execute: async () =>
       ({ content: [{ type: 'text', text: 'fixture continued' }], details: undefined }) });
   pi.registerProvider('planning-offline', { api: 'openai-completions', apiKey: 'fixture-not-a-credential',
     baseUrl: 'https://network.invalid', models: [modelSpec], streamSimple: (model, context) => {
       requests++; contexts.push(context);
+      const requestNumber = requests;
       const stream = createAssistantMessageEventStream(), text = output, stopReason = toolLoop ? 'toolUse' : reason,
         wait = providerGate, useTool = toolLoop;
       toolLoop = false;
@@ -65,6 +75,7 @@ function fixture(pi) {
           stream.push({ type: 'done', reason: stopReason, message });
         }
         stream.end();
+        if (requestNumber === requestTarget) { requestTargetReached?.(); requestTargetReached = undefined; }
       })();
       return stream;
     } });
@@ -117,7 +128,7 @@ assert.equal(state().stopped, undefined, 'fresh explicit start follows durable r
 
 // Seed an online observation as the deterministic clock test does; native Pi
 // lifecycle, persistence and delivery remain real. No wall-clock waiting.
-const slot = future - 2 * period;
+const slot = future - 3 * period;
 writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: slot, through: slot, due: [slot] }));
 await session.prompt('A partial update', { source: 'rpc' });
 assert.deepEqual(state().due, [slot]);
@@ -146,12 +157,43 @@ for (const context of runContexts) {
   assert.ok(serialized.includes(initialBoundary), 'latched claim remains in every model call');
   assert.ok(!serialized.includes(laterBoundary), 'later slot never expands the active run claim');
 }
-await session.prompt('Complete later update', { source: 'rpc' });
+continuationSlot = toolSlot + period;
+continueRun = true;
+const continuationContextStart = contexts.length;
+await session.prompt('Complete later update through settlement continuation', { source: 'rpc' });
+assert.deepEqual(state().due, [continuationSlot], 'settlement continuation retains its later slot');
+const continuationContexts = contexts.slice(continuationContextStart);
+assert.equal(continuationContexts.length, 2);
+const claimedBoundary = new Date(toolSlot + 8 * 3600000).toISOString().slice(0, 19);
+const continuationBoundary = new Date(continuationSlot + 8 * 3600000).toISOString().slice(0, 19);
+for (const context of continuationContexts) {
+  const serialized = JSON.stringify(context);
+  assert.ok(serialized.includes(claimedBoundary), 'settlement continuation retains the initial claim');
+  assert.ok(!serialized.includes(continuationBoundary), 'settlement continuation cannot expand the claim');
+}
+await session.prompt('Complete retained continuation slot', { source: 'rpc' });
 assert.deepEqual(state().due, []);
 const receipt = state().delivery;
 assert.ok(session.sessionManager.getEntry(receipt.entryId));
 assert.ok(readFileSync(session.sessionManager.getSessionFile(), 'utf8').includes(receipt.entryId));
 console.log(`ok - real Pi ${version} failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery`);
+
+const deliveryFailureSlot = slot - period;
+writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: deliveryFailureSlot, due: [deliveryFailureSlot] }));
+let deliveryRelease;
+providerGate = new Promise(resolve => { deliveryRelease = resolve; });
+const deliveryArrived = new Promise(resolve => { entered = resolve; });
+const failingDelivery = session.prompt('Complete update during ledger failure', { source: 'rpc' });
+await deliveryArrived;
+chmodSync(`${home}/state`, 0o500);
+deliveryRelease(); await failingDelivery;
+chmodSync(`${home}/state`, 0o700);
+assert.deepEqual(state().due, [deliveryFailureSlot], 'failed delivery retains due work');
+await session.reload();
+assert.equal(state().stopped, 'ledger-failure', 'reload reconciles delivery failure without resuming');
+await session.prompt('/planning-session status', { source: 'rpc' });
+assert.equal(JSON.parse(notices.at(-1)).armed, false);
+await session.prompt(`/planning-session start ${iso}`, { source: 'rpc' });
 
 await session.prompt('/planning-session status', { source: 'rpc' });
 assert.equal(JSON.parse(notices.at(-1)).armed, true, 'timer remains armed before busy follow-up');
@@ -167,16 +209,18 @@ const settled = new Promise(resolve => {
 });
 const running = session.prompt('Busy-turn fixture', { source: 'rpc' });
 await arrived;
-const busySlot = slot - period;
+requestTarget = before + 3;
+const deferredArrived = new Promise(resolve => { requestTargetReached = resolve; });
+const busySlot = deliveryFailureSlot - period;
 const busyBoundary = new Date(busySlot + 8 * 3600000).toISOString().slice(0, 19);
 writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: busySlot, due: [busySlot] }));
 // Same public delivery API/options as the timer, with no interrupt or user-message synthesis.
 savedPi.sendMessage({ customType: 'firstmate-planning-slot', content: 'Due fixture', display: false },
   { triggerTurn: true, deliverAs: 'followUp' });
 assert.equal(requests, before + 1, 'busy response must not be interrupted');
-release(); await running; await settled;
-assert.equal(requests, before + 2, 'exactly one safe follow-up');
-assert.ok(JSON.stringify(contexts.at(-1)).includes(busyBoundary), 'safe follow-up receives the pending slot');
+release(); await running; await settled; await deferredArrived; await session.waitForIdle();
+assert.equal(requests, before + 3, 'one queued wake and exactly one post-settlement follow-up');
+assert.ok(JSON.stringify(contexts.at(-1)).includes(busyBoundary), 'post-settlement follow-up receives the retained slot');
 assert.deepEqual(state().due, [busySlot], 'incomplete follow-up retains the busy-turn slot');
 output = tables;
 await session.prompt('Complete busy-turn update', { source: 'rpc' });
@@ -187,4 +231,4 @@ assert.equal(state().stopped, 'command');
 session.dispose();
 assert.deepEqual(readFileSync(canonical), canonicalBefore);
 assert.deepEqual(errors, []);
-console.log(`ok - real Pi ${version} busy response completes before one follow-up, canonical bytes unchanged, timer does not keep process alive`);
+console.log(`ok - real Pi ${version} busy response, one post-settlement follow-up, canonical bytes unchanged, timer does not keep process alive`);
