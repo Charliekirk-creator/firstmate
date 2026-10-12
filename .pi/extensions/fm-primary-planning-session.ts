@@ -158,8 +158,7 @@ export default function (pi: ExtensionAPI) {
           clock!.stop("command");
           context.ui.notify("Planning slots stopped for this session.", "info");
         } else if (action === "status" && !value) {
-          const state = fileStore(ledger).read();
-          const armed = clock!.isArmed();
+          const { armed, state } = clock!.status();
           context.ui.notify(JSON.stringify({ armed,
             nextSlot: armed && state ? state.through + HALF_HOUR : null, ledger: state ?? null }), "info");
         } else throw new Error("Usage: /planning-session start YYYY-MM-DDTHH:MM:00+08:00 | status | stop");

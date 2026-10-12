@@ -119,13 +119,16 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     console.log('ok - failed ownership revocation survives reload, retries durably and requires explicit restart');
 
     assert.equal(completePlanningTables(tables), true);
+    assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
       tables.replace('| Task | Ready | Finish | No |', '| Task | Ready |'),
       tables.replace('| Test | Verified |', ''), tables.replace('Completed outcome', 'Outcome'),
       tables.replace('| Idea | No material change | Review later | No |', '| Idea | | Review later | No |'),
       tables + '\n## Ideas\n', '~~~\n' + tables + '\n~~~',
-      '<!--\n' + tables + '\n-->', '<div hidden>\n' + tables + '\n</div>']) assert.equal(completePlanningTables(text), false);
+      '<!--\n' + tables + '\n-->', '<div hidden>\n' + tables + '\n</div>',
+      '<section hidden>\n' + tables + '\n</section>', '<article aria-hidden="true">\n' + tables + '\n</article>',
+      '<custom-panel>\n' + tables + '\n</custom-panel>']) assert.equal(completePlanningTables(text), false);
     console.log('ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused');
 
     assert.deepEqual(wifiInterfaces('Hardware Port: Ethernet\nDevice: en1\n\nHardware Port: Wi-Fi\nDevice: en0\n'), ['en0']);
@@ -231,7 +234,30 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     startReload.start(first); assert.ok(callback); startReload.dispose();
     console.log('ok - boundary, delivery, stop and start failures retain work and require explicit recovery');
 
+    for (const path of ['resume', 'claim', 'isArmed', 'status']) {
+      let readState = { ...old, stopped: undefined }, readFails = path === 'resume';
+      const readFailures = new Map();
+      const readStore = { read: () => {
+        if (readFails) throw new Error('malformed active ledger');
+        return readState;
+      }, write: state => { readState = state; } };
+      let reading = new PlanningSessionClock(owner, readStore, io, readFailures);
+      if (path !== 'resume') { reading.resume(); readFails = true; }
+      assert.throws(() => path === 'resume' ? reading.resume() : path === 'claim' ? reading.claim()
+        : path === 'isArmed' ? reading.isArmed() : reading.status(), /malformed active ledger/);
+      assert.equal(callback, undefined); assert.equal(readFailures.size, 1, `${path} must fail stopped`);
+      reading = new PlanningSessionClock(owner, readStore, io, readFailures);
+      assert.throws(() => reading.resume(), /malformed active ledger/, `${path} repeated reload remains stopped`);
+      readFails = false;
+      reading = new PlanningSessionClock(owner, readStore, io, readFailures);
+      reading.resume();
+      assert.equal(callback, undefined); assert.equal(readState.stopped, 'ledger-failure');
+      reading.start(first); assert.ok(callback); reading.dispose();
+    }
+    console.log('ok - active ledger read failures fail stopped across resume, claim, armed status and reload');
+
     assert.throws(() => validateState({ ...old, due: [first, first] }), /Malformed/);
+    assert.throws(() => validateState({ ...old, owner: { ...owner, pid: 0 } }), /Malformed/);
     assert.throws(() => validateState({ ...old, through: old.through + 1 }), /Malformed/);
     writeFileSync(join(lab, 'bad.json'), '{'); assert.throws(() => fileStore(join(lab, 'bad.json')).read());
     symlinkSync(join(lab, 'slots.json'), join(lab, 'link.json'));

@@ -140,6 +140,7 @@ export class PlanningSessionClock {
   private cancel?: () => void;
   private active = false;
   private ownsSchedule = false;
+  private lastState?: SlotState;
   constructor(owner: Owner, store: Store, io: ClockIO, revocations: Revocations = new Map()) {
     this.owner = owner;
     this.store = store;
@@ -169,6 +170,10 @@ export class PlanningSessionClock {
   }
   private ownedState(): SlotState | undefined {
     const state = this.store.read();
+    if (state && !sameOwner(state.owner, this.owner) && this.ownsSchedule) {
+      throw new Error("Planning ledger owner changed while the schedule was active");
+    }
+    if (state && sameOwner(state.owner, this.owner)) this.lastState = state;
     return state && sameOwner(state.owner, this.owner) ? state : undefined;
   }
   ownershipLost(force = false): void {
@@ -199,10 +204,15 @@ export class PlanningSessionClock {
     this.rememberFailure(due, candidate);
   }
   private current(): SlotState | undefined {
-    if (this.reconcileRevocation()) return undefined;
-    if (!this.io.valid()) { this.ownershipLost(); return undefined; }
-    const state = this.ownedState();
-    return state && !state.stopped ? state : undefined;
+    try {
+      if (this.reconcileRevocation()) return undefined;
+      if (!this.io.valid()) { this.ownershipLost(); return undefined; }
+      const state = this.ownedState();
+      return state && !state.stopped ? state : undefined;
+    } catch (error) {
+      this.failStopped(this.lastState?.due ?? [], this.lastState);
+      throw error;
+    }
   }
   start(firstSlot: number): void {
     if (!this.io.valid()) {
@@ -233,6 +243,7 @@ export class PlanningSessionClock {
     this.rememberFailure(candidate.due, candidate);
     try {
       this.store.write(candidate);
+      this.lastState = candidate;
       this.revocations.delete(ownerKey(this.owner));
     } catch (error) {
       this.failStopped(candidate.due, candidate);
@@ -302,6 +313,20 @@ export class PlanningSessionClock {
   isArmed(): boolean {
     return this.active && this.cancel !== undefined && this.current() !== undefined;
   }
+  status(): { armed: boolean; state: SlotState | undefined } {
+    try {
+      const armed = this.isArmed();
+      const state = this.store.read();
+      if (state && !sameOwner(state.owner, this.owner) && this.ownsSchedule) {
+        throw new Error("Planning ledger owner changed while the schedule was active");
+      }
+      if (state && sameOwner(state.owner, this.owner)) this.lastState = state;
+      return { armed, state };
+    } catch (error) {
+      this.failStopped(this.lastState?.due ?? [], this.lastState);
+      throw error;
+    }
+  }
   claim(): Claim | undefined {
     if (!this.active) return undefined;
     const state = this.current();
@@ -369,7 +394,7 @@ export function completePlanningTables(text: string): boolean {
     }
     return fence ? "" : line;
   });
-  if (visible.some((line) => /<\/?(?:details|div|span|script|style|pre|template|iframe)\b/i.test(line))) return false;
+  if (visible.some((line) => /<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*?)?\/?>|<![A-Za-z][^<>]*>|<\?[^<>]*>/i.test(line))) return false;
   const sections: [string, string[]][] = [
     ["Ideas", ["Work", "Meaningful change", "Next step", "Needs you?"]],
     ["To-do list", ["Work", "Meaningful change", "Next step", "Needs you?"]],
