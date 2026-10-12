@@ -128,7 +128,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       tables + '\n## Ideas\n', '~~~\n' + tables + '\n~~~',
       '<!--\n' + tables + '\n-->', '<div hidden>\n' + tables + '\n</div>',
       '<section hidden>\n' + tables + '\n</section>', '<article aria-hidden="true">\n' + tables + '\n</article>',
-      '<custom-panel>\n' + tables + '\n</custom-panel>']) assert.equal(completePlanningTables(text), false);
+      '<custom-panel>\n' + tables + '\n</custom-panel>', '<section\n hidden>\n' + tables + '\n</section\n>',
+      '<article\n aria-hidden="true">\n' + tables + '\n</article\n>',
+      '<![CDATA[\n' + tables + '\n]]>', '```html\n<section hidden>\n' + tables + '\n</section>\n```']) assert.equal(completePlanningTables(text), false);
     console.log('ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused');
 
     assert.deepEqual(wifiInterfaces('Hardware Port: Ethernet\nDevice: en1\n\nHardware Port: Wi-Fi\nDevice: en0\n'), ['en0']);
@@ -249,9 +251,17 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       reading = new PlanningSessionClock(owner, readStore, io, readFailures);
       assert.throws(() => reading.resume(), /malformed active ledger/, `${path} repeated reload remains stopped`);
       readFails = false;
-      reading = new PlanningSessionClock(owner, readStore, io, readFailures);
-      reading.resume();
-      assert.equal(callback, undefined); assert.equal(readState.stopped, 'ledger-failure');
+      if (path === 'status') {
+        const recoveredStatus = reading.status();
+        assert.equal(recoveredStatus.armed, false); assert.equal(recoveredStatus.state.stopped, 'ledger-failure');
+        reading = new PlanningSessionClock(owner, readStore, io, new Map());
+        reading.resume();
+        assert.equal(callback, undefined, 'durable status reconciliation survives process-local state loss');
+      } else {
+        reading = new PlanningSessionClock(owner, readStore, io, readFailures);
+        reading.resume();
+        assert.equal(callback, undefined); assert.equal(readState.stopped, 'ledger-failure');
+      }
       reading.start(first); assert.ok(callback); reading.dispose();
     }
     console.log('ok - active ledger read failures fail stopped across resume, claim, armed status and reload');

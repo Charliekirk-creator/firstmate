@@ -315,7 +315,8 @@ export class PlanningSessionClock {
   }
   status(): { armed: boolean; state: SlotState | undefined } {
     try {
-      const armed = this.isArmed();
+      const reconciled = this.reconcileRevocation();
+      const armed = !reconciled && this.isArmed();
       const state = this.store.read();
       if (state && !sameOwner(state.owner, this.owner) && this.ownsSchedule) {
         throw new Error("Planning ledger owner changed while the schedule was active");
@@ -394,7 +395,7 @@ export function completePlanningTables(text: string): boolean {
     }
     return fence ? "" : line;
   });
-  if (visible.some((line) => /<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*?)?\/?>|<![A-Za-z][^<>]*>|<\?[^<>]*>/i.test(line))) return false;
+  if (/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*?)?\/?>|<![A-Za-z][^<>]*>|<!\[[^<>]*>|<\?[^<>]*>/i.test(visible.join("\n"))) return false;
   const sections: [string, string[]][] = [
     ["Ideas", ["Work", "Meaningful change", "Next step", "Needs you?"]],
     ["To-do list", ["Work", "Meaningful change", "Next step", "Needs you?"]],
