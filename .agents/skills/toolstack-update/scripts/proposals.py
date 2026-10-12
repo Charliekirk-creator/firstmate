@@ -191,7 +191,12 @@ def hosted_declaration(host, path, ref, protocol):
     if canonical_host == "github.com":
         if len(segments) < 2 or (len(segments) >= 3 and segments[2] != "tree"):
             return host, path, ref, False
-        effective_ref = segments[3] if len(segments) >= 4 else ref
+        if len(segments) == 3:
+            effective_ref = "undefined"
+        elif len(segments) >= 4:
+            effective_ref = segments[3] or None
+        else:
+            effective_ref = ref
         return canonical_host, "/".join(segments[:2]), effective_ref, True
     if canonical_host == "bitbucket.org":
         if len(segments) < 2 or (len(segments) >= 3 and segments[2] == "get"):
@@ -240,11 +245,16 @@ def git_declaration(source):
     if hosted:
         host, path = HOSTED_GIT[hosted], value
         hosted_identity = True
+        if "/" in path and "@" in path:
+            repo_path, candidate_ref = path.split("@", 1)
+            if repo_path and candidate_ref:
+                path, ref = repo_path, candidate_ref
+        elif hosted == "gist" and "@" in path:
+            path = path.split("@", 1)[1]
         if "#" in path:
-            path, ref = path.split("#", 1)
+            path, fragment = path.split("#", 1)
+            ref = fragment + "#" + ref if ref else fragment
         if hosted == "gist" and "/" not in path:
-            if "@" in path:
-                path = path.split("@", 1)[1]
             path = "null/" + path
     elif value.startswith("git@"):
         if not prefixed:
@@ -307,7 +317,7 @@ def git_declaration(source):
         return None
     if not host or not path or len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9.:-]+", host):
         return None
-    if ref is None and "@" in path:
+    if ref is None and not hosted_identity and "@" in path:
         path, ref = path.split("@", 1)
     if hosted_identity and host.lower() == "gist.github.com" and "/" not in path:
         path = "null/" + path

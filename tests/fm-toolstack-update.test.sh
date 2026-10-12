@@ -665,9 +665,18 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='gist-ordinary-ref-skill', kind='skill', path='skills/gist-ordinary-ref/SKILL.md', owner='pi-package',
          scope='user', source='git:gist:user/abc123@release%2F1',
          declarations=['git:gist:user/abc123@release%2F1']),
+    dict(name='tree-missing-ref-skill', kind='skill', path='skills/tree-missing-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:github.com/u/r/tree',
+         declarations=['git:github.com/u/r/tree']),
+    dict(name='tree-empty-ref-skill', kind='skill', path='skills/tree-empty-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:github.com/u/r/tree/',
+         declarations=['git:github.com/u/r/tree/'], pins=[]),
+    dict(name='gist-multiple-at-skill', kind='skill', path='skills/gist-multiple-at/SKILL.md', owner='pi-package',
+         scope='user', source='git:gist:abc@release@candidate',
+         declarations=['git:gist:abc@release@candidate'], pins=[]),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 42
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 45
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -728,6 +737,12 @@ assert inspected_resources[40]['pins'] == []
 assert inspected_resources[40]['identity']['update_unit']['identity'] == 'gist.github.com/null/release/1'
 assert inspected_resources[41]['pins'] == ['release/1']
 assert inspected_resources[41]['identity']['update_unit']['identity'] == 'gist.github.com/user/abc123'
+assert inspected_resources[42]['pins'] == ['undefined']
+assert inspected_resources[42]['identity']['update_unit']['identity'] == 'github.com/u/r'
+assert inspected_resources[43]['pins'] == []
+assert inspected_resources[43]['identity']['update_unit']['identity'] == 'github.com/u/r'
+assert inspected_resources[44]['pins'] == []
+assert inspected_resources[44]['identity']['update_unit']['identity'] == 'gist.github.com/null/release@candidate'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
