@@ -577,9 +577,18 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='hosted-encoded-skill', kind='skill', path='skills/hosted-encoded/SKILL.md', owner='pi-package',
          scope='user', source='https://github.com/org%2Fteam/repo',
          declarations=['https://github.com/org%2Fteam/repo'], pins=[]),
+    dict(name='unsupported-host-protocol-skill', kind='skill', path='skills/host-protocol/SKILL.md', owner='pi-package',
+         scope='user', source='http://bitbucket.org/user/repo#v1',
+         declarations=['http://bitbucket.org/user/repo#v1'], pins=[]),
+    dict(name='ported-generic-skill', kind='skill', path='skills/ported-generic/SKILL.md', owner='pi-package',
+         scope='user', source='https://example.com:8443/org/repo',
+         declarations=['https://example.com:8443/org/repo'], pins=[]),
+    dict(name='generic-raw-ref-skill', kind='skill', path='skills/generic-raw-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:https://example.com/org/repo@release%2F1',
+         declarations=['git:https://example.com/org/repo@release%2F1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 24
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 27
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -606,6 +615,12 @@ assert inspected_resources[20]['identity']['update_unit']['identity'] == 'bitbuc
 assert inspected_resources[21]['identity']['update_unit']['identity'] == 'gist.github.com/user/abc123/raw/file'
 assert inspected_resources[22]['identity']['update_unit']['identity'] == 'example.com/org%2Fteam/repo'
 assert inspected_resources[23]['identity']['update_unit']['identity'] == 'github.com/org/team/repo'
+assert inspected_resources[24]['pins'] == []
+assert inspected_resources[24]['identity']['update_unit']['identity'] == 'bitbucket.org/user/repo'
+assert inspected_resources[25]['identity']['update_unit']['identity'] == 'example.com/org/repo'
+assert inspected_resources[25]['source'] == 'https://example.com:8443/org/repo'
+assert inspected_resources[26]['pins'] == ['release%2F1']
+assert inspected_resources[26]['identity']['update_unit']['identity'] == 'example.com/org/repo'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']

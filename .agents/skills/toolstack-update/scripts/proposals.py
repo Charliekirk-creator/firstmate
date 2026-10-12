@@ -56,6 +56,13 @@ COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
 HOSTED_GIT = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org",
               "gist": "gist.github.com", "sourcehut": "git.sr.ht"}
+HOSTED_PROTOCOLS = {
+    "github.com": {"git", "http", "git+ssh", "git+https", "ssh", "https"},
+    "bitbucket.org": {"git+ssh", "git+https", "ssh", "https"},
+    "gitlab.com": {"git+ssh", "git+https", "ssh", "https"},
+    "gist.github.com": {"git", "git+ssh", "git+https", "ssh", "https"},
+    "git.sr.ht": {"git+ssh", "https"},
+}
 NPM_SELECTOR = re.compile(r"[\x20-\x7e]{1,128}\Z")
 DIST_TAG = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
@@ -189,6 +196,7 @@ def git_declaration(source):
     port = None
     hosted = None
     preserve_encoded_path = False
+    hosted_identity = False
     if prefixed:
         shortcut = re.fullmatch(r"(github|gitlab|bitbucket|gist|sourcehut):(.+)", value, re.IGNORECASE)
         if shortcut:
@@ -198,6 +206,7 @@ def git_declaration(source):
             hosted = "github"
     if hosted:
         host, path = HOSTED_GIT[hosted], value
+        hosted_identity = True
         if "#" in path:
             path, ref = path.split("#", 1)
         if hosted == "gist" and "/" not in path:
@@ -216,7 +225,9 @@ def git_declaration(source):
                 return None
             host, port = parsed.hostname, parsed.port
             unaliased_host = host[4:] if host and host.lower().startswith("www.") else host
-            if unaliased_host and unaliased_host.lower() in HOSTED_GIT.values():
+            hosted_protocol = bool(unaliased_host and
+                                   parsed.scheme.lower() in HOSTED_PROTOCOLS.get(unaliased_host.lower(), set()))
+            if hosted_protocol:
                 host = unaliased_host.lower()
         except ValueError:
             return None
@@ -226,31 +237,38 @@ def git_declaration(source):
         fragment = parsed.fragment or None
         segments = path.split("/")
         preserve_encoded_path = True
-        if host == "github.com":
+        if hosted_protocol and host == "github.com":
             if len(segments) >= 3 and segments[2] == "tree":
                 path = "/".join(segments[:2])
                 ref = segments[3] if len(segments) >= 4 else None
                 preserve_encoded_path = False
+                hosted_identity = True
             elif len(segments) == 2:
                 ref = fragment
                 preserve_encoded_path = False
-        elif host == "bitbucket.org" and len(segments) >= 2 and \
+                hosted_identity = True
+        elif hosted_protocol and host == "bitbucket.org" and len(segments) >= 2 and \
                 (len(segments) == 2 or segments[2] != "get"):
             path = "/".join(segments[:2])
             ref = fragment
             preserve_encoded_path = False
-        elif host == "git.sr.ht" and len(segments) >= 2 and \
+            hosted_identity = True
+        elif hosted_protocol and host == "git.sr.ht" and len(segments) >= 2 and \
                 (len(segments) == 2 or segments[2] != "archive"):
             path = "/".join(segments[:2])
             ref = fragment
             preserve_encoded_path = False
-        elif host == "gist.github.com" and (len(segments) < 3 or segments[2] != "raw"):
+            hosted_identity = True
+        elif hosted_protocol and host == "gist.github.com" and \
+                (len(segments) < 3 or segments[2] != "raw"):
             path = "null/" + path if len(segments) == 1 else "/".join(segments[:2])
             ref = fragment
             preserve_encoded_path = False
-        elif host == "gitlab.com" and "/-/" not in "/" + path + "/":
+            hosted_identity = True
+        elif hosted_protocol and host == "gitlab.com" and "/-/" not in "/" + path + "/":
             ref = fragment
             preserve_encoded_path = False
+            hosted_identity = True
     elif prefixed and "/" in value:
         host, path = value.split("/", 1)
     else:
@@ -259,6 +277,7 @@ def git_declaration(source):
         return None
     if ref is None and host.lower() in HOSTED_GIT.values() and "#" in path:
         path, ref = path.split("#", 1)
+        hosted_identity = True
     if ref is None and "@" in path:
         path, ref = path.split("@", 1)
     if re.search(r"%(?![0-9a-fA-F]{2})", path) or (ref is not None and re.search(r"%(?![0-9a-fA-F]{2})", ref)):
@@ -275,8 +294,8 @@ def git_declaration(source):
                                     re.search(r"[\x00-\x1f\\]", decoded_ref)):
         return None
     identity_path = path if preserve_encoded_path else decoded_path
-    identity = host.lower() + ((":" + str(port)) if port is not None else "") + "/" + identity_path.removesuffix(".git")
-    return (identity, decoded_ref)
+    identity = host.lower() + "/" + identity_path.removesuffix(".git")
+    return (identity, decoded_ref if hosted_identity else ref)
 
 
 def selector_has_credentials(selector):
