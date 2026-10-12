@@ -74,7 +74,7 @@ OBS_FIELDS = {"installed", "used", "loaded", "available", "owner", "compatible",
               "available_verified", "relation", "update_label", "resources", "resources_complete"} \
              | ASSESSMENT_FIELDS | VERSION_FIELDS
 RESOURCE_FIELDS = {"name", "kind", "path", "owner", "available", "installed", "discovered",
-                   "loaded", "used", "compatible", "owner_verified", "available_verified"} \
+                   "loaded", "used", "compatible", "owner_verified", "available_verified", "version_status"} \
                   | ASSESSMENT_FIELDS | VERSION_FIELDS
 CHECKPOINT_FIELDS = {"actor", "active_sessions", "active_workers", "active_validation",
                      "pins_preserved", "packages_preserved", "credentials_untouched",
@@ -235,6 +235,13 @@ def git_declaration(source):
             return None
         path = parsed.path.lstrip("/")
         fragment = parsed.fragment or None
+        path_ref = None
+        if "@" in path:
+            repo_path, candidate_ref = path.split("@", 1)
+            if repo_path and candidate_ref:
+                path, path_ref = repo_path, candidate_ref
+        hosted_ref = (fragment + "#" + path_ref) if fragment and path_ref else path_ref or fragment
+        ref = path_ref
         segments = path.split("/")
         preserve_encoded_path = True
         if hosted_protocol and host == "github.com":
@@ -244,29 +251,29 @@ def git_declaration(source):
                 preserve_encoded_path = False
                 hosted_identity = True
             elif len(segments) == 2:
-                ref = fragment
+                ref = hosted_ref
                 preserve_encoded_path = False
                 hosted_identity = True
         elif hosted_protocol and host == "bitbucket.org" and len(segments) >= 2 and \
                 (len(segments) == 2 or segments[2] != "get"):
             path = "/".join(segments[:2])
-            ref = fragment
+            ref = hosted_ref
             preserve_encoded_path = False
             hosted_identity = True
         elif hosted_protocol and host == "git.sr.ht" and len(segments) >= 2 and \
                 (len(segments) == 2 or segments[2] != "archive"):
             path = "/".join(segments[:2])
-            ref = fragment
+            ref = hosted_ref
             preserve_encoded_path = False
             hosted_identity = True
         elif hosted_protocol and host == "gist.github.com" and \
                 (len(segments) < 3 or segments[2] != "raw"):
             path = "null/" + path if len(segments) == 1 else "/".join(segments[:2])
-            ref = fragment
+            ref = hosted_ref
             preserve_encoded_path = False
             hosted_identity = True
         elif hosted_protocol and host == "gitlab.com" and "/-/" not in "/" + path + "/":
-            ref = fragment
+            ref = hosted_ref
             preserve_encoded_path = False
             hosted_identity = True
     elif prefixed and "/" in value:
@@ -393,6 +400,9 @@ def resource_record(row):
     for field in ("installed_version", "effective_version", "available"):
         value = row.get(field)
         version(value, "firstmate" if row["owner"] == "firstmate" or (isinstance(value, str) and COMMIT.fullmatch(value)) else "pi")
+    if row.get("version_status") is not None and row["version_status"] not in {
+            "verified", "inherently-unversioned", "unknown", "unavailable"}:
+        raise Invalid("Resource version status must distinguish verified, unversioned, unknown, and unavailable evidence.")
     availability_evidence(row)
     source = row.get("source")
     if source is None:
@@ -539,6 +549,15 @@ def require_assessment(row, loaded_field):
     require_version_evidence(row, loaded_field)
 
 
+def require_resource_version_evidence(row):
+    if row.get("version_status") == "inherently-unversioned":
+        if npm_declaration(row.get("source")) or row.get("installed_version") is not None or \
+                row.get("effective_version") is not None:
+            raise Invalid("Only non-npm resources with null versions may be inherently unversioned.")
+        return
+    require_version_evidence(row, "loaded")
+
+
 def require_pi_resource_compatibility(row):
     required = ("source", "scope", "declarations", "pins", "compatibility_evidence",
                 "owner_evidence", "installed_version_evidence", "effective_version_evidence", "observed_at")
@@ -552,7 +571,7 @@ def require_pi_resource_compatibility(row):
            ("installed", "discovered", "compatible", "owner_verified")) or \
             any(type(row.get(field)) is not bool for field in ("used", "loaded")):
         raise Invalid("A Pi update requires verified resource presence, owner, loading, and compatibility.")
-    require_version_evidence(row, "loaded")
+    require_resource_version_evidence(row)
 
 
 def parent_pi_context(row):

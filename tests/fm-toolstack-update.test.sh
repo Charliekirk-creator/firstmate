@@ -479,8 +479,8 @@ all_sources['observations']['pi']['resources'] = [
     dict(name='git-skill', kind='skill', path='skills/git-skill/SKILL.md', owner='pi-package', scope='user',
          source='git:github.com/example/skills@main', declarations=['git:github.com/example/skills@main'],
          pins=['main'], installed=True, discovered=True, loaded=True, used=True, compatible=True,
-         owner_verified=True, available_verified=False, installed_version='1.0.0',
-         effective_version='0.9.0', available=None, installed_version_evidence='git checkout',
+         owner_verified=True, available_verified=False, version_status='inherently-unversioned',
+         installed_version=None, effective_version=None, available=None, installed_version_evidence='git checkout revision main',
          effective_version_evidence='loaded resource inventory', owner_evidence='Pi package inventory',
          compatibility_evidence='reviewed against Pi 1.1.0', observed_at='2026-02-20T12:00:00Z',
          availability_status='unavailable',
@@ -488,8 +488,8 @@ all_sources['observations']['pi']['resources'] = [
     dict(name='local-template', kind='prompt-template', path='prompts/local-template.md', owner='local', scope='project',
          source='./templates/local-template', declarations=['./templates/local-template'], pins=[],
          installed=True, discovered=True, loaded=False, used=False, compatible=True,
-         owner_verified=True, available_verified=None, installed_version='1.0.0',
-         effective_version=None, available=None, installed_version_evidence='local source revision',
+         owner_verified=True, available_verified=None, version_status='inherently-unversioned',
+         installed_version=None, effective_version=None, available=None, installed_version_evidence='inherently unversioned local source',
          effective_version_evidence='not loaded in affected process', owner_evidence='local source owner',
          compatibility_evidence='reviewed against Pi 1.1.0', observed_at='2026-02-20T12:00:00Z',
          availability_status='unknown'),
@@ -498,6 +498,17 @@ code, inspected = invoke('inspect', {'observations': all_sources['observations']
 assert code == 0, inspected
 assert strip_identity(inspected['targets'][0]['observation']['resources']) == all_sources['observations']['pi']['resources']
 assert strip_identity(prepared(approved(all_sources))['affected_resources']) == all_sources['observations']['pi']['resources']
+unknown_resource_revision = copy.deepcopy(all_sources)
+unknown_resource_revision['observations']['pi']['resources'][1]['version_status'] = 'unknown'
+refuse('propose', unknown_resource_revision)
+npm_unversioned = copy.deepcopy(data)
+npm_unversioned['observations']['pi']['resources'][0].update(
+    version_status='inherently-unversioned', installed_version=None, effective_version=None)
+refuse('propose', npm_unversioned)
+changed_unversioned_evidence = approved(all_sources)
+changed_unversioned_evidence['observations']['pi']['resources'][1][
+    'installed_version_evidence'] = 'changed local revision evidence'
+refuse('prepare', changed_unversioned_evidence)
 for name in ['git-skill', 'local-template']:
     bad = copy.deepcopy(all_sources)
     bad['resource'] = resource_selector(next(row for row in bad['observations']['pi']['resources']
@@ -586,9 +597,12 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='generic-raw-ref-skill', kind='skill', path='skills/generic-raw-ref/SKILL.md', owner='pi-package',
          scope='user', source='git:https://example.com/org/repo@release%2F1',
          declarations=['git:https://example.com/org/repo@release%2F1']),
+    dict(name='combined-hosted-ref-skill', kind='skill', path='skills/combined-hosted-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:https://github.com/user/repo@release#readme',
+         declarations=['git:https://github.com/user/repo@release#readme']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 27
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 28
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -621,6 +635,8 @@ assert inspected_resources[25]['identity']['update_unit']['identity'] == 'exampl
 assert inspected_resources[25]['source'] == 'https://example.com:8443/org/repo'
 assert inspected_resources[26]['pins'] == ['release%2F1']
 assert inspected_resources[26]['identity']['update_unit']['identity'] == 'example.com/org/repo'
+assert inspected_resources[27]['pins'] == ['readme#release']
+assert inspected_resources[27]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
