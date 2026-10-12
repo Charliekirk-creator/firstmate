@@ -69,7 +69,7 @@ def invoke(command=None, data=None, raw=None, extra=(), forbidden=()):
         args.append(command)
     args.extend(extra)
     result = subprocess.run(args, input=raw if raw is not None else json.dumps(data or {}),
-                            text=True, capture_output=True, env=env, timeout=10)
+                            text=True, capture_output=True, env=env, timeout=30)
     assert secret not in result.stdout + result.stderr, 'credential input leaked'
     assert all(value not in result.stdout + result.stderr for value in forbidden), 'input credential leaked'
     assert result.returncode != 91, ('helper attempted execution, network, or protected reads', result.stderr)
@@ -368,6 +368,23 @@ refuse('inspect', {'observations': nonboolean_resource_usage['observations']})
 unused_resource = copy.deepcopy(whole_pi)
 unused_resource['observations']['pi']['resources'][0]['used'] = False
 assert prepared(approved(unused_resource))['affected_resources'][0]['used'] is False
+tagged_update = copy.deepcopy(data)
+tagged_update['observations']['pi']['resources'][0].update(
+    source='npm:example-extension@next', declarations=['npm:example-extension@next'])
+tagged_update['observations']['pi']['resources'][0].pop('pins')
+tagged_peer = copy.deepcopy(tagged_update['observations']['pi']['resources'][0])
+tagged_peer.update(name='ExamplePrompt', kind='prompt-template', path='prompts/example.md')
+tagged_update['observations']['pi']['resources'].append(tagged_peer)
+tagged_update['resource'] = resource_selector(tagged_update['observations']['pi']['resources'][0])
+tagged_proposal = prepared(approved(tagged_update))
+assert tagged_proposal['dispatch'] == {
+    'argv': ['pi', 'update', 'npm:example-extension@next', '--no-approve']}
+assert len(tagged_proposal['affected_resources']) == 2
+assert all(row['pins'] == ['next'] for row in tagged_proposal['affected_resources'])
+substituted_tag = approved(tagged_update)
+substituted_tag['observations']['pi']['resources'][0].update(
+    source='npm:example-extension@beta', declarations=['npm:example-extension@beta'])
+refuse('prepare', substituted_tag)
 object_declaration = copy.deepcopy(data)
 object_declaration['observations']['pi']['resources'][0]['declarations'] = [{
     'source': 'npm:example-extension', 'autoload': False,
@@ -539,9 +556,15 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='sourcehut-alias-skill', kind='skill', path='skills/sourcehut-alias/SKILL.md', owner='pi-package',
          scope='user', source='git:sourcehut:~alice/tools#v2',
          declarations=['git:sourcehut:~alice/tools#v2']),
+    dict(name='host-alias-skill', kind='skill', path='skills/host-alias/SKILL.md', owner='pi-package',
+         scope='user', source='git:https://www.github.com/user/repo.git#v1',
+         declarations=['git:https://www.github.com/user/repo.git#v1']),
+    dict(name='decoded-ref-skill', kind='skill', path='skills/decoded-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:github:user/repo#release%2F1',
+         declarations=['git:github:user/repo#release%2F1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 17
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 19
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -556,9 +579,14 @@ assert inspected_resources[15]['pins'] == ['v1']
 assert inspected_resources[16]['pins'] == ['v2']
 for index in (15, 16):
     assert inspected_resources[index]['identity']['update_unit']['identity'] == 'git.sr.ht/~alice/tools'
+assert inspected_resources[17]['pins'] == ['v1']
+assert inspected_resources[17]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[18]['pins'] == ['release/1']
+assert inspected_resources[18]['declarations'] == ['git:github:user/repo#release%2F1']
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
+matching_git_pin['observations']['pi']['resources'][18]['pins'] = ['release/1']
 assert invoke('inspect', {'observations': matching_git_pin['observations']})[0] == 0
 mismatched_git_pin = copy.deepcopy(source_forms)
 mismatched_git_pin['observations']['pi']['resources'][5]['pins'] = ['other-ref']
@@ -566,6 +594,9 @@ refuse('inspect', {'observations': mismatched_git_pin['observations']})
 mismatched_shorthand_pin = copy.deepcopy(source_forms)
 mismatched_shorthand_pin['observations']['pi']['resources'][9]['pins'] = ['other-ref']
 refuse('inspect', {'observations': mismatched_shorthand_pin['observations']})
+raw_encoded_pin = copy.deepcopy(source_forms)
+raw_encoded_pin['observations']['pi']['resources'][18]['pins'] = ['release%2F1']
+refuse('inspect', {'observations': raw_encoded_pin['observations']})
 credentialed_git = copy.deepcopy(source_forms)
 credentialed_git['observations']['pi']['resources'][5].update(
     source='ssh://deploy:embedded-secret@example.com:2222/org/tools@release+1',
@@ -580,6 +611,14 @@ credentialed_npm['observations']['pi']['resources'][0].update(
 code, npm_credential_refusal = invoke(
     'inspect', {'observations': credentialed_npm['observations']}, forbidden=(npm_credential,))
 assert code == 2 and npm_credential not in json.dumps(npm_credential_refusal)
+npm_query = 'npm-query-canary'
+query_npm = copy.deepcopy(source_forms)
+query_npm['observations']['pi']['resources'][0].update(
+    source=f'npm:example@https://example.com/package.tgz?token={npm_query}',
+    declarations=[f'npm:example@https://example.com/package.tgz?token={npm_query}'])
+code, npm_query_refusal = invoke(
+    'inspect', {'observations': query_npm['observations']}, forbidden=(npm_query,))
+assert code == 2 and npm_query not in json.dumps(npm_query_refusal)
 for row in source_forms['observations']['pi']['resources']:
     assert row['source'] in json.dumps(source_inspection)
 range_update = copy.deepcopy(data)

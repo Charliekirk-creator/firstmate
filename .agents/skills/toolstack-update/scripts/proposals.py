@@ -57,6 +57,7 @@ PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z"
 HOSTED_GIT = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org",
               "gist": "gist.github.com", "sourcehut": "git.sr.ht"}
 NPM_SELECTOR = re.compile(r"[\x20-\x7e]{1,128}\Z")
+DIST_TAG = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
                      "maintenance", "rollback", "verification", "compatibility_evidence",
                      "owner_evidence", "release_evidence", "availability_status", "observed_at"}
@@ -212,6 +213,9 @@ def git_declaration(source):
             if parsed.password is not None or (parsed.username is not None and parsed.scheme.lower() not in {"ssh", "git+ssh"}):
                 return None
             host, port = parsed.hostname, parsed.port
+            unaliased_host = host[4:] if host and host.lower().startswith("www.") else host
+            if unaliased_host and unaliased_host.lower() in HOSTED_GIT.values():
+                host = unaliased_host.lower()
         except ValueError:
             return None
         if parsed.query:
@@ -231,6 +235,8 @@ def git_declaration(source):
         path, ref = path.split("#", 1)
     if ref is None and "@" in path:
         path, ref = path.split("@", 1)
+    if re.search(r"%(?![0-9a-fA-F]{2})", path) or (ref is not None and re.search(r"%(?![0-9a-fA-F]{2})", ref)):
+        return None
     try:
         decoded_path = unquote(path)
         decoded_ref = unquote(ref) if ref is not None else None
@@ -243,12 +249,22 @@ def git_declaration(source):
                                     re.search(r"[\x00-\x1f\\]", decoded_ref)):
         return None
     identity = host.lower() + ((":" + str(port)) if port is not None else "") + "/" + decoded_path.removesuffix(".git")
-    return (identity, ref)
+    return (identity, decoded_ref)
 
 
 def selector_has_credentials(selector):
     match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]*)", selector)
-    return bool(match and "@" in match.group(1))
+    if not match:
+        return False
+    try:
+        parsed = urlsplit(selector)
+    except ValueError:
+        return True
+    return "@" in match.group(1) or "?" in selector.split("#", 1)[0]
+
+
+def is_dist_tag(selector):
+    return isinstance(selector, str) and bool(DIST_TAG.fullmatch(selector)) and not VERSION.fullmatch(selector)
 
 
 def local_declaration(source):
@@ -282,6 +298,8 @@ def selector_identity(selector):
         return "latest"
     if VERSION.fullmatch(selector):
         return "exact:" + selector.lstrip("v")
+    if is_dist_tag(selector):
+        return "tag:" + selector
     return "constraint:" + selector
 
 
@@ -343,7 +361,8 @@ def resource_record(row):
             raise Invalid("A resource declaration must exactly identify its update unit without flattening filters.")
         selector = match[2] if match else None
         git_ref = git_declaration(source)[1] if git_declaration(source) else None
-        expected_pins = [selector] if selector and VERSION.fullmatch(selector) else [git_ref] if git_ref else []
+        expected_pins = [selector] if selector and (VERSION.fullmatch(selector) or
+                                                      (is_dist_tag(selector) and selector != "latest")) else [git_ref] if git_ref else []
         if row.get("pins") is not None and row["pins"] != expected_pins:
             raise Invalid("Resource pin evidence must match its unchanged declaration.")
         row["pins"] = expected_pins
@@ -511,8 +530,8 @@ def dispatch(target, row, selected):
         if not source:
             raise Invalid("A managed resource needs its unchanged package declaration.")
         match = PACKAGE.fullmatch(source)
-        if not match or match[2] not in {None, "latest"}:
-            raise Invalid("Pinned, Git, local, range, or other tag sources need their existing owner's separately reviewed proposal.")
+        if not match or (match[2] is not None and not is_dist_tag(match[2])):
+            raise Invalid("Pinned, Git, local, and range sources need their existing owner's separately reviewed proposal.")
         if selected["scope"] != "user":
             raise Invalid("Project package scope needs separately verified owner isolation; never assume a personal update is project-only.")
         return {"argv": ["pi", "update", source, "--no-approve"]}
