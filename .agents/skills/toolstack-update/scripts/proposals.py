@@ -50,12 +50,12 @@ OWNERS = {
 }
 KINDS = ["extension", "skill", "prompt-template"]
 AXI_NATIVE = {"gh-axi", "quota-axi", "lavish-axi", "chrome-devtools-axi"}
-VERSION = re.compile(r"v?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*)|(?:[a-zA-Z-][a-zA-Z0-9-]*))(?:\.(?:(?:0|[1-9]\d*)|(?:[a-zA-Z-][a-zA-Z0-9-]*)))*)?(?:\+[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?\Z")
-WEZ_VERSION = re.compile(r"\d{8}-\d{6}-[a-f0-9]{8}\Z")
+VERSION = re.compile(r"v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[a-zA-Z-][a-zA-Z0-9-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[a-zA-Z-][a-zA-Z0-9-]*)))*)?(?:\+[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?\Z")
+WEZ_VERSION = re.compile(r"[0-9]{8}-[0-9]{6}-[a-f0-9]{8}\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
-NAME = re.compile(r"(?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*\Z")
 PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
-HOSTED_GIT = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org", "gist": "gist.github.com"}
+HOSTED_GIT = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org",
+              "gist": "gist.github.com", "sourcehut": "git.sr.ht"}
 NPM_SELECTOR = re.compile(r"[\x20-\x7e]{1,128}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
                      "maintenance", "rollback", "verification", "compatibility_evidence",
@@ -152,7 +152,7 @@ def assessment_record(row):
         raise Invalid("Source must be a bounded non-secret identifier.")
     observed_at = row.get("observed_at")
     if observed_at is not None and (not isinstance(observed_at, str) or
-                                    not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", observed_at)):
+                                    not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", observed_at)):
         raise Invalid("Evidence freshness requires a canonical UTC observation time.")
 
 
@@ -188,7 +188,7 @@ def git_declaration(source):
     port = None
     hosted = None
     if prefixed:
-        shortcut = re.fullmatch(r"(github|gitlab|bitbucket|gist):(.+)", value, re.IGNORECASE)
+        shortcut = re.fullmatch(r"(github|gitlab|bitbucket|gist|sourcehut):(.+)", value, re.IGNORECASE)
         if shortcut:
             hosted, value = shortcut.group(1).lower(), shortcut.group(2)
         elif not explicit_protocol and not value.startswith("git@") and value.count("/") == 1:
@@ -309,8 +309,9 @@ def declaration_source(row):
 def resource_record(row):
     object_fields(row, RESOURCE_FIELDS)
     assessment_record(row)
-    if not isinstance(row.get("name"), str) or not NAME.fullmatch(row["name"]):
-        raise Invalid("A resource needs a safe canonical name.")
+    if (not isinstance(row.get("name"), str) or not row["name"] or len(row["name"]) > 200 or
+            re.search(r"[\x00-\x1f]", row["name"])):
+        raise Invalid("A resource needs a bounded display or command name.")
     if row.get("kind") not in KINDS or row.get("owner") not in {"pi-package", "firstmate", "local"}:
         raise Invalid("Unknown resource kind or owner.")
     if row.get("scope") not in {"user", "project"}:
@@ -479,7 +480,8 @@ def require_pi_resource_compatibility(row):
                  "effective_version_evidence", "observed_at")):
         raise Invalid("A Pi update requires complete resource presence, owner, source, version, and compatibility evidence.")
     if any(row.get(field) is not True for field in
-           ("installed", "discovered", "compatible", "owner_verified")) or type(row.get("loaded")) is not bool:
+           ("installed", "discovered", "compatible", "owner_verified")) or \
+            any(type(row.get(field)) is not bool for field in ("used", "loaded")):
         raise Invalid("A Pi update requires verified resource presence, owner, loading, and compatibility.")
     require_version_evidence(row, "loaded")
 

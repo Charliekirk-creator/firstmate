@@ -296,7 +296,7 @@ for installed_version, available, category in [
         assert prepared(approved(semver_data))['available'] == available
     else:
         refuse('propose', semver_data)
-for malformed_version in ['1.0.0-01', '1.0.0-alpha..1', '01.0.0']:
+for malformed_version in ['1.0.0-01', '1.0.0-alpha..1', '01.0.0', '1.1١.0']:
     malformed_semver = request()
     malformed_semver['observations']['gh-axi']['installed_version'] = malformed_version
     refuse('inspect', {'observations': malformed_semver['observations']})
@@ -356,6 +356,18 @@ assert strip_identity(result['affected_resources']) == [resource] and data == be
 assert result['affected_resources'][0]['identity'] == resource_selector(resource)
 assert result['parent_pi']['owner'] == 'npm-global'
 assert result['parent_pi']['loaded'] is True
+whole_pi = copy.deepcopy(data)
+whole_pi.pop('resource')
+assert prepared(approved(whole_pi))['affected_resources'][0]['used'] is True
+unknown_resource_usage = copy.deepcopy(whole_pi)
+unknown_resource_usage['observations']['pi']['resources'][0].pop('used')
+refuse('propose', unknown_resource_usage)
+nonboolean_resource_usage = copy.deepcopy(whole_pi)
+nonboolean_resource_usage['observations']['pi']['resources'][0]['used'] = 1
+refuse('inspect', {'observations': nonboolean_resource_usage['observations']})
+unused_resource = copy.deepcopy(whole_pi)
+unused_resource['observations']['pi']['resources'][0]['used'] = False
+assert prepared(approved(unused_resource))['affected_resources'][0]['used'] is False
 object_declaration = copy.deepcopy(data)
 object_declaration['observations']['pi']['resources'][0]['declarations'] = [{
     'source': 'npm:example-extension', 'autoload': False,
@@ -521,9 +533,15 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='git-plus-ssh-skill', kind='skill', path='skills/git-plus-ssh/SKILL.md', owner='pi-package',
          scope='user', source='git:git+ssh://git@github.com/user/repo.git#v1',
          declarations=['git:git+ssh://git@github.com/user/repo.git#v1']),
+    dict(name='sourcehut-skill', kind='skill', path='skills/sourcehut/SKILL.md', owner='pi-package',
+         scope='user', source='git:git+ssh://git@git.sr.ht/~alice/tools.git#v1',
+         declarations=['git:git+ssh://git@git.sr.ht/~alice/tools.git#v1']),
+    dict(name='sourcehut-alias-skill', kind='skill', path='skills/sourcehut-alias/SKILL.md', owner='pi-package',
+         scope='user', source='git:sourcehut:~alice/tools#v2',
+         declarations=['git:sourcehut:~alice/tools#v2']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 15
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 17
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -534,6 +552,10 @@ assert inspected_resources[9]['declarations'] == ['git:github.com/user/repo#v1']
 for index in (13, 14):
     assert inspected_resources[index]['pins'] == ['v1']
     assert inspected_resources[index]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[15]['pins'] == ['v1']
+assert inspected_resources[16]['pins'] == ['v2']
+for index in (15, 16):
+    assert inspected_resources[index]['identity']['update_unit']['identity'] == 'git.sr.ht/~alice/tools'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
@@ -600,11 +622,21 @@ assert code == 0
 git_plus_update['resource'] = git_plus_inspection[
     'targets'][0]['observation']['resources'][0]['identity']
 refuse('propose', git_plus_update)
+sourcehut_update = copy.deepcopy(data)
+sourcehut_update['observations']['pi']['resources'][0].update(
+    source='git:git+ssh://git@git.sr.ht/~alice/tools.git#v1',
+    declarations=['git:git+ssh://git@git.sr.ht/~alice/tools.git#v1'])
+sourcehut_update['observations']['pi']['resources'][0].pop('pins')
+code, sourcehut_inspection = invoke('inspect', {'observations': sourcehut_update['observations']})
+assert code == 0
+sourcehut_update['resource'] = sourcehut_inspection[
+    'targets'][0]['observation']['resources'][0]['identity']
+refuse('propose', sourcehut_update)
 print('ok - supported npm ranges, Git URLs, shorthand, and local sources remain inspectable and deferred')
 
 collision_data = request('pi')
 collision_a = copy.deepcopy(resource)
-collision_a.update(name='review', kind='prompt-template', path='prompts/a/review.md',
+collision_a.update(name='Review', kind='prompt-template', path='prompts/a/review.md',
                    source='npm:collision-package', declarations=['npm:collision-package'])
 collision_b = copy.deepcopy(collision_a)
 collision_b['path'] = 'prompts/b/review.md'
