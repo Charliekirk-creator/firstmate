@@ -110,18 +110,22 @@ def assessment(source, scope='system'):
                 verification=['installed version', 'effective version', 'health'],
                 compatibility_evidence='synthetic compatibility review',
                 owner_evidence='synthetic installation receipt', release_evidence='synthetic release record',
-                availability_status='verified')
+                installed_version_evidence='synthetic package receipt',
+                effective_version_evidence='synthetic executable response', availability_status='verified')
 
 
 def observation(target):
-    row = dict(installed=True, used=True, current='1.0.0', available='1.1.0',
+    row = dict(installed=True, used=True, installed_version='1.0.0', effective_version='1.0.0',
+               available='1.1.0',
                owner=catalog['targets'][expected.index(target)]['owners'][0],
                compatible=True, owner_verified=True, available_verified=True,
                **assessment('synthetic:' + target))
     if target == 'firstmate':
-        row.update(current='0' * 40, available='1' * 40, relation='fast-forward')
+        row.update(installed_version='0' * 40, effective_version='0' * 40,
+                   available='1' * 40, relation='fast-forward')
     if target == 'wezterm':
-        row.update(current='20240203-110809-5046fc22', available='20260203-110809-5046fc22')
+        row.update(installed_version='20240203-110809-5046fc22',
+                   effective_version='20240203-110809-5046fc22', available='20260203-110809-5046fc22')
     if target == 'git':
         row['update_label'] = 'Command Line Tools for Xcode-26.1'
     if target == 'pi':
@@ -194,7 +198,8 @@ for flag in ['installed', 'used', 'compatible', 'owner_verified', 'available_ver
     refuse('propose', data)
     data['observations']['gh-axi'][flag] = 'true'
     refuse('propose', data)
-for field in ['current', 'available']:
+for field in ['installed_version', 'effective_version', 'installed_version_evidence',
+              'effective_version_evidence', 'available']:
     data = request()
     del data['observations']['gh-axi'][field]
     refuse('propose', data)
@@ -202,12 +207,13 @@ data = request('pi')
 del data['observations']['pi']['resources_complete']
 refuse('propose', data)
 data = request()
-data['observations']['gh-axi']['used'] = False
-assert prepared(approved(data))['target'] == 'gh-axi'
+data['observations']['gh-axi'].update(used=False, effective_version=None,
+                                      effective_version_evidence='not loaded in any affected process')
+assert prepared(approved(data))['effective_version'] is None
 print('ok - actual-use evidence differs from installation; unknown compatibility/resources block proposals')
 
 data = request()
-data['observations']['gh-axi'].update(current='v1.0.0', available='1.0.0')
+data['observations']['gh-axi'].update(installed_version='v1.0.0', available='1.0.0')
 code, inspected = invoke('inspect', {'observations': data['observations']})
 assert code == 0 and inspected['targets'][expected.index('gh-axi')]['outcome']['category'] == 'unchanged'
 assert inspected['targets'][expected.index('gh-axi')]['outcome']['evidence'] == 'synthetic release record'
@@ -216,6 +222,9 @@ for category, changes in [
                  'release_evidence': None}),
     ('unavailable', {'availability_status': 'unavailable', 'available': None, 'available_verified': False,
                      'release_evidence': 'registry lookup failed after bounded attempt'}),
+    ('unavailable', {'availability_status': 'unavailable', 'installed_version': None,
+                     'available': None, 'available_verified': False,
+                     'release_evidence': 'registry lookup failed with installed version unknown'}),
     ('deferred', {'available': '0.9.0'}),
     ('candidate', {}),
 ]:
@@ -248,7 +257,10 @@ for command in [['brew', 'upgrade'], ['npm', 'update', '-g'], ['pi', 'update', '
     bad['approval']['dispatch'] = {'argv': command}
     refuse('prepare', bad)
     refuse('inspect', {'command': command})
-for field, value in [('current', '1.0.1'), ('available', '1.2.0'), ('owner', 'pnpm-global')]:
+for field, value in [('installed_version', '1.0.1'), ('effective_version', '0.9.0'),
+                     ('installed_version_evidence', 'different receipt'),
+                     ('effective_version_evidence', 'different process response'),
+                     ('available', '1.2.0'), ('owner', 'pnpm-global')]:
     bad = copy.deepcopy(data)
     bad['observations']['gh-axi'][field] = value
     refuse('prepare', bad)
@@ -273,7 +285,8 @@ refuse('prepare', bad)
 print('ok - active/unknown work and incomplete/non-primary checkpoints cannot be prepared')
 
 resource = dict(name='example-extension', kind='extension', owner='pi-package',
-                current='1.0.0', available='1.1.0', installed=True, discovered=True,
+                installed_version='1.0.0', effective_version='0.9.0', available='1.1.0',
+                installed=True, discovered=True,
                 loaded=True, used=True, compatible=True, owner_verified=True, available_verified=True,
                 **assessment('npm:example-extension', 'user'))
 data = request('pi')
@@ -282,7 +295,11 @@ data['resource'] = resource['name']
 before = copy.deepcopy(data)
 result = prepared(approved(data))
 assert result['dispatch'] == {'argv': ['pi', 'update', 'npm:example-extension', '--no-approve']}
+assert result['installed_version'] == '1.0.0' and result['effective_version'] == '0.9.0'
 assert result['affected_resources'] == [resource] and data == before
+missing_effective = copy.deepcopy(data)
+missing_effective['observations']['pi']['resources'][0]['effective_version'] = None
+refuse('propose', missing_effective)
 pinned = copy.deepcopy(data)
 pinned['observations']['pi']['resources'][0].update(source='npm:example-extension@v1.1.0',
                                                     declarations=['npm:example-extension@v1.1.0'],
@@ -303,7 +320,9 @@ for owner in ['firstmate', 'local']:
     bad['observations']['pi']['resources'][0]['owner'] = owner
     bad['observations']['pi']['resources'][0].pop('source')
     if owner == 'firstmate':
-        bad['observations']['pi']['resources'][0].update(current='0' * 40, available='1' * 40)
+        bad['observations']['pi']['resources'][0].update(installed_version='0' * 40,
+                                                         effective_version='0' * 40,
+                                                         available='1' * 40)
     refuse('propose', bad)
 bad = approved(data)
 bad['observations']['pi']['resources'][0]['source'] += '@1.1.0'
@@ -318,19 +337,33 @@ print('ok - Pi resources retain exact declarations, pins, owner, scope, and sing
 all_sources = request('pi')
 all_sources['observations']['pi']['resources'] = [
     dict(name='git-skill', kind='skill', owner='pi-package', scope='user',
-         source='git:github.com/example/skills@main', current=None, available=None),
+         source='git:github.com/example/skills@main', declarations=['git:github.com/example/skills@main'],
+         pins=[], installed=True, discovered=True, loaded=True, used=True, compatible=True,
+         owner_verified=True, available_verified=False, installed_version='1.0.0',
+         effective_version='0.9.0', available=None, installed_version_evidence='git checkout',
+         effective_version_evidence='loaded resource inventory', owner_evidence='Pi package inventory',
+         compatibility_evidence='reviewed against Pi 1.1.0', availability_status='unavailable',
+         release_evidence='Git resource update intentionally deferred'),
     dict(name='local-template', kind='prompt-template', owner='local', scope='project',
-         source='./templates/local-template', current=None, available=None),
+         source='./templates/local-template', declarations=['./templates/local-template'], pins=[],
+         installed=True, discovered=True, loaded=False, used=False, compatible=True,
+         owner_verified=True, available_verified=None, installed_version='1.0.0',
+         effective_version=None, available=None, installed_version_evidence='local source revision',
+         effective_version_evidence='not loaded in affected process', owner_evidence='local source owner',
+         compatibility_evidence='reviewed against Pi 1.1.0', availability_status='unknown'),
 ]
 code, inspected = invoke('inspect', {'observations': all_sources['observations']})
 assert code == 0, inspected
 assert inspected['targets'][0]['observation']['resources'] == all_sources['observations']['pi']['resources']
-refuse('propose', all_sources)
+assert prepared(approved(all_sources))['affected_resources'] == all_sources['observations']['pi']['resources']
 for name in ['git-skill', 'local-template']:
     bad = copy.deepcopy(all_sources)
     bad['resource'] = name
     refuse('propose', bad)
-print('ok - complete Git/local resource inspection preserves sources without inventing package updates')
+unknown_compatibility = copy.deepcopy(all_sources)
+unknown_compatibility['observations']['pi']['resources'][1]['compatible'] = None
+refuse('propose', unknown_compatibility)
+print('ok - Pi updates bind Git/local compatibility without requiring resource releases')
 
 shared = request('pi')
 shared_a = copy.deepcopy(resource)
@@ -348,6 +381,10 @@ for changed in ['installed', 'discovered', 'compatible', 'owner_verified', 'avai
 missing = copy.deepcopy(shared)
 del missing['observations']['pi']['resources'][1]['compatibility_evidence']
 refuse('propose', missing)
+changed_effective = approved(shared)
+changed_effective['observations']['pi']['resources'][1].update(
+    effective_version='0.8.0', effective_version_evidence='different loaded process')
+refuse('prepare', changed_effective)
 print('ok - shared package proposals bind every resource and require resource-specific evidence')
 
 bound = approved(request())

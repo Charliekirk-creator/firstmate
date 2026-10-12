@@ -60,12 +60,14 @@ NPM_SELECTOR = re.compile(r"[a-zA-Z0-9.^~+*-]{1,64}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
                      "maintenance", "rollback", "verification", "compatibility_evidence",
                      "owner_evidence", "release_evidence", "availability_status"}
-OBS_FIELDS = {"installed", "used", "current", "available", "owner", "compatible",
-              "owner_verified", "available_verified", "relation", "update_label", "resources",
-              "resources_complete"} | ASSESSMENT_FIELDS
-RESOURCE_FIELDS = {"name", "kind", "owner", "current", "available", "pin", "installed",
-                   "discovered", "loaded", "used", "compatible", "owner_verified",
-                   "available_verified"} | ASSESSMENT_FIELDS
+VERSION_FIELDS = {"installed_version", "effective_version", "installed_version_evidence",
+                  "effective_version_evidence"}
+OBS_FIELDS = {"installed", "used", "available", "owner", "compatible", "owner_verified",
+              "available_verified", "relation", "update_label", "resources", "resources_complete"} \
+             | ASSESSMENT_FIELDS | VERSION_FIELDS
+RESOURCE_FIELDS = {"name", "kind", "owner", "available", "pin", "installed", "discovered",
+                   "loaded", "used", "compatible", "owner_verified", "available_verified"} \
+                  | ASSESSMENT_FIELDS | VERSION_FIELDS
 CHECKPOINT_FIELDS = {"actor", "active_sessions", "active_workers", "active_validation",
                      "pins_preserved", "packages_preserved", "credentials_untouched",
                      "local_state_preserved", "rollback_reviewed"}
@@ -115,7 +117,8 @@ def assessment_record(row):
                                    any(not isinstance(value, str) or not value or len(value) > 300 for value in values)):
             raise Invalid("Declarations, pins, dependencies, and verification facts must be bounded non-empty strings.")
     for field in ("disruption", "maintenance", "rollback", "compatibility_evidence",
-                  "owner_evidence", "release_evidence"):
+                  "owner_evidence", "release_evidence", "installed_version_evidence",
+                  "effective_version_evidence"):
         value = row.get(field)
         if value is not None and (not isinstance(value, str) or not value or len(value) > 500):
             raise Invalid("Assessment evidence must be a bounded non-empty string.")
@@ -149,7 +152,7 @@ def resource_record(row):
     for field in ("installed", "discovered", "loaded", "used", "compatible", "owner_verified", "available_verified"):
         if row.get(field) is not None and type(row[field]) is not bool:
             raise Invalid("Resource inventory and assessment flags must be booleans or unknown.")
-    for field in ("current", "available", "pin"):
+    for field in ("installed_version", "effective_version", "available", "pin"):
         value = row.get(field)
         version(value, "firstmate" if row["owner"] == "firstmate" or (isinstance(value, str) and COMMIT.fullmatch(value)) else "pi")
     availability_evidence(row)
@@ -183,7 +186,7 @@ def observations(data):
         for field in ("installed", "used", "compatible", "owner_verified", "available_verified", "resources_complete"):
             if row.get(field) is not None and type(row[field]) is not bool:
                 raise Invalid("Observation flags must be booleans or unknown.")
-        for field in ("current", "available"):
+        for field in ("installed_version", "effective_version", "available"):
             version(row.get(field), target)
         availability_evidence(row)
         if row.get("owner") is not None and not re.fullmatch(r"[a-z][a-z-]{0,40}", row["owner"]):
@@ -205,31 +208,39 @@ def observations(data):
 
 
 def outcome(target, row):
-    current, available = row.get("current"), row.get("available")
+    installed_version, available = row.get("installed_version"), row.get("available")
     status = row.get("availability_status")
     evidence = row.get("release_evidence")
     if row.get("installed") is False:
         category = "not-installed"
-    elif row.get("installed") is not True or not current or status in {None, "unknown"}:
-        category = "unknown"
-    elif status == "unavailable":
+    elif row.get("installed") is True and status == "unavailable":
         category = "unavailable"
+    elif row.get("installed") is not True or not installed_version or status in {None, "unknown"}:
+        category = "unknown"
     elif status != "verified" or not available or row.get("available_verified") is not True:
         category = "unknown"
-    elif current.lstrip("v") == available.lstrip("v"):
+    elif installed_version.lstrip("v") == available.lstrip("v"):
         category = "unchanged"
     elif target == "firstmate":
         category = "candidate" if row.get("relation") == "fast-forward" else "deferred"
     elif target == "wezterm":
-        category = "candidate" if available[:15] > current[:15] else "deferred"
+        category = "candidate" if available[:15] > installed_version[:15] else "deferred"
     else:
         stable = r"v?(\d+)\.(\d+)\.(\d+)"
-        a, b = re.fullmatch(stable, current), re.fullmatch(stable, available)
+        a, b = re.fullmatch(stable, installed_version), re.fullmatch(stable, available)
         category = "candidate" if a and b and tuple(map(int, b.groups())) > tuple(map(int, a.groups())) else "deferred"
     return {"category": category, "evidence": evidence}
 
 
-def require_assessment(row):
+def require_version_evidence(row, loaded_field):
+    if not row.get("installed_version") or not row.get("installed_version_evidence") or \
+            not row.get("effective_version_evidence"):
+        raise Invalid("Installed and effective versions require separate provenance.")
+    if row.get(loaded_field) is True and not row.get("effective_version"):
+        raise Invalid("A loaded or used item requires its independently observed effective version.")
+
+
+def require_assessment(row, loaded_field):
     required = ("source", "scope", "declarations", "pins", "dependencies", "disruption",
                 "maintenance", "rollback", "verification", "compatibility_evidence",
                 "owner_evidence", "release_evidence")
@@ -240,6 +251,20 @@ def require_assessment(row):
         raise Invalid("A proposal requires concrete non-empty assessment and verification facts.")
     if row.get("availability_status") != "verified":
         raise Invalid("A proposal requires a verified available release.")
+    require_version_evidence(row, loaded_field)
+
+
+def require_pi_resource_compatibility(row):
+    required = ("source", "scope", "declarations", "pins", "compatibility_evidence",
+                "owner_evidence", "installed_version_evidence", "effective_version_evidence")
+    if any(field not in row for field in required) or any(not row[field] for field in
+            ("source", "compatibility_evidence", "owner_evidence", "installed_version_evidence",
+             "effective_version_evidence")):
+        raise Invalid("A Pi update requires complete resource presence, owner, source, version, and compatibility evidence.")
+    if any(row.get(field) is not True for field in
+           ("installed", "discovered", "compatible", "owner_verified")) or type(row.get("loaded")) is not bool:
+        raise Invalid("A Pi update requires verified resource presence, owner, loading, and compatibility.")
+    require_version_evidence(row, "loaded")
 
 
 def dispatch(target, row, selected):
@@ -314,30 +339,31 @@ def proposal(data, rows):
         if any(r.get("owner") != "pi-package" or r.get("scope") != selected.get("scope") for r in affected):
             raise Invalid("Every resource supplied by a package must share its verified owner and scope.")
         for resource in affected:
-            require_assessment(resource)
+            require_assessment(resource, "loaded")
             if any(resource.get(k) is not True for k in
                    ("installed", "discovered", "compatible", "owner_verified", "available_verified")) or \
                     any(type(resource.get(k)) is not bool for k in ("loaded", "used")):
                 raise Invalid("Every affected resource needs its own presence, loading, use, compatibility, owner, and release evidence.")
             if outcome(target, resource)["category"] != "candidate":
                 raise Invalid("Every affected resource must be assessed for the same candidate package release.")
-        if any((r.get("current"), r.get("available")) !=
-               (selected.get("current"), selected.get("available")) for r in affected):
+        if any((r.get("installed_version"), r.get("available")) !=
+               (selected.get("installed_version"), selected.get("available")) for r in affected):
             raise Invalid("Affected resources must identify one concrete package version transition.")
     candidate = selected if selected is not None else row
     if target == "pi" and selected is None:
         for resource in affected:
-            require_assessment(resource)
-            if resource.get("installed") is not True or resource.get("discovered") is not True or \
-                    resource.get("compatible") is not True or type(resource.get("loaded")) is not bool:
-                raise Invalid("A Pi update requires presence, loading, and compatibility evidence for every affected resource.")
-    require_assessment(candidate)
+            require_pi_resource_compatibility(resource)
+    require_assessment(candidate, "loaded" if selected is not None else "used")
     if outcome(target, candidate)["category"] != "candidate":
         raise Invalid("No verified, compatible newer stable release can be proposed.")
     proposed = {"target": target, "resource": data.get("resource"),
                 "update_unit": selected["source"] if selected else target,
                 "owner": selected["owner"] if selected else row["owner"],
-                "current": candidate["current"], "available": candidate["available"],
+                "installed_version": candidate["installed_version"],
+                "effective_version": candidate.get("effective_version"),
+                "installed_version_evidence": candidate["installed_version_evidence"],
+                "effective_version_evidence": candidate["effective_version_evidence"],
+                "available": candidate["available"],
                 "dispatch": dispatch(target, candidate, selected),
                 "affected_resources": affected}
     proposed.update(bound_context(candidate))
