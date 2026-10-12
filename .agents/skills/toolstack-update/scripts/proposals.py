@@ -222,6 +222,10 @@ def git_declaration(source):
         if "git+ssh" in HOSTED_PROTOCOLS.get(unaliased_host.lower(), set()):
             host = unaliased_host.lower()
             hosted_identity = True
+            segments = path.split("/")
+            if host == "github.com" and len(segments) >= 3 and segments[2] == "tree":
+                path = "/".join(segments[:2])
+                ref = segments[3] if len(segments) >= 4 else None
     elif explicit_protocol:
         try:
             parsed = urlsplit(value)
@@ -403,14 +407,17 @@ def resource_record(row):
     for field in ("installed", "discovered", "loaded", "used", "compatible", "owner_verified", "available_verified"):
         if row.get(field) is not None and type(row[field]) is not bool:
             raise Invalid("Resource inventory and assessment flags must be booleans or unknown.")
+    source = row.get("source")
+    npm_source = npm_declaration(source)
     for field in ("installed_version", "effective_version", "available"):
         value = row.get(field)
-        version(value, "firstmate" if row["owner"] == "firstmate" or (isinstance(value, str) and COMMIT.fullmatch(value)) else "pi")
+        revision_target = "firstmate" if row["owner"] == "firstmate" or \
+            (npm_source is None and isinstance(value, str) and COMMIT.fullmatch(value)) else "pi"
+        version(value, revision_target)
     if row.get("version_status") is not None and row["version_status"] not in {
             "verified", "inherently-unversioned", "unknown", "unavailable"}:
         raise Invalid("Resource version status must distinguish verified, unversioned, unknown, and unavailable evidence.")
     availability_evidence(row)
-    source = row.get("source")
     if source is None:
         raise Invalid("A resource needs its exact source-backed identity.")
     if source is not None:
@@ -556,6 +563,8 @@ def require_assessment(row, loaded_field):
 
 
 def require_resource_version_evidence(row):
+    if row.get("version_status") in {"unknown", "unavailable"}:
+        raise Invalid("Unknown or unavailable resource revisions cannot be proposed.")
     if row.get("version_status") == "inherently-unversioned":
         if npm_declaration(row.get("source")) or row.get("installed_version") is not None or \
                 row.get("effective_version") is not None:
@@ -682,6 +691,7 @@ def proposal(data, rows):
             raise Invalid("Pinned npm packages are excluded by Pi update and have no preparable owner action.")
         for resource in affected:
             require_assessment(resource, "loaded")
+            require_resource_version_evidence(resource)
             if any(resource.get(k) is not True for k in
                    ("installed", "discovered", "compatible", "owner_verified", "available_verified")) or \
                     any(type(resource.get(k)) is not bool for k in ("loaded", "used")):

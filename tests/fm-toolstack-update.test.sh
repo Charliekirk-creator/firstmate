@@ -384,6 +384,19 @@ assert tagged_proposal['dispatch'] == {
     'argv': ['pi', 'update', 'npm:example-extension@next', '--no-approve']}
 assert len(tagged_proposal['affected_resources']) == 2
 assert all(row['pins'] == ['next'] for row in tagged_proposal['affected_resources'])
+for contradictory_status in ('unknown', 'unavailable'):
+    contradictory_resource = copy.deepcopy(data)
+    contradictory_resource['observations']['pi']['resources'][0]['version_status'] = contradictory_status
+    refuse('propose', contradictory_resource)
+verified_resource = copy.deepcopy(data)
+verified_resource['observations']['pi']['resources'][0]['version_status'] = 'verified'
+changed_resource_status = approved(verified_resource)
+changed_resource_status['observations']['pi']['resources'][0]['version_status'] = 'unknown'
+refuse('prepare', changed_resource_status)
+commit_npm = copy.deepcopy(data)
+for field in ('installed_version', 'effective_version', 'available'):
+    commit_npm['observations']['pi']['resources'][0][field] = 'a' * 40
+refuse('inspect', {'observations': commit_npm['observations']})
 substituted_tag = approved(tagged_update)
 substituted_tag['observations']['pi']['resources'][0].update(
     source='npm:example-extension@beta', declarations=['npm:example-extension@beta'])
@@ -501,6 +514,10 @@ code, inspected = invoke('inspect', {'observations': all_sources['observations']
 assert code == 0, inspected
 assert strip_identity(inspected['targets'][0]['observation']['resources']) == all_sources['observations']['pi']['resources']
 assert strip_identity(prepared(approved(all_sources))['affected_resources']) == all_sources['observations']['pi']['resources']
+commit_git_resource = copy.deepcopy(all_sources)
+commit_git_resource['observations']['pi']['resources'][0].update(
+    version_status='verified', installed_version='a' * 40, effective_version='a' * 40)
+assert prepared(approved(commit_git_resource))['affected_resources'][0]['installed_version'] == 'a' * 40
 unknown_resource_revision = copy.deepcopy(all_sources)
 unknown_resource_revision['observations']['pi']['resources'][1]['version_status'] = 'unknown'
 refuse('propose', unknown_resource_revision)
@@ -609,9 +626,12 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='scp-host-alias-skill', kind='skill', path='skills/scp-host-alias/SKILL.md', owner='pi-package',
          scope='user', source='git:git@www.github.com:user/repo#v1',
          declarations=['git:git@www.github.com:user/repo#v1']),
+    dict(name='scp-browser-skill', kind='skill', path='skills/scp-browser/SKILL.md', owner='pi-package',
+         scope='user', source='git:git@github.com:user/repo/tree/v1',
+         declarations=['git:git@github.com:user/repo/tree/v1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 30
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 31
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -650,6 +670,8 @@ assert inspected_resources[28]['pins'] == ['release/1']
 assert inspected_resources[28]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 assert inspected_resources[29]['pins'] == ['v1']
 assert inspected_resources[29]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[30]['pins'] == ['v1']
+assert inspected_resources[30]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
