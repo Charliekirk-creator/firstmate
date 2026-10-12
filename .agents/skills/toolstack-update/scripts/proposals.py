@@ -182,7 +182,7 @@ def npm_declaration(source):
     return (match.group(1), match.group(2)) if match else None
 
 
-def hosted_declaration(host, path, ref, protocol):
+def hosted_declaration(host, path, ref, protocol, combine_tree_ref=False):
     canonical_host = host[4:] if host.lower().startswith("www.") else host
     canonical_host = canonical_host.lower()
     if protocol not in HOSTED_PROTOCOLS.get(canonical_host, set()):
@@ -194,7 +194,8 @@ def hosted_declaration(host, path, ref, protocol):
         if len(segments) == 3:
             effective_ref = "undefined"
         elif len(segments) >= 4:
-            effective_ref = segments[3] + "@" + ref if segments[3] and ref else segments[3] or None
+            effective_ref = (segments[3] + "@" + ref if combine_tree_ref and segments[3] and ref
+                             else segments[3] or None)
         else:
             effective_ref = ref
         return canonical_host, "/".join(segments[:2]), effective_ref, True
@@ -310,7 +311,7 @@ def git_declaration(source):
                 path, ref = repo_path, candidate_ref
         candidate_path, fragment = path.split("#", 1) if "#" in path else (path, None)
         hosted_ref = (fragment + "#" + ref) if fragment and ref else ref or fragment
-        normalized = hosted_declaration(host, candidate_path, hosted_ref, "https")
+        normalized = hosted_declaration(host, candidate_path, hosted_ref, "https", combine_tree_ref=True)
         if normalized[3]:
             host, path, ref, hosted_identity = normalized
         else:

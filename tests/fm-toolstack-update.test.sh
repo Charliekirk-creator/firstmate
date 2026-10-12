@@ -680,9 +680,18 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='uppercase-hosted-protocol-skill', kind='skill', path='skills/uppercase-hosted/SKILL.md', owner='pi-package',
          scope='user', source='HTTPS://github.com/u/r',
          declarations=['HTTPS://github.com/u/r'], pins=[]),
+    dict(name='url-tree-combined-ref-skill', kind='skill', path='skills/url-tree-ref/SKILL.md', owner='pi-package',
+         scope='user', source='https://github.com/u/r/tree/release@candidate',
+         declarations=['https://github.com/u/r/tree/release@candidate']),
+    dict(name='prefixed-url-tree-ref-skill', kind='skill', path='skills/prefixed-url-tree-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:https://github.com/u/r/tree/release@candidate',
+         declarations=['git:https://github.com/u/r/tree/release@candidate']),
+    dict(name='scp-tree-ref-skill', kind='skill', path='skills/scp-tree-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:git@github.com:u/r/tree/release@candidate',
+         declarations=['git:git@github.com:u/r/tree/release@candidate']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 47
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 50
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -753,6 +762,9 @@ assert inspected_resources[45]['pins'] == ['release@candidate']
 assert inspected_resources[45]['identity']['update_unit']['identity'] == 'github.com/u/r'
 assert inspected_resources[46]['pins'] == []
 assert inspected_resources[46]['identity']['update_unit']['identity'] == 'github.com/u/r'
+for index in (47, 48, 49):
+    assert inspected_resources[index]['pins'] == ['release']
+    assert inspected_resources[index]['identity']['update_unit']['identity'] == 'github.com/u/r'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
