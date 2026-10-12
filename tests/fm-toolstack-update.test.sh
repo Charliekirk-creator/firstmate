@@ -295,6 +295,10 @@ for installed_version, available, category in [
         assert prepared(approved(semver_data))['available'] == available
     else:
         refuse('propose', semver_data)
+for malformed_version in ['1.0.0-01', '1.0.0-alpha..1', '01.0.0']:
+    malformed_semver = request()
+    malformed_semver['observations']['gh-axi']['installed_version'] = malformed_version
+    refuse('inspect', {'observations': malformed_semver['observations']})
 print('ok - semantic version precedence, divergence, and unrelated Apple updates are handled safely')
 
 data = approved(request())
@@ -496,10 +500,22 @@ source_forms['observations']['pi']['resources'] = [
          declarations=['ssh://deploy@example.com:2222/org/tools@release+1']),
     dict(name='local-skill', kind='skill', path='skills/local/SKILL.md', owner='local',
          scope='project', source='../local tools', declarations=['../local tools'], pins=[]),
+    dict(name='historical-git-skill', kind='skill', path='skills/historical/SKILL.md', owner='pi-package',
+         scope='user', source='git:github:user/repo', declarations=['git:github:user/repo'], pins=[]),
+    dict(name='hosted-ref-skill', kind='skill', path='skills/hosted-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:https://github.com/user/repo#v1',
+         declarations=['git:https://github.com/user/repo#v1']),
+    dict(name='gist-skill', kind='skill', path='skills/gist/SKILL.md', owner='pi-package',
+         scope='user', source='git:gist:abc123', declarations=['git:gist:abc123'], pins=[]),
+    dict(name='bare-local-skill', kind='skill', path='skills/bare-local/SKILL.md', owner='local',
+         scope='project', source='packages/pi-tools', declarations=['packages/pi-tools'], pins=[]),
+    dict(name='file-local-skill', kind='skill', path='skills/file-local/SKILL.md', owner='local',
+         scope='project', source='file:../pi-tools', declarations=['file:../pi-tools'], pins=[]),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 7
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 12
 assert source_inspection['targets'][0]['observation']['resources'][5]['pins'] == ['release+1']
+assert source_inspection['targets'][0]['observation']['resources'][8]['pins'] == ['v1']
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 assert invoke('inspect', {'observations': matching_git_pin['observations']})[0] == 0
@@ -545,7 +561,12 @@ collision_b['path'] = 'prompts/b/review.md'
 collision_other = copy.deepcopy(collision_a)
 collision_other.update(path='prompts/review.md', scope='project', source='npm:other-package',
                        declarations=['npm:other-package'])
-collision_data['observations']['pi']['resources'] = [collision_a, collision_b, collision_other]
+non_command_a = copy.deepcopy(resource)
+non_command_a.update(name='shared-name', kind='skill', path='skills/shared-name/SKILL.md')
+non_command_b = copy.deepcopy(resource)
+non_command_b.update(name='shared-name', kind='skill', path='skills/other-shared-name/SKILL.md')
+collision_data['observations']['pi']['resources'] = [
+    collision_a, collision_b, collision_other, non_command_a, non_command_b]
 code, collision_inspection = invoke('inspect', {'observations': collision_data['observations']})
 assert code == 0
 collision_report = collision_inspection['targets'][0]['resource_collisions']

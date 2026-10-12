@@ -50,12 +50,12 @@ OWNERS = {
 }
 KINDS = ["extension", "skill", "prompt-template"]
 AXI_NATIVE = {"gh-axi", "quota-axi", "lavish-axi", "chrome-devtools-axi"}
-VERSION = re.compile(r"v?\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?\Z")
+VERSION = re.compile(r"v?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*)|(?:[a-zA-Z-][a-zA-Z0-9-]*))(?:\.(?:(?:0|[1-9]\d*)|(?:[a-zA-Z-][a-zA-Z0-9-]*)))*)?(?:\+[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?\Z")
 WEZ_VERSION = re.compile(r"\d{8}-\d{6}-[a-f0-9]{8}\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 NAME = re.compile(r"(?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*\Z")
 PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
-LOCAL_SOURCE = re.compile(r"(?:~/|/|\./|\.\./)[a-zA-Z0-9_./ -]+\Z")
+HOSTED_GIT = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org", "gist": "gist.github.com"}
 NPM_SELECTOR = re.compile(r"[\x20-\x7e]{1,128}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
                      "maintenance", "rollback", "verification", "compatibility_evidence",
@@ -182,9 +182,22 @@ def git_declaration(source):
     if prefixed:
         value = value[4:].strip()
     explicit_protocol = re.match(r"^(https?|ssh|git)://", value, re.IGNORECASE)
-    host = path = None
+    host = path = ref = None
     port = None
-    if value.startswith("git@"):
+    hosted = None
+    if prefixed:
+        shortcut = re.fullmatch(r"(github|gitlab|bitbucket|gist):(.+)", value, re.IGNORECASE)
+        if shortcut:
+            hosted, value = shortcut.group(1).lower(), shortcut.group(2)
+        elif not explicit_protocol and not value.startswith("git@") and value.count("/") == 1:
+            hosted = "github"
+    if hosted:
+        host, path = HOSTED_GIT[hosted], value
+        if "#" in path:
+            path, ref = path.split("#", 1)
+        if hosted == "gist" and "/" not in path:
+            path = "null/" + path
+    elif value.startswith("git@"):
         if not prefixed:
             return None
         match = re.fullmatch(r"git@([^:]+):(.+)", value)
@@ -199,17 +212,20 @@ def git_declaration(source):
             host, port = parsed.hostname, parsed.port
         except ValueError:
             return None
-        if parsed.query or parsed.fragment:
+        if parsed.query:
             return None
         path = parsed.path.lstrip("/")
+        if parsed.fragment:
+            if host not in HOSTED_GIT.values():
+                return None
+            ref = parsed.fragment
     elif prefixed and "/" in value:
         host, path = value.split("/", 1)
     else:
         return None
     if not host or not path or len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9.:-]+", host):
         return None
-    ref = None
-    if "@" in path:
+    if ref is None and "@" in path:
         path, ref = path.split("@", 1)
     try:
         decoded_path = unquote(path)
@@ -224,6 +240,24 @@ def git_declaration(source):
         return None
     identity = host.lower() + ((":" + str(port)) if port is not None else "") + "/" + decoded_path.removesuffix(".git")
     return (identity, ref)
+
+
+def local_declaration(source):
+    if not isinstance(source, str) or not source or len(source) > 500:
+        return False
+    value = source.strip()
+    if not value or re.search(r"[\x00-\x1f]", value):
+        return False
+    if value.startswith(("npm:", "git:", "github:", "http:", "https:", "ssh:")):
+        return False
+    if value.startswith("file:"):
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        return (parsed.username is None and parsed.password is None and
+                parsed.netloc in {"", "localhost"} and not parsed.query and not parsed.fragment)
+    return True
 
 
 def update_identity(source):
@@ -292,7 +326,7 @@ def resource_record(row):
         if match:
             if match[2] is not None and not NPM_SELECTOR.fullmatch(match[2]):
                 raise Invalid("Unsupported npm declaration; never include credentials or command text.")
-        elif git_declaration(source) is None and not LOCAL_SOURCE.fullmatch(source):
+        elif git_declaration(source) is None and not local_declaration(source):
             raise Invalid("Only credential-free npm, Git, or local resource declarations are accepted.")
         if row.get("declarations") is not None and declaration_source(row) != source:
             raise Invalid("A resource declaration must exactly identify its update unit without flattening filters.")
@@ -342,6 +376,8 @@ def observations(data):
 def resource_collisions(resources):
     groups = {}
     for resource in resources:
+        if resource["kind"] != "prompt-template":
+            continue
         key = (resource["kind"], resource["name"])
         groups.setdefault(key, []).append(copy.deepcopy(resource["identity"]))
     return [{"kind": key[0], "name": key[1], "resources": identities}
