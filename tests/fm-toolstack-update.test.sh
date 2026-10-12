@@ -562,9 +562,12 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='decoded-ref-skill', kind='skill', path='skills/decoded-ref/SKILL.md', owner='pi-package',
          scope='user', source='git:github:user/repo#release%2F1',
          declarations=['git:github:user/repo#release%2F1']),
+    dict(name='browser-url-skill', kind='skill', path='skills/browser-url/SKILL.md', owner='pi-package',
+         scope='user', source='https://github.com/user/repo/tree/v1',
+         declarations=['https://github.com/user/repo/tree/v1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 19
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 20
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -583,6 +586,9 @@ assert inspected_resources[17]['pins'] == ['v1']
 assert inspected_resources[17]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 assert inspected_resources[18]['pins'] == ['release/1']
 assert inspected_resources[18]['declarations'] == ['git:github:user/repo#release%2F1']
+assert inspected_resources[19]['pins'] == ['v1']
+assert inspected_resources[19]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[19]['declarations'] == ['https://github.com/user/repo/tree/v1']
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
@@ -597,6 +603,11 @@ refuse('inspect', {'observations': mismatched_shorthand_pin['observations']})
 raw_encoded_pin = copy.deepcopy(source_forms)
 raw_encoded_pin['observations']['pi']['resources'][18]['pins'] = ['release%2F1']
 refuse('inspect', {'observations': raw_encoded_pin['observations']})
+malformed_encoded_ref = copy.deepcopy(source_forms)
+malformed_encoded_ref['observations']['pi']['resources'][18].update(
+    source='git:github:user/repo#release%FF',
+    declarations=['git:github:user/repo#release%FF'])
+refuse('inspect', {'observations': malformed_encoded_ref['observations']})
 credentialed_git = copy.deepcopy(source_forms)
 credentialed_git['observations']['pi']['resources'][5].update(
     source='ssh://deploy:embedded-secret@example.com:2222/org/tools@release+1',

@@ -192,7 +192,8 @@ def git_declaration(source):
         shortcut = re.fullmatch(r"(github|gitlab|bitbucket|gist|sourcehut):(.+)", value, re.IGNORECASE)
         if shortcut:
             hosted, value = shortcut.group(1).lower(), shortcut.group(2)
-        elif not explicit_protocol and not value.startswith("git@") and value.count("/") == 1:
+        elif (not explicit_protocol and not value.startswith("git@") and
+              value.split("#", 1)[0].count("/") == 1):
             hosted = "github"
     if hosted:
         host, path = HOSTED_GIT[hosted], value
@@ -225,6 +226,11 @@ def git_declaration(source):
             if host not in HOSTED_GIT.values():
                 return None
             ref = parsed.fragment
+        segments = path.split("/")
+        if host == "github.com" and len(segments) >= 3 and segments[2] == "tree":
+            path = "/".join(segments[:2])
+            if ref is None and len(segments) >= 4:
+                ref = segments[3]
     elif prefixed and "/" in value:
         host, path = value.split("/", 1)
     else:
@@ -238,8 +244,8 @@ def git_declaration(source):
     if re.search(r"%(?![0-9a-fA-F]{2})", path) or (ref is not None and re.search(r"%(?![0-9a-fA-F]{2})", ref)):
         return None
     try:
-        decoded_path = unquote(path)
-        decoded_ref = unquote(ref) if ref is not None else None
+        decoded_path = unquote(path, errors="strict")
+        decoded_ref = unquote(ref, errors="strict") if ref is not None else None
     except (UnicodeError, ValueError):
         return None
     if (not decoded_path or len(decoded_path) > 300 or decoded_path.startswith("/") or "\\" in decoded_path or
