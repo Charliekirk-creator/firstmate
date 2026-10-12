@@ -54,9 +54,9 @@ WEZ_VERSION = re.compile(r"\d{8}-\d{6}-[a-f0-9]{8}\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 NAME = re.compile(r"(?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*\Z")
 PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
-GIT_SOURCE = re.compile(r"git:(?:(?:https://)?[a-zA-Z0-9.-]+/|git@[a-zA-Z0-9.-]+:)[a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+(?:@[a-zA-Z0-9_./-]+)?\Z")
+GIT_SOURCE = re.compile(r"(?:git:(?:(?:https?://)?[a-zA-Z0-9.-]+/|git@[a-zA-Z0-9.-]+:)|https?://[a-zA-Z0-9.-]+/|ssh://git@[a-zA-Z0-9.-]+/)[a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+(?:@[a-zA-Z0-9_./-]+)?\Z")
 LOCAL_SOURCE = re.compile(r"(?:~/|/|\./|\.\./)[a-zA-Z0-9_./ -]+\Z")
-NPM_SELECTOR = re.compile(r"[a-zA-Z0-9.^~+*-]{1,64}\Z")
+NPM_SELECTOR = re.compile(r"[\x20-\x7e]{1,128}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
                      "maintenance", "rollback", "verification", "compatibility_evidence",
                      "owner_evidence", "release_evidence", "availability_status", "observed_at"}
@@ -65,7 +65,7 @@ VERSION_FIELDS = {"installed_version", "effective_version", "installed_version_e
 OBS_FIELDS = {"installed", "used", "loaded", "available", "owner", "compatible", "owner_verified",
               "available_verified", "relation", "update_label", "resources", "resources_complete"} \
              | ASSESSMENT_FIELDS | VERSION_FIELDS
-RESOURCE_FIELDS = {"name", "kind", "owner", "available", "installed", "discovered",
+RESOURCE_FIELDS = {"name", "kind", "path", "owner", "available", "installed", "discovered",
                    "loaded", "used", "compatible", "owner_verified", "available_verified"} \
                   | ASSESSMENT_FIELDS | VERSION_FIELDS
 CHECKPOINT_FIELDS = {"actor", "active_sessions", "active_workers", "active_validation",
@@ -174,9 +174,25 @@ def npm_declaration(source):
     return (match.group(1), match.group(2)) if match else None
 
 
+def git_declaration(source):
+    if not isinstance(source, str) or not GIT_SOURCE.fullmatch(source):
+        return None
+    value = source[4:] if source.startswith("git:") else source
+    value = re.sub(r"^(?:https?://|ssh://git@)", "", value)
+    if value.startswith("git@"):
+        value = value[4:].replace(":", "/", 1)
+    ref = None
+    if "@" in value[value.rfind("/") + 1:]:
+        value, ref = value.rsplit("@", 1)
+    return (value.removesuffix(".git"), ref)
+
+
 def update_identity(source):
     declaration = npm_declaration(source)
-    return ("npm", declaration[0]) if declaration else ("source", source)
+    if declaration:
+        return ("npm", declaration[0])
+    declaration = git_declaration(source)
+    return ("git", declaration[0]) if declaration else ("source", source)
 
 
 def selector_identity(selector):
@@ -185,6 +201,13 @@ def selector_identity(selector):
     if VERSION.fullmatch(selector):
         return "exact:" + selector.lstrip("v")
     return "constraint:" + selector
+
+
+def resource_identity(row):
+    unit = update_identity(row["source"])
+    return {"scope": row["scope"], "kind": row["kind"], "name": row["name"],
+            "source": row["source"], "path": row["path"],
+            "update_unit": {"type": unit[0], "identity": unit[1], "scope": row["scope"]}}
 
 
 def declaration_source(row):
@@ -204,6 +227,9 @@ def resource_record(row):
         raise Invalid("Unknown resource kind or owner.")
     if row.get("scope") not in {"user", "project"}:
         raise Invalid("A resource needs its actual user or project scope.")
+    path = row.get("path")
+    if not isinstance(path, str) or not path or len(path) > 500 or re.search(r"[\x00-\x1f]", path):
+        raise Invalid("A resource needs its bounded discovered source path.")
     for field in ("installed", "discovered", "loaded", "used", "compatible", "owner_verified", "available_verified"):
         if row.get(field) is not None and type(row[field]) is not bool:
             raise Invalid("Resource inventory and assessment flags must be booleans or unknown.")
@@ -212,6 +238,8 @@ def resource_record(row):
         version(value, "firstmate" if row["owner"] == "firstmate" or (isinstance(value, str) and COMMIT.fullmatch(value)) else "pi")
     availability_evidence(row)
     source = row.get("source")
+    if source is None:
+        raise Invalid("A resource needs its exact source-backed identity.")
     if source is not None:
         if not isinstance(source, str) or len(source) > 200:
             raise Invalid("Resource sources must be bounded non-secret declarations.")
@@ -227,7 +255,9 @@ def resource_record(row):
         expected_pins = [selector] if selector and VERSION.fullmatch(selector) else []
         if row.get("pins") is not None and row["pins"] != expected_pins:
             raise Invalid("Resource pin evidence must match its unchanged declaration.")
-    return copy.deepcopy(row)
+    result = copy.deepcopy(row)
+    result["identity"] = resource_identity(result)
+    return result
 
 
 def observations(data):
@@ -255,11 +285,20 @@ def observations(data):
         if not isinstance(resources, list) or len(resources) > 1000 or (resources and target != "pi"):
             raise Invalid("Resources belong only to Pi.")
         row["resources"] = [resource_record(r) for r in resources]
-        keys = [(r["kind"], r["scope"], r["name"]) for r in row["resources"]]
+        keys = [json.dumps(resource["identity"], sort_keys=True) for resource in row["resources"]]
         if len(keys) != len(set(keys)):
-            raise Invalid("Duplicate resources must be reconciled rather than hidden.")
+            raise Invalid("Duplicate source/path-backed resource identities must be reconciled.")
         result[target] = row
     return result
+
+
+def resource_collisions(resources):
+    groups = {}
+    for resource in resources:
+        key = (resource["kind"], resource["scope"], resource["name"])
+        groups.setdefault(key, []).append(copy.deepcopy(resource["identity"]))
+    return [{"kind": key[0], "scope": key[1], "name": key[2], "resources": identities}
+            for key, identities in groups.items() if len(identities) > 1]
 
 
 def outcome(target, row):
@@ -397,12 +436,13 @@ def proposal(data, rows):
     selected = None
     parent_context = None
     if selector is not None:
-        object_fields(selector, {"name", "kind", "scope", "source"})
-        if set(selector) != {"name", "kind", "scope", "source"} or target != "pi":
-            raise Invalid("Select one Pi package resource by its complete identity.")
+        identity_fields = {"name", "kind", "scope", "source", "path", "update_unit"}
+        object_fields(selector, identity_fields)
+        object_fields(selector.get("update_unit"), {"type", "identity", "scope"})
+        if set(selector) != identity_fields or set(selector["update_unit"]) != {"type", "identity", "scope"} or target != "pi":
+            raise Invalid("Select one Pi package resource by its complete source/path-backed identity.")
         parent_context = parent_pi_context(row)
-        matches = [resource for resource in row.get("resources", []) if
-                   all(resource.get(field) == selector[field] for field in selector)]
+        matches = [resource for resource in row.get("resources", []) if resource["identity"] == selector]
         if len(matches) != 1:
             raise Invalid("Select one unambiguous inventoried Pi package resource.")
         selected = matches[0]
@@ -445,9 +485,7 @@ def proposal(data, rows):
     if outcome(target, candidate)["category"] != "candidate":
         raise Invalid("No verified, compatible newer stable release can be proposed.")
     proposed = {"target": target, "resource": copy.deepcopy(selector),
-                "update_unit": ({"type": "npm-package" if update_identity(selected["source"])[0] == "npm" else "source",
-                                 "identity": update_identity(selected["source"])[1],
-                                 "scope": selected["scope"]}
+                "update_unit": (copy.deepcopy(selected["identity"]["update_unit"])
                                 if selected else {"target": target}),
                 "owner": selected["owner"] if selected else row["owner"],
                 "installed_version": candidate["installed_version"],
@@ -504,7 +542,8 @@ def main():
         rows = observations(data)
         if args.command == "inspect":
             result = {"mode": "inspection-only", "targets": [{"id": k, "name": v,
-                       "outcome": outcome(k, rows.get(k, {})), "observation": rows.get(k, {})}
+                       "outcome": outcome(k, rows.get(k, {})), "observation": rows.get(k, {}),
+                       "resource_collisions": resource_collisions(rows.get(k, {}).get("resources", []))}
                       for k, v in TARGETS.items()], "dependency_only": DEPENDENCY_ONLY}
         else:
             proposed = proposal(data, rows)

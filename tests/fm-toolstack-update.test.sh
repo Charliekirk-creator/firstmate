@@ -140,7 +140,35 @@ def request(target='gh-axi'):
 
 
 def resource_selector(row):
-    return {field: row[field] for field in ('name', 'kind', 'scope', 'source')}
+    source = row['source']
+    if source.startswith('npm:'):
+        spec = source[4:]
+        package = spec.split('@', 2)[0] if not spec.startswith('@') else '@' + '/'.join(spec[1:].split('/')[:1])
+        if spec.startswith('@'):
+            package = '@' + spec[1:].split('@', 1)[0]
+        unit_type = 'npm'
+    elif source.startswith(('git:', 'http://', 'https://', 'ssh://', 'git@')):
+        value = source[4:] if source.startswith('git:') else source
+        for prefix in ('https://', 'http://', 'ssh://git@'):
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+        if value.startswith('git@'):
+            value = value[4:].replace(':', '/', 1)
+        tail = value[value.rfind('/') + 1:]
+        if '@' in tail:
+            value = value.rsplit('@', 1)[0]
+        package = value[:-4] if value.endswith('.git') else value
+        unit_type = 'git'
+    else:
+        package = source
+        unit_type = 'source'
+    return {'name': row['name'], 'kind': row['kind'], 'scope': row['scope'],
+            'source': source, 'path': row['path'],
+            'update_unit': {'type': unit_type, 'identity': package, 'scope': row['scope']}}
+
+
+def strip_identity(rows):
+    return [{key: value for key, value in row.items() if key != 'identity'} for row in rows]
 
 
 def checkpoint():
@@ -292,7 +320,7 @@ del bad['checkpoint']['active_validation']
 refuse('prepare', bad)
 print('ok - active/unknown work and incomplete/non-primary checkpoints cannot be prepared')
 
-resource = dict(name='example-extension', kind='extension', owner='pi-package',
+resource = dict(name='example-extension', kind='extension', path='extensions/example.ts', owner='pi-package',
                 installed_version='1.0.0', effective_version='0.9.0', available='1.1.0',
                 installed=True, discovered=True,
                 loaded=True, used=True, compatible=True, owner_verified=True, available_verified=True,
@@ -304,7 +332,8 @@ before = copy.deepcopy(data)
 result = prepared(approved(data))
 assert result['dispatch'] == {'argv': ['pi', 'update', 'npm:example-extension', '--no-approve']}
 assert result['installed_version'] == '1.0.0' and result['effective_version'] == '0.9.0'
-assert result['affected_resources'] == [resource] and data == before
+assert strip_identity(result['affected_resources']) == [resource] and data == before
+assert result['affected_resources'][0]['identity'] == resource_selector(resource)
 assert result['parent_pi']['owner'] == 'npm-global'
 assert result['parent_pi']['loaded'] is True
 object_declaration = copy.deepcopy(data)
@@ -398,7 +427,7 @@ print('ok - Pi resources retain declarations, filters, parent context, pins, own
 # them, even when the main Pi binary itself has a supported proposal.
 all_sources = request('pi')
 all_sources['observations']['pi']['resources'] = [
-    dict(name='git-skill', kind='skill', owner='pi-package', scope='user',
+    dict(name='git-skill', kind='skill', path='skills/git-skill/SKILL.md', owner='pi-package', scope='user',
          source='git:github.com/example/skills@main', declarations=['git:github.com/example/skills@main'],
          pins=[], installed=True, discovered=True, loaded=True, used=True, compatible=True,
          owner_verified=True, available_verified=False, installed_version='1.0.0',
@@ -407,7 +436,7 @@ all_sources['observations']['pi']['resources'] = [
          compatibility_evidence='reviewed against Pi 1.1.0', observed_at='2026-02-20T12:00:00Z',
          availability_status='unavailable',
          release_evidence='Git resource update intentionally deferred'),
-    dict(name='local-template', kind='prompt-template', owner='local', scope='project',
+    dict(name='local-template', kind='prompt-template', path='prompts/local-template.md', owner='local', scope='project',
          source='./templates/local-template', declarations=['./templates/local-template'], pins=[],
          installed=True, discovered=True, loaded=False, used=False, compatible=True,
          owner_verified=True, available_verified=None, installed_version='1.0.0',
@@ -418,8 +447,8 @@ all_sources['observations']['pi']['resources'] = [
 ]
 code, inspected = invoke('inspect', {'observations': all_sources['observations']})
 assert code == 0, inspected
-assert inspected['targets'][0]['observation']['resources'] == all_sources['observations']['pi']['resources']
-assert prepared(approved(all_sources))['affected_resources'] == all_sources['observations']['pi']['resources']
+assert strip_identity(inspected['targets'][0]['observation']['resources']) == all_sources['observations']['pi']['resources']
+assert strip_identity(prepared(approved(all_sources))['affected_resources']) == all_sources['observations']['pi']['resources']
 for name in ['git-skill', 'local-template']:
     bad = copy.deepcopy(all_sources)
     bad['resource'] = resource_selector(next(row for row in bad['observations']['pi']['resources']
@@ -429,6 +458,63 @@ unknown_compatibility = copy.deepcopy(all_sources)
 unknown_compatibility['observations']['pi']['resources'][1]['compatible'] = None
 refuse('propose', unknown_compatibility)
 print('ok - Pi updates bind Git/local compatibility without requiring resource releases')
+
+source_forms = request('pi')
+source_forms['observations']['pi']['resources'] = [
+    dict(name='range-extension', kind='extension', path='extensions/range.ts', owner='pi-package',
+         scope='user', source='npm:range-package@>=1.0.0 <2.0.0',
+         declarations=['npm:range-package@>=1.0.0 <2.0.0'], pins=[]),
+    dict(name='scoped-range-skill', kind='skill', path='skills/scoped/SKILL.md', owner='pi-package',
+         scope='user', source='npm:@example/scoped@^1.0.0',
+         declarations=['npm:@example/scoped@^1.0.0'], pins=[]),
+    dict(name='url-skill', kind='skill', path='skills/url/SKILL.md', owner='pi-package',
+         scope='user', source='https://github.com/example/pi-tools',
+         declarations=['https://github.com/example/pi-tools'], pins=[]),
+    dict(name='git-template', kind='prompt-template', path='prompts/git.md', owner='pi-package',
+         scope='user', source='git:github.com/example/pi-tools@main',
+         declarations=['git:github.com/example/pi-tools@main'], pins=[]),
+    dict(name='local-skill', kind='skill', path='skills/local/SKILL.md', owner='local',
+         scope='project', source='../local tools', declarations=['../local tools'], pins=[]),
+]
+code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 5
+for row in source_forms['observations']['pi']['resources']:
+    assert row['source'] in json.dumps(source_inspection)
+range_update = copy.deepcopy(data)
+range_update['observations']['pi']['resources'][0].update(
+    source='npm:example-extension@>=1.0.0 <2.0.0',
+    declarations=['npm:example-extension@>=1.0.0 <2.0.0'], pins=[])
+range_update['resource'] = resource_selector(range_update['observations']['pi']['resources'][0])
+refuse('propose', range_update)
+url_update = copy.deepcopy(data)
+url_update['observations']['pi']['resources'][0].update(
+    source='https://github.com/example/pi-tools', declarations=['https://github.com/example/pi-tools'])
+url_update['resource'] = resource_selector(url_update['observations']['pi']['resources'][0])
+refuse('propose', url_update)
+print('ok - supported npm ranges, Git URLs, shorthand, and local sources remain inspectable and deferred')
+
+collision_data = request('pi')
+collision_a = copy.deepcopy(resource)
+collision_a.update(name='review', kind='prompt-template', path='prompts/a/review.md',
+                   source='npm:collision-package', declarations=['npm:collision-package'])
+collision_b = copy.deepcopy(collision_a)
+collision_b['path'] = 'prompts/b/review.md'
+collision_other = copy.deepcopy(collision_a)
+collision_other.update(path='prompts/review.md', source='npm:other-package',
+                       declarations=['npm:other-package'])
+collision_data['observations']['pi']['resources'] = [collision_a, collision_b, collision_other]
+code, collision_inspection = invoke('inspect', {'observations': collision_data['observations']})
+assert code == 0
+collision_report = collision_inspection['targets'][0]['resource_collisions']
+assert len(collision_report) == 1 and len(collision_report[0]['resources']) == 3
+collision_data['resource'] = resource_selector(collision_a)
+collision_proposal = prepared(approved(collision_data))
+assert {row['path'] for row in collision_proposal['affected_resources']} == {
+    'prompts/a/review.md', 'prompts/b/review.md'}
+ambiguous = copy.deepcopy(collision_data)
+ambiguous['resource']['path'] = 'prompts/missing/review.md'
+refuse('propose', ambiguous)
+print('ok - source/path identities preserve collisions and bind only the selected package unit')
 
 shared = request('pi')
 shared_a = copy.deepcopy(resource)
@@ -440,7 +526,7 @@ shared['resource'] = resource_selector(shared_a)
 proposal = prepared(approved(shared))
 assert {(r['name'], r['kind']) for r in proposal['affected_resources']} == {
     ('example-extension', 'extension'), ('example-extension', 'skill')}
-assert proposal['update_unit'] == {'type': 'npm-package', 'identity': 'example-extension', 'scope': 'user'}
+assert proposal['update_unit'] == {'type': 'npm', 'identity': 'example-extension', 'scope': 'user'}
 selected_alias = copy.deepcopy(shared)
 selected_alias['resource'] = resource_selector(selected_alias['observations']['pi']['resources'][1])
 alias_proposal = prepared(approved(selected_alias))
