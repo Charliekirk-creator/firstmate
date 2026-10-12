@@ -59,10 +59,10 @@ LOCAL_SOURCE = re.compile(r"(?:~/|/|\./|\.\./)[a-zA-Z0-9_./ -]+\Z")
 NPM_SELECTOR = re.compile(r"[a-zA-Z0-9.^~+*-]{1,64}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
                      "maintenance", "rollback", "verification", "compatibility_evidence",
-                     "owner_evidence", "release_evidence", "availability_status"}
+                     "owner_evidence", "release_evidence", "availability_status", "observed_at"}
 VERSION_FIELDS = {"installed_version", "effective_version", "installed_version_evidence",
                   "effective_version_evidence"}
-OBS_FIELDS = {"installed", "used", "available", "owner", "compatible", "owner_verified",
+OBS_FIELDS = {"installed", "used", "loaded", "available", "owner", "compatible", "owner_verified",
               "available_verified", "relation", "update_label", "resources", "resources_complete"} \
              | ASSESSMENT_FIELDS | VERSION_FIELDS
 RESOURCE_FIELDS = {"name", "kind", "owner", "available", "installed", "discovered",
@@ -105,17 +105,42 @@ def version(value, target):
         raise Invalid("Versions must be canonical release versions (or a full Firstmate commit).")
 
 
+def declaration_record(value):
+    if isinstance(value, str):
+        if not value or len(value) > 300:
+            raise Invalid("Package declarations must be bounded non-empty values.")
+        return copy.deepcopy(value)
+    fields = {"source", "autoload", "extensions", "skills", "prompts", "themes"}
+    object_fields(value, fields)
+    if not isinstance(value.get("source"), str) or not value["source"] or len(value["source"]) > 200:
+        raise Invalid("An object package declaration requires its complete source.")
+    if "autoload" in value and type(value["autoload"]) is not bool:
+        raise Invalid("Package declaration autoload must be boolean.")
+    for field in fields - {"source", "autoload"}:
+        patterns = value.get(field)
+        if patterns is not None and (not isinstance(patterns, list) or len(patterns) > 100 or
+                                     any(not isinstance(pattern, str) or not pattern or len(pattern) > 300
+                                         for pattern in patterns)):
+            raise Invalid("Package resource filters must be bounded string lists.")
+    return copy.deepcopy(value)
+
+
 def assessment_record(row):
     status = row.get("availability_status")
     if status is not None and status not in {"unknown", "unavailable", "verified"}:
         raise Invalid("Availability status must distinguish unknown, unavailable, and verified evidence.")
     if row.get("scope") is not None and row["scope"] not in {"user", "project", "system", "shared"}:
         raise Invalid("Scope must identify the concrete update boundary.")
-    for field in ("declarations", "pins", "dependencies", "verification"):
+    declarations = row.get("declarations")
+    if declarations is not None:
+        if not isinstance(declarations, list) or len(declarations) > 100:
+            raise Invalid("Declarations must be a bounded list.")
+        row["declarations"] = [declaration_record(value) for value in declarations]
+    for field in ("pins", "dependencies", "verification"):
         values = row.get(field)
         if values is not None and (not isinstance(values, list) or len(values) > 100 or
                                    any(not isinstance(value, str) or not value or len(value) > 300 for value in values)):
-            raise Invalid("Declarations, pins, dependencies, and verification facts must be bounded non-empty strings.")
+            raise Invalid("Pins, dependencies, and verification facts must be bounded non-empty strings.")
     for field in ("disruption", "maintenance", "rollback", "compatibility_evidence",
                   "owner_evidence", "release_evidence", "installed_version_evidence",
                   "effective_version_evidence"):
@@ -125,6 +150,10 @@ def assessment_record(row):
     source = row.get("source")
     if source is not None and (not isinstance(source, str) or not source or len(source) > 200):
         raise Invalid("Source must be a bounded non-secret identifier.")
+    observed_at = row.get("observed_at")
+    if observed_at is not None and (not isinstance(observed_at, str) or
+                                    not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", observed_at)):
+        raise Invalid("Evidence freshness requires a canonical UTC observation time.")
 
 
 def availability_evidence(row):
@@ -158,6 +187,14 @@ def selector_identity(selector):
     return "constraint:" + selector
 
 
+def declaration_source(row):
+    declarations = row.get("declarations")
+    if not isinstance(declarations, list) or len(declarations) != 1:
+        raise Invalid("A Pi resource must retain exactly one complete package declaration.")
+    declaration = declarations[0]
+    return declaration if isinstance(declaration, str) else declaration["source"]
+
+
 def resource_record(row):
     object_fields(row, RESOURCE_FIELDS)
     assessment_record(row)
@@ -184,8 +221,8 @@ def resource_record(row):
                 raise Invalid("Unsupported npm declaration; never include credentials or command text.")
         elif not GIT_SOURCE.fullmatch(source) and not LOCAL_SOURCE.fullmatch(source):
             raise Invalid("Only credential-free npm, Git, or local resource declarations are accepted.")
-        if row.get("declarations") is not None and row["declarations"] != [source]:
-            raise Invalid("A resource declaration must exactly identify its update unit.")
+        if row.get("declarations") is not None and declaration_source(row) != source:
+            raise Invalid("A resource declaration must exactly identify its update unit without flattening filters.")
         selector = match[2] if match else None
         expected_pins = [selector] if selector and VERSION.fullmatch(selector) else []
         if row.get("pins") is not None and row["pins"] != expected_pins:
@@ -201,7 +238,7 @@ def observations(data):
         object_fields(raw, OBS_FIELDS)
         row = copy.deepcopy(raw)
         assessment_record(row)
-        for field in ("installed", "used", "compatible", "owner_verified", "available_verified", "resources_complete"):
+        for field in ("installed", "used", "loaded", "compatible", "owner_verified", "available_verified", "resources_complete"):
             if row.get(field) is not None and type(row[field]) is not bool:
                 raise Invalid("Observation flags must be booleans or unknown.")
         for field in ("installed_version", "effective_version", "available"):
@@ -263,13 +300,13 @@ def require_version_evidence(row, loaded_field):
 def require_assessment(row, loaded_field):
     required = ("source", "scope", "declarations", "pins", "dependencies", "disruption",
                 "maintenance", "rollback", "verification", "compatibility_evidence",
-                "owner_evidence", "release_evidence")
+                "owner_evidence", "release_evidence", "observed_at")
     if any(field not in row for field in required) or not isinstance(row.get("scope"), str) or \
             any(not isinstance(row.get(field), list) for field in
                 ("declarations", "pins", "dependencies", "verification")):
         raise Invalid("A proposal requires concrete typed source, scope, declarations, pins, dependencies, and verification facts.")
     if any(not row[field] for field in ("source", "scope", "disruption", "maintenance", "rollback", "verification",
-                                        "compatibility_evidence", "owner_evidence", "release_evidence")):
+                                        "compatibility_evidence", "owner_evidence", "release_evidence", "observed_at")):
         raise Invalid("A proposal requires concrete non-empty assessment and verification facts.")
     if row.get("availability_status") != "verified":
         raise Invalid("A proposal requires a verified available release.")
@@ -278,17 +315,31 @@ def require_assessment(row, loaded_field):
 
 def require_pi_resource_compatibility(row):
     required = ("source", "scope", "declarations", "pins", "compatibility_evidence",
-                "owner_evidence", "installed_version_evidence", "effective_version_evidence")
+                "owner_evidence", "installed_version_evidence", "effective_version_evidence", "observed_at")
     if any(field not in row for field in required) or not isinstance(row.get("scope"), str) or \
             any(not isinstance(row.get(field), list) for field in ("declarations", "pins")) or \
             any(not row[field] for field in
                 ("source", "scope", "compatibility_evidence", "owner_evidence", "installed_version_evidence",
-                 "effective_version_evidence")):
+                 "effective_version_evidence", "observed_at")):
         raise Invalid("A Pi update requires complete resource presence, owner, source, version, and compatibility evidence.")
     if any(row.get(field) is not True for field in
            ("installed", "discovered", "compatible", "owner_verified")) or type(row.get("loaded")) is not bool:
         raise Invalid("A Pi update requires verified resource presence, owner, loading, and compatibility.")
     require_version_evidence(row, "loaded")
+
+
+def parent_pi_context(row):
+    fields = ("installed", "used", "loaded", "owner", "owner_verified", "source", "scope",
+              "declarations", "pins", "installed_version", "effective_version",
+              "installed_version_evidence", "effective_version_evidence", "owner_evidence", "observed_at")
+    if any(field not in row for field in fields) or row.get("installed") is not True or \
+            row.get("owner_verified") is not True or row.get("owner") not in OWNERS["pi"] or \
+            any(type(row.get(field)) is not bool for field in ("used", "loaded")) or \
+            not isinstance(row.get("declarations"), list) or not isinstance(row.get("pins"), list) or \
+            any(not row.get(field) for field in ("source", "scope", "owner_evidence", "observed_at")):
+        raise Invalid("Pi installation, channel, loading, version, provenance, and freshness evidence must be established first.")
+    require_version_evidence(row, "loaded")
+    return {field: copy.deepcopy(row[field]) for field in fields}
 
 
 def dispatch(target, row, selected):
@@ -298,7 +349,7 @@ def dispatch(target, row, selected):
     if selected is not None:
         if selected["owner"] != "pi-package":
             raise Invalid("Use /updatefirstmate for Firstmate resources; local resources need their source owner's reviewed edit.")
-        source = selected.get("source")
+        source = declaration_source(selected)
         if not source:
             raise Invalid("A managed resource needs its unchanged package declaration.")
         match = PACKAGE.fullmatch(source)
@@ -333,7 +384,8 @@ def dispatch(target, row, selected):
 def bound_context(row):
     return {field: copy.deepcopy(row[field]) for field in
             ("source", "scope", "declarations", "pins", "dependencies", "disruption", "maintenance",
-             "rollback", "verification", "compatibility_evidence", "owner_evidence", "release_evidence")}
+             "rollback", "verification", "compatibility_evidence", "owner_evidence", "release_evidence",
+             "observed_at")}
 
 
 def proposal(data, rows):
@@ -343,14 +395,12 @@ def proposal(data, rows):
     row = rows.get(target, {})
     selector = data.get("resource")
     selected = None
+    parent_context = None
     if selector is not None:
         object_fields(selector, {"name", "kind", "scope", "source"})
         if set(selector) != {"name", "kind", "scope", "source"} or target != "pi":
             raise Invalid("Select one Pi package resource by its complete identity.")
-        if row.get("installed") is not True or row.get("owner_verified") is not True or \
-                row.get("owner") not in OWNERS["pi"] or type(row.get("used")) is not bool:
-            raise Invalid("Pi installation, use, and package-owner evidence must be established first.")
-        require_version_evidence(row, "used")
+        parent_context = parent_pi_context(row)
         matches = [resource for resource in row.get("resources", []) if
                    all(resource.get(field) == selector[field] for field in selector)]
         if len(matches) != 1:
@@ -359,7 +409,7 @@ def proposal(data, rows):
     else:
         if any(row.get(k) is not True for k in
                ("installed", "compatible", "owner_verified", "available_verified")) or \
-                type(row.get("used")) is not bool:
+                any(type(row.get(field)) is not bool for field in ("used", "loaded")):
             raise Invalid("Installed status, actual-use evidence, compatibility, owner, and available release must be established first.")
     if target == "pi" and row.get("resources_complete") is not True:
         raise Invalid("Complete Pi extensions, skills, templates, and scope inventory before proposing an update.")
@@ -391,7 +441,7 @@ def proposal(data, rows):
     if target == "pi" and selected is None:
         for resource in affected:
             require_pi_resource_compatibility(resource)
-    require_assessment(candidate, "loaded" if selected is not None else "used")
+    require_assessment(candidate, "loaded")
     if outcome(target, candidate)["category"] != "candidate":
         raise Invalid("No verified, compatible newer stable release can be proposed.")
     proposed = {"target": target, "resource": copy.deepcopy(selector),
@@ -407,6 +457,8 @@ def proposal(data, rows):
                 "available": candidate["available"],
                 "dispatch": dispatch(target, candidate, selected),
                 "affected_resources": affected}
+    if parent_context is not None:
+        proposed["parent_pi"] = parent_context
     proposed.update(bound_context(candidate))
     return proposed
 

@@ -111,11 +111,13 @@ def assessment(source, scope='system'):
                 compatibility_evidence='synthetic compatibility review',
                 owner_evidence='synthetic installation receipt', release_evidence='synthetic release record',
                 installed_version_evidence='synthetic package receipt',
-                effective_version_evidence='synthetic executable response', availability_status='verified')
+                effective_version_evidence='synthetic executable response',
+                observed_at='2026-02-20T12:00:00Z', availability_status='verified')
 
 
 def observation(target):
-    row = dict(installed=True, used=True, installed_version='1.0.0', effective_version='1.0.0',
+    row = dict(installed=True, used=True, loaded=True,
+               installed_version='1.0.0', effective_version='1.0.0',
                available='1.1.0',
                owner=catalog['targets'][expected.index(target)]['owners'][0],
                compatible=True, owner_verified=True, available_verified=True,
@@ -196,7 +198,7 @@ for target in expected:
     refuse('propose', data)
 print('ok - alternate known receipts retain their owner; unknown owners cannot silently fall back')
 
-for flag in ['installed', 'used', 'compatible', 'owner_verified', 'available_verified']:
+for flag in ['installed', 'used', 'loaded', 'compatible', 'owner_verified', 'available_verified']:
     data = request()
     data['observations']['gh-axi'][flag] = None
     refuse('propose', data)
@@ -211,7 +213,7 @@ data = request('pi')
 del data['observations']['pi']['resources_complete']
 refuse('propose', data)
 data = request()
-data['observations']['gh-axi'].update(used=False, effective_version=None,
+data['observations']['gh-axi'].update(used=False, loaded=False, effective_version=None,
                                       effective_version_evidence='not loaded in any affected process')
 assert prepared(approved(data))['effective_version'] is None
 print('ok - actual-use evidence differs from installation; unknown compatibility/resources block proposals')
@@ -303,6 +305,33 @@ result = prepared(approved(data))
 assert result['dispatch'] == {'argv': ['pi', 'update', 'npm:example-extension', '--no-approve']}
 assert result['installed_version'] == '1.0.0' and result['effective_version'] == '0.9.0'
 assert result['affected_resources'] == [resource] and data == before
+assert result['parent_pi']['owner'] == 'npm-global'
+assert result['parent_pi']['loaded'] is True
+object_declaration = copy.deepcopy(data)
+object_declaration['observations']['pi']['resources'][0]['declarations'] = [{
+    'source': 'npm:example-extension', 'autoload': False,
+    'extensions': ['extensions/*.ts'], 'skills': [], 'prompts': [], 'themes': []}]
+object_proposal = prepared(approved(object_declaration))
+assert object_proposal['affected_resources'][0]['declarations'][0]['skills'] == []
+changed_filter = approved(object_declaration)
+changed_filter['observations']['pi']['resources'][0]['declarations'][0]['skills'] = ['skills/review']
+refuse('prepare', changed_filter)
+unsupported_declaration = copy.deepcopy(object_declaration)
+unsupported_declaration['observations']['pi']['resources'][0]['declarations'][0]['unknown'] = []
+refuse('inspect', {'observations': unsupported_declaration['observations']})
+parent_approved = approved(data)
+for field, replacement in [
+    ('owner', 'pi-managed'), ('source', 'synthetic:alternate-pi'),
+    ('used', False), ('loaded', False),
+    ('installed_version', '1.0.1'), ('effective_version', '0.9.0'),
+    ('installed_version_evidence', 'different Pi receipt'),
+    ('effective_version_evidence', 'different Pi process'),
+    ('owner_evidence', 'different Pi owner evidence'),
+    ('observed_at', '2026-02-20T12:00:01Z'),
+]:
+    changed_parent = copy.deepcopy(parent_approved)
+    changed_parent['observations']['pi'][field] = replacement
+    refuse('prepare', changed_parent)
 for root_changes in [
     {'available': '1.0.0'},
     {'availability_status': 'unavailable', 'available': None, 'available_verified': False,
@@ -363,7 +392,7 @@ refuse('prepare', bad)
 bad = copy.deepcopy(data)
 bad['observations']['pi']['resources'] *= 2
 refuse('inspect', {'observations': bad['observations']})
-print('ok - Pi resources retain exact declarations, pins, owner, scope, and single-resource selection')
+print('ok - Pi resources retain declarations, filters, parent context, pins, owner, and scope')
 
 # Inspection must retain non-npm resources without inventing an updater for
 # them, even when the main Pi binary itself has a supported proposal.
@@ -375,7 +404,8 @@ all_sources['observations']['pi']['resources'] = [
          owner_verified=True, available_verified=False, installed_version='1.0.0',
          effective_version='0.9.0', available=None, installed_version_evidence='git checkout',
          effective_version_evidence='loaded resource inventory', owner_evidence='Pi package inventory',
-         compatibility_evidence='reviewed against Pi 1.1.0', availability_status='unavailable',
+         compatibility_evidence='reviewed against Pi 1.1.0', observed_at='2026-02-20T12:00:00Z',
+         availability_status='unavailable',
          release_evidence='Git resource update intentionally deferred'),
     dict(name='local-template', kind='prompt-template', owner='local', scope='project',
          source='./templates/local-template', declarations=['./templates/local-template'], pins=[],
@@ -383,7 +413,8 @@ all_sources['observations']['pi']['resources'] = [
          owner_verified=True, available_verified=None, installed_version='1.0.0',
          effective_version=None, available=None, installed_version_evidence='local source revision',
          effective_version_evidence='not loaded in affected process', owner_evidence='local source owner',
-         compatibility_evidence='reviewed against Pi 1.1.0', availability_status='unknown'),
+         compatibility_evidence='reviewed against Pi 1.1.0', observed_at='2026-02-20T12:00:00Z',
+         availability_status='unknown'),
 ]
 code, inspected = invoke('inspect', {'observations': all_sources['observations']})
 assert code == 0, inspected
@@ -456,6 +487,7 @@ for field, replacement in [
     ('maintenance', 'different interval'), ('rollback', 'no rollback'),
     ('verification', ['different check']), ('compatibility_evidence', 'different compatibility'),
     ('owner_evidence', 'different receipt'), ('release_evidence', 'different release source'),
+    ('observed_at', '2026-02-20T12:00:01Z'),
 ]:
     bad = copy.deepcopy(bound)
     bad['observations']['gh-axi'][field] = replacement
