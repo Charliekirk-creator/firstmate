@@ -21,6 +21,7 @@ import copy
 import json
 import re
 import sys
+from urllib.parse import unquote, urlsplit
 
 TARGETS = {
     "pi": "Pi and its extensions, skills, and prompt templates",
@@ -54,7 +55,6 @@ WEZ_VERSION = re.compile(r"\d{8}-\d{6}-[a-f0-9]{8}\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 NAME = re.compile(r"(?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*\Z")
 PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
-GIT_SOURCE = re.compile(r"(?:git:(?:(?:(?:https?|git)://[a-zA-Z0-9.-]+/)|ssh://git@[a-zA-Z0-9.-]+/|git@[a-zA-Z0-9.-]+:|[a-zA-Z0-9.-]+/)|(?:(?:https?|git)://[a-zA-Z0-9.-]+/|ssh://git@[a-zA-Z0-9.-]+/))[a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+(?:@[a-zA-Z0-9_./-]+)?\Z")
 LOCAL_SOURCE = re.compile(r"(?:~/|/|\./|\.\./)[a-zA-Z0-9_./ -]+\Z")
 NPM_SELECTOR = re.compile(r"[\x20-\x7e]{1,128}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
@@ -112,7 +112,7 @@ def declaration_record(value):
         return copy.deepcopy(value)
     fields = {"source", "autoload", "extensions", "skills", "prompts", "themes"}
     object_fields(value, fields)
-    if not isinstance(value.get("source"), str) or not value["source"] or len(value["source"]) > 200:
+    if not isinstance(value.get("source"), str) or not value["source"] or len(value["source"]) > 500:
         raise Invalid("An object package declaration requires its complete source.")
     if "autoload" in value and type(value["autoload"]) is not bool:
         raise Invalid("Package declaration autoload must be boolean.")
@@ -148,7 +148,7 @@ def assessment_record(row):
         if value is not None and (not isinstance(value, str) or not value or len(value) > 500):
             raise Invalid("Assessment evidence must be a bounded non-empty string.")
     source = row.get("source")
-    if source is not None and (not isinstance(source, str) or not source or len(source) > 200):
+    if source is not None and (not isinstance(source, str) or not source or len(source) > 500):
         raise Invalid("Source must be a bounded non-secret identifier.")
     observed_at = row.get("observed_at")
     if observed_at is not None and (not isinstance(observed_at, str) or
@@ -175,16 +175,55 @@ def npm_declaration(source):
 
 
 def git_declaration(source):
-    if not isinstance(source, str) or not GIT_SOURCE.fullmatch(source):
+    if not isinstance(source, str) or not source or len(source) > 500:
         return None
-    value = source[4:] if source.startswith("git:") else source
-    value = re.sub(r"^(?:(?:https?|git)://|ssh://git@)", "", value)
+    value = source.strip()
+    prefixed = value.startswith("git:") and not value.startswith("git://")
+    if prefixed:
+        value = value[4:].strip()
+    explicit_protocol = re.match(r"^(https?|ssh|git)://", value, re.IGNORECASE)
+    host = path = None
+    port = None
     if value.startswith("git@"):
-        value = value[4:].replace(":", "/", 1)
+        if not prefixed:
+            return None
+        match = re.fullmatch(r"git@([^:]+):(.+)", value)
+        if not match:
+            return None
+        host, path = match.groups()
+    elif explicit_protocol:
+        try:
+            parsed = urlsplit(value)
+            if parsed.password is not None or (parsed.username is not None and parsed.scheme.lower() != "ssh"):
+                return None
+            host, port = parsed.hostname, parsed.port
+        except ValueError:
+            return None
+        if parsed.query or parsed.fragment:
+            return None
+        path = parsed.path.lstrip("/")
+    elif prefixed and "/" in value:
+        host, path = value.split("/", 1)
+    else:
+        return None
+    if not host or not path or len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9.:-]+", host):
+        return None
     ref = None
-    if "@" in value[value.rfind("/") + 1:]:
-        value, ref = value.rsplit("@", 1)
-    return (value.removesuffix(".git"), ref)
+    if "@" in path:
+        path, ref = path.split("@", 1)
+    try:
+        decoded_path = unquote(path)
+        decoded_ref = unquote(ref) if ref is not None else None
+    except (UnicodeError, ValueError):
+        return None
+    if (not decoded_path or len(decoded_path) > 300 or decoded_path.startswith("/") or "\\" in decoded_path or
+            "\x00" in decoded_path or ".." in decoded_path.split("/") or len(decoded_path.split("/")) < 2):
+        return None
+    if decoded_ref is not None and (not decoded_ref or len(decoded_ref) > 200 or
+                                    re.search(r"[\x00-\x1f\\]", decoded_ref)):
+        return None
+    identity = host.lower() + ((":" + str(port)) if port is not None else "") + "/" + decoded_path.removesuffix(".git")
+    return (identity, ref)
 
 
 def update_identity(source):
@@ -247,13 +286,13 @@ def resource_record(row):
     if source is None:
         raise Invalid("A resource needs its exact source-backed identity.")
     if source is not None:
-        if not isinstance(source, str) or len(source) > 200:
+        if not isinstance(source, str) or len(source) > 500:
             raise Invalid("Resource sources must be bounded non-secret declarations.")
         match = PACKAGE.fullmatch(source)
         if match:
             if match[2] is not None and not NPM_SELECTOR.fullmatch(match[2]):
                 raise Invalid("Unsupported npm declaration; never include credentials or command text.")
-        elif not GIT_SOURCE.fullmatch(source) and not LOCAL_SOURCE.fullmatch(source):
+        elif git_declaration(source) is None and not LOCAL_SOURCE.fullmatch(source):
             raise Invalid("Only credential-free npm, Git, or local resource declarations are accepted.")
         if row.get("declarations") is not None and declaration_source(row) != source:
             raise Invalid("A resource declaration must exactly identify its update unit without flattening filters.")
@@ -262,6 +301,7 @@ def resource_record(row):
         expected_pins = [selector] if selector and VERSION.fullmatch(selector) else [git_ref] if git_ref else []
         if row.get("pins") is not None and row["pins"] != expected_pins:
             raise Invalid("Resource pin evidence must match its unchanged declaration.")
+        row["pins"] = expected_pins
     result = copy.deepcopy(row)
     result["identity"] = resource_identity(result)
     return result

@@ -492,14 +492,26 @@ source_forms['observations']['pi']['resources'] = [
          scope='user', source='git://github.com/example/protocol-tools',
          declarations=['git://github.com/example/protocol-tools'], pins=[]),
     dict(name='git-ssh-template', kind='prompt-template', path='prompts/git-ssh.md', owner='pi-package',
-         scope='user', source='git:ssh://git@github.com/example/ssh-tools@v1.2.3',
-         declarations=['git:ssh://git@github.com/example/ssh-tools@v1.2.3'], pins=['v1.2.3']),
+         scope='user', source='ssh://deploy@example.com:2222/org/tools@release+1',
+         declarations=['ssh://deploy@example.com:2222/org/tools@release+1']),
     dict(name='local-skill', kind='skill', path='skills/local/SKILL.md', owner='local',
          scope='project', source='../local tools', declarations=['../local tools'], pins=[]),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
 assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 7
-assert source_inspection['targets'][0]['observation']['resources'][5]['pins'] == ['v1.2.3']
+assert source_inspection['targets'][0]['observation']['resources'][5]['pins'] == ['release+1']
+matching_git_pin = copy.deepcopy(source_forms)
+matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
+assert invoke('inspect', {'observations': matching_git_pin['observations']})[0] == 0
+mismatched_git_pin = copy.deepcopy(source_forms)
+mismatched_git_pin['observations']['pi']['resources'][5]['pins'] = ['other-ref']
+refuse('inspect', {'observations': mismatched_git_pin['observations']})
+credentialed_git = copy.deepcopy(source_forms)
+credentialed_git['observations']['pi']['resources'][5].update(
+    source='ssh://deploy:embedded-secret@example.com:2222/org/tools@release+1',
+    declarations=['ssh://deploy:embedded-secret@example.com:2222/org/tools@release+1'])
+code, credential_refusal = invoke('inspect', {'observations': credentialed_git['observations']})
+assert code == 2 and 'embedded-secret' not in json.dumps(credential_refusal)
 for row in source_forms['observations']['pi']['resources']:
     assert row['source'] in json.dumps(source_inspection)
 range_update = copy.deepcopy(data)
@@ -513,6 +525,15 @@ url_update['observations']['pi']['resources'][0].update(
     source='https://github.com/example/pi-tools', declarations=['https://github.com/example/pi-tools'])
 url_update['resource'] = resource_selector(url_update['observations']['pi']['resources'][0])
 refuse('propose', url_update)
+ssh_update = copy.deepcopy(data)
+ssh_update['observations']['pi']['resources'][0].update(
+    source='ssh://deploy@example.com:2222/org/tools@release+1',
+    declarations=['ssh://deploy@example.com:2222/org/tools@release+1'])
+ssh_update['observations']['pi']['resources'][0].pop('pins')
+code, ssh_update_inspection = invoke('inspect', {'observations': ssh_update['observations']})
+assert code == 0
+ssh_update['resource'] = ssh_update_inspection['targets'][0]['observation']['resources'][0]['identity']
+refuse('propose', ssh_update)
 print('ok - supported npm ranges, Git URLs, shorthand, and local sources remain inspectable and deferred')
 
 collision_data = request('pi')
