@@ -44,6 +44,36 @@ The producer's header and `--help` own exact bounds, validation, path-safety, an
 `AGENTS.md` retains the run-once and read-once operator rules, lock-refusal safety, installation consent, and direct-report recovery boundaries because those facts apply at every session start.
 Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, while persistent-secondmate recovery is owned by `secondmate-provisioning`.
 
+## Session-only planning slots (state/planning-session.json)
+
+The Pi extension `.pi/extensions/fm-primary-planning-session.ts` is inert until an operator explicitly invokes `/planning-session start YYYY-MM-DDTHH:MM:00+08:00` in lock-owning Main with persistent conversation history.
+The supplied first boundary must be at `:00` or `:30` in Asia/Hong_Kong; subsequent boundaries are thirty minutes apart, not thirty minutes after the last response.
+Starting after a boundary skips its unobserved slot rather than reconstructing past connectivity.
+`/planning-session status` reports the current runtime `armed` flag, next boundary, and durable receipt; `/planning-session stop` ends the schedule for that session.
+Retire any temporary timer through its existing owner before activating this schedule, so two timers do not request the same update.
+Shipping the code does not activate a schedule, reload Main, or replace the existing planning policy globally.
+The command must be available in the running Pi extension set before use; loading new code into a running Main requires separately authorized lifecycle handling.
+
+The timer uses Pi's native session lifecycle and an unreferenced in-process timeout, with no independent service or process-event registration.
+Its private ledger binds the session ID, session file, PID, and process start time, recording processed slots, pending online slots, and the last persisted delivery receipt.
+Reload can resume only the same still-open process and session; quit, new, resume, fork, loss of Main ownership, or a different process cannot inherit the schedule.
+A schedule cannot keep Pi alive or run after its process exits.
+Workers, secondmates, supervision branches, and isolated project copies cannot arm it.
+
+At each boundary, read-only macOS `networksetup` hardware/radio evidence and `ifconfig` active Wi-Fi link evidence qualify the slot without requesting an SSID, location permission, screen access, or internet connectivity.
+Offline or indeterminate slots are skipped and never replayed on reconnection.
+A suspended or blocked event loop cannot establish historical connectivity: a slot whose boundary observation cannot complete within five seconds is also skipped, never retroactively declared online.
+An indeterminate Wi-Fi probe reports a local error; a ledger failure stops the timer and reports the error rather than claiming a wake was saved.
+The next observed online slot may request one consolidated update for still-pending online slots, not a burst of missed reports.
+
+A native hidden follow-up requests the update without interrupting a busy Main response.
+The reminder applies `planning-capture`'s content, sole-list, ownership, and authority policy while explicitly replacing its message-count cadence for this armed session.
+Pending slots remain due until a normally completed, on-disk Main assistant entry contains all three complete accepted Markdown tables.
+A response acknowledges only the slots included before its model request; later slots remain pending, and the receipt records actual acknowledgement time and lateness from the earliest included boundary.
+Partial, fenced, malformed, aborted, failed, or truncated responses do not acknowledge delivery.
+The extension does not edit the planning list or the Planning Coordinator's presentation record, request permissions, send external notifications, or initiate separately paid services.
+[Runtime verification](verification/runtime-backends.md#session-only-planning-slots) owns the executable checks and supported integration evidence.
+
 ## Pi Calm preference (config/calm)
 
 The Pi Calm extension stores the captain's home-local presentation choice in gitignored `config/calm` under the effective Firstmate home, resolved from `FM_HOME`, then `FM_ROOT_OVERRIDE`, then the tracked code root derived from the extension path, or under `FM_CONFIG_OVERRIDE` when that test and specialized-setup override is present.

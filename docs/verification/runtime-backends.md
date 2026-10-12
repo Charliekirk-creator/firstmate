@@ -1054,3 +1054,49 @@ The focused extension suite also exercised the installed Pi 0.84.4 picker and ou
 
 Scope of the earlier evidence: the installed signed `pi` CLI (0.82.0 at verification time) is a compiled binary whose bundled SDK is not importable from Node, so the importable npm package is the only surface the guard and the typecheck can pin.
 The extension executes inside the signed CLI's own runtime, so a CLI upgrade can drift ahead of the pinned npm surface; refresh this record after every Pi upgrade by re-running the live guard, picker regression, and strict typecheck above (point `FM_PI_PACKAGE_DIR` at a matching npm install when one exists) and by watching the branch's own fallback line - every branch failure degrades to the pre-branch wake-to-main path by construction, which `tests/fm-pi-branch-extension.test.sh` holds with a broken generator and the live guard holds with the real SDK.
+
+## Session-only planning slots
+
+The operator contract is [Session-only planning slots](../configuration.md#session-only-planning-slots-stateplanning-sessionjson).
+The implementation uses native Pi timeouts, session events, hidden follow-ups, and persisted assistant-entry IDs; it does not replace fleet monitoring or use backend lifecycle commands.
+
+Verification on 2026-10-12 with Node 26.7.0 and the installed importable Pi 0.87.1 SDK:
+
+```sh
+bash tests/fm-planning-session.test.sh
+FM_PLANNING_SESSION_LIVE=1 bash tests/fm-planning-session-live-e2e.test.sh
+bash tests/fm-pi-primary-types.test.sh
+```
+
+```text
+ok - Hong Kong 16:30 alignment, 30-minute boundaries, durable dedup, reload and pre-response delivery
+ok - offline skip, no reconnect burst, suspended-loop skip and unknown Wi-Fi refusal
+ok - owner process, PID reuse, fork/new session, lock loss and Main-closed stop
+ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused
+ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability
+ok - storage failure never wakes falsely, malformed state preserved, unsafe links refused, late activation does not backfill
+ok - real Pi 0.87.1 arming, hidden context, partial/error/abort/truncation retention, reload and persisted delivery
+ok - real Pi 0.87.1 busy response completes before one follow-up, canonical bytes unchanged, timer does not keep process alive
+skip: tsc not found for Pi extension typecheck
+```
+
+The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects rather than implementation-source text.
+The real-SDK test uses a temporary primary repository, isolated Main home and agent directory, and an in-process fixture provider with networking denied.
+It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command, context, response-persistence, reload, and busy follow-up paths.
+Neither test activates a timer in the operator's Main or contacts a model provider.
+The strict typecheck skip is missing verification, not a passing type verdict; rerun it with an already available supported TypeScript compiler before relying on that evidence.
+
+A read-only native macOS probe used `/usr/sbin/networksetup -listallhardwareports`, `/usr/sbin/networksetup -getairportpower en0`, and `/sbin/ifconfig en0` after the first command identified `en0` as Wi-Fi.
+The observed radio was `On`, the interface flags included `UP` and `RUNNING`, and its link status was `active`.
+The implementation's `macWifi()` returned `online`; SSIDs, external reachability, screen contents, and permission prompts were not consulted.
+Offline behavior is covered by executable input fixtures, not a live disconnection experiment.
+
+| Integration axis inspected | Applicability and evidence |
+|---|---|
+| Pi primary | Real installed SDK exercise above; native Main activation remains a separate operator action |
+| Pi signed | Same extension contract intended, but no claim that the importable npm SDK proves the signed runtime; repeat matching-runtime verification before relying on it |
+| Claude, Codex, Cursor | Inspected tracked hook configurations; they do not load Pi extensions and receive no timer behavior |
+| OpenCode, Grok | Inspected primary plugin and hook entry points; no timer or shared hook change |
+| Kimi, Muse | Their adapter references and primary-hook routing do not load this Pi extension; no timer integration is asserted |
+| tmux, Herdr, Zellij, Orca, cmux | Inspected backend launch/control surfaces; scheduling stays within the Pi process and issues no backend commands, so no backend lifecycle experiment was needed or performed |
+| Worker, secondmate, supervision branch | Main ownership, primary-copy and session-path checks exclude these roles; no inherited schedule is created |
