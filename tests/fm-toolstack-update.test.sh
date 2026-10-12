@@ -93,7 +93,7 @@ assert set(catalog['dependency_only']) == {'chrome', 'excel', 'typora', 'node', 
 assert catalog['discovery_scope'] == 'firstmate-project-shared-not-main-only'
 code, empty = invoke()
 assert code == 0 and len(empty['targets']) == 12
-assert all(r['comparison'] == 'unknown' for r in empty['targets'])
+assert all(r['outcome']['category'] == 'unknown' for r in empty['targets'])
 assert 'dispatch' not in json.dumps(empty) and empty['mode'] == 'inspection-only'
 print('ok - exact default inventory, Pi resources, dependency-only exclusions, and inspection default')
 
@@ -103,10 +103,21 @@ for excluded in catalog['dependency_only'] + ['npm', 'brew', 'pi-typesafe']:
 print('ok - excluded applications, owners, and proposed packages cannot become default update targets')
 
 
+def assessment(source, scope='system'):
+    return dict(source=source, scope=scope, declarations=[source], pins=[],
+                dependencies=['synthetic-runtime@1.0.0'], disruption='brief command replacement',
+                maintenance='no affected work may be active', rollback='restore reviewed package artifact',
+                verification=['installed version', 'effective version', 'health'],
+                compatibility_evidence='synthetic compatibility review',
+                owner_evidence='synthetic installation receipt', release_evidence='synthetic release record',
+                availability_status='verified')
+
+
 def observation(target):
     row = dict(installed=True, used=True, current='1.0.0', available='1.1.0',
                owner=catalog['targets'][expected.index(target)]['owners'][0],
-               compatible=True, owner_verified=True, available_verified=True)
+               compatible=True, owner_verified=True, available_verified=True,
+               **assessment('synthetic:' + target))
     if target == 'firstmate':
         row.update(current='0' * 40, available='1' * 40, relation='fast-forward')
     if target == 'wezterm':
@@ -198,7 +209,20 @@ print('ok - actual-use evidence differs from installation; unknown compatibility
 data = request()
 data['observations']['gh-axi'].update(current='v1.0.0', available='1.0.0')
 code, inspected = invoke('inspect', {'observations': data['observations']})
-assert code == 0 and inspected['targets'][expected.index('gh-axi')]['comparison'] == 'current'
+assert code == 0 and inspected['targets'][expected.index('gh-axi')]['outcome']['category'] == 'unchanged'
+assert inspected['targets'][expected.index('gh-axi')]['outcome']['evidence'] == 'synthetic release record'
+for category, changes in [
+    ('unknown', {'availability_status': 'unknown', 'available': None, 'available_verified': None,
+                 'release_evidence': None}),
+    ('unavailable', {'availability_status': 'unavailable', 'available': None, 'available_verified': False,
+                     'release_evidence': 'registry lookup failed after bounded attempt'}),
+    ('deferred', {'available': '0.9.0'}),
+    ('candidate', {}),
+]:
+    row = observation('gh-axi')
+    row.update(changes)
+    code, inspected = invoke('inspect', {'observations': {'gh-axi': row}})
+    assert code == 0 and inspected['targets'][expected.index('gh-axi')]['outcome']['category'] == category
 for available in ['1.0.0', '0.9.0', '1.1.0-beta.1']:
     data = request()
     data['observations']['gh-axi']['available'] = available
@@ -248,17 +272,21 @@ del bad['checkpoint']['active_validation']
 refuse('prepare', bad)
 print('ok - active/unknown work and incomplete/non-primary checkpoints cannot be prepared')
 
-resource = dict(name='example-extension', kind='extension', owner='pi-package', source='npm:example-extension',
-                scope='user', current='1.0.0', available='1.1.0')
+resource = dict(name='example-extension', kind='extension', owner='pi-package',
+                current='1.0.0', available='1.1.0', installed=True, discovered=True,
+                loaded=True, used=True, compatible=True, owner_verified=True, available_verified=True,
+                **assessment('npm:example-extension', 'user'))
 data = request('pi')
 data['observations']['pi']['resources'] = [resource]
 data['resource'] = resource['name']
 before = copy.deepcopy(data)
 result = prepared(approved(data))
 assert result['dispatch'] == {'argv': ['pi', 'update', 'npm:example-extension', '--no-approve']}
-assert result['resources'] == [resource] and data == before
+assert result['affected_resources'] == [resource] and data == before
 pinned = copy.deepcopy(data)
-pinned['observations']['pi']['resources'][0].update(source='npm:example-extension@v1.1.0', pin='1.1.0')
+pinned['observations']['pi']['resources'][0].update(source='npm:example-extension@v1.1.0',
+                                                    declarations=['npm:example-extension@v1.1.0'],
+                                                    pin='1.1.0', pins=['1.1.0'])
 assert prepared(approved(pinned))['dispatch']['argv'][2] == 'npm:example-extension@v1.1.0'
 for pin_kind in ['source', 'field']:
     bad = copy.deepcopy(data)
@@ -297,12 +325,43 @@ all_sources['observations']['pi']['resources'] = [
 code, inspected = invoke('inspect', {'observations': all_sources['observations']})
 assert code == 0, inspected
 assert inspected['targets'][0]['observation']['resources'] == all_sources['observations']['pi']['resources']
-assert prepared(approved(all_sources))['resources'] == all_sources['observations']['pi']['resources']
+refuse('propose', all_sources)
 for name in ['git-skill', 'local-template']:
     bad = copy.deepcopy(all_sources)
     bad['resource'] = name
     refuse('propose', bad)
 print('ok - complete Git/local resource inspection preserves sources without inventing package updates')
+
+shared = request('pi')
+shared_a = copy.deepcopy(resource)
+shared_b = copy.deepcopy(resource)
+shared_b.update(name='example-skill', kind='skill')
+shared['observations']['pi']['resources'] = [shared_a, shared_b]
+shared['resource'] = shared_a['name']
+proposal = prepared(approved(shared))
+assert {r['name'] for r in proposal['affected_resources']} == {'example-extension', 'example-skill'}
+assert proposal['update_unit'] == 'npm:example-extension'
+for changed in ['installed', 'discovered', 'compatible', 'owner_verified', 'available_verified']:
+    bad = copy.deepcopy(shared)
+    bad['observations']['pi']['resources'][1][changed] = False
+    refuse('propose', bad)
+missing = copy.deepcopy(shared)
+del missing['observations']['pi']['resources'][1]['compatibility_evidence']
+refuse('propose', missing)
+print('ok - shared package proposals bind every resource and require resource-specific evidence')
+
+bound = approved(request())
+for field, replacement in [
+    ('source', 'synthetic:other-owner'), ('scope', 'shared'), ('declarations', ['changed']),
+    ('pins', ['1.1.0']), ('dependencies', ['runtime@2']), ('disruption', 'restart required'),
+    ('maintenance', 'different interval'), ('rollback', 'no rollback'),
+    ('verification', ['different check']), ('compatibility_evidence', 'different compatibility'),
+    ('owner_evidence', 'different receipt'), ('release_evidence', 'different release source'),
+]:
+    bad = copy.deepcopy(bound)
+    bad['observations']['gh-axi'][field] = replacement
+    refuse('prepare', bad)
+print('ok - approval equality binds source, scope, declarations, pins, dependencies, consequences, and evidence')
 
 for field in ['credentials', 'apiKey', 'environment', 'auth_file', 'command']:
     refuse('inspect', {field: secret})
