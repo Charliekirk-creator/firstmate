@@ -63,7 +63,7 @@ env = dict(os.environ, HOME=str(home), PI_CODING_AGENT_DIR=str(home / '.pi/agent
            TYPESAFE_API_KEY=secret, OPENAI_API_KEY=secret, PYTHONDONTWRITEBYTECODE='1',
            PYTHONPYCACHEPREFIX=str(root / 'python-cache'), PYTHONNOUSERSITE='1', PYTHONPATH='')
 
-def invoke(command=None, data=None, raw=None, extra=()):
+def invoke(command=None, data=None, raw=None, extra=(), forbidden=()):
     args = [sys.executable, '-B', str(launcher), str(home), str(helper)]
     if command is not None:
         args.append(command)
@@ -71,6 +71,7 @@ def invoke(command=None, data=None, raw=None, extra=()):
     result = subprocess.run(args, input=raw if raw is not None else json.dumps(data or {}),
                             text=True, capture_output=True, env=env, timeout=10)
     assert secret not in result.stdout + result.stderr, 'credential input leaked'
+    assert all(value not in result.stdout + result.stderr for value in forbidden), 'input credential leaked'
     assert result.returncode != 91, ('helper attempted execution, network, or protected reads', result.stderr)
     body = json.loads(result.stdout) if result.stdout else None
     return result.returncode, body
@@ -514,9 +515,15 @@ source_forms['observations']['pi']['resources'] = [
          scope='project', source='packages/pi-tools', declarations=['packages/pi-tools'], pins=[]),
     dict(name='file-local-skill', kind='skill', path='skills/file-local/SKILL.md', owner='local',
          scope='project', source='file:../pi-tools', declarations=['file:../pi-tools'], pins=[]),
+    dict(name='git-plus-https-skill', kind='skill', path='skills/git-plus-https/SKILL.md', owner='pi-package',
+         scope='user', source='git:git+https://github.com/user/repo.git#v1',
+         declarations=['git:git+https://github.com/user/repo.git#v1']),
+    dict(name='git-plus-ssh-skill', kind='skill', path='skills/git-plus-ssh/SKILL.md', owner='pi-package',
+         scope='user', source='git:git+ssh://git@github.com/user/repo.git#v1',
+         declarations=['git:git+ssh://git@github.com/user/repo.git#v1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 13
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 15
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -524,6 +531,9 @@ assert inspected_resources[9]['pins'] == ['v1']
 assert inspected_resources[9]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 assert inspected_resources[9]['source'] == 'git:github.com/user/repo#v1'
 assert inspected_resources[9]['declarations'] == ['git:github.com/user/repo#v1']
+for index in (13, 14):
+    assert inspected_resources[index]['pins'] == ['v1']
+    assert inspected_resources[index]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
@@ -540,6 +550,14 @@ credentialed_git['observations']['pi']['resources'][5].update(
     declarations=['ssh://deploy:embedded-secret@example.com:2222/org/tools@release+1'])
 code, credential_refusal = invoke('inspect', {'observations': credentialed_git['observations']})
 assert code == 2 and 'embedded-secret' not in json.dumps(credential_refusal)
+npm_credential = 'npm-url-credential-canary'
+credentialed_npm = copy.deepcopy(source_forms)
+credentialed_npm['observations']['pi']['resources'][0].update(
+    source=f'npm:example@https://user:{npm_credential}@example.com/package.tgz',
+    declarations=[f'npm:example@https://user:{npm_credential}@example.com/package.tgz'])
+code, npm_credential_refusal = invoke(
+    'inspect', {'observations': credentialed_npm['observations']}, forbidden=(npm_credential,))
+assert code == 2 and npm_credential not in json.dumps(npm_credential_refusal)
 for row in source_forms['observations']['pi']['resources']:
     assert row['source'] in json.dumps(source_inspection)
 range_update = copy.deepcopy(data)
@@ -572,6 +590,16 @@ assert code == 0
 hosted_shorthand_update['resource'] = shorthand_update_inspection[
     'targets'][0]['observation']['resources'][0]['identity']
 refuse('propose', hosted_shorthand_update)
+git_plus_update = copy.deepcopy(data)
+git_plus_update['observations']['pi']['resources'][0].update(
+    source='git:git+https://github.com/user/repo.git#v1',
+    declarations=['git:git+https://github.com/user/repo.git#v1'])
+git_plus_update['observations']['pi']['resources'][0].pop('pins')
+code, git_plus_inspection = invoke('inspect', {'observations': git_plus_update['observations']})
+assert code == 0
+git_plus_update['resource'] = git_plus_inspection[
+    'targets'][0]['observation']['resources'][0]['identity']
+refuse('propose', git_plus_update)
 print('ok - supported npm ranges, Git URLs, shorthand, and local sources remain inspectable and deferred')
 
 collision_data = request('pi')

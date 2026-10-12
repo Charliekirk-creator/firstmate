@@ -181,7 +181,9 @@ def git_declaration(source):
     prefixed = value.startswith("git:") and not value.startswith("git://")
     if prefixed:
         value = value[4:].strip()
-    explicit_protocol = re.match(r"^(https?|ssh|git)://", value, re.IGNORECASE)
+    explicit_protocol = re.match(r"^((?:git\+)?(?:https?|ssh)|git)://", value, re.IGNORECASE)
+    if explicit_protocol and explicit_protocol.group(1).lower().startswith("git+") and not prefixed:
+        return None
     host = path = ref = None
     port = None
     hosted = None
@@ -207,7 +209,7 @@ def git_declaration(source):
     elif explicit_protocol:
         try:
             parsed = urlsplit(value)
-            if parsed.password is not None or (parsed.username is not None and parsed.scheme.lower() != "ssh"):
+            if parsed.password is not None or (parsed.username is not None and parsed.scheme.lower() not in {"ssh", "git+ssh"}):
                 return None
             host, port = parsed.hostname, parsed.port
         except ValueError:
@@ -242,6 +244,11 @@ def git_declaration(source):
         return None
     identity = host.lower() + ((":" + str(port)) if port is not None else "") + "/" + decoded_path.removesuffix(".git")
     return (identity, ref)
+
+
+def selector_has_credentials(selector):
+    match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]*)", selector)
+    return bool(match and "@" in match.group(1))
 
 
 def local_declaration(source):
@@ -326,7 +333,8 @@ def resource_record(row):
             raise Invalid("Resource sources must be bounded non-secret declarations.")
         match = PACKAGE.fullmatch(source)
         if match:
-            if match[2] is not None and not NPM_SELECTOR.fullmatch(match[2]):
+            if (match[2] is not None and
+                    (not NPM_SELECTOR.fullmatch(match[2]) or selector_has_credentials(match[2]))):
                 raise Invalid("Unsupported npm declaration; never include credentials or command text.")
         elif git_declaration(source) is None and not local_declaration(source):
             raise Invalid("Only credential-free npm, Git, or local resource declarations are accepted.")
