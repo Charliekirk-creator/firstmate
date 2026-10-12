@@ -222,15 +222,36 @@ def git_declaration(source):
         if parsed.query:
             return None
         path = parsed.path.lstrip("/")
-        if parsed.fragment:
-            if host not in HOSTED_GIT.values():
-                return None
-            ref = parsed.fragment
+        fragment = parsed.fragment or None
         segments = path.split("/")
-        if host == "github.com" and len(segments) >= 3 and segments[2] == "tree":
-            path = "/".join(segments[:2])
-            if ref is None and len(segments) >= 4:
-                ref = segments[3]
+        if host == "github.com":
+            if len(segments) >= 3 and segments[2] == "tree":
+                path = "/".join(segments[:2])
+                ref = segments[3] if len(segments) >= 4 else None
+            elif len(segments) == 2:
+                ref = fragment
+        elif host == "bitbucket.org":
+            if len(segments) >= 3 and segments[2] != "get":
+                path = "/".join(segments[:2])
+                ref = segments[3] if segments[2] == "src" and len(segments) >= 4 else fragment
+            elif len(segments) == 2:
+                ref = fragment
+        elif host == "git.sr.ht":
+            if len(segments) >= 3 and segments[2] != "archive":
+                path = "/".join(segments[:2])
+                ref = fragment
+            elif len(segments) == 2:
+                ref = fragment
+        elif host == "gist.github.com":
+            if len(segments) == 1:
+                path = "null/" + path
+            elif len(segments) >= 2:
+                path = "/".join(segments[:2])
+            ref = fragment
+        elif host == "gitlab.com" and "/-/" not in "/" + path + "/":
+            ref = fragment
+        elif fragment and host not in HOSTED_GIT.values():
+            return None
     elif prefixed and "/" in value:
         host, path = value.split("/", 1)
     else:
@@ -279,15 +300,19 @@ def local_declaration(source):
     value = source.strip()
     if not value or re.search(r"[\x00-\x1f]", value):
         return False
-    if value.startswith(("npm:", "git:", "github:", "http:", "https:", "ssh:")):
+    scheme = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):", value)
+    if scheme and len(scheme.group(1)) == 1 and len(value) > 2 and value[2] in {"/", "\\"}:
+        return True
+    if scheme and scheme.group(1).lower() != "file":
         return False
-    if value.startswith("file:"):
+    if scheme:
         try:
             parsed = urlsplit(value)
         except ValueError:
             return False
         return (parsed.username is None and parsed.password is None and
-                parsed.netloc in {"", "localhost"} and not parsed.query and not parsed.fragment)
+                parsed.netloc in {"", "localhost"} and bool(parsed.path) and
+                not parsed.query and not parsed.fragment)
     return True
 
 

@@ -563,11 +563,14 @@ source_forms['observations']['pi']['resources'] = [
          scope='user', source='git:github:user/repo#release%2F1',
          declarations=['git:github:user/repo#release%2F1']),
     dict(name='browser-url-skill', kind='skill', path='skills/browser-url/SKILL.md', owner='pi-package',
-         scope='user', source='https://github.com/user/repo/tree/v1',
-         declarations=['https://github.com/user/repo/tree/v1']),
+         scope='user', source='https://github.com/user/repo/tree/v1#readme',
+         declarations=['https://github.com/user/repo/tree/v1#readme']),
+    dict(name='bitbucket-browser-skill', kind='skill', path='skills/bitbucket-browser/SKILL.md', owner='pi-package',
+         scope='user', source='https://bitbucket.org/user/repo/src/v1',
+         declarations=['https://bitbucket.org/user/repo/src/v1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 20
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 21
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -588,7 +591,9 @@ assert inspected_resources[18]['pins'] == ['release/1']
 assert inspected_resources[18]['declarations'] == ['git:github:user/repo#release%2F1']
 assert inspected_resources[19]['pins'] == ['v1']
 assert inspected_resources[19]['identity']['update_unit']['identity'] == 'github.com/user/repo'
-assert inspected_resources[19]['declarations'] == ['https://github.com/user/repo/tree/v1']
+assert inspected_resources[19]['declarations'] == ['https://github.com/user/repo/tree/v1#readme']
+assert inspected_resources[20]['pins'] == ['v1']
+assert inspected_resources[20]['identity']['update_unit']['identity'] == 'bitbucket.org/user/repo'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
@@ -614,6 +619,16 @@ credentialed_git['observations']['pi']['resources'][5].update(
     declarations=['ssh://deploy:embedded-secret@example.com:2222/org/tools@release+1'])
 code, credential_refusal = invoke('inspect', {'observations': credentialed_git['observations']})
 assert code == 2 and 'embedded-secret' not in json.dumps(credential_refusal)
+uppercase_url_credential = 'uppercase-url-canary'
+uppercase_credentialed_url = copy.deepcopy(source_forms)
+for protocol in ('HTTPS', 'HtTpS'):
+    url = f'{protocol}://user:{uppercase_url_credential}@example.com/pkg?token={uppercase_url_credential}'
+    uppercase_credentialed_url['observations']['pi']['resources'][5].update(
+        source=url, declarations=[url])
+    code, uppercase_url_refusal = invoke(
+        'inspect', {'observations': uppercase_credentialed_url['observations']},
+        forbidden=(uppercase_url_credential,))
+    assert code == 2 and uppercase_url_credential not in json.dumps(uppercase_url_refusal)
 npm_credential = 'npm-url-credential-canary'
 credentialed_npm = copy.deepcopy(source_forms)
 credentialed_npm['observations']['pi']['resources'][0].update(
