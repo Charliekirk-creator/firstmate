@@ -149,7 +149,7 @@ def resource_selector(row):
         unit_type = 'npm'
     elif source.startswith(('git:', 'http://', 'https://', 'ssh://', 'git@')):
         value = source[4:] if source.startswith('git:') else source
-        for prefix in ('https://', 'http://', 'ssh://git@'):
+        for prefix in ('https://', 'http://', 'git://', 'ssh://git@'):
             if value.startswith(prefix):
                 value = value[len(prefix):]
         if value.startswith('git@'):
@@ -268,7 +268,7 @@ for category, changes in [
     row.update(changes)
     code, inspected = invoke('inspect', {'observations': {'gh-axi': row}})
     assert code == 0 and inspected['targets'][expected.index('gh-axi')]['outcome']['category'] == category
-for available in ['1.0.0', '0.9.0', '1.1.0-beta.1']:
+for available in ['1.0.0', '0.9.0']:
     data = request()
     data['observations']['gh-axi']['available'] = available
     refuse('propose', data)
@@ -280,7 +280,22 @@ for label in ['macOS Tahoe-26.1', '--all', 'Command Line Tools for Xcode; echo u
     data = request('git')
     data['observations']['git']['update_label'] = label
     refuse('propose', data)
-print('ok - unchanged releases, downgrades, prereleases, diverged histories, and unrelated Apple updates are refused')
+for installed_version, available, category in [
+    ('1.0.0-beta.1', '1.0.0', 'candidate'),
+    ('1.0.0-beta.1', '1.0.0-beta.2', 'candidate'),
+    ('1.0.0+build.1', '1.0.0+build.2', 'unchanged'),
+]:
+    semver_data = request()
+    semver_data['observations']['gh-axi'].update(
+        installed_version=installed_version, effective_version=installed_version, available=available)
+    code, semver_inspection = invoke('inspect', {'observations': semver_data['observations']})
+    assert code == 0
+    assert semver_inspection['targets'][expected.index('gh-axi')]['outcome']['category'] == category
+    if category == 'candidate':
+        assert prepared(approved(semver_data))['available'] == available
+    else:
+        refuse('propose', semver_data)
+print('ok - semantic version precedence, divergence, and unrelated Apple updates are handled safely')
 
 data = approved(request())
 refuse('prepare', request())
@@ -429,7 +444,7 @@ all_sources = request('pi')
 all_sources['observations']['pi']['resources'] = [
     dict(name='git-skill', kind='skill', path='skills/git-skill/SKILL.md', owner='pi-package', scope='user',
          source='git:github.com/example/skills@main', declarations=['git:github.com/example/skills@main'],
-         pins=[], installed=True, discovered=True, loaded=True, used=True, compatible=True,
+         pins=['main'], installed=True, discovered=True, loaded=True, used=True, compatible=True,
          owner_verified=True, available_verified=False, installed_version='1.0.0',
          effective_version='0.9.0', available=None, installed_version_evidence='git checkout',
          effective_version_evidence='loaded resource inventory', owner_evidence='Pi package inventory',
@@ -472,12 +487,19 @@ source_forms['observations']['pi']['resources'] = [
          declarations=['https://github.com/example/pi-tools'], pins=[]),
     dict(name='git-template', kind='prompt-template', path='prompts/git.md', owner='pi-package',
          scope='user', source='git:github.com/example/pi-tools@main',
-         declarations=['git:github.com/example/pi-tools@main'], pins=[]),
+         declarations=['git:github.com/example/pi-tools@main'], pins=['main']),
+    dict(name='git-protocol-skill', kind='skill', path='skills/git-protocol/SKILL.md', owner='pi-package',
+         scope='user', source='git://github.com/example/protocol-tools',
+         declarations=['git://github.com/example/protocol-tools'], pins=[]),
+    dict(name='git-ssh-template', kind='prompt-template', path='prompts/git-ssh.md', owner='pi-package',
+         scope='user', source='git:ssh://git@github.com/example/ssh-tools@v1.2.3',
+         declarations=['git:ssh://git@github.com/example/ssh-tools@v1.2.3'], pins=['v1.2.3']),
     dict(name='local-skill', kind='skill', path='skills/local/SKILL.md', owner='local',
          scope='project', source='../local tools', declarations=['../local tools'], pins=[]),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 5
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 7
+assert source_inspection['targets'][0]['observation']['resources'][5]['pins'] == ['v1.2.3']
 for row in source_forms['observations']['pi']['resources']:
     assert row['source'] in json.dumps(source_inspection)
 range_update = copy.deepcopy(data)
@@ -500,7 +522,7 @@ collision_a.update(name='review', kind='prompt-template', path='prompts/a/review
 collision_b = copy.deepcopy(collision_a)
 collision_b['path'] = 'prompts/b/review.md'
 collision_other = copy.deepcopy(collision_a)
-collision_other.update(path='prompts/review.md', source='npm:other-package',
+collision_other.update(path='prompts/review.md', scope='project', source='npm:other-package',
                        declarations=['npm:other-package'])
 collision_data['observations']['pi']['resources'] = [collision_a, collision_b, collision_other]
 code, collision_inspection = invoke('inspect', {'observations': collision_data['observations']})
@@ -532,6 +554,28 @@ selected_alias['resource'] = resource_selector(selected_alias['observations']['p
 alias_proposal = prepared(approved(selected_alias))
 assert alias_proposal['dispatch']['argv'][2] == 'npm:example-extension@latest'
 assert len(alias_proposal['affected_resources']) == 2
+filter_delta_data = copy.deepcopy(data)
+filter_delta = copy.deepcopy(resource)
+filter_delta.update(name='project-filter', kind='skill', path='skills/project-filter/SKILL.md',
+                    scope='project', declarations=[{
+                        'source': 'npm:example-extension', 'autoload': False,
+                        'extensions': [], 'skills': ['+skills/project-filter/SKILL.md'],
+                        'prompts': [], 'themes': []}])
+filter_delta_data['observations']['pi']['resources'].append(filter_delta)
+filter_delta_proposal = prepared(approved(filter_delta_data))
+assert {(row['scope'], row['path']) for row in filter_delta_proposal['affected_resources']} == {
+    ('user', 'extensions/example.ts'), ('project', 'skills/project-filter/SKILL.md')}
+missing_delta_evidence = copy.deepcopy(filter_delta_data)
+del missing_delta_evidence['observations']['pi']['resources'][1]['compatibility_evidence']
+refuse('propose', missing_delta_evidence)
+changed_delta = approved(filter_delta_data)
+changed_delta['observations']['pi']['resources'][1]['declarations'][0]['skills'] = []
+refuse('prepare', changed_delta)
+independent_scope = copy.deepcopy(data)
+independent_project = copy.deepcopy(filter_delta)
+independent_project['declarations'] = [{'source': 'npm:example-extension', 'skills': []}]
+independent_scope['observations']['pi']['resources'].append(independent_project)
+assert len(prepared(approved(independent_scope))['affected_resources']) == 1
 for changed in ['installed', 'discovered', 'compatible', 'owner_verified', 'available_verified']:
     bad = copy.deepcopy(shared)
     bad['observations']['pi']['resources'][1][changed] = False

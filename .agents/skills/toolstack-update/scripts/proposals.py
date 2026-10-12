@@ -54,7 +54,7 @@ WEZ_VERSION = re.compile(r"\d{8}-\d{6}-[a-f0-9]{8}\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 NAME = re.compile(r"(?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*\Z")
 PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
-GIT_SOURCE = re.compile(r"(?:git:(?:(?:https?://)?[a-zA-Z0-9.-]+/|git@[a-zA-Z0-9.-]+:)|https?://[a-zA-Z0-9.-]+/|ssh://git@[a-zA-Z0-9.-]+/)[a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+(?:@[a-zA-Z0-9_./-]+)?\Z")
+GIT_SOURCE = re.compile(r"(?:git:(?:(?:(?:https?|git)://[a-zA-Z0-9.-]+/)|ssh://git@[a-zA-Z0-9.-]+/|git@[a-zA-Z0-9.-]+:|[a-zA-Z0-9.-]+/)|(?:(?:https?|git)://[a-zA-Z0-9.-]+/|ssh://git@[a-zA-Z0-9.-]+/))[a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+(?:@[a-zA-Z0-9_./-]+)?\Z")
 LOCAL_SOURCE = re.compile(r"(?:~/|/|\./|\.\./)[a-zA-Z0-9_./ -]+\Z")
 NPM_SELECTOR = re.compile(r"[\x20-\x7e]{1,128}\Z")
 ASSESSMENT_FIELDS = {"source", "scope", "declarations", "pins", "dependencies", "disruption",
@@ -178,7 +178,7 @@ def git_declaration(source):
     if not isinstance(source, str) or not GIT_SOURCE.fullmatch(source):
         return None
     value = source[4:] if source.startswith("git:") else source
-    value = re.sub(r"^(?:https?://|ssh://git@)", "", value)
+    value = re.sub(r"^(?:(?:https?|git)://|ssh://git@)", "", value)
     if value.startswith("git@"):
         value = value[4:].replace(":", "/", 1)
     ref = None
@@ -208,6 +208,12 @@ def resource_identity(row):
     return {"scope": row["scope"], "kind": row["kind"], "name": row["name"],
             "source": row["source"], "path": row["path"],
             "update_unit": {"type": unit[0], "identity": unit[1], "scope": row["scope"]}}
+
+
+def is_project_filter_delta(row):
+    declarations = row.get("declarations")
+    return (row.get("scope") == "project" and isinstance(declarations, list) and len(declarations) == 1 and
+            isinstance(declarations[0], dict) and declarations[0].get("autoload") is False)
 
 
 def declaration_source(row):
@@ -252,7 +258,8 @@ def resource_record(row):
         if row.get("declarations") is not None and declaration_source(row) != source:
             raise Invalid("A resource declaration must exactly identify its update unit without flattening filters.")
         selector = match[2] if match else None
-        expected_pins = [selector] if selector and VERSION.fullmatch(selector) else []
+        git_ref = git_declaration(source)[1] if git_declaration(source) else None
+        expected_pins = [selector] if selector and VERSION.fullmatch(selector) else [git_ref] if git_ref else []
         if row.get("pins") is not None and row["pins"] != expected_pins:
             raise Invalid("Resource pin evidence must match its unchanged declaration.")
     result = copy.deepcopy(row)
@@ -295,10 +302,35 @@ def observations(data):
 def resource_collisions(resources):
     groups = {}
     for resource in resources:
-        key = (resource["kind"], resource["scope"], resource["name"])
+        key = (resource["kind"], resource["name"])
         groups.setdefault(key, []).append(copy.deepcopy(resource["identity"]))
-    return [{"kind": key[0], "scope": key[1], "name": key[2], "resources": identities}
+    return [{"kind": key[0], "name": key[1], "resources": identities}
             for key, identities in groups.items() if len(identities) > 1]
+
+
+def semver_parts(value):
+    value = value.lstrip("v").split("+", 1)[0]
+    core, separator, prerelease = value.partition("-")
+    return tuple(map(int, core.split("."))), prerelease.split(".") if separator else None
+
+
+def semver_compare(left, right):
+    left_core, left_pre = semver_parts(left)
+    right_core, right_pre = semver_parts(right)
+    if left_core != right_core:
+        return (left_core > right_core) - (left_core < right_core)
+    if left_pre is None or right_pre is None:
+        return (left_pre is None) - (right_pre is None)
+    for left_part, right_part in zip(left_pre, right_pre):
+        if left_part == right_part:
+            continue
+        left_numeric, right_numeric = left_part.isdigit(), right_part.isdigit()
+        if left_numeric and right_numeric:
+            return (int(left_part) > int(right_part)) - (int(left_part) < int(right_part))
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return (left_part > right_part) - (left_part < right_part)
+    return (len(left_pre) > len(right_pre)) - (len(left_pre) < len(right_pre))
 
 
 def outcome(target, row):
@@ -313,7 +345,8 @@ def outcome(target, row):
         category = "unknown"
     elif status != "verified" or not available or row.get("available_verified") is not True:
         category = "unknown"
-    elif installed_version.lstrip("v") == available.lstrip("v"):
+    elif (target not in {"firstmate", "wezterm"} and semver_compare(installed_version, available) == 0) or \
+            installed_version.lstrip("v") == available.lstrip("v"):
         category = "unchanged"
     elif row.get("compatible") is not True:
         category = "deferred"
@@ -322,9 +355,7 @@ def outcome(target, row):
     elif target == "wezterm":
         category = "candidate" if available[:15] > installed_version[:15] else "deferred"
     else:
-        stable = r"v?(\d+)\.(\d+)\.(\d+)"
-        a, b = re.fullmatch(stable, installed_version), re.fullmatch(stable, available)
-        category = "candidate" if a and b and tuple(map(int, b.groups())) > tuple(map(int, a.groups())) else "deferred"
+        category = "candidate" if semver_compare(available, installed_version) > 0 else "deferred"
     return {"category": category, "evidence": evidence}
 
 
@@ -458,9 +489,10 @@ def proposal(data, rows):
         identity = update_identity(selected["source"])
         affected = [copy.deepcopy(resource) for resource in row["resources"] if
                     update_identity(resource.get("source")) == identity and
-                    resource.get("scope") == selected["scope"]]
+                    (resource.get("scope") == selected["scope"] or
+                     (selected["scope"] == "user" and is_project_filter_delta(resource)))]
         if any(resource.get("owner") != "pi-package" for resource in affected):
-            raise Invalid("Every resource supplied by a package must share its verified owner and scope.")
+            raise Invalid("Every resource affected by a package update must retain its verified package owner.")
         npm_sources = [npm_declaration(resource["source"]) for resource in affected]
         if identity[0] == "npm" and len({selector_identity(source[1]) for source in npm_sources}) != 1:
             raise Invalid("Conflicting declarations for one npm package require reconciliation before approval.")
@@ -483,7 +515,7 @@ def proposal(data, rows):
             require_pi_resource_compatibility(resource)
     require_assessment(candidate, "loaded")
     if outcome(target, candidate)["category"] != "candidate":
-        raise Invalid("No verified, compatible newer stable release can be proposed.")
+        raise Invalid("No verified, compatible newer semantic release can be proposed.")
     proposed = {"target": target, "resource": copy.deepcopy(selector),
                 "update_unit": (copy.deepcopy(selected["identity"]["update_unit"])
                                 if selected else {"target": target}),
