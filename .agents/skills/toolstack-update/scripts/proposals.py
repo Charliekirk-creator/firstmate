@@ -182,6 +182,37 @@ def npm_declaration(source):
     return (match.group(1), match.group(2)) if match else None
 
 
+def scp_hosted_declaration(host, path, ref):
+    canonical_host = host[4:] if host.lower().startswith("www.") else host
+    canonical_host = canonical_host.lower()
+    if "git+ssh" not in HOSTED_PROTOCOLS.get(canonical_host, set()):
+        return host, path, ref, False
+    segments = path.split("/")
+    if canonical_host == "github.com":
+        if len(segments) < 2 or (len(segments) >= 3 and segments[2] != "tree"):
+            return host, path, ref, False
+        effective_ref = segments[3] if len(segments) >= 4 else ref
+        return canonical_host, "/".join(segments[:2]), effective_ref, True
+    if canonical_host == "bitbucket.org":
+        if len(segments) < 2 or (len(segments) >= 3 and segments[2] == "get"):
+            return host, path, ref, False
+        return canonical_host, "/".join(segments[:2]), ref, True
+    if canonical_host == "gitlab.com":
+        if len(segments) < 2 or "/-/" in "/" + path + "/":
+            return host, path, ref, False
+        return canonical_host, path, ref, True
+    if canonical_host == "gist.github.com":
+        if len(segments) >= 3 and segments[2] == "raw":
+            return host, path, ref, False
+        normalized = "null/" + path if len(segments) == 1 else "/".join(segments[:2])
+        return canonical_host, normalized, ref, True
+    if canonical_host == "git.sr.ht":
+        if len(segments) < 2 or (len(segments) >= 3 and segments[2] == "archive"):
+            return host, path, ref, False
+        return canonical_host, "/".join(segments[:2]), ref, True
+    return host, path, ref, False
+
+
 def git_declaration(source):
     if not isinstance(source, str) or not source or len(source) > 500:
         return None
@@ -189,6 +220,8 @@ def git_declaration(source):
     prefixed = value.startswith("git:") and not value.startswith("git://")
     if prefixed:
         value = value[4:].strip()
+    if "?" in value.split("#", 1)[0]:
+        return None
     explicit_protocol = re.match(r"^((?:git\+)?(?:https?|ssh)|git)://", value, re.IGNORECASE)
     if explicit_protocol and explicit_protocol.group(1).lower().startswith("git+") and not prefixed:
         return None
@@ -218,14 +251,11 @@ def git_declaration(source):
         if not match:
             return None
         host, path = match.groups()
-        unaliased_host = host[4:] if host.lower().startswith("www.") else host
-        if "git+ssh" in HOSTED_PROTOCOLS.get(unaliased_host.lower(), set()):
-            host = unaliased_host.lower()
-            hosted_identity = True
-            segments = path.split("/")
-            if host == "github.com" and len(segments) >= 3 and segments[2] == "tree":
-                path = "/".join(segments[:2])
-                ref = segments[3] if len(segments) >= 4 else None
+        if "@" in path:
+            repo_path, candidate_ref = path.split("@", 1)
+            if repo_path and candidate_ref:
+                path, ref = repo_path, candidate_ref
+        host, path, ref, hosted_identity = scp_hosted_declaration(host, path, ref)
     elif explicit_protocol:
         try:
             parsed = urlsplit(value)
@@ -411,8 +441,9 @@ def resource_record(row):
     npm_source = npm_declaration(source)
     for field in ("installed_version", "effective_version", "available"):
         value = row.get(field)
-        revision_target = "firstmate" if row["owner"] == "firstmate" or \
-            (npm_source is None and isinstance(value, str) and COMMIT.fullmatch(value)) else "pi"
+        revision_target = "pi" if npm_source is not None else \
+            "firstmate" if row["owner"] == "firstmate" or \
+            (isinstance(value, str) and COMMIT.fullmatch(value)) else "pi"
         version(value, revision_target)
     if row.get("version_status") is not None and row["version_status"] not in {
             "verified", "inherently-unversioned", "unknown", "unavailable"}:

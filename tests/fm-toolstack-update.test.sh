@@ -397,6 +397,9 @@ commit_npm = copy.deepcopy(data)
 for field in ('installed_version', 'effective_version', 'available'):
     commit_npm['observations']['pi']['resources'][0][field] = 'a' * 40
 refuse('inspect', {'observations': commit_npm['observations']})
+firstmate_owned_commit_npm = copy.deepcopy(commit_npm)
+firstmate_owned_commit_npm['observations']['pi']['resources'][0]['owner'] = 'firstmate'
+refuse('inspect', {'observations': firstmate_owned_commit_npm['observations']})
 substituted_tag = approved(tagged_update)
 substituted_tag['observations']['pi']['resources'][0].update(
     source='npm:example-extension@beta', declarations=['npm:example-extension@beta'])
@@ -629,9 +632,15 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='scp-browser-skill', kind='skill', path='skills/scp-browser/SKILL.md', owner='pi-package',
          scope='user', source='git:git@github.com:user/repo/tree/v1',
          declarations=['git:git@github.com:user/repo/tree/v1']),
+    dict(name='scp-bitbucket-browser-skill', kind='skill', path='skills/scp-bitbucket/SKILL.md', owner='pi-package',
+         scope='user', source='git:git@bitbucket.org:user/repo/src/v1',
+         declarations=['git:git@bitbucket.org:user/repo/src/v1']),
+    dict(name='scp-gitlab-fallback-skill', kind='skill', path='skills/scp-gitlab/SKILL.md', owner='pi-package',
+         scope='user', source='git:git@gitlab.com:group/repo/-/tree/main@release%2F1',
+         declarations=['git:git@gitlab.com:group/repo/-/tree/main@release%2F1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 31
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 33
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -672,6 +681,10 @@ assert inspected_resources[29]['pins'] == ['v1']
 assert inspected_resources[29]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 assert inspected_resources[30]['pins'] == ['v1']
 assert inspected_resources[30]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[31]['pins'] == []
+assert inspected_resources[31]['identity']['update_unit']['identity'] == 'bitbucket.org/user/repo'
+assert inspected_resources[32]['pins'] == ['release%2F1']
+assert inspected_resources[32]['identity']['update_unit']['identity'] == 'gitlab.com/group/repo/-/tree/main'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
@@ -707,6 +720,16 @@ for protocol in ('HTTPS', 'HtTpS'):
         'inspect', {'observations': uppercase_credentialed_url['observations']},
         forbidden=(uppercase_url_credential,))
     assert code == 2 and uppercase_url_credential not in json.dumps(uppercase_url_refusal)
+git_query_canary = 'git-query-canary'
+for query_source in (
+        f'git:git@github.com:user/repo?token={git_query_canary}',
+        f'git:github.com/user/repo?token={git_query_canary}'):
+    query_git = copy.deepcopy(source_forms)
+    query_git['observations']['pi']['resources'][5].update(
+        source=query_source, declarations=[query_source])
+    code, git_query_refusal = invoke(
+        'inspect', {'observations': query_git['observations']}, forbidden=(git_query_canary,))
+    assert code == 2 and git_query_canary not in json.dumps(git_query_refusal)
 npm_credential = 'npm-url-credential-canary'
 credentialed_npm = copy.deepcopy(source_forms)
 credentialed_npm['observations']['pi']['resources'][0].update(
