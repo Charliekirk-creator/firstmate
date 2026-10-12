@@ -137,6 +137,10 @@ def request(target='gh-axi'):
     return {'observations': {target: observation(target)}, 'target': target}
 
 
+def resource_selector(row):
+    return {field: row[field] for field in ('name', 'kind', 'scope', 'source')}
+
+
 def checkpoint():
     return dict(actor='primary', active_sessions=False, active_workers=False,
                 active_validation=False, pins_preserved=True, packages_preserved=True,
@@ -227,6 +231,8 @@ for category, changes in [
                      'release_evidence': 'registry lookup failed with installed version unknown'}),
     ('deferred', {'available': '0.9.0'}),
     ('candidate', {}),
+    ('deferred', {'compatible': False}),
+    ('deferred', {'compatible': None}),
 ]:
     row = observation('gh-axi')
     row.update(changes)
@@ -291,27 +297,40 @@ resource = dict(name='example-extension', kind='extension', owner='pi-package',
                 **assessment('npm:example-extension', 'user'))
 data = request('pi')
 data['observations']['pi']['resources'] = [resource]
-data['resource'] = resource['name']
+data['resource'] = resource_selector(resource)
 before = copy.deepcopy(data)
 result = prepared(approved(data))
 assert result['dispatch'] == {'argv': ['pi', 'update', 'npm:example-extension', '--no-approve']}
 assert result['installed_version'] == '1.0.0' and result['effective_version'] == '0.9.0'
 assert result['affected_resources'] == [resource] and data == before
+for root_changes in [
+    {'available': '1.0.0'},
+    {'availability_status': 'unavailable', 'available': None, 'available_verified': False,
+     'compatible': None, 'release_evidence': 'Pi release lookup unavailable'},
+]:
+    independent = copy.deepcopy(data)
+    independent['observations']['pi'].update(root_changes)
+    assert prepared(approved(independent))['resource'] == resource_selector(resource)
 missing_effective = copy.deepcopy(data)
 missing_effective['observations']['pi']['resources'][0]['effective_version'] = None
 refuse('propose', missing_effective)
 pinned = copy.deepcopy(data)
 pinned['observations']['pi']['resources'][0].update(source='npm:example-extension@v1.1.0',
                                                     declarations=['npm:example-extension@v1.1.0'],
-                                                    pin='1.1.0', pins=['1.1.0'])
+                                                    pins=['v1.1.0'])
+pinned['resource'] = resource_selector(pinned['observations']['pi']['resources'][0])
 assert prepared(approved(pinned))['dispatch']['argv'][2] == 'npm:example-extension@v1.1.0'
-for pin_kind in ['source', 'field']:
-    bad = copy.deepcopy(data)
-    if pin_kind == 'source':
-        bad['observations']['pi']['resources'][0]['source'] += '@1.0.0'
-    else:
-        bad['observations']['pi']['resources'][0]['pin'] = '1.0.0'
-    refuse('propose', bad)
+bad = copy.deepcopy(data)
+bad['observations']['pi']['resources'][0]['pin'] = '1.1.0'
+refuse('propose', bad)
+bad = copy.deepcopy(data)
+bad['observations']['pi']['resources'][0]['pins'] = ['1.1.0']
+refuse('propose', bad)
+scoped = copy.deepcopy(data)
+scoped['observations']['pi']['resources'][0].update(
+    source='npm:@example/extension@1.1.0', declarations=['npm:@example/extension@1.1.0'], pins=['1.1.0'])
+scoped['resource'] = resource_selector(scoped['observations']['pi']['resources'][0])
+assert prepared(approved(scoped))['dispatch']['argv'][2] == 'npm:@example/extension@1.1.0'
 bad = copy.deepcopy(data)
 bad['observations']['pi']['resources'][0]['scope'] = 'project'
 refuse('propose', bad)
@@ -358,7 +377,8 @@ assert inspected['targets'][0]['observation']['resources'] == all_sources['obser
 assert prepared(approved(all_sources))['affected_resources'] == all_sources['observations']['pi']['resources']
 for name in ['git-skill', 'local-template']:
     bad = copy.deepcopy(all_sources)
-    bad['resource'] = name
+    bad['resource'] = resource_selector(next(row for row in bad['observations']['pi']['resources']
+                                             if row['name'] == name))
     refuse('propose', bad)
 unknown_compatibility = copy.deepcopy(all_sources)
 unknown_compatibility['observations']['pi']['resources'][1]['compatible'] = None
@@ -368,12 +388,13 @@ print('ok - Pi updates bind Git/local compatibility without requiring resource r
 shared = request('pi')
 shared_a = copy.deepcopy(resource)
 shared_b = copy.deepcopy(resource)
-shared_b.update(name='example-skill', kind='skill')
+shared_b.update(kind='skill')
 shared['observations']['pi']['resources'] = [shared_a, shared_b]
-shared['resource'] = shared_a['name']
+shared['resource'] = resource_selector(shared_a)
 proposal = prepared(approved(shared))
-assert {r['name'] for r in proposal['affected_resources']} == {'example-extension', 'example-skill'}
-assert proposal['update_unit'] == 'npm:example-extension'
+assert {(r['name'], r['kind']) for r in proposal['affected_resources']} == {
+    ('example-extension', 'extension'), ('example-extension', 'skill')}
+assert proposal['update_unit'] == {'source': 'npm:example-extension', 'scope': 'user'}
 for changed in ['installed', 'discovered', 'compatible', 'owner_verified', 'available_verified']:
     bad = copy.deepcopy(shared)
     bad['observations']['pi']['resources'][1][changed] = False
@@ -386,6 +407,15 @@ changed_effective['observations']['pi']['resources'][1].update(
     effective_version='0.8.0', effective_version_evidence='different loaded process')
 refuse('prepare', changed_effective)
 print('ok - shared package proposals bind every resource and require resource-specific evidence')
+
+for field in ['scope', 'declarations', 'pins', 'dependencies']:
+    incomplete = request()
+    incomplete['observations']['gh-axi'][field] = None
+    refuse('propose', incomplete)
+for field in ['declarations', 'pins', 'dependencies']:
+    malformed = request()
+    malformed['observations']['gh-axi'][field] = 'none'
+    refuse('propose', malformed)
 
 bound = approved(request())
 for field, replacement in [

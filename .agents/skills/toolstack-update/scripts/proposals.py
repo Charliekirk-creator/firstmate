@@ -11,7 +11,7 @@ Commands: catalog; inspect (default); propose; prepare.
 Resource source records can retain credential-free npm, Git, and local sources;
 only exact-version/unpinned npm user packages have a preparable resource action.
 inspect takes {observations: {target: observation}} and always returns the full
-catalog. propose adds target and optionally resource (a Pi resource name).
+catalog. propose adds target and optionally resource (a Pi resource identity object).
 prepare additionally needs approval equal to the current proposal and checkpoint.
 Use --help for the observation/checkpoint fields. No apply command exists.
 """
@@ -65,7 +65,7 @@ VERSION_FIELDS = {"installed_version", "effective_version", "installed_version_e
 OBS_FIELDS = {"installed", "used", "available", "owner", "compatible", "owner_verified",
               "available_verified", "relation", "update_label", "resources", "resources_complete"} \
              | ASSESSMENT_FIELDS | VERSION_FIELDS
-RESOURCE_FIELDS = {"name", "kind", "owner", "available", "pin", "installed", "discovered",
+RESOURCE_FIELDS = {"name", "kind", "owner", "available", "installed", "discovered",
                    "loaded", "used", "compatible", "owner_verified", "available_verified"} \
                   | ASSESSMENT_FIELDS | VERSION_FIELDS
 CHECKPOINT_FIELDS = {"actor", "active_sessions", "active_workers", "active_validation",
@@ -152,7 +152,7 @@ def resource_record(row):
     for field in ("installed", "discovered", "loaded", "used", "compatible", "owner_verified", "available_verified"):
         if row.get(field) is not None and type(row[field]) is not bool:
             raise Invalid("Resource inventory and assessment flags must be booleans or unknown.")
-    for field in ("installed_version", "effective_version", "available", "pin"):
+    for field in ("installed_version", "effective_version", "available"):
         value = row.get(field)
         version(value, "firstmate" if row["owner"] == "firstmate" or (isinstance(value, str) and COMMIT.fullmatch(value)) else "pi")
     availability_evidence(row)
@@ -168,7 +168,7 @@ def resource_record(row):
             raise Invalid("Only credential-free npm, Git, or local resource declarations are accepted.")
         if row.get("declarations") is not None and row["declarations"] != [source]:
             raise Invalid("A resource declaration must exactly identify its update unit.")
-        declared_pin = row.get("pin") or (match[2] if match else None)
+        declared_pin = match[2] if match else None
         expected_pins = [declared_pin] if declared_pin else []
         if row.get("pins") is not None and row["pins"] != expected_pins:
             raise Invalid("Resource pin evidence must match its unchanged declaration.")
@@ -221,6 +221,8 @@ def outcome(target, row):
         category = "unknown"
     elif installed_version.lstrip("v") == available.lstrip("v"):
         category = "unchanged"
+    elif row.get("compatible") is not True:
+        category = "deferred"
     elif target == "firstmate":
         category = "candidate" if row.get("relation") == "fast-forward" else "deferred"
     elif target == "wezterm":
@@ -244,9 +246,11 @@ def require_assessment(row, loaded_field):
     required = ("source", "scope", "declarations", "pins", "dependencies", "disruption",
                 "maintenance", "rollback", "verification", "compatibility_evidence",
                 "owner_evidence", "release_evidence")
-    if any(field not in row for field in required):
-        raise Invalid("A proposal requires complete source, scope, declaration, dependency, consequence, recovery, verification, and evidence facts.")
-    if any(not row[field] for field in ("source", "disruption", "maintenance", "rollback", "verification",
+    if any(field not in row for field in required) or not isinstance(row.get("scope"), str) or \
+            any(not isinstance(row.get(field), list) for field in
+                ("declarations", "pins", "dependencies", "verification")):
+        raise Invalid("A proposal requires concrete typed source, scope, declarations, pins, dependencies, and verification facts.")
+    if any(not row[field] for field in ("source", "scope", "disruption", "maintenance", "rollback", "verification",
                                         "compatibility_evidence", "owner_evidence", "release_evidence")):
         raise Invalid("A proposal requires concrete non-empty assessment and verification facts.")
     if row.get("availability_status") != "verified":
@@ -257,9 +261,11 @@ def require_assessment(row, loaded_field):
 def require_pi_resource_compatibility(row):
     required = ("source", "scope", "declarations", "pins", "compatibility_evidence",
                 "owner_evidence", "installed_version_evidence", "effective_version_evidence")
-    if any(field not in row for field in required) or any(not row[field] for field in
-            ("source", "compatibility_evidence", "owner_evidence", "installed_version_evidence",
-             "effective_version_evidence")):
+    if any(field not in row for field in required) or not isinstance(row.get("scope"), str) or \
+            any(not isinstance(row.get(field), list) for field in ("declarations", "pins")) or \
+            any(not row[field] for field in
+                ("source", "scope", "compatibility_evidence", "owner_evidence", "installed_version_evidence",
+                 "effective_version_evidence")):
         raise Invalid("A Pi update requires complete resource presence, owner, source, version, and compatibility evidence.")
     if any(row.get(field) is not True for field in
            ("installed", "discovered", "compatible", "owner_verified")) or type(row.get("loaded")) is not bool:
@@ -280,9 +286,7 @@ def dispatch(target, row, selected):
         match = PACKAGE.fullmatch(source)
         if not match or (match[2] is not None and not VERSION.fullmatch(match[2])):
             raise Invalid("Git, local, or range/tag sources need their existing owner's separately reviewed proposal.")
-        pin = selected.get("pin") or match[2]
-        if selected.get("pin") and match[2] and selected["pin"].lstrip("v") != match[2].lstrip("v"):
-            raise Invalid("Pin evidence contradicts the unchanged package declaration.")
+        pin = match[2]
         if pin and selected["available"].lstrip("v") != pin.lstrip("v"):
             raise Invalid("Explicit pins are preserved; changing a pin is a separate authorization.")
         if selected["scope"] != "user":
@@ -322,21 +326,33 @@ def proposal(data, rows):
     if target not in TARGETS:
         raise Invalid("Select exactly one default target; dependency-only tools are not update targets.")
     row = rows.get(target, {})
-    if any(row.get(k) is not True for k in ("installed", "compatible", "owner_verified", "available_verified")) or type(row.get("used")) is not bool:
-        raise Invalid("Installed status, actual-use evidence, compatibility, owner, and available release must be established first.")
+    selector = data.get("resource")
+    selected = None
+    if selector is not None:
+        object_fields(selector, {"name", "kind", "scope", "source"})
+        if set(selector) != {"name", "kind", "scope", "source"} or target != "pi":
+            raise Invalid("Select one Pi package resource by its complete identity.")
+        if row.get("installed") is not True or row.get("owner_verified") is not True or \
+                row.get("owner") not in OWNERS["pi"] or type(row.get("used")) is not bool:
+            raise Invalid("Pi installation, use, and package-owner evidence must be established first.")
+        require_version_evidence(row, "used")
+        matches = [resource for resource in row.get("resources", []) if
+                   all(resource.get(field) == selector[field] for field in selector)]
+        if len(matches) != 1:
+            raise Invalid("Select one unambiguous inventoried Pi package resource.")
+        selected = matches[0]
+    else:
+        if any(row.get(k) is not True for k in
+               ("installed", "compatible", "owner_verified", "available_verified")) or \
+                type(row.get("used")) is not bool:
+            raise Invalid("Installed status, actual-use evidence, compatibility, owner, and available release must be established first.")
     if target == "pi" and row.get("resources_complete") is not True:
         raise Invalid("Complete Pi extensions, skills, templates, and scope inventory before proposing an update.")
-    selected = None
     affected = copy.deepcopy(row.get("resources", [])) if target == "pi" else []
-    if data.get("resource") is not None:
-        matches = [r for r in row.get("resources", []) if r["name"] == data["resource"]]
-        if target != "pi" or len(matches) != 1:
-            raise Invalid("Select one unambiguous inventoried Pi resource.")
-        selected = matches[0]
-        if not selected.get("source"):
-            raise Invalid("A managed resource needs its unchanged package declaration.")
-        affected = [copy.deepcopy(r) for r in row["resources"] if r.get("source") == selected["source"]]
-        if any(r.get("owner") != "pi-package" or r.get("scope") != selected.get("scope") for r in affected):
+    if selected is not None:
+        affected = [copy.deepcopy(resource) for resource in row["resources"] if
+                    resource.get("source") == selected["source"] and resource.get("scope") == selected["scope"]]
+        if any(resource.get("owner") != "pi-package" for resource in affected):
             raise Invalid("Every resource supplied by a package must share its verified owner and scope.")
         for resource in affected:
             require_assessment(resource, "loaded")
@@ -346,8 +362,8 @@ def proposal(data, rows):
                 raise Invalid("Every affected resource needs its own presence, loading, use, compatibility, owner, and release evidence.")
             if outcome(target, resource)["category"] != "candidate":
                 raise Invalid("Every affected resource must be assessed for the same candidate package release.")
-        if any((r.get("installed_version"), r.get("available")) !=
-               (selected.get("installed_version"), selected.get("available")) for r in affected):
+        if any((resource.get("installed_version"), resource.get("available")) !=
+               (selected.get("installed_version"), selected.get("available")) for resource in affected):
             raise Invalid("Affected resources must identify one concrete package version transition.")
     candidate = selected if selected is not None else row
     if target == "pi" and selected is None:
@@ -356,8 +372,9 @@ def proposal(data, rows):
     require_assessment(candidate, "loaded" if selected is not None else "used")
     if outcome(target, candidate)["category"] != "candidate":
         raise Invalid("No verified, compatible newer stable release can be proposed.")
-    proposed = {"target": target, "resource": data.get("resource"),
-                "update_unit": selected["source"] if selected else target,
+    proposed = {"target": target, "resource": copy.deepcopy(selector),
+                "update_unit": ({"source": selected["source"], "scope": selected["scope"]}
+                                if selected else {"target": target}),
                 "owner": selected["owner"] if selected else row["owner"],
                 "installed_version": candidate["installed_version"],
                 "effective_version": candidate.get("effective_version"),
