@@ -90,6 +90,7 @@ export default function (pi: ExtensionAPI) {
   let claim: (Claim & { leaf: string | null }) | undefined;
   let settlement: { entryId: string; message: unknown } | undefined;
   let claimLatched = false;
+  let runActive = false;
   let live = false;
   let wakeQueued = false;
   let wakeDeferred = false;
@@ -102,13 +103,14 @@ export default function (pi: ExtensionAPI) {
     claim = undefined;
     settlement = undefined;
     claimLatched = false;
+    runActive = false;
     wakeQueued = false;
     wakeDeferred = false;
   } };
   const error = (problem: unknown) => ctx?.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");
   const queueWake = (slots: number[]) => {
     if (!live) return;
-    if (wakeQueued) { wakeDeferred = true; return; }
+    if (runActive || wakeQueued) { wakeDeferred = true; return; }
     pi.sendMessage({ customType, content: instructions(slots), display: false },
       { triggerTurn: true, deliverAs: "followUp" });
     wakeQueued = true;
@@ -122,6 +124,7 @@ export default function (pi: ExtensionAPI) {
     claim = undefined;
     settlement = undefined;
     claimLatched = false;
+    runActive = false;
     wakeQueued = false;
     wakeDeferred = false;
     const sessionFile = context.sessionManager.getSessionFile();
@@ -178,6 +181,15 @@ export default function (pi: ExtensionAPI) {
     lifecycle.dispose();
     if (instances.get(key) === lifecycle) instances.delete(key);
   });
+  pi.on("agent_start", (_event, context) => {
+    if (runActive) return;
+    runActive = true;
+    claimLatched = true;
+    try {
+      const due = clock?.claim();
+      claim = due ? { ...due, leaf: context.sessionManager.getLeafId() } : undefined;
+    } catch (problem) { claim = undefined; error(problem); }
+  });
   pi.on("context", (event, context) => {
     const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== customType);
     try {
@@ -185,10 +197,6 @@ export default function (pi: ExtensionAPI) {
         claimLatched = true;
         const due = clock?.claim();
         if (due) claim = { ...due, leaf: context.sessionManager.getLeafId() };
-      }
-      if (event.messages.some((message) => message.role === "custom" && message.customType === customType)) {
-        const pending = clock?.claim();
-        if (pending?.slots.some((slot) => !claim?.slots.includes(slot))) wakeDeferred = true;
       }
       if (!claim) return { messages };
       return { messages: [...messages, { role: "custom" as const, customType, content: instructions(claim.slots),
@@ -235,6 +243,7 @@ export default function (pi: ExtensionAPI) {
     claim = undefined;
     settlement = undefined;
     claimLatched = false;
+    runActive = false;
     wakeQueued = false;
     wakeDeferred = false;
     if (deferred) {

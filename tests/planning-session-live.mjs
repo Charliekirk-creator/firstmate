@@ -209,23 +209,29 @@ const settled = new Promise(resolve => {
 });
 const running = session.prompt('Busy-turn fixture', { source: 'rpc' });
 await arrived;
-requestTarget = before + 3;
-const deferredArrived = new Promise(resolve => { requestTargetReached = resolve; });
 const busySlot = deliveryFailureSlot - period;
 const busyBoundary = new Date(busySlot + 8 * 3600000).toISOString().slice(0, 19);
 writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: busySlot, due: [busySlot] }));
-// Same public delivery API/options as the timer, with no interrupt or user-message synthesis.
+assert.equal(requests, before + 1, 'busy response must not be interrupted');
+release(); await running; await settled;
+requestTarget = before + 2;
+const deferredArrived = new Promise(resolve => { requestTargetReached = resolve; });
 savedPi.sendMessage({ customType: 'firstmate-planning-slot', content: 'Due fixture', display: false },
   { triggerTurn: true, deliverAs: 'followUp' });
-assert.equal(requests, before + 1, 'busy response must not be interrupted');
-release(); await running; await settled; await deferredArrived; await session.waitForIdle();
-assert.equal(requests, before + 3, 'one queued wake and exactly one post-settlement follow-up');
+await deferredArrived; await session.waitForIdle();
+assert.equal(requests, before + 2, 'exactly one post-settlement follow-up');
 assert.ok(JSON.stringify(contexts.at(-1)).includes(busyBoundary), 'post-settlement follow-up receives the retained slot');
 assert.deepEqual(state().due, [busySlot], 'incomplete follow-up retains the busy-turn slot');
 output = tables;
 await session.prompt('Complete busy-turn update', { source: 'rpc' });
 assert.deepEqual(errors, []);
 assert.deepEqual(state().due, []);
+chmodSync(`${home}/state`, 0o500);
+await session.prompt('/planning-session stop', { source: 'rpc' });
+chmodSync(`${home}/state`, 0o700);
+await session.reload();
+assert.equal(state().stopped, 'ledger-failure', 'failed stop cannot silently resume after reload');
+await session.prompt(`/planning-session start ${iso}`, { source: 'rpc' });
 await session.prompt('/planning-session stop', { source: 'rpc' });
 assert.equal(state().stopped, 'command');
 session.dispose();

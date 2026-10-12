@@ -21,7 +21,9 @@ export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && 
 export const ownerKey = (owner: Owner): string => JSON.stringify([
   owner.sessionId, owner.sessionFile, owner.pid, owner.processStart,
 ]);
-export type Revocations = Map<string, { owner: Owner; reason: "ownership-lost" | "ledger-failure" }>;
+export type Revocations = Map<string, {
+  owner: Owner; reason: "ownership-lost" | "ledger-failure"; due?: number[];
+}>;
 
 export function parseFirstSlot(value: string): number {
   if (!/^\d{4}-\d\d-\d\dT\d\d:(00|30):00\+08:00$/.test(value)) {
@@ -128,7 +130,11 @@ export class PlanningSessionClock {
     if (!revoked || !sameOwner(revoked.owner, state.owner)) {
       throw new Error("Planning terminal stop does not match the ledger owner");
     }
-    if (!state.stopped) this.store.write({ ...state, stopped: revoked.reason });
+    if (!state.stopped || revoked.due?.length) {
+      const due = [...new Set([...state.due, ...(revoked.due ?? [])])].sort((a, b) => a - b);
+      const delivery = state.delivery?.slots.some((slot) => due.includes(slot)) ? undefined : state.delivery;
+      this.store.write({ ...state, due, delivery, stopped: revoked.reason });
+    }
     this.revocations.delete(key);
     if (sameOwner(state.owner, this.owner)) this.ownsSchedule = false;
     return sameOwner(state.owner, this.owner);
@@ -148,12 +154,15 @@ export class PlanningSessionClock {
     this.revocations.set(ownerKey(this.owner), { owner: this.owner, reason: "ownership-lost" });
     this.reconcileRevocation();
   }
-  private failStopped(): void {
-    this.dispose();
+  private rememberFailure(due: number[] = []): void {
     const key = ownerKey(this.owner);
-    if (!this.revocations.has(key)) {
-      this.revocations.set(key, { owner: this.owner, reason: "ledger-failure" });
-    }
+    const prior = this.revocations.get(key);
+    this.revocations.set(key, prior ? { ...prior, due: [...new Set([...(prior.due ?? []), ...due])] }
+      : { owner: this.owner, reason: "ledger-failure", due: [...due] });
+  }
+  private failStopped(due: number[] = []): void {
+    this.dispose();
+    this.rememberFailure(due);
   }
   private current(): SlotState | undefined {
     if (this.reconcileRevocation()) return undefined;
@@ -191,10 +200,15 @@ export class PlanningSessionClock {
   }
   stop(reason: string): void {
     this.dispose();
-    const state = this.current();
-    if (state) {
-      this.store.write({ ...state, stopped: reason });
-      this.ownsSchedule = false;
+    try {
+      const state = this.current();
+      if (state) {
+        this.store.write({ ...state, stopped: reason });
+        this.ownsSchedule = false;
+      }
+    } catch (error) {
+      this.failStopped();
+      throw error;
     }
   }
   private schedule(): void {
@@ -238,18 +252,22 @@ export class PlanningSessionClock {
     return state?.due.length ? { owner: this.owner, slots: [...state.due] } : undefined;
   }
   deliver(claim: Claim, entryId: string): boolean {
+    let retained: number[] = [];
     try {
       const state = this.active ? this.current() : undefined;
       if (!state || !sameOwner(claim.owner, this.owner) || !entryId || state.delivery?.entryId === entryId) return false;
       const slots = claim.slots.filter((slot) => state.due.includes(slot));
       if (!slots.length) return false;
+      retained = slots;
       const at = this.io.now();
       if (slots.some((slot) => slot > at)) return false;
+      this.rememberFailure(slots);
       this.store.write({ ...state, due: state.due.filter((slot) => !slots.includes(slot)),
         delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } });
+      this.revocations.delete(ownerKey(this.owner));
       return true;
     } catch (error) {
-      this.failStopped();
+      this.failStopped(retained);
       throw error;
     }
   }

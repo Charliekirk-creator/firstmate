@@ -137,10 +137,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(wifiLink('Wi-Fi Power (en0): On\n', active.replace('RUNNING,', '')), false);
     console.log('ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability');
 
-    let failureState = { ...old, stopped: undefined }, storageFails = true;
+    let failureState = { ...old, stopped: undefined }, storageFails = true, commitBeforeFailure = false;
     const failures = new Map();
     const failureStore = { read: () => failureState, write: (state) => {
-      if (storageFails) throw new Error('disk full');
+      if (storageFails) {
+        if (commitBeforeFailure) failureState = state;
+        throw new Error('disk full');
+      }
       failureState = state;
     } };
     const failed = new PlanningSessionClock(owner, failureStore, io, failures); now = old.through + HALF_HOUR - 1000;
@@ -157,20 +160,33 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     failureReload.start(first); failureReload.dispose();
 
     failureState = { ...old, stopped: undefined, due: [old.through] };
-    storageFails = true;
+    storageFails = true; commitBeforeFailure = true;
     const deliveryFailures = new Map();
     const deliveryFailure = new PlanningSessionClock(owner, failureStore, io, deliveryFailures);
     now = old.through + 1000; deliveryFailure.resume();
     const failedClaim = deliveryFailure.claim();
     assert.throws(() => deliveryFailure.deliver(failedClaim, 'failed-delivery'), /disk full/);
-    assert.equal(callback, undefined); assert.deepEqual(failureState.due, [old.through]);
+    assert.equal(callback, undefined); assert.deepEqual(failureState.due, [], 'rename may have uncertainly committed');
     const deliveryReload = new PlanningSessionClock(owner, failureStore, io, deliveryFailures);
     assert.throws(() => deliveryReload.resume(), /disk full/);
     assert.equal(callback, undefined);
-    storageFails = false; deliveryReload.resume();
+    storageFails = false; commitBeforeFailure = false; deliveryReload.resume();
     assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ledger-failure');
+    assert.deepEqual(failureState.due, [old.through], 'recovery restores every unproved delivery slot');
+    assert.equal(failureState.delivery, undefined);
     deliveryReload.start(first); assert.ok(callback); deliveryReload.dispose();
-    console.log('ok - boundary and delivery write failures stop, retain due work and require explicit recovery');
+
+    failureState = { ...old, stopped: undefined }; storageFails = true;
+    const stopFailures = new Map();
+    const stopFailure = new PlanningSessionClock(owner, failureStore, io, stopFailures);
+    stopFailure.resume(); assert.throws(() => stopFailure.stop('command'), /disk full/);
+    assert.equal(callback, undefined); assert.equal(stopFailures.size, 1);
+    const stopReload = new PlanningSessionClock(owner, failureStore, io, stopFailures);
+    assert.throws(() => stopReload.resume(), /disk full/); assert.equal(callback, undefined);
+    storageFails = false; stopReload.resume();
+    assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ledger-failure');
+    stopReload.start(first); assert.ok(callback); stopReload.dispose();
+    console.log('ok - boundary, delivery and stop failures retain work and require explicit recovery');
 
     assert.throws(() => validateState({ ...old, due: [first, first] }), /Malformed/);
     assert.throws(() => validateState({ ...old, through: old.through + 1 }), /Malformed/);
