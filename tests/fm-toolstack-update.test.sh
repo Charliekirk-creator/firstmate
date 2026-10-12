@@ -284,6 +284,9 @@ for label in ['macOS Tahoe-26.1', '--all', 'Command Line Tools for Xcode; echo u
 for installed_version, available, category in [
     ('1.0.0-beta.1', '1.0.0', 'candidate'),
     ('1.0.0-beta.1', '1.0.0-beta.2', 'candidate'),
+    ('1.0.0-1alpha', '1.0.0-2alpha', 'candidate'),
+    ('1.0.0-1', '1.0.0-1alpha', 'candidate'),
+    ('1.0.0-1alpha.01beta', '1.0.0-1alpha.02beta', 'candidate'),
     ('1.0.0+build.1', '1.0.0+build.2', 'unchanged'),
 ]:
     semver_data = request()
@@ -600,9 +603,15 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='combined-hosted-ref-skill', kind='skill', path='skills/combined-hosted-ref/SKILL.md', owner='pi-package',
          scope='user', source='git:https://github.com/user/repo@release#readme',
          declarations=['git:https://github.com/user/repo@release#readme']),
+    dict(name='scp-hosted-ref-skill', kind='skill', path='skills/scp-hosted-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:git@github.com:user/repo@release%2F1',
+         declarations=['git:git@github.com:user/repo@release%2F1']),
+    dict(name='scp-host-alias-skill', kind='skill', path='skills/scp-host-alias/SKILL.md', owner='pi-package',
+         scope='user', source='git:git@www.github.com:user/repo#v1',
+         declarations=['git:git@www.github.com:user/repo#v1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 28
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 30
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -637,6 +646,10 @@ assert inspected_resources[26]['pins'] == ['release%2F1']
 assert inspected_resources[26]['identity']['update_unit']['identity'] == 'example.com/org/repo'
 assert inspected_resources[27]['pins'] == ['readme#release']
 assert inspected_resources[27]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[28]['pins'] == ['release/1']
+assert inspected_resources[28]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[29]['pins'] == ['v1']
+assert inspected_resources[29]['identity']['update_unit']['identity'] == 'github.com/user/repo'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']

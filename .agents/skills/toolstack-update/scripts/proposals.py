@@ -50,7 +50,7 @@ OWNERS = {
 }
 KINDS = ["extension", "skill", "prompt-template"]
 AXI_NATIVE = {"gh-axi", "quota-axi", "lavish-axi", "chrome-devtools-axi"}
-VERSION = re.compile(r"v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[a-zA-Z-][a-zA-Z0-9-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[a-zA-Z-][a-zA-Z0-9-]*)))*)?(?:\+[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?\Z")
+VERSION = re.compile(r"v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[a-zA-Z0-9-]*[a-zA-Z-][a-zA-Z0-9-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[a-zA-Z0-9-]*[a-zA-Z-][a-zA-Z0-9-]*)))*)?(?:\+[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?\Z")
 WEZ_VERSION = re.compile(r"[0-9]{8}-[0-9]{6}-[a-f0-9]{8}\Z")
 COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
@@ -218,6 +218,10 @@ def git_declaration(source):
         if not match:
             return None
         host, path = match.groups()
+        unaliased_host = host[4:] if host.lower().startswith("www.") else host
+        if "git+ssh" in HOSTED_PROTOCOLS.get(unaliased_host.lower(), set()):
+            host = unaliased_host.lower()
+            hosted_identity = True
     elif explicit_protocol:
         try:
             parsed = urlsplit(value)
@@ -282,11 +286,13 @@ def git_declaration(source):
         return None
     if not host or not path or len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9.:-]+", host):
         return None
+    if ref is None and "@" in path:
+        path, ref = path.split("@", 1)
     if ref is None and host.lower() in HOSTED_GIT.values() and "#" in path:
         path, ref = path.split("#", 1)
         hosted_identity = True
-    if ref is None and "@" in path:
-        path, ref = path.split("@", 1)
+    if hosted_identity and host.lower() == "gist.github.com" and "/" not in path:
+        path = "null/" + path
     if re.search(r"%(?![0-9a-fA-F]{2})", path) or (ref is not None and re.search(r"%(?![0-9a-fA-F]{2})", ref)):
         return None
     try:
