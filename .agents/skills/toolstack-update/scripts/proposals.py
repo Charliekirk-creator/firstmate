@@ -188,6 +188,7 @@ def git_declaration(source):
     host = path = ref = None
     port = None
     hosted = None
+    preserve_encoded_path = False
     if prefixed:
         shortcut = re.fullmatch(r"(github|gitlab|bitbucket|gist|sourcehut):(.+)", value, re.IGNORECASE)
         if shortcut:
@@ -224,34 +225,32 @@ def git_declaration(source):
         path = parsed.path.lstrip("/")
         fragment = parsed.fragment or None
         segments = path.split("/")
+        preserve_encoded_path = True
         if host == "github.com":
             if len(segments) >= 3 and segments[2] == "tree":
                 path = "/".join(segments[:2])
                 ref = segments[3] if len(segments) >= 4 else None
+                preserve_encoded_path = False
             elif len(segments) == 2:
                 ref = fragment
-        elif host == "bitbucket.org":
-            if len(segments) >= 3 and segments[2] != "get":
-                path = "/".join(segments[:2])
-                ref = segments[3] if segments[2] == "src" and len(segments) >= 4 else fragment
-            elif len(segments) == 2:
-                ref = fragment
-        elif host == "git.sr.ht":
-            if len(segments) >= 3 and segments[2] != "archive":
-                path = "/".join(segments[:2])
-                ref = fragment
-            elif len(segments) == 2:
-                ref = fragment
-        elif host == "gist.github.com":
-            if len(segments) == 1:
-                path = "null/" + path
-            elif len(segments) >= 2:
-                path = "/".join(segments[:2])
+                preserve_encoded_path = False
+        elif host == "bitbucket.org" and len(segments) >= 2 and \
+                (len(segments) == 2 or segments[2] != "get"):
+            path = "/".join(segments[:2])
             ref = fragment
+            preserve_encoded_path = False
+        elif host == "git.sr.ht" and len(segments) >= 2 and \
+                (len(segments) == 2 or segments[2] != "archive"):
+            path = "/".join(segments[:2])
+            ref = fragment
+            preserve_encoded_path = False
+        elif host == "gist.github.com" and (len(segments) < 3 or segments[2] != "raw"):
+            path = "null/" + path if len(segments) == 1 else "/".join(segments[:2])
+            ref = fragment
+            preserve_encoded_path = False
         elif host == "gitlab.com" and "/-/" not in "/" + path + "/":
             ref = fragment
-        elif fragment and host not in HOSTED_GIT.values():
-            return None
+            preserve_encoded_path = False
     elif prefixed and "/" in value:
         host, path = value.split("/", 1)
     else:
@@ -275,7 +274,8 @@ def git_declaration(source):
     if decoded_ref is not None and (not decoded_ref or len(decoded_ref) > 200 or
                                     re.search(r"[\x00-\x1f\\]", decoded_ref)):
         return None
-    identity = host.lower() + ((":" + str(port)) if port is not None else "") + "/" + decoded_path.removesuffix(".git")
+    identity_path = path if preserve_encoded_path else decoded_path
+    identity = host.lower() + ((":" + str(port)) if port is not None else "") + "/" + identity_path.removesuffix(".git")
     return (identity, decoded_ref)
 
 
