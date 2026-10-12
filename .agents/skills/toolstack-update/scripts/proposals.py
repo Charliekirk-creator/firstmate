@@ -9,7 +9,7 @@ A supplied approval is a caller's assertion, not proof of captain authority.
 
 Commands: catalog; inspect (default); propose; prepare.
 Resource source records can retain credential-free npm, Git, and local sources;
-only exact-version, unpinned, or latest npm user packages have a preparable resource action.
+only unpinned or latest npm user packages have a preparable resource action.
 inspect takes {observations: {target: observation}} and always returns the full
 catalog. propose adds target and optionally resource (a Pi resource identity object).
 prepare additionally needs approval equal to the current proposal and checkpoint.
@@ -302,11 +302,8 @@ def dispatch(target, row, selected):
         if not source:
             raise Invalid("A managed resource needs its unchanged package declaration.")
         match = PACKAGE.fullmatch(source)
-        if not match or (match[2] not in {None, "latest"} and not VERSION.fullmatch(match[2])):
-            raise Invalid("Git, local, or range/tag sources need their existing owner's separately reviewed proposal.")
-        pin = match[2] if match[2] and VERSION.fullmatch(match[2]) else None
-        if pin and selected["available"].lstrip("v") != pin.lstrip("v"):
-            raise Invalid("Explicit pins are preserved; changing a pin is a separate authorization.")
+        if not match or match[2] not in {None, "latest"}:
+            raise Invalid("Pinned, Git, local, range, or other tag sources need their existing owner's separately reviewed proposal.")
         if selected["scope"] != "user":
             raise Invalid("Project package scope needs separately verified owner isolation; never assume a personal update is project-only.")
         return {"argv": ["pi", "update", source, "--no-approve"]}
@@ -377,6 +374,8 @@ def proposal(data, rows):
         npm_sources = [npm_declaration(resource["source"]) for resource in affected]
         if identity[0] == "npm" and len({selector_identity(source[1]) for source in npm_sources}) != 1:
             raise Invalid("Conflicting declarations for one npm package require reconciliation before approval.")
+        if identity[0] == "npm" and any(source[1] and VERSION.fullmatch(source[1]) for source in npm_sources):
+            raise Invalid("Pinned npm packages are excluded by Pi update and have no preparable owner action.")
         for resource in affected:
             require_assessment(resource, "loaded")
             if any(resource.get(k) is not True for k in

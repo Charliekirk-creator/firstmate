@@ -319,7 +319,10 @@ pinned['observations']['pi']['resources'][0].update(source='npm:example-extensio
                                                     declarations=['npm:example-extension@v1.1.0'],
                                                     pins=['v1.1.0'])
 pinned['resource'] = resource_selector(pinned['observations']['pi']['resources'][0])
-assert prepared(approved(pinned))['dispatch']['argv'][2] == 'npm:example-extension@v1.1.0'
+code, pinned_inspection = invoke('inspect', {'observations': pinned['observations']})
+assert code == 0
+assert pinned_inspection['targets'][0]['observation']['resources'][0]['pins'] == ['v1.1.0']
+refuse('propose', pinned)
 bad = copy.deepcopy(data)
 bad['observations']['pi']['resources'][0]['pin'] = '1.1.0'
 refuse('propose', bad)
@@ -330,7 +333,7 @@ scoped = copy.deepcopy(data)
 scoped['observations']['pi']['resources'][0].update(
     source='npm:@example/extension@1.1.0', declarations=['npm:@example/extension@1.1.0'], pins=['1.1.0'])
 scoped['resource'] = resource_selector(scoped['observations']['pi']['resources'][0])
-assert prepared(approved(scoped))['dispatch']['argv'][2] == 'npm:@example/extension@1.1.0'
+refuse('propose', scoped)
 scoped_aliases = copy.deepcopy(data)
 scoped_aliases['observations']['pi']['resources'][0].update(
     source='npm:@example/extension', declarations=['npm:@example/extension'])
@@ -423,6 +426,14 @@ conflicting = copy.deepcopy(shared)
 conflicting['observations']['pi']['resources'][1].update(
     source='npm:example-extension@1.1.0', declarations=['npm:example-extension@1.1.0'], pins=['1.1.0'])
 refuse('propose', conflicting)
+pinned_package = copy.deepcopy(shared)
+for sibling in pinned_package['observations']['pi']['resources']:
+    sibling.update(source='npm:example-extension@1.1.0',
+                   declarations=['npm:example-extension@1.1.0'], pins=['1.1.0'])
+pinned_package['resource'] = resource_selector(pinned_package['observations']['pi']['resources'][0])
+code, pinned_siblings = invoke('inspect', {'observations': pinned_package['observations']})
+assert code == 0 and len(pinned_siblings['targets'][0]['observation']['resources']) == 2
+refuse('propose', pinned_package)
 changed_effective = approved(shared)
 changed_effective['observations']['pi']['resources'][1].update(
     effective_version='0.8.0', effective_version_evidence='different loaded process')
