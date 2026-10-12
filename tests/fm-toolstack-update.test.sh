@@ -674,9 +674,15 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='gist-multiple-at-skill', kind='skill', path='skills/gist-multiple-at/SKILL.md', owner='pi-package',
          scope='user', source='git:gist:abc@release@candidate',
          declarations=['git:gist:abc@release@candidate'], pins=[]),
+    dict(name='tree-combined-ref-skill', kind='skill', path='skills/tree-combined-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:github.com/u/r/tree/release@candidate',
+         declarations=['git:github.com/u/r/tree/release@candidate']),
+    dict(name='uppercase-hosted-protocol-skill', kind='skill', path='skills/uppercase-hosted/SKILL.md', owner='pi-package',
+         scope='user', source='HTTPS://github.com/u/r',
+         declarations=['HTTPS://github.com/u/r'], pins=[]),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 45
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 47
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -743,6 +749,10 @@ assert inspected_resources[43]['pins'] == []
 assert inspected_resources[43]['identity']['update_unit']['identity'] == 'github.com/u/r'
 assert inspected_resources[44]['pins'] == []
 assert inspected_resources[44]['identity']['update_unit']['identity'] == 'gist.github.com/null/release@candidate'
+assert inspected_resources[45]['pins'] == ['release@candidate']
+assert inspected_resources[45]['identity']['update_unit']['identity'] == 'github.com/u/r'
+assert inspected_resources[46]['pins'] == []
+assert inspected_resources[46]['identity']['update_unit']['identity'] == 'github.com/u/r'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
@@ -804,6 +814,10 @@ query_npm['observations']['pi']['resources'][0].update(
 code, npm_query_refusal = invoke(
     'inspect', {'observations': query_npm['observations']}, forbidden=(npm_query,))
 assert code == 2 and npm_query not in json.dumps(npm_query_refusal)
+unsupported_uppercase_url = copy.deepcopy(source_forms)
+unsupported_uppercase_url['observations']['pi']['resources'][46].update(
+    source='HTTPS://example.com/org/repo', declarations=['HTTPS://example.com/org/repo'])
+refuse('inspect', {'observations': unsupported_uppercase_url['observations']})
 for row in source_forms['observations']['pi']['resources']:
     assert row['source'] in json.dumps(source_inspection)
 range_update = copy.deepcopy(data)

@@ -194,7 +194,7 @@ def hosted_declaration(host, path, ref, protocol):
         if len(segments) == 3:
             effective_ref = "undefined"
         elif len(segments) >= 4:
-            effective_ref = segments[3] or None
+            effective_ref = segments[3] + "@" + ref if segments[3] and ref else segments[3] or None
         else:
             effective_ref = ref
         return canonical_host, "/".join(segments[:2]), effective_ref, True
@@ -293,9 +293,12 @@ def git_declaration(source):
                 path, path_ref = repo_path, candidate_ref
         hosted_ref = (fragment + "#" + path_ref) if fragment and path_ref else path_ref or fragment
         ref = path_ref
-        normalized = hosted_declaration(host, path, hosted_ref, parsed.scheme.lower())
+        extraction_ref = path_ref if len(path.split("/")) >= 3 and path.split("/")[2] == "tree" else hosted_ref
+        normalized = hosted_declaration(host, path, extraction_ref, parsed.scheme.lower())
         if normalized[3]:
             host, path, ref, hosted_identity = normalized
+        elif explicit_protocol.group(1) != explicit_protocol.group(1).lower():
+            return None
         else:
             preserve_encoded_path = True
     elif prefixed and "/" in value:
