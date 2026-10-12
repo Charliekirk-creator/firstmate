@@ -656,9 +656,18 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='bare-gitlab-archive-skill', kind='skill', path='skills/bare-gitlab-archive/SKILL.md', owner='pi-package',
          scope='user', source='git:gitlab.com/group/repo/archive.tar.gz@release%2F1',
          declarations=['git:gitlab.com/group/repo/archive.tar.gz@release%2F1']),
+    dict(name='gitlab-leading-archive-skill', kind='skill', path='skills/gitlab-leading-archive/SKILL.md', owner='pi-package',
+         scope='user', source='git:gitlab.com/archive.tar.gz/repo@release%2F1',
+         declarations=['git:gitlab.com/archive.tar.gz/repo@release%2F1']),
+    dict(name='gist-suffix-skill', kind='skill', path='skills/gist-suffix/SKILL.md', owner='pi-package',
+         scope='user', source='git:gist:abc123@release%2F1',
+         declarations=['git:gist:abc123@release%2F1'], pins=[]),
+    dict(name='gist-ordinary-ref-skill', kind='skill', path='skills/gist-ordinary-ref/SKILL.md', owner='pi-package',
+         scope='user', source='git:gist:user/abc123@release%2F1',
+         declarations=['git:gist:user/abc123@release%2F1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 39
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 42
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -713,6 +722,12 @@ for index in (36, 38):
     assert inspected_resources[index]['identity']['update_unit']['identity'] == 'gitlab.com/group/repo/archive.tar.gz'
 assert inspected_resources[37]['pins'] == []
 assert inspected_resources[37]['identity']['update_unit']['identity'] == 'gitlab.com/group/repo/archive.tar.gz'
+assert inspected_resources[39]['pins'] == ['release/1']
+assert inspected_resources[39]['identity']['update_unit']['identity'] == 'gitlab.com/archive.tar.gz/repo'
+assert inspected_resources[40]['pins'] == []
+assert inspected_resources[40]['identity']['update_unit']['identity'] == 'gist.github.com/null/release/1'
+assert inspected_resources[41]['pins'] == ['release/1']
+assert inspected_resources[41]['identity']['update_unit']['identity'] == 'gist.github.com/user/abc123'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']

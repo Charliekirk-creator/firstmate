@@ -198,7 +198,7 @@ def hosted_declaration(host, path, ref, protocol):
             return host, path, ref, False
         return canonical_host, "/".join(segments[:2]), ref, True
     if canonical_host == "gitlab.com":
-        if len(segments) < 2 or "/-/" in "/" + path + "/" or "/archive.tar.gz" in "/" + path:
+        if len(segments) < 2 or "/-/" in "/" + path + "/" or "/archive.tar.gz" in path:
             return host, path, ref, False
         return canonical_host, path, ref, True
     if canonical_host == "gist.github.com":
@@ -243,6 +243,8 @@ def git_declaration(source):
         if "#" in path:
             path, ref = path.split("#", 1)
         if hosted == "gist" and "/" not in path:
+            if "@" in path:
+                path = path.split("@", 1)[1]
             path = "null/" + path
     elif value.startswith("git@"):
         if not prefixed:
