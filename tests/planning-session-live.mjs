@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import http from 'node:http';
@@ -99,15 +99,21 @@ assert.equal(state().owner.processStart, Math.floor(performance.timeOrigin));
 assert.equal(state().owner.sessionId, session.sessionManager.getSessionId());
 assert.equal(state().firstSlot, future);
 assert.deepEqual(state().due, []);
+const savedLedger = `${ledger}.saved`;
+renameSync(ledger, savedLedger);
+symlinkSync(savedLedger, ledger);
 writeFileSync(`${home}/state/.lock`, String(process.pid + 1));
 await session.prompt('/planning-session status', { source: 'rpc' });
-assert.equal(state().stopped, 'ownership-lost');
+assert.ok(notices.at(-1).includes('Unsafe planning-session ledger'));
+unlinkSync(ledger);
+renameSync(savedLedger, ledger);
 writeFileSync(`${home}/state/.lock`, String(process.pid));
 await session.reload();
+assert.equal(state().stopped, 'ownership-lost', 'reload retries the failed revocation durably');
 await session.prompt('/planning-session status', { source: 'rpc' });
 assert.equal(JSON.parse(notices.at(-1)).armed, false, 'lock regain and reload cannot silently re-arm');
 await session.prompt(`/planning-session start ${iso}`, { source: 'rpc' });
-assert.equal(state().stopped, undefined, 'fresh explicit start creates a new ownership epoch');
+assert.equal(state().stopped, undefined, 'fresh explicit start follows durable reconciliation');
 
 // Seed an online observation as the deterministic clock test does; native Pi
 // lifecycle, persistence and delivery remain real. No wall-clock waiting.
@@ -145,7 +151,7 @@ assert.deepEqual(state().due, []);
 const receipt = state().delivery;
 assert.ok(session.sessionManager.getEntry(receipt.entryId));
 assert.ok(readFileSync(session.sessionManager.getSessionFile(), 'utf8').includes(receipt.entryId));
-console.log(`ok - real Pi ${version} terminal ownership loss, explicit restart, latched tool-loop claim and persisted delivery`);
+console.log(`ok - real Pi ${version} failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery`);
 
 await session.prompt('/planning-session status', { source: 'rpc' });
 assert.equal(JSON.parse(notices.at(-1)).armed, true, 'timer remains armed before busy follow-up');

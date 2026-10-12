@@ -7,7 +7,7 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completePlanningTables, fileStore, HALF_HOUR, parseFirstSlot, PlanningSessionClock, wifiInterfaces, wifiLink,
-  type Claim, type Owner } from "./lib/fm-planning-session.ts";
+  type Claim, type Owner, type Revocations } from "./lib/fm-planning-session.ts";
 
 const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "../.."));
 const home = process.env.FM_HOME || root;
@@ -77,8 +77,12 @@ function instructions(slots: number[]): string {
 }
 
 type Lifecycle = { dispose(): void };
-const globals = globalThis as typeof globalThis & { __fmPlanningSession?: Map<string, Lifecycle> };
+const globals = globalThis as typeof globalThis & {
+  __fmPlanningSession?: Map<string, Lifecycle>;
+  __fmPlanningRevocations?: Map<string, Revocations>;
+};
 const instances = globals.__fmPlanningSession ??= new Map<string, Lifecycle>();
+const processRevocations = globals.__fmPlanningRevocations ??= new Map<string, Revocations>();
 
 export default function (pi: ExtensionAPI) {
   let clock: PlanningSessionClock | undefined;
@@ -90,6 +94,8 @@ export default function (pi: ExtensionAPI) {
   let live = false;
   let wakeQueued = false;
   const key = `${root}\0${home}`;
+  const revocations = processRevocations.get(key) ?? new Map();
+  processRevocations.set(key, revocations);
   const lifecycle: Lifecycle = { dispose() {
     live = false;
     clock?.dispose();
@@ -133,8 +139,8 @@ export default function (pi: ExtensionAPI) {
         wakeQueued = true;
       },
       error,
-    });
-    if (!live) { clock.ownershipLost(); return; }
+    }, revocations);
+    if (!live) { clock.ownershipLost(true); return; }
     clock.resume();
   };
 

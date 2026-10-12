@@ -94,6 +94,30 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     clock.resume(); assert.equal(callback, undefined);
     console.log('ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit restart and Main-closed stop');
 
+    let revocationState = { ...old, stopped: undefined }, revocationWriteFails = true;
+    const revocations = new Map();
+    const revocationStore = { read: () => revocationState, write: (state) => {
+      if (revocationWriteFails) throw new Error('revocation disk full');
+      revocationState = state;
+    } };
+    valid = true;
+    const lost = new PlanningSessionClock(owner, revocationStore, io, revocations);
+    lost.resume();
+    valid = false;
+    assert.throws(() => lost.ownershipLost(), /revocation disk full/);
+    assert.equal(callback, undefined); assert.equal(revocations.size, 1);
+    valid = true;
+    const recovered = new PlanningSessionClock(owner, revocationStore, io, revocations);
+    assert.throws(() => recovered.resume(), /revocation disk full/);
+    assert.equal(callback, undefined); assert.equal(revocations.size, 1, 'reload retains unresolved revocation');
+    revocationWriteFails = false;
+    recovered.resume();
+    assert.equal(callback, undefined, 'storage recovery reconciles without silent resume');
+    assert.equal(revocationState.stopped, 'ownership-lost'); assert.equal(revocations.size, 0);
+    recovered.start(first); assert.ok(callback, 'explicit start follows durable reconciliation');
+    recovered.dispose();
+    console.log('ok - failed ownership revocation survives reload, retries durably and requires explicit restart');
+
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',

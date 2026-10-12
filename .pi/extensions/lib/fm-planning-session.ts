@@ -18,6 +18,10 @@ export type Store = { read(): SlotState | undefined; write(state: SlotState): vo
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0;
 export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && a.sessionFile === b.sessionFile &&
   a.pid === b.pid && a.processStart === b.processStart;
+export const ownerKey = (owner: Owner): string => JSON.stringify([
+  owner.sessionId, owner.sessionFile, owner.pid, owner.processStart,
+]);
+export type Revocations = Map<string, Owner>;
 
 export function parseFirstSlot(value: string): number {
   if (!/^\d{4}-\d\d-\d\dT\d\d:(00|30):00\+08:00$/.test(value)) {
@@ -104,23 +108,46 @@ export class PlanningSessionClock {
   private owner: Owner;
   private store: Store;
   private io: ClockIO;
+  private revocations: Revocations;
   private cancel?: () => void;
   private active = false;
-  constructor(owner: Owner, store: Store, io: ClockIO) {
+  constructor(owner: Owner, store: Store, io: ClockIO, revocations: Revocations = new Map()) {
     this.owner = owner;
     this.store = store;
     this.io = io;
+    this.revocations = revocations;
+  }
+  private reconcileRevocation(): boolean {
+    if (!this.revocations.size) return false;
+    this.dispose();
+    const state = this.store.read();
+    if (!state) throw new Error("Planning ownership revocation is unresolved without its ledger");
+    const key = ownerKey(state.owner);
+    const revoked = this.revocations.get(key);
+    if (!revoked || !sameOwner(revoked, state.owner)) {
+      throw new Error("Planning ownership revocation does not match the ledger owner");
+    }
+    if (!state.stopped) this.store.write({ ...state, stopped: "ownership-lost" });
+    this.revocations.delete(key);
+    return sameOwner(state.owner, this.owner);
   }
   private ownedState(): SlotState | undefined {
     const state = this.store.read();
     return state && sameOwner(state.owner, this.owner) ? state : undefined;
   }
-  ownershipLost(): void {
+  ownershipLost(force = false): void {
+    if (!this.active) {
+      if (!force) return;
+      if (this.revocations.size) { this.reconcileRevocation(); return; }
+      const state = this.ownedState();
+      if (!state || state.stopped) return;
+    }
     this.dispose();
-    const state = this.ownedState();
-    if (state && !state.stopped) this.store.write({ ...state, stopped: "ownership-lost" });
+    this.revocations.set(ownerKey(this.owner), this.owner);
+    this.reconcileRevocation();
   }
   private current(): SlotState | undefined {
+    if (this.reconcileRevocation()) return undefined;
     if (!this.io.valid()) { this.ownershipLost(); return undefined; }
     const state = this.ownedState();
     return state && !state.stopped ? state : undefined;
@@ -130,6 +157,7 @@ export class PlanningSessionClock {
       this.ownershipLost();
       throw new Error("Only the live lock-owning Main session may start planning updates");
     }
+    this.reconcileRevocation();
     const prior = this.store.read();
     if (prior && sameOwner(prior.owner, this.owner) && !prior.stopped) {
       if (prior.firstSlot !== firstSlot) throw new Error("This session already has a different schedule");
