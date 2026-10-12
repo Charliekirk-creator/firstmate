@@ -84,10 +84,21 @@ export default function (pi: ExtensionAPI) {
   let clock: PlanningSessionClock | undefined;
   let ctx: ExtensionContext | undefined;
   let claim: (Claim & { leaf: string | null }) | undefined;
+  let responseClaim: (Claim & { leaf: string | null }) | undefined;
+  let claimLatched = false;
+  let requestBoundary: string | undefined;
   let live = false;
   let wakeQueued = false;
   const key = `${root}\0${home}`;
-  const lifecycle: Lifecycle = { dispose() { live = false; clock?.dispose(); claim = undefined; } };
+  const lifecycle: Lifecycle = { dispose() {
+    live = false;
+    clock?.dispose();
+    claim = undefined;
+    responseClaim = undefined;
+    claimLatched = false;
+    requestBoundary = undefined;
+    wakeQueued = false;
+  } };
   const error = (problem: unknown) => ctx?.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");
 
   const setup = (context: ExtensionContext) => {
@@ -96,10 +107,14 @@ export default function (pi: ExtensionAPI) {
     ctx = context;
     live = main(context);
     claim = undefined;
+    responseClaim = undefined;
+    claimLatched = false;
+    requestBoundary = undefined;
     wakeQueued = false;
-    if (!live) return;
+    const sessionFile = context.sessionManager.getSessionFile();
+    if (!sessionFile) return;
     const owner: Owner = { sessionId: context.sessionManager.getSessionId(),
-      sessionFile: context.sessionManager.getSessionFile()!, pid: process.pid, processStart };
+      sessionFile, pid: process.pid, processStart };
     clock = new PlanningSessionClock(owner, fileStore(ledger), {
       now: Date.now,
       valid: () => live && instances.get(key) === lifecycle && !!ctx && main(ctx) &&
@@ -119,6 +134,7 @@ export default function (pi: ExtensionAPI) {
       },
       error,
     });
+    if (!live) { clock.ownershipLost(); return; }
     clock.resume();
   };
 
@@ -126,7 +142,10 @@ export default function (pi: ExtensionAPI) {
     description: "Explicitly start this Main session's half-hour planning slots: start <Hong-Kong ISO time>, status, or stop",
     handler: async (args, context) => {
       try {
-        if (!main(context)) throw new Error("Planning slots require the lock-owning Main session with persistent history");
+        if (!main(context)) {
+          clock?.ownershipLost();
+          throw new Error("Planning slots require the lock-owning Main session with persistent history");
+        }
         if (!live || !clock) setup(context);
         const [action, value, extra] = args.trim().split(/\s+/);
         if (action === "start" && value && !extra) {
@@ -152,22 +171,53 @@ export default function (pi: ExtensionAPI) {
     lifecycle.dispose();
     if (instances.get(key) === lifecycle) instances.delete(key);
   });
-  pi.on("context", (event, context) => {
-    const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== customType);
+  pi.on("before_agent_start", () => {
     claim = undefined;
+    claimLatched = false;
+  });
+  pi.on("context", (event, context) => {
+    const boundary = event.messages.findLast((message) => message.role === "custom" && message.customType === customType);
+    const boundaryKey = boundary ? JSON.stringify([boundary.timestamp, boundary.content]) : undefined;
+    if (boundaryKey && boundaryKey !== requestBoundary) {
+      requestBoundary = boundaryKey;
+      claim = undefined;
+      claimLatched = false;
+    }
+    const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== customType);
+    const last = messages.at(-1);
+    if (claimLatched && last?.role === "assistant" && last.stopReason === "stop") {
+      claim = undefined;
+      claimLatched = false;
+    }
     try {
-      const due = clock?.claim();
-      if (!due) return { messages };
-      claim = { ...due, leaf: context.sessionManager.getLeafId() };
-      return { messages: [...messages, { role: "custom" as const, customType, content: instructions(due.slots),
+      if (!claimLatched) {
+        claimLatched = true;
+        const due = clock?.claim();
+        if (due) claim = { ...due, leaf: context.sessionManager.getLeafId() };
+      }
+      responseClaim = claim;
+      if (!claim) return { messages };
+      return { messages: [...messages, { role: "custom" as const, customType, content: instructions(claim.slots),
         display: false, timestamp: Date.now() }] };
-    } catch (problem) { error(problem); return { messages }; }
+    } catch (problem) {
+      responseClaim = undefined;
+      error(problem);
+      return { messages };
+    }
   });
   pi.on("turn_end", (event, context) => {
-    const snapshot = claim;
-    claim = undefined;
-    if (!snapshot || !live || !main(context) || event.outcome !== "completed" ||
-        event.message.role !== "assistant" || event.message.stopReason !== "stop") return;
+    const snapshot = responseClaim;
+    const responseComplete = event.outcome === "completed" && event.message.role === "assistant" &&
+      event.message.stopReason === "stop";
+    if (responseComplete) {
+      claim = undefined;
+      claimLatched = false;
+    }
+    if (!snapshot || !live || !responseComplete) return;
+    if (!main(context)) {
+      try { clock?.ownershipLost(); } catch (problem) { error(problem); }
+      return;
+    }
     try {
       // Prove the actual entry is on disk and descends from this request's boundary.
       const file = context.sessionManager.getSessionFile();
@@ -192,5 +242,39 @@ export default function (pi: ExtensionAPI) {
       if (completePlanningTables(text)) clock?.deliver(snapshot, event.messageEntryId);
     } catch (problem) { error(problem); }
   });
-  pi.on("agent_settled", () => { wakeQueued = false; claim = undefined; });
+  pi.on("agent_settled", () => {
+    const snapshot = responseClaim;
+    try {
+      if (snapshot && live && ctx && main(ctx)) {
+        const file = ctx.sessionManager.getSessionFile();
+        const entryId = ctx.sessionManager.getLeafId();
+        if (file === snapshot.owner.sessionFile && entryId) {
+          const stat = lstatSync(file);
+          if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1) {
+            const entries = readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+            const byId = new Map(entries.filter((entry) => entry.type !== "session").map((entry) => [entry.id, entry]));
+            const entry = byId.get(entryId);
+            let ancestor = entry?.parentId;
+            const visited = new Set<string>();
+            while (ancestor !== null && ancestor !== snapshot.leaf && !visited.has(ancestor)) {
+              visited.add(ancestor);
+              ancestor = byId.get(ancestor)?.parentId;
+              if (ancestor === undefined) break;
+            }
+            const text = entry?.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "stop"
+              ? entry.message.content.filter((part: { type: string }) => part.type === "text")
+                .map((part: { text: string }) => part.text).join("\n") : "";
+            if (entries[0]?.type === "session" && entries[0]?.id === snapshot.owner.sessionId &&
+                ancestor === snapshot.leaf && entryId !== snapshot.leaf && completePlanningTables(text)) {
+              clock?.deliver(snapshot, entryId);
+            }
+          }
+        }
+      }
+    } catch (problem) { error(problem); }
+    claim = undefined;
+    responseClaim = undefined;
+    claimLatched = false;
+    wakeQueued = false;
+  });
 }

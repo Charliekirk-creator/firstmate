@@ -111,16 +111,28 @@ export class PlanningSessionClock {
     this.store = store;
     this.io = io;
   }
-  private current(): SlotState | undefined {
-    if (!this.io.valid()) return undefined;
+  private ownedState(): SlotState | undefined {
     const state = this.store.read();
-    return state && sameOwner(state.owner, this.owner) && !state.stopped ? state : undefined;
+    return state && sameOwner(state.owner, this.owner) ? state : undefined;
+  }
+  ownershipLost(): void {
+    this.dispose();
+    const state = this.ownedState();
+    if (state && !state.stopped) this.store.write({ ...state, stopped: "ownership-lost" });
+  }
+  private current(): SlotState | undefined {
+    if (!this.io.valid()) { this.ownershipLost(); return undefined; }
+    const state = this.ownedState();
+    return state && !state.stopped ? state : undefined;
   }
   start(firstSlot: number): void {
-    if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may start planning updates");
+    if (!this.io.valid()) {
+      this.ownershipLost();
+      throw new Error("Only the live lock-owning Main session may start planning updates");
+    }
     const prior = this.store.read();
-    if (prior && sameOwner(prior.owner, this.owner)) {
-      if (prior.stopped || prior.firstSlot !== firstSlot) throw new Error("This session already has a different or stopped schedule");
+    if (prior && sameOwner(prior.owner, this.owner) && !prior.stopped) {
+      if (prior.firstSlot !== firstSlot) throw new Error("This session already has a different schedule");
     } else {
       // Starting late never reconstructs connectivity for earlier boundaries.
       const through = Math.max(firstSlot - HALF_HOUR, firstSlot + Math.floor((this.io.now() - firstSlot) / HALF_HOUR) * HALF_HOUR);

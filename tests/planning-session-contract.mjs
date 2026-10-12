@@ -83,11 +83,16 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.deepEqual(store.read(), old);
     clock.resume(); valid = false; fire(first + 7 * HALF_HOUR);
     assert.equal(callback, undefined); assert.equal(clock.claim(), undefined);
-    valid = true; clock.resume(); clock.stop('quit');
+    assert.equal(store.read().stopped, 'ownership-lost');
+    valid = true; clock.resume(); assert.equal(callback, undefined, 'lock regain cannot silently re-arm');
+    clock = new PlanningSessionClock(owner, store, io); clock.resume();
+    assert.equal(callback, undefined, 'same-owner reload cannot silently re-arm');
+    clock.start(first); assert.ok(callback, 'fresh explicit start may create a new ownership epoch');
+    assert.equal(store.read().stopped, undefined);
+    clock.stop('quit');
     assert.equal(callback, undefined); assert.equal(store.read().stopped, 'quit');
     clock.resume(); assert.equal(callback, undefined);
-    assert.throws(() => clock.start(first), /stopped/);
-    console.log('ok - owner process, PID reuse, fork/new session, lock loss and Main-closed stop');
+    console.log('ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit restart and Main-closed stop');
 
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);

@@ -1071,18 +1071,18 @@ bash tests/fm-pi-primary-types.test.sh
 ```text
 ok - Hong Kong 16:30 alignment, 30-minute boundaries, durable dedup, reload and pre-response delivery
 ok - offline skip, no reconnect burst, suspended-loop skip and unknown Wi-Fi refusal
-ok - owner process, PID reuse, fork/new session, lock loss and Main-closed stop
+ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit restart and Main-closed stop
 ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused
 ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability
 ok - storage failure never wakes falsely, malformed state preserved, unsafe links refused, late activation does not backfill
-ok - real Pi 0.87.1 arming, hidden context, partial/error/abort/truncation retention, reload and persisted delivery
+ok - real Pi 0.87.1 terminal ownership loss, explicit restart, latched tool-loop claim and persisted delivery
 ok - real Pi 0.87.1 busy response completes before one follow-up, canonical bytes unchanged, timer does not keep process alive
 skip: tsc not found for Pi extension typecheck
 ```
 
 The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects rather than implementation-source text.
 The real-SDK test uses a temporary primary repository, isolated Main home and agent directory, and an in-process fixture provider with networking denied.
-It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command, context, response-persistence, reload, and busy follow-up paths.
+It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command, multi-call tool-loop context, response-persistence, ownership loss, reload, explicit restart, and busy follow-up paths.
 Neither test activates a timer in the operator's Main or contacts a model provider.
 The strict typecheck skip is missing verification, not a passing type verdict; rerun it with an already available supported TypeScript compiler before relying on that evidence.
 

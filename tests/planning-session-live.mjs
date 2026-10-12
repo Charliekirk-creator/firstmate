@@ -16,33 +16,49 @@ const code = `${lab}/code`, home = `${lab}/home`, ledger = `${home}/state/planni
 const { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, ModelRuntime } =
   await import(pathToFileURL(`${pkg}/dist/index.js`));
 const { createAssistantMessageEventStream } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`));
+const { Type } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/index.js`));
 const version = JSON.parse(readFileSync(`${pkg}/package.json`)).version;
 process.chdir(code);
 writeFileSync(`${home}/state/.lock`, String(process.pid));
 const canonical = `${home}/data/planning/planning.md`, canonicalBefore = readFileSync(canonical);
 const state = () => JSON.parse(readFileSync(ledger, 'utf8'));
 let output = 'Captain, partial response.', reason = 'stop', requests = 0, providerGate, entered;
-let savedPi;
+let savedPi, toolLoop = false, toolSlot;
 const contexts = [];
 const modelSpec = { id: 'offline', name: 'Offline fixture', reasoning: false, input: ['text'],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2048 };
 function fixture(pi) {
   savedPi = pi;
+  pi.registerTool({ name: 'planning_fixture', label: 'Planning fixture', description: 'Continue the isolated slot fixture',
+    parameters: Type.Object({}), execute: async () =>
+      ({ content: [{ type: 'text', text: 'fixture continued' }], details: undefined }) });
   pi.registerProvider('planning-offline', { api: 'openai-completions', apiKey: 'fixture-not-a-credential',
     baseUrl: 'https://network.invalid', models: [modelSpec], streamSimple: (model, context) => {
       requests++; contexts.push(context);
-      const stream = createAssistantMessageEventStream(), text = output, stopReason = reason, wait = providerGate;
+      const stream = createAssistantMessageEventStream(), text = output, stopReason = toolLoop ? 'toolUse' : reason,
+        wait = providerGate, useTool = toolLoop;
+      toolLoop = false;
       providerGate = undefined;
       entered?.(); entered = undefined;
       void (async () => {
         await wait;
+        if (useTool) {
+          const current = state();
+          writeFileSync(ledger, JSON.stringify({ ...current, through: toolSlot, due: [...current.due, toolSlot] }));
+        }
+        const content = useTool ? [{ type: 'toolCall', id: `fixture-${requests}`, name: 'planning_fixture', arguments: {} }]
+          : [{ type: 'text', text }];
         const message = { role: 'assistant', api: model.api, provider: model.provider, model: model.id,
-          content: [{ type: 'text', text }], timestamp: Date.now(), stopReason,
+          content, timestamp: Date.now(), stopReason,
           usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
         stream.push({ type: 'start', partial: message });
         if (['error', 'aborted'].includes(stopReason)) stream.push({ type: 'error', reason: stopReason, error: message });
-        else {
+        else if (useTool) {
+          stream.push({ type: 'toolcall_start', contentIndex: 0, partial: message });
+          stream.push({ type: 'toolcall_end', contentIndex: 0, toolCall: content[0], partial: message });
+          stream.push({ type: 'done', reason: stopReason, message });
+        } else {
           stream.push({ type: 'text_start', contentIndex: 0, partial: message });
           stream.push({ type: 'text_delta', contentIndex: 0, delta: text, partial: message });
           stream.push({ type: 'text_end', contentIndex: 0, content: text, partial: message });
@@ -83,6 +99,15 @@ assert.equal(state().owner.processStart, Math.floor(performance.timeOrigin));
 assert.equal(state().owner.sessionId, session.sessionManager.getSessionId());
 assert.equal(state().firstSlot, future);
 assert.deepEqual(state().due, []);
+writeFileSync(`${home}/state/.lock`, String(process.pid + 1));
+await session.prompt('/planning-session status', { source: 'rpc' });
+assert.equal(state().stopped, 'ownership-lost');
+writeFileSync(`${home}/state/.lock`, String(process.pid));
+await session.reload();
+await session.prompt('/planning-session status', { source: 'rpc' });
+assert.equal(JSON.parse(notices.at(-1)).armed, false, 'lock regain and reload cannot silently re-arm');
+await session.prompt(`/planning-session start ${iso}`, { source: 'rpc' });
+assert.equal(state().stopped, undefined, 'fresh explicit start creates a new ownership epoch');
 
 // Seed an online observation as the deterministic clock test does; native Pi
 // lifecycle, persistence and delivery remain real. No wall-clock waiting.
@@ -101,27 +126,55 @@ reason = 'stop'; output = tables.replace('| Test | Verified |', '');
 await session.prompt('Missing completed row', { source: 'rpc' }); assert.deepEqual(state().due, [slot]);
 await session.reload(); assert.deepEqual(state().due, [slot]);
 output = tables;
-await session.prompt('Complete update', { source: 'rpc' });
+toolSlot = slot + period;
+toolLoop = true;
+const contextStart = contexts.length;
+await session.prompt('Complete update through a tool loop', { source: 'rpc' });
+assert.deepEqual(state().due, [toolSlot], 'slot arriving during the run remains pending');
+const runContexts = contexts.slice(contextStart);
+assert.equal(runContexts.length, 2);
+const initialBoundary = new Date(slot + 8 * 3600000).toISOString().slice(0, 19);
+const laterBoundary = new Date(toolSlot + 8 * 3600000).toISOString().slice(0, 19);
+for (const context of runContexts) {
+  const serialized = JSON.stringify(context);
+  assert.ok(serialized.includes(initialBoundary), 'latched claim remains in every model call');
+  assert.ok(!serialized.includes(laterBoundary), 'later slot never expands the active run claim');
+}
+await session.prompt('Complete later update', { source: 'rpc' });
 assert.deepEqual(state().due, []);
 const receipt = state().delivery;
 assert.ok(session.sessionManager.getEntry(receipt.entryId));
 assert.ok(readFileSync(session.sessionManager.getSessionFile(), 'utf8').includes(receipt.entryId));
-console.log(`ok - real Pi ${version} arming, hidden context, partial/error/abort/truncation retention, reload and persisted delivery`);
+console.log(`ok - real Pi ${version} terminal ownership loss, explicit restart, latched tool-loop claim and persisted delivery`);
 
+await session.prompt('/planning-session status', { source: 'rpc' });
+assert.equal(JSON.parse(notices.at(-1)).armed, true, 'timer remains armed before busy follow-up');
 output = 'Captain, working.';
 let release;
 providerGate = new Promise(resolve => { release = resolve; });
 const arrived = new Promise(resolve => { entered = resolve; });
 const before = requests;
+const settled = new Promise(resolve => {
+  const unsubscribe = session.subscribe(event => {
+    if (event.type === 'agent_settled') { unsubscribe(); resolve(); }
+  });
+});
 const running = session.prompt('Busy-turn fixture', { source: 'rpc' });
 await arrived;
-writeFileSync(ledger, JSON.stringify({ ...state(), through: slot + period, due: [slot + period] }));
+const busySlot = slot - period;
+const busyBoundary = new Date(busySlot + 8 * 3600000).toISOString().slice(0, 19);
+writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: busySlot, due: [busySlot] }));
 // Same public delivery API/options as the timer, with no interrupt or user-message synthesis.
 savedPi.sendMessage({ customType: 'firstmate-planning-slot', content: 'Due fixture', display: false },
   { triggerTurn: true, deliverAs: 'followUp' });
 assert.equal(requests, before + 1, 'busy response must not be interrupted');
-output = tables; release(); await running;
+release(); await running; await settled;
 assert.equal(requests, before + 2, 'exactly one safe follow-up');
+assert.ok(JSON.stringify(contexts.at(-1)).includes(busyBoundary), 'safe follow-up receives the pending slot');
+assert.deepEqual(state().due, [busySlot], 'incomplete follow-up retains the busy-turn slot');
+output = tables;
+await session.prompt('Complete busy-turn update', { source: 'rpc' });
+assert.deepEqual(errors, []);
 assert.deepEqual(state().due, []);
 await session.prompt('/planning-session stop', { source: 'rpc' });
 assert.equal(state().stopped, 'command');
