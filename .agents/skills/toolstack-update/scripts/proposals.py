@@ -182,10 +182,10 @@ def npm_declaration(source):
     return (match.group(1), match.group(2)) if match else None
 
 
-def scp_hosted_declaration(host, path, ref):
+def hosted_declaration(host, path, ref, protocol):
     canonical_host = host[4:] if host.lower().startswith("www.") else host
     canonical_host = canonical_host.lower()
-    if "git+ssh" not in HOSTED_PROTOCOLS.get(canonical_host, set()):
+    if protocol not in HOSTED_PROTOCOLS.get(canonical_host, set()):
         return host, path, ref, False
     segments = path.split("/")
     if canonical_host == "github.com":
@@ -198,7 +198,7 @@ def scp_hosted_declaration(host, path, ref):
             return host, path, ref, False
         return canonical_host, "/".join(segments[:2]), ref, True
     if canonical_host == "gitlab.com":
-        if len(segments) < 2 or "/-/" in "/" + path + "/":
+        if len(segments) < 2 or "/-/" in "/" + path + "/" or "/archive.tar.gz" in "/" + path:
             return host, path, ref, False
         return canonical_host, path, ref, True
     if canonical_host == "gist.github.com":
@@ -255,18 +255,19 @@ def git_declaration(source):
             repo_path, candidate_ref = path.split("@", 1)
             if repo_path and candidate_ref:
                 path, ref = repo_path, candidate_ref
-        host, path, ref, hosted_identity = scp_hosted_declaration(host, path, ref)
+        candidate_path, fragment = path.split("#", 1) if "#" in path else (path, None)
+        hosted_ref = (fragment + "#" + ref) if fragment and ref else ref or fragment
+        normalized = hosted_declaration(host, candidate_path, hosted_ref, "git+ssh")
+        if normalized[3]:
+            host, path, ref, hosted_identity = normalized
+        else:
+            preserve_encoded_path = True
     elif explicit_protocol:
         try:
             parsed = urlsplit(value)
             if parsed.password is not None or (parsed.username is not None and parsed.scheme.lower() not in {"ssh", "git+ssh"}):
                 return None
             host, port = parsed.hostname, parsed.port
-            unaliased_host = host[4:] if host and host.lower().startswith("www.") else host
-            hosted_protocol = bool(unaliased_host and
-                                   parsed.scheme.lower() in HOSTED_PROTOCOLS.get(unaliased_host.lower(), set()))
-            if hosted_protocol:
-                host = unaliased_host.lower()
         except ValueError:
             return None
         if parsed.query:
@@ -280,51 +281,32 @@ def git_declaration(source):
                 path, path_ref = repo_path, candidate_ref
         hosted_ref = (fragment + "#" + path_ref) if fragment and path_ref else path_ref or fragment
         ref = path_ref
-        segments = path.split("/")
-        preserve_encoded_path = True
-        if hosted_protocol and host == "github.com":
-            if len(segments) >= 3 and segments[2] == "tree":
-                path = "/".join(segments[:2])
-                ref = segments[3] if len(segments) >= 4 else None
-                preserve_encoded_path = False
-                hosted_identity = True
-            elif len(segments) == 2:
-                ref = hosted_ref
-                preserve_encoded_path = False
-                hosted_identity = True
-        elif hosted_protocol and host == "bitbucket.org" and len(segments) >= 2 and \
-                (len(segments) == 2 or segments[2] != "get"):
-            path = "/".join(segments[:2])
-            ref = hosted_ref
-            preserve_encoded_path = False
-            hosted_identity = True
-        elif hosted_protocol and host == "git.sr.ht" and len(segments) >= 2 and \
-                (len(segments) == 2 or segments[2] != "archive"):
-            path = "/".join(segments[:2])
-            ref = hosted_ref
-            preserve_encoded_path = False
-            hosted_identity = True
-        elif hosted_protocol and host == "gist.github.com" and \
-                (len(segments) < 3 or segments[2] != "raw"):
-            path = "null/" + path if len(segments) == 1 else "/".join(segments[:2])
-            ref = hosted_ref
-            preserve_encoded_path = False
-            hosted_identity = True
-        elif hosted_protocol and host == "gitlab.com" and "/-/" not in "/" + path + "/":
-            ref = hosted_ref
-            preserve_encoded_path = False
-            hosted_identity = True
+        normalized = hosted_declaration(host, path, hosted_ref, parsed.scheme.lower())
+        if normalized[3]:
+            host, path, ref, hosted_identity = normalized
+        else:
+            preserve_encoded_path = True
     elif prefixed and "/" in value:
         host, path = value.split("/", 1)
+        original_path = path
+        if "@" in path:
+            repo_path, candidate_ref = path.split("@", 1)
+            if repo_path and candidate_ref:
+                path, ref = repo_path, candidate_ref
+        candidate_path, fragment = path.split("#", 1) if "#" in path else (path, None)
+        hosted_ref = (fragment + "#" + ref) if fragment and ref else ref or fragment
+        normalized = hosted_declaration(host, candidate_path, hosted_ref, "https")
+        if normalized[3]:
+            host, path, ref, hosted_identity = normalized
+        else:
+            path = original_path.split("@", 1)[0] if ref is not None else original_path
+            preserve_encoded_path = True
     else:
         return None
     if not host or not path or len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9.:-]+", host):
         return None
     if ref is None and "@" in path:
         path, ref = path.split("@", 1)
-    if ref is None and host.lower() in HOSTED_GIT.values() and "#" in path:
-        path, ref = path.split("#", 1)
-        hosted_identity = True
     if hosted_identity and host.lower() == "gist.github.com" and "/" not in path:
         path = "null/" + path
     if re.search(r"%(?![0-9a-fA-F]{2})", path) or (ref is not None and re.search(r"%(?![0-9a-fA-F]{2})", ref)):

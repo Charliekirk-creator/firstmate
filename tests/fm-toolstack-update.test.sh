@@ -638,9 +638,27 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='scp-gitlab-fallback-skill', kind='skill', path='skills/scp-gitlab/SKILL.md', owner='pi-package',
          scope='user', source='git:git@gitlab.com:group/repo/-/tree/main@release%2F1',
          declarations=['git:git@gitlab.com:group/repo/-/tree/main@release%2F1']),
+    dict(name='bare-host-tree-skill', kind='skill', path='skills/bare-host-tree/SKILL.md', owner='pi-package',
+         scope='user', source='git:github.com/user/repo/tree/v1',
+         declarations=['git:github.com/user/repo/tree/v1']),
+    dict(name='bare-bitbucket-ref-skill', kind='skill', path='skills/bare-bitbucket/SKILL.md', owner='pi-package',
+         scope='user', source='git:bitbucket.org/user/repo@release%2F1',
+         declarations=['git:bitbucket.org/user/repo@release%2F1']),
+    dict(name='bare-gitlab-ref-skill', kind='skill', path='skills/bare-gitlab/SKILL.md', owner='pi-package',
+         scope='user', source='git:gitlab.com/group/repo@release%2F1',
+         declarations=['git:gitlab.com/group/repo@release%2F1']),
+    dict(name='scp-gitlab-archive-skill', kind='skill', path='skills/scp-gitlab-archive/SKILL.md', owner='pi-package',
+         scope='user', source='git:git@gitlab.com:group/repo/archive.tar.gz@release%2F1',
+         declarations=['git:git@gitlab.com:group/repo/archive.tar.gz@release%2F1']),
+    dict(name='url-gitlab-archive-skill', kind='skill', path='skills/url-gitlab-archive/SKILL.md', owner='pi-package',
+         scope='user', source='https://gitlab.com/group/repo/archive.tar.gz#release',
+         declarations=['https://gitlab.com/group/repo/archive.tar.gz#release'], pins=[]),
+    dict(name='bare-gitlab-archive-skill', kind='skill', path='skills/bare-gitlab-archive/SKILL.md', owner='pi-package',
+         scope='user', source='git:gitlab.com/group/repo/archive.tar.gz@release%2F1',
+         declarations=['git:gitlab.com/group/repo/archive.tar.gz@release%2F1']),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 33
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 39
 inspected_resources = source_inspection['targets'][0]['observation']['resources']
 assert inspected_resources[5]['pins'] == ['release+1']
 assert inspected_resources[8]['pins'] == ['v1']
@@ -685,6 +703,16 @@ assert inspected_resources[31]['pins'] == []
 assert inspected_resources[31]['identity']['update_unit']['identity'] == 'bitbucket.org/user/repo'
 assert inspected_resources[32]['pins'] == ['release%2F1']
 assert inspected_resources[32]['identity']['update_unit']['identity'] == 'gitlab.com/group/repo/-/tree/main'
+assert inspected_resources[33]['pins'] == ['v1']
+assert inspected_resources[33]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+for index, identity in ((34, 'bitbucket.org/user/repo'), (35, 'gitlab.com/group/repo')):
+    assert inspected_resources[index]['pins'] == ['release/1']
+    assert inspected_resources[index]['identity']['update_unit']['identity'] == identity
+for index in (36, 38):
+    assert inspected_resources[index]['pins'] == ['release%2F1']
+    assert inspected_resources[index]['identity']['update_unit']['identity'] == 'gitlab.com/group/repo/archive.tar.gz'
+assert inspected_resources[37]['pins'] == []
+assert inspected_resources[37]['identity']['update_unit']['identity'] == 'gitlab.com/group/repo/archive.tar.gz'
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
 matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
