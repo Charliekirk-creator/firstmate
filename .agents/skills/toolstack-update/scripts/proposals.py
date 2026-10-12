@@ -225,6 +225,8 @@ def git_declaration(source):
         return None
     if not host or not path or len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9.:-]+", host):
         return None
+    if ref is None and host.lower() in HOSTED_GIT.values() and "#" in path:
+        path, ref = path.split("#", 1)
     if ref is None and "@" in path:
         path, ref = path.split("@", 1)
     try:

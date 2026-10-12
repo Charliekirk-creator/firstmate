@@ -505,6 +505,9 @@ source_forms['observations']['pi']['resources'] = [
     dict(name='hosted-ref-skill', kind='skill', path='skills/hosted-ref/SKILL.md', owner='pi-package',
          scope='user', source='git:https://github.com/user/repo#v1',
          declarations=['git:https://github.com/user/repo#v1']),
+    dict(name='hosted-shorthand-skill', kind='skill', path='skills/hosted-shorthand/SKILL.md', owner='pi-package',
+         scope='user', source='git:github.com/user/repo#v1',
+         declarations=['git:github.com/user/repo#v1']),
     dict(name='gist-skill', kind='skill', path='skills/gist/SKILL.md', owner='pi-package',
          scope='user', source='git:gist:abc123', declarations=['git:gist:abc123'], pins=[]),
     dict(name='bare-local-skill', kind='skill', path='skills/bare-local/SKILL.md', owner='local',
@@ -513,15 +516,24 @@ source_forms['observations']['pi']['resources'] = [
          scope='project', source='file:../pi-tools', declarations=['file:../pi-tools'], pins=[]),
 ]
 code, source_inspection = invoke('inspect', {'observations': source_forms['observations']})
-assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 12
-assert source_inspection['targets'][0]['observation']['resources'][5]['pins'] == ['release+1']
-assert source_inspection['targets'][0]['observation']['resources'][8]['pins'] == ['v1']
+assert code == 0 and len(source_inspection['targets'][0]['observation']['resources']) == 13
+inspected_resources = source_inspection['targets'][0]['observation']['resources']
+assert inspected_resources[5]['pins'] == ['release+1']
+assert inspected_resources[8]['pins'] == ['v1']
+assert inspected_resources[9]['pins'] == ['v1']
+assert inspected_resources[9]['identity']['update_unit']['identity'] == 'github.com/user/repo'
+assert inspected_resources[9]['source'] == 'git:github.com/user/repo#v1'
+assert inspected_resources[9]['declarations'] == ['git:github.com/user/repo#v1']
 matching_git_pin = copy.deepcopy(source_forms)
 matching_git_pin['observations']['pi']['resources'][5]['pins'] = ['release+1']
+matching_git_pin['observations']['pi']['resources'][9]['pins'] = ['v1']
 assert invoke('inspect', {'observations': matching_git_pin['observations']})[0] == 0
 mismatched_git_pin = copy.deepcopy(source_forms)
 mismatched_git_pin['observations']['pi']['resources'][5]['pins'] = ['other-ref']
 refuse('inspect', {'observations': mismatched_git_pin['observations']})
+mismatched_shorthand_pin = copy.deepcopy(source_forms)
+mismatched_shorthand_pin['observations']['pi']['resources'][9]['pins'] = ['other-ref']
+refuse('inspect', {'observations': mismatched_shorthand_pin['observations']})
 credentialed_git = copy.deepcopy(source_forms)
 credentialed_git['observations']['pi']['resources'][5].update(
     source='ssh://deploy:embedded-secret@example.com:2222/org/tools@release+1',
@@ -550,6 +562,16 @@ code, ssh_update_inspection = invoke('inspect', {'observations': ssh_update['obs
 assert code == 0
 ssh_update['resource'] = ssh_update_inspection['targets'][0]['observation']['resources'][0]['identity']
 refuse('propose', ssh_update)
+hosted_shorthand_update = copy.deepcopy(data)
+hosted_shorthand_update['observations']['pi']['resources'][0].update(
+    source='git:github.com/user/repo#v1', declarations=['git:github.com/user/repo#v1'])
+hosted_shorthand_update['observations']['pi']['resources'][0].pop('pins')
+code, shorthand_update_inspection = invoke(
+    'inspect', {'observations': hosted_shorthand_update['observations']})
+assert code == 0
+hosted_shorthand_update['resource'] = shorthand_update_inspection[
+    'targets'][0]['observation']['resources'][0]['identity']
+refuse('propose', hosted_shorthand_update)
 print('ok - supported npm ranges, Git URLs, shorthand, and local sources remain inspectable and deferred')
 
 collision_data = request('pi')
