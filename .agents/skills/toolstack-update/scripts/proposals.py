@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Non-executing update proposal helper for the toolstack-update skill.
+
+The skill owns the workflow; this module owns the catalog, input schema,
+comparison, and supported dispatch descriptions. It only reads bounded JSON
+from stdin and writes JSON to stdout. It never probes tools, reads configuration
+or credentials, downloads, installs, executes a dispatch, or records approvals.
+A supplied approval is a caller's assertion, not proof of captain authority.
+
+Commands: catalog; inspect (default); propose; prepare.
+Resource source records can retain credential-free npm, Git, and local sources;
+only exact-version/unpinned npm user packages have a preparable resource action.
+inspect takes {observations: {target: observation}} and always returns the full
+catalog. propose adds target and optionally resource (a Pi resource name).
+prepare additionally needs approval equal to the current proposal and checkpoint.
+Use --help for the observation/checkpoint fields. No apply command exists.
+"""
+
+import argparse
+import copy
+import json
+import re
+import sys
+
+TARGETS = {
+    "pi": "Pi and its extensions, skills, and prompt templates",
+    "firstmate": "Firstmate",
+    "herdr": "Herdr",
+    "wezterm": "WezTerm",
+    "treehouse": "Treehouse",
+    "git": "Git",
+    "gh-axi": "gh-axi",
+    "tasks-axi": "tasks-axi",
+    "quota-axi": "quota-axi",
+    "lavish-axi": "lavish-axi",
+    "chrome-devtools-axi": "chrome-devtools-axi",
+    "no-mistakes": "No Mistakes",
+}
+DEPENDENCY_ONLY = ["chrome", "excel", "typora", "node", "package-managers"]
+OWNERS = {
+    "pi": ["npm-global", "pi-managed"], "firstmate": ["firstmate"],
+    "herdr": ["brew-formula", "herdr-native"], "wezterm": ["brew-cask"],
+    "treehouse": ["treehouse-native"], "git": ["apple-clt"],
+    "gh-axi": ["npm-global", "pnpm-global"], "tasks-axi": ["npm-global"],
+    "quota-axi": ["npm-global", "pnpm-global"],
+    "lavish-axi": ["npm-global", "pnpm-global"],
+    "chrome-devtools-axi": ["npm-global", "pnpm-global"],
+    "no-mistakes": ["no-mistakes-native"],
+}
+KINDS = ["extension", "skill", "prompt-template"]
+AXI_NATIVE = {"gh-axi", "quota-axi", "lavish-axi", "chrome-devtools-axi"}
+VERSION = re.compile(r"v?\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?\Z")
+WEZ_VERSION = re.compile(r"\d{8}-\d{6}-[a-f0-9]{8}\Z")
+COMMIT = re.compile(r"[a-f0-9]{40}\Z")
+NAME = re.compile(r"(?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*\Z")
+PACKAGE = re.compile(r"npm:((?:@[a-z0-9_-]+/)?[a-z0-9][a-z0-9._-]*)(?:@(.+))?\Z")
+GIT_SOURCE = re.compile(r"git:(?:(?:https://)?[a-zA-Z0-9.-]+/|git@[a-zA-Z0-9.-]+:)[a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+(?:@[a-zA-Z0-9_./-]+)?\Z")
+LOCAL_SOURCE = re.compile(r"(?:~/|/|\./|\.\./)[a-zA-Z0-9_./ -]+\Z")
+NPM_SELECTOR = re.compile(r"[a-zA-Z0-9.^~+*-]{1,64}\Z")
+OBS_FIELDS = {"installed", "used", "current", "available", "owner", "compatible",
+              "owner_verified", "available_verified", "relation", "update_label", "resources", "resources_complete"}
+RESOURCE_FIELDS = {"name", "kind", "owner", "source", "scope", "current", "available", "pin"}
+CHECKPOINT_FIELDS = {"actor", "active_sessions", "active_workers", "active_validation",
+                     "pins_preserved", "packages_preserved", "credentials_untouched",
+                     "local_state_preserved", "rollback_reviewed"}
+LIMIT = 128 * 1024
+
+
+class Invalid(ValueError):
+    pass
+
+
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, "Invalid helper arguments; use --help. No apply or credential options exist.\n")
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise Invalid("Duplicate JSON fields are refused.")
+        value[key] = item
+    return value
+
+
+def object_fields(value, allowed):
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise Invalid("Unexpected fields or non-object input; credentials and arbitrary commands are not accepted.")
+
+
+def version(value, target):
+    if value is None:
+        return
+    pattern = COMMIT if target == "firstmate" else WEZ_VERSION if target == "wezterm" else VERSION
+    if not isinstance(value, str) or len(value) > 64 or not pattern.fullmatch(value):
+        raise Invalid("Versions must be canonical release versions (or a full Firstmate commit).")
+
+
+def resource_record(row):
+    object_fields(row, RESOURCE_FIELDS)
+    if not isinstance(row.get("name"), str) or not NAME.fullmatch(row["name"]):
+        raise Invalid("A resource needs a safe canonical name.")
+    if row.get("kind") not in KINDS or row.get("owner") not in {"pi-package", "firstmate", "local"}:
+        raise Invalid("Unknown resource kind or owner.")
+    if row.get("scope") not in {"user", "project"}:
+        raise Invalid("A resource needs its actual user or project scope.")
+    for field in ("current", "available", "pin"):
+        value = row.get(field)
+        version(value, "firstmate" if row["owner"] == "firstmate" or (isinstance(value, str) and COMMIT.fullmatch(value)) else "pi")
+    source = row.get("source")
+    if source is not None:
+        if not isinstance(source, str) or len(source) > 200:
+            raise Invalid("Resource sources must be bounded non-secret declarations.")
+        match = PACKAGE.fullmatch(source)
+        if match:
+            if match[2] is not None and not NPM_SELECTOR.fullmatch(match[2]):
+                raise Invalid("Unsupported npm declaration; never include credentials or command text.")
+        elif not GIT_SOURCE.fullmatch(source) and not LOCAL_SOURCE.fullmatch(source):
+            raise Invalid("Only credential-free npm, Git, or local resource declarations are accepted.")
+    return copy.deepcopy(row)
+
+
+def observations(data):
+    rows = data.get("observations", {})
+    object_fields(rows, set(TARGETS))
+    result = {}
+    for target, raw in rows.items():
+        object_fields(raw, OBS_FIELDS)
+        row = copy.deepcopy(raw)
+        for field in ("installed", "used", "compatible", "owner_verified", "available_verified", "resources_complete"):
+            if row.get(field) is not None and type(row[field]) is not bool:
+                raise Invalid("Observation flags must be booleans or unknown.")
+        for field in ("current", "available"):
+            version(row.get(field), target)
+        if row.get("owner") is not None and not re.fullmatch(r"[a-z][a-z-]{0,40}", row["owner"]):
+            raise Invalid("Owner must be a canonical owner identifier, never a command.")
+        if row.get("relation") is not None and row["relation"] not in {"same", "fast-forward", "diverged", "unknown"}:
+            raise Invalid("Unknown commit relationship.")
+        label = row.get("update_label")
+        if label is not None and (target != "git" or not isinstance(label, str) or not re.fullmatch(r"Command Line Tools for Xcode[- A-Za-z0-9.]{1,80}", label)):
+            raise Invalid("Only a reviewed Command Line Tools label is accepted.")
+        resources = row.get("resources", [])
+        if not isinstance(resources, list) or len(resources) > 1000 or (resources and target != "pi"):
+            raise Invalid("Resources belong only to Pi.")
+        row["resources"] = [resource_record(r) for r in resources]
+        keys = [(r["kind"], r["scope"], r["name"]) for r in row["resources"]]
+        if len(keys) != len(set(keys)):
+            raise Invalid("Duplicate resources must be reconciled rather than hidden.")
+        result[target] = row
+    return result
+
+
+def comparison(target, row):
+    current, available = row.get("current"), row.get("available")
+    if row.get("installed") is False:
+        return "not-installed"
+    if row.get("installed") is not True or not current or not available or row.get("available_verified") is not True:
+        return "unknown"
+    if current.lstrip("v") == available.lstrip("v"):
+        return "current"
+    if target == "firstmate":
+        return "candidate" if row.get("relation") == "fast-forward" else "deferred"
+    if target == "wezterm":
+        return "candidate" if available[:15] > current[:15] else "deferred"
+    # Only stable releases have an unambiguous order here. Never silently choose
+    # a prerelease, build, or downgrade; the agent can inspect those separately.
+    stable = r"v?(\d+)\.(\d+)\.(\d+)"
+    a, b = re.fullmatch(stable, current), re.fullmatch(stable, available)
+    if a and b:
+        return "candidate" if tuple(map(int, b.groups())) > tuple(map(int, a.groups())) else "deferred"
+    return "deferred"
+
+
+def dispatch(target, row, selected):
+    owner = row.get("owner")
+    if selected is None and owner not in OWNERS[target]:
+        raise Invalid("Unsupported installation owner; never infer or substitute another owner.")
+    if selected is not None:
+        if selected["owner"] != "pi-package":
+            raise Invalid("Use /updatefirstmate for Firstmate resources; local resources need their source owner's reviewed edit.")
+        source = selected.get("source")
+        if not source:
+            raise Invalid("A managed resource needs its unchanged package declaration.")
+        match = PACKAGE.fullmatch(source)
+        if not match or (match[2] is not None and not VERSION.fullmatch(match[2])):
+            raise Invalid("Git, local, or range/tag sources need their existing owner's separately reviewed proposal.")
+        pin = selected.get("pin") or match[2]
+        if selected.get("pin") and match[2] and selected["pin"].lstrip("v") != match[2].lstrip("v"):
+            raise Invalid("Pin evidence contradicts the unchanged package declaration.")
+        if pin and selected["available"].lstrip("v") != pin.lstrip("v"):
+            raise Invalid("Explicit pins are preserved; changing a pin is a separate authorization.")
+        if selected["scope"] != "user":
+            raise Invalid("Project package scope needs separately verified owner isolation; never assume a personal update is project-only.")
+        return {"argv": ["pi", "update", source, "--no-approve"]}
+    if target == "firstmate" and owner == "firstmate":
+        return {"skill": "updatefirstmate"}
+    if target == "pi" and owner in {"npm-global", "pi-managed"}:
+        return {"argv": ["pi", "update", "--no-approve"]}
+    if target == "herdr" and owner == "brew-formula":
+        return {"argv": ["brew", "upgrade", "herdr"]}
+    if target == "herdr" and owner == "herdr-native":
+        return {"argv": ["herdr", "update"]}
+    if target == "wezterm" and owner == "brew-cask":
+        return {"argv": ["brew", "upgrade", "--cask", "wezterm"]}
+    if target == "treehouse" and owner == "treehouse-native":
+        return {"argv": ["treehouse", "update"]}
+    if target == "git" and owner == "apple-clt" and row.get("update_label"):
+        return {"argv": ["softwareupdate", "--install", row["update_label"]]}
+    if target in AXI_NATIVE and owner in {"npm-global", "pnpm-global"}:
+        return {"argv": [target, "update"]}
+    if target == "tasks-axi" and owner == "npm-global":
+        return {"argv": ["npm", "install", "-g", "tasks-axi@" + row["available"]]}
+    if target == "no-mistakes" and owner == "no-mistakes-native":
+        return {"argv": ["no-mistakes", "update"]}
+    raise Invalid("Update owner is unverified or not supported by this helper; inspect its current help, never substitute another owner.")
+
+
+def proposal(data, rows):
+    target = data.get("target")
+    if target not in TARGETS:
+        raise Invalid("Select exactly one default target; dependency-only tools are not update targets.")
+    row = rows.get(target, {})
+    if any(row.get(k) is not True for k in ("installed", "compatible", "owner_verified", "available_verified")) or type(row.get("used")) is not bool:
+        raise Invalid("Installed status, actual-use evidence, compatibility, owner, and available release must be established first.")
+    if target == "pi" and row.get("resources_complete") is not True:
+        raise Invalid("Complete Pi extensions, skills, templates, and scope inventory before proposing an update.")
+    selected = None
+    if data.get("resource") is not None:
+        matches = [r for r in row.get("resources", []) if r["name"] == data["resource"]]
+        if target != "pi" or len(matches) != 1:
+            raise Invalid("Select one unambiguous inventoried Pi resource.")
+        selected = matches[0]
+    candidate = dict(row)
+    if selected is not None:
+        candidate.update(current=selected.get("current"), available=selected.get("available"))
+    if comparison(target, candidate) != "candidate":
+        raise Invalid("No verified, compatible newer stable release can be proposed.")
+    return {"target": target, "resource": data.get("resource"), "owner": selected["owner"] if selected else row["owner"],
+            "current": candidate["current"], "available": candidate["available"],
+            "dispatch": dispatch(target, candidate, selected),
+            "resources": copy.deepcopy(row.get("resources", []))}
+
+
+def prepare(data, proposed):
+    if data.get("approval") != proposed:
+        raise Invalid("One concrete matching captain approval is required; batch, stale, or altered approvals are refused.")
+    checkpoint = data.get("checkpoint")
+    object_fields(checkpoint, CHECKPOINT_FIELDS)
+    if set(checkpoint) != CHECKPOINT_FIELDS or checkpoint["actor"] != "primary":
+        raise Invalid("Preparation requires the owning primary's complete checkpoint, not worker or second-mate authority.")
+    for field in ("active_sessions", "active_workers", "active_validation"):
+        if checkpoint[field] is not False:
+            raise Invalid("Active or unknown affected work refuses preparation; never stop, cancel, reload, or resume it to clear this check.")
+    for field in CHECKPOINT_FIELDS - {"actor", "active_sessions", "active_workers", "active_validation"}:
+        if checkpoint[field] is not True:
+            raise Invalid("Pins, declarations, credentials, local state, and recovery must remain protected.")
+    return {"status": "prepared-not-executed", "proposal": proposed, "execution_authorized_by_helper": False}
+
+
+def main():
+    parser = SafeParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="Observation fields: " + ", ".join(sorted(OBS_FIELDS)) +
+                                     "\nResource fields: " + ", ".join(sorted(RESOURCE_FIELDS)) +
+                                     "\nCheckpoint fields: " + ", ".join(sorted(CHECKPOINT_FIELDS)) +
+                                     "\nFlags are booleans, never strings. Missing evidence remains unknown.\n"
+                                     "prepare does not execute; actual captain authority and fresh owner checks remain required.")
+    parser.add_argument("command", choices=["catalog", "inspect", "propose", "prepare"], nargs="?", default="inspect")
+    args = parser.parse_args()
+    if args.command == "catalog":
+        result = {"targets": [{"id": k, "name": v, "owners": OWNERS[k]} for k, v in TARGETS.items()],
+                  "dependency_only": DEPENDENCY_ONLY, "resource_kinds": KINDS,
+                  "discovery_scope": "firstmate-project-shared-not-main-only"}
+    else:
+        raw = b"" if sys.stdin.isatty() else sys.stdin.buffer.read(LIMIT + 1)
+        if len(raw) > LIMIT:
+            raise Invalid("Input exceeds the bounded evidence limit.")
+        data = json.loads(raw, object_pairs_hook=unique_object) if raw.strip() else {}
+        fields = {"observations"} if args.command == "inspect" else {"observations", "target", "resource"}
+        if args.command == "prepare":
+            fields |= {"approval", "checkpoint"}
+        object_fields(data, fields)
+        rows = observations(data)
+        if args.command == "inspect":
+            result = {"mode": "inspection-only", "targets": [{"id": k, "name": v,
+                       "comparison": comparison(k, rows.get(k, {})), "observation": rows.get(k, {})}
+                      for k, v in TARGETS.items()], "dependency_only": DEPENDENCY_ONLY}
+        else:
+            proposed = proposal(data, rows)
+            result = {"status": "needs-individual-captain-approval", "proposal": proposed} if args.command == "propose" else prepare(data, proposed)
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Invalid as error:
+        # Invalid reasons are fixed diagnostic strings, never interpolated input.
+        print(json.dumps({"status": "refused", "reason": str(error)}))
+        sys.exit(2)
+    except (ValueError, TypeError, RecursionError):
+        # Never echo rejected input, secrets, arbitrary command text, or parser
+        # exceptions into either output stream.
+        print(json.dumps({"status": "refused", "reason": "Malformed or unsupported evidence; inspect the helper schema."}))
+        sys.exit(2)
