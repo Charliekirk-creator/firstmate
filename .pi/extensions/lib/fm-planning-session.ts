@@ -22,7 +22,7 @@ export const ownerKey = (owner: Owner): string => JSON.stringify([
   owner.sessionId, owner.sessionFile, owner.pid, owner.processStart,
 ]);
 export type Revocations = Map<string, {
-  owner: Owner; reason: "ownership-lost" | "ledger-failure"; due?: number[];
+  owner: Owner; reason: "ownership-lost" | "ledger-failure"; due?: number[]; candidate?: SlotState;
 }>;
 
 export function parseFirstSlot(value: string): number {
@@ -149,17 +149,19 @@ export class PlanningSessionClock {
   private reconcileRevocation(): boolean {
     if (!this.revocations.size) return false;
     this.dispose();
-    const state = this.store.read();
-    if (!state) throw new Error("Planning ownership revocation is unresolved without its ledger");
-    const key = ownerKey(state.owner);
-    const revoked = this.revocations.get(key);
-    if (!revoked || !sameOwner(revoked.owner, state.owner)) {
-      throw new Error("Planning terminal stop does not match the ledger owner");
+    const stored = this.store.read();
+    const unresolved = [...this.revocations.values()];
+    const revoked = stored ? this.revocations.get(ownerKey(stored.owner)) : unresolved.length === 1 ? unresolved[0] : undefined;
+    const state = stored ?? revoked?.candidate;
+    if (!state || !revoked || !sameOwner(revoked.owner, state.owner)) {
+      throw new Error("Planning terminal stop does not match a recoverable ledger owner");
     }
-    if (!state.stopped || revoked.due?.length) {
-      const due = [...new Set([...state.due, ...(revoked.due ?? [])])].sort((a, b) => a - b);
-      const delivery = state.delivery?.slots.some((slot) => due.includes(slot)) ? undefined : state.delivery;
-      this.store.write({ ...state, due, delivery, stopped: revoked.reason });
+    const key = ownerKey(state.owner);
+    const due = [...new Set([...state.due, ...(revoked.due ?? [])])].sort((a, b) => a - b);
+    const delivery = state.delivery?.slots.some((slot) => due.includes(slot)) ? undefined : state.delivery;
+    const through = due.length ? Math.max(state.through, ...due) : state.through;
+    if (!stored || !state.stopped || revoked.due?.length) {
+      this.store.write({ ...state, through, due, delivery, stopped: revoked.reason });
     }
     this.revocations.delete(key);
     if (sameOwner(state.owner, this.owner)) this.ownsSchedule = false;
@@ -185,15 +187,16 @@ export class PlanningSessionClock {
     this.revocations.set(key, { owner: this.owner, reason: "ownership-lost", due });
     this.reconcileRevocation();
   }
-  private rememberFailure(due: number[] = []): void {
+  private rememberFailure(due: number[] = [], candidate?: SlotState): void {
     const key = ownerKey(this.owner);
     const prior = this.revocations.get(key);
-    this.revocations.set(key, prior ? { ...prior, due: [...new Set([...(prior.due ?? []), ...due])] }
-      : { owner: this.owner, reason: "ledger-failure", due: [...due] });
+    this.revocations.set(key, prior
+      ? { ...prior, due: [...new Set([...(prior.due ?? []), ...due])], candidate: prior.candidate ?? candidate }
+      : { owner: this.owner, reason: "ledger-failure", due: [...due], candidate });
   }
-  private failStopped(due: number[] = []): void {
+  private failStopped(due: number[] = [], candidate?: SlotState): void {
     this.dispose();
-    this.rememberFailure(due);
+    this.rememberFailure(due, candidate);
   }
   private current(): SlotState | undefined {
     if (this.reconcileRevocation()) return undefined;
@@ -206,14 +209,34 @@ export class PlanningSessionClock {
       this.ownershipLost();
       throw new Error("Only the live lock-owning Main session may start planning updates");
     }
-    this.reconcileRevocation();
-    const prior = this.store.read();
+    const through = Math.max(firstSlot - HALF_HOUR,
+      firstSlot + Math.floor((this.io.now() - firstSlot) / HALF_HOUR) * HALF_HOUR);
+    const fresh: SlotState = { version: 1, owner: this.owner, firstSlot, through, due: [] };
+    let prior: SlotState | undefined;
+    try {
+      this.reconcileRevocation();
+      prior = this.store.read();
+    } catch (error) {
+      this.failStopped([], fresh);
+      throw error;
+    }
+    const compatible = !!prior && sameOwner(prior.owner, this.owner) && prior.firstSlot === firstSlot;
+    if (prior?.due.length && !compatible) {
+      throw new Error("Cannot replace a schedule with retained planning slots");
+    }
     if (prior && sameOwner(prior.owner, this.owner) && !prior.stopped) {
-      if (prior.firstSlot !== firstSlot) throw new Error("This session already has a different schedule");
-    } else {
-      // Starting late never reconstructs connectivity for earlier boundaries.
-      const through = Math.max(firstSlot - HALF_HOUR, firstSlot + Math.floor((this.io.now() - firstSlot) / HALF_HOUR) * HALF_HOUR);
-      this.store.write({ version: 1, owner: this.owner, firstSlot, through, due: [] });
+      if (!compatible) throw new Error("This session already has a different schedule");
+      this.resume();
+      return;
+    }
+    const candidate: SlotState = compatible && prior ? { ...prior, stopped: undefined } : fresh;
+    this.rememberFailure(candidate.due, candidate);
+    try {
+      this.store.write(candidate);
+      this.revocations.delete(ownerKey(this.owner));
+    } catch (error) {
+      this.failStopped(candidate.due, candidate);
+      throw error;
     }
     this.resume();
   }
@@ -267,7 +290,9 @@ export class PlanningSessionClock {
       if (!this.active) return;
       if (!this.io.valid()) { this.ownershipLost(); return; }
       const due = result === "online" ? [...state.due, slot] : state.due;
+      if (result === "online") this.rememberFailure([slot]);
       this.store.write({ ...state, through: slot, due, observation: { slot, result } });
+      if (result === "online") this.revocations.delete(ownerKey(this.owner));
       if (result === "unknown") this.io.error(new Error("Wi-Fi link could not be verified; this slot was skipped"));
       // Offline and unobserved slots never enqueue catch-up requests.
       if (result === "online") this.io.wake(due);

@@ -149,6 +149,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const failed = new PlanningSessionClock(owner, failureStore, io, failures); now = old.through + HALF_HOUR - 1000;
     failed.resume(); const wakeCount = wakes.length; wifi = 'online'; fire(old.through + HALF_HOUR);
     assert.equal(wakes.length, wakeCount); assert.equal(callback, undefined); assert.ok(errors.at(-1).includes('disk full'));
+    const failedBoundary = old.through + HALF_HOUR;
+    assert.deepEqual(failures.get(JSON.stringify([
+      owner.sessionId, owner.sessionFile, owner.pid, owner.processStart,
+    ])).due, [failedBoundary], 'online boundary is retained before persistence');
     valid = false;
     assert.throws(() => failed.ownershipLost(), /disk full/);
     assert.equal(failures.get(JSON.stringify([owner.sessionId, owner.sessionFile, owner.pid, owner.processStart])).reason,
@@ -157,7 +161,22 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const failureReload = new PlanningSessionClock(owner, failureStore, io, failures);
     failureReload.resume();
     assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ownership-lost');
-    failureReload.start(first); failureReload.dispose();
+    assert.deepEqual(failureState.due, [failedBoundary]);
+    assert.throws(() => failureReload.start(first + HALF_HOUR), /retained planning slots/);
+    failureReload.start(first); assert.deepEqual(failureState.due, [failedBoundary]); failureReload.dispose();
+
+    failureState = { ...old, stopped: undefined }; storageFails = true; commitBeforeFailure = true;
+    const committedBoundaryFailures = new Map();
+    const committedBoundary = new PlanningSessionClock(owner, failureStore, io, committedBoundaryFailures);
+    now = old.through + HALF_HOUR - 1000; committedBoundary.resume();
+    fire(failedBoundary);
+    assert.deepEqual(failureState.due, [failedBoundary], 'boundary rename may have uncertainly committed');
+    storageFails = false; commitBeforeFailure = false;
+    const committedBoundaryReload = new PlanningSessionClock(owner, failureStore, io, committedBoundaryFailures);
+    committedBoundaryReload.resume();
+    assert.equal(callback, undefined); assert.deepEqual(failureState.due, [failedBoundary]);
+    committedBoundaryReload.start(first); assert.deepEqual(failureState.due, [failedBoundary]);
+    committedBoundaryReload.dispose();
 
     failureState = { ...old, stopped: undefined, due: [old.through] };
     storageFails = true; commitBeforeFailure = true;
@@ -194,7 +213,23 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     storageFails = false; stopReload.resume();
     assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ledger-failure');
     stopReload.start(first); assert.ok(callback); stopReload.dispose();
-    console.log('ok - boundary, delivery and stop failures retain work and require explicit recovery');
+
+    let startState, startWriteFails = true;
+    const startFailures = new Map();
+    const startStore = { read: () => startState, write: state => {
+      startState = state;
+      if (startWriteFails) throw new Error('start fsync failed');
+    } };
+    now = first - 1000;
+    const failedStart = new PlanningSessionClock(owner, startStore, io, startFailures);
+    assert.throws(() => failedStart.start(first), /start fsync failed/);
+    assert.equal(callback, undefined); assert.equal(startFailures.size, 1);
+    const startReload = new PlanningSessionClock(owner, startStore, io, startFailures);
+    assert.throws(() => startReload.resume(), /start fsync failed/); assert.equal(callback, undefined);
+    startWriteFails = false; startReload.resume();
+    assert.equal(callback, undefined); assert.equal(startState.stopped, 'ledger-failure');
+    startReload.start(first); assert.ok(callback); startReload.dispose();
+    console.log('ok - boundary, delivery, stop and start failures retain work and require explicit recovery');
 
     assert.throws(() => validateState({ ...old, due: [first, first] }), /Malformed/);
     assert.throws(() => validateState({ ...old, through: old.through + 1 }), /Malformed/);

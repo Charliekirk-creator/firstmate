@@ -1075,14 +1075,14 @@ ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit re
 ok - failed ownership revocation survives reload, retries durably and requires explicit restart
 ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused
 ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability
-ok - boundary, delivery and stop failures retain work and require explicit recovery
+ok - boundary, delivery, stop and start failures retain work and require explicit recovery
 ok - storage failure never wakes falsely, malformed state preserved, unsafe links refused, late activation does not backfill
 ok - real Pi 0.87.1 failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery
 ok - real Pi 0.87.1 busy response, one post-settlement follow-up, canonical bytes unchanged, timer does not keep process alive
 skip: tsc not found for Pi extension typecheck
 ```
 
-The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects, terminal boundary/delivery/stop failures, uncertain-commit due union retention, and explicit recovery rather than implementation-source text.
+The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects, terminal boundary/delivery/stop/start failures, uncertain-commit due union retention, compatible restart preservation, and explicit recovery rather than implementation-source text.
 The real-SDK test uses a temporary primary repository, isolated Main home and agent directory, and an in-process fixture provider with networking denied.
 It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command, multi-call tool and settlement-continuation context, response-persistence, failed ownership/delivery/stop persistence, storage recovery, reload, explicit restart, and one post-settlement busy follow-up.
 Neither test activates a timer in the operator's Main or contacts a model provider.
