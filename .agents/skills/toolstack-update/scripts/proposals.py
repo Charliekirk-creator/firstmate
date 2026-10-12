@@ -9,7 +9,7 @@ A supplied approval is a caller's assertion, not proof of captain authority.
 
 Commands: catalog; inspect (default); propose; prepare.
 Resource source records can retain credential-free npm, Git, and local sources;
-only exact-version/unpinned npm user packages have a preparable resource action.
+only exact-version, unpinned, or latest npm user packages have a preparable resource action.
 inspect takes {observations: {target: observation}} and always returns the full
 catalog. propose adds target and optionally resource (a Pi resource identity object).
 prepare additionally needs approval equal to the current proposal and checkpoint.
@@ -140,6 +140,24 @@ def availability_evidence(row):
         raise Invalid("Unknown availability cannot claim verified release evidence.")
 
 
+def npm_declaration(source):
+    match = PACKAGE.fullmatch(source) if isinstance(source, str) else None
+    return (match.group(1), match.group(2)) if match else None
+
+
+def update_identity(source):
+    declaration = npm_declaration(source)
+    return ("npm", declaration[0]) if declaration else ("source", source)
+
+
+def selector_identity(selector):
+    if selector in {None, "latest"}:
+        return "latest"
+    if VERSION.fullmatch(selector):
+        return "exact:" + selector.lstrip("v")
+    return "constraint:" + selector
+
+
 def resource_record(row):
     object_fields(row, RESOURCE_FIELDS)
     assessment_record(row)
@@ -168,8 +186,8 @@ def resource_record(row):
             raise Invalid("Only credential-free npm, Git, or local resource declarations are accepted.")
         if row.get("declarations") is not None and row["declarations"] != [source]:
             raise Invalid("A resource declaration must exactly identify its update unit.")
-        declared_pin = match[2] if match else None
-        expected_pins = [declared_pin] if declared_pin else []
+        selector = match[2] if match else None
+        expected_pins = [selector] if selector and VERSION.fullmatch(selector) else []
         if row.get("pins") is not None and row["pins"] != expected_pins:
             raise Invalid("Resource pin evidence must match its unchanged declaration.")
     return copy.deepcopy(row)
@@ -284,9 +302,9 @@ def dispatch(target, row, selected):
         if not source:
             raise Invalid("A managed resource needs its unchanged package declaration.")
         match = PACKAGE.fullmatch(source)
-        if not match or (match[2] is not None and not VERSION.fullmatch(match[2])):
+        if not match or (match[2] not in {None, "latest"} and not VERSION.fullmatch(match[2])):
             raise Invalid("Git, local, or range/tag sources need their existing owner's separately reviewed proposal.")
-        pin = match[2]
+        pin = match[2] if match[2] and VERSION.fullmatch(match[2]) else None
         if pin and selected["available"].lstrip("v") != pin.lstrip("v"):
             raise Invalid("Explicit pins are preserved; changing a pin is a separate authorization.")
         if selected["scope"] != "user":
@@ -350,10 +368,15 @@ def proposal(data, rows):
         raise Invalid("Complete Pi extensions, skills, templates, and scope inventory before proposing an update.")
     affected = copy.deepcopy(row.get("resources", [])) if target == "pi" else []
     if selected is not None:
+        identity = update_identity(selected["source"])
         affected = [copy.deepcopy(resource) for resource in row["resources"] if
-                    resource.get("source") == selected["source"] and resource.get("scope") == selected["scope"]]
+                    update_identity(resource.get("source")) == identity and
+                    resource.get("scope") == selected["scope"]]
         if any(resource.get("owner") != "pi-package" for resource in affected):
             raise Invalid("Every resource supplied by a package must share its verified owner and scope.")
+        npm_sources = [npm_declaration(resource["source"]) for resource in affected]
+        if identity[0] == "npm" and len({selector_identity(source[1]) for source in npm_sources}) != 1:
+            raise Invalid("Conflicting declarations for one npm package require reconciliation before approval.")
         for resource in affected:
             require_assessment(resource, "loaded")
             if any(resource.get(k) is not True for k in
@@ -373,7 +396,9 @@ def proposal(data, rows):
     if outcome(target, candidate)["category"] != "candidate":
         raise Invalid("No verified, compatible newer stable release can be proposed.")
     proposed = {"target": target, "resource": copy.deepcopy(selector),
-                "update_unit": ({"source": selected["source"], "scope": selected["scope"]}
+                "update_unit": ({"type": "npm-package" if update_identity(selected["source"])[0] == "npm" else "source",
+                                 "identity": update_identity(selected["source"])[1],
+                                 "scope": selected["scope"]}
                                 if selected else {"target": target}),
                 "owner": selected["owner"] if selected else row["owner"],
                 "installed_version": candidate["installed_version"],

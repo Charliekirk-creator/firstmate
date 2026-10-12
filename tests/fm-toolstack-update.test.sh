@@ -331,6 +331,17 @@ scoped['observations']['pi']['resources'][0].update(
     source='npm:@example/extension@1.1.0', declarations=['npm:@example/extension@1.1.0'], pins=['1.1.0'])
 scoped['resource'] = resource_selector(scoped['observations']['pi']['resources'][0])
 assert prepared(approved(scoped))['dispatch']['argv'][2] == 'npm:@example/extension@1.1.0'
+scoped_aliases = copy.deepcopy(data)
+scoped_aliases['observations']['pi']['resources'][0].update(
+    source='npm:@example/extension', declarations=['npm:@example/extension'])
+scoped_sibling = copy.deepcopy(scoped_aliases['observations']['pi']['resources'][0])
+scoped_sibling.update(name='scoped-skill', kind='skill', source='npm:@example/extension@latest',
+                      declarations=['npm:@example/extension@latest'])
+scoped_aliases['observations']['pi']['resources'].append(scoped_sibling)
+scoped_aliases['resource'] = resource_selector(scoped_aliases['observations']['pi']['resources'][0])
+scoped_proposal = prepared(approved(scoped_aliases))
+assert len(scoped_proposal['affected_resources']) == 2
+assert scoped_proposal['update_unit']['identity'] == '@example/extension'
 bad = copy.deepcopy(data)
 bad['observations']['pi']['resources'][0]['scope'] = 'project'
 refuse('propose', bad)
@@ -388,13 +399,19 @@ print('ok - Pi updates bind Git/local compatibility without requiring resource r
 shared = request('pi')
 shared_a = copy.deepcopy(resource)
 shared_b = copy.deepcopy(resource)
-shared_b.update(kind='skill')
+shared_b.update(kind='skill', source='npm:example-extension@latest',
+                declarations=['npm:example-extension@latest'])
 shared['observations']['pi']['resources'] = [shared_a, shared_b]
 shared['resource'] = resource_selector(shared_a)
 proposal = prepared(approved(shared))
 assert {(r['name'], r['kind']) for r in proposal['affected_resources']} == {
     ('example-extension', 'extension'), ('example-extension', 'skill')}
-assert proposal['update_unit'] == {'source': 'npm:example-extension', 'scope': 'user'}
+assert proposal['update_unit'] == {'type': 'npm-package', 'identity': 'example-extension', 'scope': 'user'}
+selected_alias = copy.deepcopy(shared)
+selected_alias['resource'] = resource_selector(selected_alias['observations']['pi']['resources'][1])
+alias_proposal = prepared(approved(selected_alias))
+assert alias_proposal['dispatch']['argv'][2] == 'npm:example-extension@latest'
+assert len(alias_proposal['affected_resources']) == 2
 for changed in ['installed', 'discovered', 'compatible', 'owner_verified', 'available_verified']:
     bad = copy.deepcopy(shared)
     bad['observations']['pi']['resources'][1][changed] = False
@@ -402,6 +419,10 @@ for changed in ['installed', 'discovered', 'compatible', 'owner_verified', 'avai
 missing = copy.deepcopy(shared)
 del missing['observations']['pi']['resources'][1]['compatibility_evidence']
 refuse('propose', missing)
+conflicting = copy.deepcopy(shared)
+conflicting['observations']['pi']['resources'][1].update(
+    source='npm:example-extension@1.1.0', declarations=['npm:example-extension@1.1.0'], pins=['1.1.0'])
+refuse('propose', conflicting)
 changed_effective = approved(shared)
 changed_effective['observations']['pi']['resources'][1].update(
     effective_version='0.8.0', effective_version_evidence='different loaded process')
