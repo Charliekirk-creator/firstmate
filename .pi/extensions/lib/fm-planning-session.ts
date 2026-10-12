@@ -97,6 +97,32 @@ export function fileStore(path: string): Store {
   };
 }
 
+export class PlanningWakeGate {
+  private active = false;
+  private queued = false;
+  private deferred = false;
+  private send: (slots: number[]) => void;
+  constructor(send: (slots: number[]) => void) { this.send = send; }
+  start(): void { this.active = true; }
+  wake(slots: number[]): void {
+    if (this.active || this.queued) { this.deferred = true; return; }
+    this.send(slots);
+    this.queued = true;
+  }
+  settle(pending?: number[]): void {
+    const deferred = this.deferred;
+    this.active = false;
+    this.queued = false;
+    this.deferred = false;
+    if (deferred && pending?.length) this.wake(pending);
+  }
+  reset(): void {
+    this.active = false;
+    this.queued = false;
+    this.deferred = false;
+  }
+}
+
 export type ClockIO = {
   now(): number;
   valid(): boolean;
@@ -151,7 +177,12 @@ export class PlanningSessionClock {
       if (!state || state.stopped) return;
     }
     this.dispose();
-    this.revocations.set(ownerKey(this.owner), { owner: this.owner, reason: "ownership-lost" });
+    const key = ownerKey(this.owner);
+    const prior = this.revocations.get(key);
+    let ledgerDue: number[] = [];
+    try { ledgerDue = this.ownedState()?.due ?? []; } catch {}
+    const due = [...new Set([...(prior?.due ?? []), ...ledgerDue])].sort((a, b) => a - b);
+    this.revocations.set(key, { owner: this.owner, reason: "ownership-lost", due });
     this.reconcileRevocation();
   }
   private rememberFailure(due: number[] = []): void {

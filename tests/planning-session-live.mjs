@@ -17,6 +17,7 @@ const { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManag
   await import(pathToFileURL(`${pkg}/dist/index.js`));
 const { createAssistantMessageEventStream } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`));
 const { Type } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/index.js`));
+const { PlanningSessionClock, PlanningWakeGate } = await import(pathToFileURL(`${code}/.pi/extensions/lib/fm-planning-session.ts`));
 const version = JSON.parse(readFileSync(`${pkg}/package.json`)).version;
 process.chdir(code);
 writeFileSync(`${home}/state/.lock`, String(process.pid));
@@ -24,11 +25,16 @@ const canonical = `${home}/data/planning/planning.md`, canonicalBefore = readFil
 const state = () => JSON.parse(readFileSync(ledger, 'utf8'));
 let output = 'Captain, partial response.', reason = 'stop', requests = 0, providerGate, entered, requestTarget, requestTargetReached;
 let savedPi, toolLoop = false, toolSlot, continueRun = false, continuationSlot;
+let busyClock, busyGate, busyTimer, busyNow, busyState;
 const contexts = [];
 const modelSpec = { id: 'offline', name: 'Offline fixture', reasoning: false, input: ['text'],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2048 };
 function fixture(pi) {
   savedPi = pi;
+  busyGate = new PlanningWakeGate(slots => pi.sendMessage({ customType: 'planning-fixture-wake',
+    content: `Busy planning slot ${slots.join(',')}`, display: false }, { triggerTurn: true, deliverAs: 'followUp' }));
+  pi.on('agent_start', () => { busyGate.start(); });
+  pi.on('agent_settled', () => { busyGate.settle(busyClock?.claim()?.slots); });
   pi.on('agent_before_settle', () => {
     if (!continueRun) return;
     continueRun = false;
@@ -210,22 +216,27 @@ const settled = new Promise(resolve => {
 const running = session.prompt('Busy-turn fixture', { source: 'rpc' });
 await arrived;
 const busySlot = deliveryFailureSlot - period;
-const busyBoundary = new Date(busySlot + 8 * 3600000).toISOString().slice(0, 19);
-writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: busySlot, due: [busySlot] }));
-assert.equal(requests, before + 1, 'busy response must not be interrupted');
-release(); await running; await settled;
+busyNow = busySlot - 1000;
+busyState = undefined;
+busyClock = new PlanningSessionClock({ sessionId: 'busy-fixture', sessionFile: `${lab}/busy.jsonl`,
+  pid: process.pid, processStart: 1 }, { read: () => busyState, write: value => { busyState = value; } }, {
+  now: () => busyNow, valid: () => true, wifi: () => 'online',
+  later(callback) { busyTimer = callback; return () => { if (busyTimer === callback) busyTimer = undefined; }; },
+  wake: slots => busyGate.wake(slots), error: error => { throw error; },
+});
+busyClock.start(busySlot);
+busyNow = busySlot;
+const boundaryTimer = busyTimer; busyTimer = undefined; boundaryTimer();
+assert.deepEqual(busyState.due, [busySlot], 'actual boundary path retains the busy slot');
+assert.equal(requests, before + 1, 'timer wake must not interrupt the busy response');
 requestTarget = before + 2;
 const deferredArrived = new Promise(resolve => { requestTargetReached = resolve; });
-savedPi.sendMessage({ customType: 'firstmate-planning-slot', content: 'Due fixture', display: false },
-  { triggerTurn: true, deliverAs: 'followUp' });
-await deferredArrived; await session.waitForIdle();
-assert.equal(requests, before + 2, 'exactly one post-settlement follow-up');
-assert.ok(JSON.stringify(contexts.at(-1)).includes(busyBoundary), 'post-settlement follow-up receives the retained slot');
-assert.deepEqual(state().due, [busySlot], 'incomplete follow-up retains the busy-turn slot');
-output = tables;
-await session.prompt('Complete busy-turn update', { source: 'rpc' });
+release(); await running; await settled; await deferredArrived; await session.waitForIdle();
+assert.equal(requests, before + 2, 'exactly one automatic post-settlement follow-up');
+assert.ok(JSON.stringify(contexts.at(-1)).includes(String(busySlot)), 'automatic follow-up carries the retained slot');
+assert.deepEqual(busyState.due, [busySlot], 'incomplete follow-up retains the busy-turn slot');
+busyClock.dispose();
 assert.deepEqual(errors, []);
-assert.deepEqual(state().due, []);
 chmodSync(`${home}/state`, 0o500);
 await session.prompt('/planning-session stop', { source: 'rpc' });
 chmodSync(`${home}/state`, 0o700);

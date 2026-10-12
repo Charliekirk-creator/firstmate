@@ -167,11 +167,19 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const failedClaim = deliveryFailure.claim();
     assert.throws(() => deliveryFailure.deliver(failedClaim, 'failed-delivery'), /disk full/);
     assert.equal(callback, undefined); assert.deepEqual(failureState.due, [], 'rename may have uncertainly committed');
+    commitBeforeFailure = false; valid = false;
+    assert.throws(() => deliveryFailure.ownershipLost(), /disk full/);
+    const retainedFailure = deliveryFailures.get(JSON.stringify([
+      owner.sessionId, owner.sessionFile, owner.pid, owner.processStart,
+    ]));
+    assert.equal(retainedFailure.reason, 'ownership-lost');
+    assert.deepEqual(retainedFailure.due, [old.through], 'ownership loss preserves uncertain delivery evidence');
+    valid = true;
     const deliveryReload = new PlanningSessionClock(owner, failureStore, io, deliveryFailures);
     assert.throws(() => deliveryReload.resume(), /disk full/);
     assert.equal(callback, undefined);
     storageFails = false; commitBeforeFailure = false; deliveryReload.resume();
-    assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ledger-failure');
+    assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ownership-lost');
     assert.deepEqual(failureState.due, [old.through], 'recovery restores every unproved delivery slot');
     assert.equal(failureState.delivery, undefined);
     deliveryReload.start(first); assert.ok(callback); deliveryReload.dispose();

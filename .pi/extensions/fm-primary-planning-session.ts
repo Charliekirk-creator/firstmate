@@ -6,7 +6,7 @@ import { dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { completePlanningTables, fileStore, HALF_HOUR, parseFirstSlot, PlanningSessionClock, wifiInterfaces, wifiLink,
+import { completePlanningTables, fileStore, HALF_HOUR, parseFirstSlot, PlanningSessionClock, PlanningWakeGate, wifiInterfaces, wifiLink,
   type Claim, type Owner, type Revocations } from "./lib/fm-planning-session.ts";
 
 const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "../.."));
@@ -92,8 +92,6 @@ export default function (pi: ExtensionAPI) {
   let claimLatched = false;
   let runActive = false;
   let live = false;
-  let wakeQueued = false;
-  let wakeDeferred = false;
   const key = `${root}\0${home}`;
   const revocations = processRevocations.get(key) ?? new Map();
   processRevocations.set(key, revocations);
@@ -104,17 +102,13 @@ export default function (pi: ExtensionAPI) {
     settlement = undefined;
     claimLatched = false;
     runActive = false;
-    wakeQueued = false;
-    wakeDeferred = false;
+    wakeGate.reset();
   } };
   const error = (problem: unknown) => ctx?.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");
-  const queueWake = (slots: number[]) => {
-    if (!live) return;
-    if (runActive || wakeQueued) { wakeDeferred = true; return; }
-    pi.sendMessage({ customType, content: instructions(slots), display: false },
+  const wakeGate = new PlanningWakeGate((slots) => {
+    if (live) pi.sendMessage({ customType, content: instructions(slots), display: false },
       { triggerTurn: true, deliverAs: "followUp" });
-    wakeQueued = true;
-  };
+  });
 
   const setup = (context: ExtensionContext) => {
     instances.get(key)?.dispose();
@@ -125,8 +119,7 @@ export default function (pi: ExtensionAPI) {
     settlement = undefined;
     claimLatched = false;
     runActive = false;
-    wakeQueued = false;
-    wakeDeferred = false;
+    wakeGate.reset();
     const sessionFile = context.sessionManager.getSessionFile();
     if (!sessionFile) return;
     const owner: Owner = { sessionId: context.sessionManager.getSessionId(),
@@ -141,7 +134,7 @@ export default function (pi: ExtensionAPI) {
         timer.unref();
         return () => clearTimeout(timer);
       },
-      wake: queueWake,
+      wake: (slots) => wakeGate.wake(slots),
       error,
     }, revocations);
     if (!live) { clock.ownershipLost(true); return; }
@@ -184,6 +177,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", (_event, context) => {
     if (runActive) return;
     runActive = true;
+    wakeGate.start();
     claimLatched = true;
     try {
       const due = clock?.claim();
@@ -210,7 +204,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", () => {
     const snapshot = claim;
     const accepted = settlement;
-    const deferred = wakeDeferred;
     try {
       if (snapshot && live && ctx && !main(ctx)) clock?.ownershipLost(true);
       if (snapshot && accepted && live && ctx && main(ctx)) {
@@ -244,13 +237,7 @@ export default function (pi: ExtensionAPI) {
     settlement = undefined;
     claimLatched = false;
     runActive = false;
-    wakeQueued = false;
-    wakeDeferred = false;
-    if (deferred) {
-      try {
-        const pending = clock?.claim();
-        if (pending) queueWake(pending.slots);
-      } catch (problem) { error(problem); }
-    }
+    try { wakeGate.settle(clock?.claim()?.slots); }
+    catch (problem) { wakeGate.settle(); error(problem); }
   });
 }
