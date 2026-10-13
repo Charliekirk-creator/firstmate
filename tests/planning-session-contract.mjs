@@ -140,10 +140,15 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       .replace('## Recently completed', 'Recently completed\n=====');
     assert.equal(completePlanningTables(setextTables), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', '**No material change**')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
       tables.replace('| Task | Ready | Finish | No |', '| Task | Ready |'),
       tables.replace('| Test | Verified |', ''), tables.replace('Completed outcome', 'Outcome'),
       tables.replace('| Idea | No material change | Review later | No |', '| Idea | | Review later | No |'),
+      tables.replace('| Idea | No material change | Review later | No |', '| &nbsp; | &nbsp; | &nbsp; | &nbsp; |'),
+      tables.replace('| Task | Ready | Finish | No |', '| &#160; | &#xA0; | &#32; | &Tab; |'),
+      tables.replace('| Test | Verified |', '| ** ** | ` ` |'),
+      tables.replace('| Test | Verified |', '| []() | __ __ |'),
       tables + '\n## Ideas\n', '~~~\n' + tables + '\n~~~',
       '```markdown\n```not-a-close\n' + tables + '\n```',
       tables.split('\n').map(line => line.startsWith('|') ? '    ' + line : line).join('\n'),
@@ -190,7 +195,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('> ' + lateDisclosure([first]) + '\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('- ' + lateDisclosure([first]) + '\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late update someday.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
+    assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first + 1), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n<span>' + lateDisclosure([first]) + '</span>\n' + tables,
+      [first], first + 1), false);
+    assert.equal(completePlanningTables('<span hidden>' + lateDisclosure([first]) + '</span>\n' +
+      lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
     assert.equal(completePlanningTables(tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.NaN), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.POSITIVE_INFINITY), false);

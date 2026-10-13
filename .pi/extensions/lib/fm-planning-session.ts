@@ -401,6 +401,25 @@ export function wifiLink(power: string, link: string): boolean {
     /^\s*status: active\s*$/m.test(link);
 }
 
+function renderedCellContent(cell: string): string {
+  const named: Record<string, string> = {
+    amp: "&", apos: "'", emsp: " ", ensp: " ", gt: ">", hairsp: " ", lt: "<", mediumspace: " ",
+    nbsp: " ", newline: " ", numsp: " ", puncsp: " ", quot: '"', tab: " ", thinsp: " ", verythinspace: " ",
+    zerowidthspace: "", zwnj: "", zwj: "",
+  };
+  const decoded = cell.replace(/&(?:#x([0-9a-f]+)|#([0-9]+)|([a-z][a-z0-9]+));?/gi,
+    (reference, hex, decimal, entity) => {
+      if (hex || decimal) {
+        const point = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
+        return point >= 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)
+          ? String.fromCodePoint(point) : reference;
+      }
+      return named[String(entity).toLowerCase()] ?? reference;
+    });
+  return decoded.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/[*_~`]/g, "").replace(/[\s\u200b-\u200f\u2060\ufeff]/gu, "");
+}
+
 function cells(line: string): string[] {
   let text = line.trim();
   if (text.startsWith("|")) text = text.slice(1);
@@ -457,6 +476,18 @@ export function lateDisclosure(slots: number[]): string {
   return `Late update for: ${labels.join(", ")}.`;
 }
 
+function latenessText(line: string): string | undefined {
+  let rendered = line;
+  let prior: string;
+  do {
+    prior = rendered;
+    rendered = rendered.replace(/^ {0,3}>[ \t]?/, "")
+      .replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
+  } while (rendered !== prior);
+  rendered = rendered.replace(/^ {1,3}(?=\S)/, "");
+  return /\bLate update(?:\s|:)/.test(rendered) ? rendered : undefined;
+}
+
 export function completePlanningTables(text: string, claimedSlots: number[] = [], persistedAt?: number): boolean {
   const lines = text.split(/\r?\n/);
   let fence: string | undefined;
@@ -473,6 +504,12 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
   const joined = visible.join("\n");
   const htmlSource = maskMarkdownCode(joined);
   const htmlLines = htmlSource.split("\n");
+  const inlineTags = /<\/?(?:span|b|i|em|strong|u|small|mark|s|sub|sup)>/gi;
+  const inlineLatenessClaim = htmlLines.some((line) => {
+    const tags = line.match(/<\/?[A-Za-z][^<>]*>/g);
+    return !!tags?.length && tags.every((tag) => new RegExp(`^${inlineTags.source}$`, "i").test(tag)) &&
+      latenessText(line.replace(inlineTags, "")) !== undefined;
+  });
   const hiddenLines = new Set<number>();
   const lineAt = (offset: number) => joined.slice(0, offset).split("\n").length - 1;
   const hide = (start: number, end: number) => {
@@ -542,16 +579,10 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
     if (!Number.isFinite(persistedAt)) return false;
     const lateSlots = claimedSlots.filter((slot) => persistedAt > slot);
     const disclosures = visible.flatMap((line) => {
-      let rendered = line;
-      let prior: string;
-      do {
-        prior = rendered;
-        rendered = rendered.replace(/^ {0,3}>[ \t]?/, "")
-          .replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
-      } while (rendered !== prior);
-      rendered = rendered.replace(/^ {1,3}(?=\S)/, "");
-      return /\bLate update(?:\s|:)/.test(rendered) ? [{ line, rendered }] : [];
+      const rendered = latenessText(line);
+      return rendered === undefined ? [] : [{ line, rendered }];
     });
+    if (inlineLatenessClaim) return false;
     if (lateSlots.length) {
       const expected = lateDisclosure(lateSlots);
       if (disclosures.length !== 1 || disclosures[0].rendered !== expected || disclosures[0].line.trim() !== expected) return false;
@@ -582,7 +613,7 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
     while (++i < visible.length && visible[i].trim() && visible[i].includes("|")) {
       if (!tableSyntax(visible[i])) return false;
       const row = cells(visible[i]);
-      if (row.length !== header.length || row.some((cell) => !cell)) return false;
+      if (row.length !== header.length || row.some((cell) => !renderedCellContent(cell))) return false;
       rows += 1;
     }
     return rows > 0;
