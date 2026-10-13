@@ -122,7 +122,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
     assert.equal(completePlanningTables(tables + '\n<captain@example.invalid>'), true);
 
-    assert.equal(completePlanningTables('```markdown\n```   \n' + tables), true);
+    assert.equal(completePlanningTables('```markdown\n```   \n' + tables), false);
     assert.equal(completePlanningTables(tables.split('\n').map(line => line.startsWith('|') ? '   ' + line : line).join('\n')), true);
 
     assert.equal(completePlanningTables('Note: `<section hidden>`\n' + tables), true);
@@ -131,7 +131,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
 
     assert.equal(completePlanningTables('Note: `<style>table { display:none }</style>`\n' + tables), true);
     assert.equal(completePlanningTables('\\<style>table { display:none }\\</style>\n' + tables), true);
-    assert.equal(completePlanningTables('```html\n<style>table { display:none }</style>\n```\n' + tables), true);
+    assert.equal(completePlanningTables('```html\n<style>table { display:none }</style>\n```\n' + tables), false);
     const tabAtxTables = tables.replace('## Ideas', '##\tIdeas').replace('## To-do list', '###\tTo-do list ###')
       .replace('## Recently completed', '#\tRecently completed\t####');
     assert.equal(completePlanningTables(tabAtxTables), true);
@@ -255,8 +255,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       'Late\n*update* for: 2026-10-12 16:30 HKT.',
     ]) assert.equal(completePlanningTables(claim + '\n' + tables, [first], first), false, claim);
     assert.equal(completePlanningTables('> Late\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
-    assert.equal(completePlanningTables('> - Late\n> - update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), true);
-    assert.equal(completePlanningTables('>     Late\n>     update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), true);
+    assert.equal(completePlanningTables('> - Late\n> - update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('>     Late\n>     update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     for (const separated of [
       '> Late\n> > update for: 2026-10-12 16:30 HKT.',
       '> - Late\n> - update for: 2026-10-12 16:30 HKT.',
@@ -264,14 +264,16 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       'Late\n_ _ _\nupdate for: 2026-10-12 16:30 HKT.',
       'Late\n- - -\nupdate for: 2026-10-12 16:30 HKT.',
       'Late\n* update for: 2026-10-12 16:30 HKT.',
-      '| Late |\n| --- |\n| update for: 2026-10-12 16:30 HKT. |',
       'Late |\nnot-a-delimiter |\nupdate for: 2026-10-12 16:30 HKT.',
       '    Late\n    update for: 2026-10-12 16:30 HKT.',
-      '`Late`\n`update for: 2026-10-12 16:30 HKT.`',
       '> ```\n> Late update for: hidden code\n> ```',
       '- ~~~\n  Late update for: hidden code\n  ~~~',
       '> > - ```\n> >   Late update for: hidden code\n> >   ```',
-    ]) assert.equal(completePlanningTables(separated + '\n' + tables, [first], first), true, separated);
+    ]) assert.equal(completePlanningTables(separated + '\n' + tables, [first], first), false, separated);
+    assert.equal(completePlanningTables('| Late |\n| --- |\n| update for: 2026-10-12 16:30 HKT. |\n' + tables,
+      [first], first), true);
+    assert.equal(completePlanningTables('`Late`\n`update for: 2026-10-12 16:30 HKT.`\n' + tables,
+      [first], first), true);
     for (const visibleAfterFenceLoss of [
       '> ```\nLate update for: 2026-10-12 16:30 HKT.\n> ```',
       '> > ~~~\n> Late update for: 2026-10-12 16:30 HKT.\n> > ~~~',
@@ -286,11 +288,11 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('* Late\n    update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('+ Late\n\tupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('1. Late\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
-    assert.equal(completePlanningTables('    Late\n    update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), true);
-    assert.equal(completePlanningTables('\tLate\n\tupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), true);
+    assert.equal(completePlanningTables('    Late\n    update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('\tLate\n\tupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late\n\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), true);
     assert.equal(completePlanningTables('Late\n```text\nunrelated\n```\nupdate for: 2026-10-12 16:30 HKT.\n' + tables,
-      [first], first), true);
+      [first], first), false);
     assert.equal(completePlanningTables('[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables,
       [first], first), false);
     assert.equal(completePlanningTables('`Late update for: 2026-10-12 16:30 HKT.`\n' + tables, [first], first), true);
@@ -306,7 +308,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + tables, [first], first + 1), true);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + headingTables, [first], first + 1), true);
     assert.equal(completePlanningTables(lateDisclosure([first]) +
-      '\n\n    Late update for: hidden code\n\n' + tables, [first], first + 1), true);
+      '\n\n    Late update for: hidden code\n\n' + tables, [first], first + 1), false);
     for (const fenced of [
       '> ```\n> Late update for: hidden code\n> ```',
       '- ~~~\n  Late update for: hidden code\n  ~~~',
@@ -345,9 +347,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '- outer\n  1. inner\n\t ```\n\t Late update for: hidden code\n\t ```',
       '- outer\nlazy continuation\n***\n  ```\n  Late update for: hidden code\n  ```',
     ]) assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + fenced + '\n' + tables,
-      [first], first + 1), true, fenced);
+      [first], first + 1), false, fenced);
     assert.equal(completePlanningTables(lateDisclosure([first]) +
-      '\n\n> ````\n> ignored\n> ```\n' + tables, [first], first + 1), true);
+      '\n\n> ````\n> ignored\n> ```\n' + tables, [first], first + 1), false);
     for (const escapedFence of [
       '> ```\nLate update for: another slot.\n> ```',
       '> > ~~~\n> Late update for: another slot.\n> > ~~~',

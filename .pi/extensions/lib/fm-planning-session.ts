@@ -597,107 +597,6 @@ function markdownLineFacts(source: string, activeList = false, activeParagraph =
     atx: /^ {0,3}#{1,6}(?:[ \t]|$)/.test(content), setext, thematic };
 }
 
-function visibleMarkdownLines(lines: string[]): string[] {
-  type ContainerFrame = { kind: "quote" } |
-    { kind: "list"; startColumn: number; contentColumn: number; continuationOffset: number; marker: string };
-  type Fence = { marker: string; containers: ContainerFrame[] };
-  type Cursor = { index: number; column: number };
-  let fence: Fence | undefined;
-  let activeListContainers: ContainerFrame[] | undefined;
-  let activeListParagraph = false;
-  const advance = (cursor: Cursor, value: string) => {
-    for (const character of value) {
-      cursor.column = character === "\t" ? cursor.column + 4 - cursor.column % 4 : cursor.column + 1;
-      cursor.index += 1;
-    }
-  };
-  const parseContainers = (line: string, initial: Cursor = { index: 0, column: 0 }) => {
-    const cursor: Cursor = { ...initial };
-    const containers: ContainerFrame[] = [];
-    for (;;) {
-      const content = line.slice(cursor.index);
-      const quote = /^ {0,3}>[ \t]?/.exec(content);
-      if (quote) {
-        containers.push({ kind: "quote" });
-        advance(cursor, quote[0]);
-        continue;
-      }
-      const item = /^ {0,3}([-+*]|\d+[.)])([ \t]+)/.exec(content);
-      if (!item) break;
-      const startColumn = cursor.column;
-      advance(cursor, item[0]);
-      containers.push({ kind: "list", startColumn, contentColumn: cursor.column,
-        continuationOffset: cursor.column - startColumn, marker: item[1] });
-    }
-    return { content: line.slice(cursor.index), containers, cursor };
-  };
-  const matchingPrefix = (line: string, containers: ContainerFrame[]) => {
-    const cursor: Cursor = { index: 0, column: 0 };
-    let count = 0;
-    let indentationCredit = 0;
-    for (const frame of containers) {
-      if (frame.kind === "quote") {
-        const quote = /^ {0,3}>[ \t]?/.exec(line.slice(cursor.index));
-        if (!quote) break;
-        advance(cursor, quote[0]);
-        indentationCredit = 0;
-      } else {
-        const needed = Math.max(0, frame.continuationOffset - indentationCredit);
-        const requiredColumn = cursor.column + needed;
-        while (cursor.index < line.length && cursor.column < requiredColumn &&
-          (line[cursor.index] === " " || line[cursor.index] === "\t")) advance(cursor, line[cursor.index]);
-        if (cursor.column < requiredColumn) {
-          if (!line.slice(cursor.index).trim()) return { count: containers.length, content: "", cursor };
-          break;
-        }
-        indentationCredit = Math.max(0, indentationCredit - frame.continuationOffset) +
-          Math.max(0, cursor.column - requiredColumn);
-      }
-      count += 1;
-    }
-    return { count, content: line.slice(cursor.index), cursor };
-  };
-  const lazyParagraph = (line: string) => !!line.trim() && !/^(?:\t| {4})/.test(line) &&
-    !/^ {0,3}(?:#{1,6}(?:[ \t]|$)|`{3,}|~{3,}|(?:[*_-][ \t]*){3,})/.test(line);
-  const openingAt = (content: string, containers: ContainerFrame[]): Fence | undefined => {
-    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
-    if (!match || match[1][0] === "`" && match[2].includes("`")) return undefined;
-    return { marker: match[1], containers };
-  };
-  return lines.map((line) => {
-    if (fence) {
-      const matched = matchingPrefix(line, fence.containers);
-      if (matched.count === fence.containers.length) {
-        const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(matched.content);
-        if (closing && closing[1][0] === fence.marker[0] && closing[1].length >= fence.marker.length) fence = undefined;
-        return "";
-      }
-      activeListContainers = fence.containers.slice(0, matched.count);
-      if (!activeListContainers.some((frame) => frame.kind === "list")) activeListContainers = undefined;
-      activeListParagraph = false;
-      fence = undefined;
-    }
-    if (activeListContainers) {
-      const matched = matchingPrefix(line, activeListContainers);
-      if (matched.count < activeListContainers.length && activeListParagraph && lazyParagraph(line)) return line;
-      const retained = activeListContainers.slice(0, matched.count);
-      const entered = parseContainers(line, matched.cursor);
-      const containers = [...retained, ...entered.containers];
-      fence = openingAt(entered.content, containers);
-      if (fence) { activeListParagraph = false; return ""; }
-      activeListContainers = containers.some((frame) => frame.kind === "list") ? containers : undefined;
-      activeListParagraph = !!activeListContainers && !!entered.content.trim();
-      return line;
-    }
-    const parsed = parseContainers(line);
-    fence = openingAt(parsed.content, parsed.containers);
-    if (fence) { activeListParagraph = false; return ""; }
-    activeListContainers = parsed.containers.some((frame) => frame.kind === "list") ? parsed.containers : undefined;
-    activeListParagraph = !!activeListContainers && !!parsed.content.trim();
-    return line;
-  });
-}
-
 function markdownTableLines(lines: string[]): Set<number> {
   const structural = new Set<number>();
   const facts = lines.map((line) => markdownLineFacts(line));
@@ -717,6 +616,21 @@ function markdownTableLines(lines: string[]): Set<number> {
       cells(facts[row].content).length === cells(facts[i].content).length; row += 1) structural.add(row);
   }
   return structural;
+}
+
+function supportedMarkdownSurface(lines: string[]): boolean {
+  const tableLines = markdownTableLines(lines);
+  return lines.every((line, index) => {
+    if (!line.trim()) return true;
+    const setext = /^ {0,3}(?:=+|-+)[ \t]*$/.test(line) && index > 0 &&
+      /^(?:Ideas|To-do list|Recently completed)$/.test(lines[index - 1].trim());
+    if (/^ {0,3}>/.test(line) || /^(?:\t| {4})/.test(line) ||
+        /^ {0,3}(?:`{3,}|~{3,})/.test(line) ||
+        /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(line) ||
+        !setext && /^ {0,3}([*_-])(?:[ \t]*\1){2,}[ \t]*$/.test(line)) return false;
+    if (maskMarkdownCode(line).includes("|") && !tableLines.has(index)) return false;
+    return true;
+  });
 }
 
 function latenessClaims(lines: string[]): { rendered: string; source?: string; topLevel: boolean }[] {
@@ -765,7 +679,8 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
 
 export function completePlanningTables(text: string, claimedSlots: number[] = [], persistedAt?: number): boolean {
   const lines = text.split(/\r?\n/);
-  const visible = visibleMarkdownLines(lines);
+  if (!supportedMarkdownSurface(lines)) return false;
+  const visible = lines;
   const joined = visible.join("\n");
   const markdownSurface = maskMarkdownCode(joined)
     .replace(/<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>/g, "")
