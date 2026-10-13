@@ -235,12 +235,12 @@ export default function (pi: ExtensionAPI) {
             const text = entry?.type === "message" && entry.message.role === "assistant"
               ? entry.message.content.filter((part: { type: string }) => part.type === "text")
                 .map((part: { text: string }) => part.text).join("\n") : "";
+            const persistedAt = typeof entry?.timestamp === "string" ? Date.parse(entry.timestamp) : Number.NaN;
             if (entries[0]?.type === "session" && entries[0]?.id === snapshot.owner.sessionId &&
                 entry?.type === "message" && JSON.stringify(entry.message) === JSON.stringify(accepted.message) &&
                 ancestor === snapshot.leaf && accepted.entryId !== snapshot.leaf &&
-                completePlanningTables(text, snapshot.slots,
-                  typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : Number.NaN)) {
-              clock?.deliver(snapshot, accepted.entryId);
+                completePlanningTables(text, snapshot.slots, persistedAt)) {
+              clock?.deliver(snapshot, accepted.entryId, persistedAt);
             }
           }
         }

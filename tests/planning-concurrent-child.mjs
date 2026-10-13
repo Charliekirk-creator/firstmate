@@ -72,7 +72,7 @@ process.on('message', ({ id, command, ...options }) => {
         case 'stop': return clock.stop('command');
         case 'revoke': return clock.ownershipLost(true);
         case 'claim': claim = clock.claim(); return claim;
-        case 'deliver': return clock.deliver(claim, options.entryId ?? `${role}-response`);
+        case 'deliver': return clock.deliver(claim, options.entryId ?? `${role}-response`, options.at ?? now);
         case 'tick': {
           now = options.slot; wifi = options.wifi ?? 'online';
           const fn = callback; callback = undefined; fn?.(); return;

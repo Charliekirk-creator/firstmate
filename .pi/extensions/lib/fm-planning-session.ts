@@ -128,6 +128,7 @@ export function validateState(value: unknown): SlotState {
 export function fileStore(path: string, operations: {
   write(fd: number, data: string): void;
   sync(fd: number): void;
+  retireSync?(fd: number): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
   const journalPath = `${path}.recovery.json`;
   const pendingPath = `${path}.pending-recovery.json`;
@@ -211,10 +212,27 @@ export function fileStore(path: string, operations: {
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}
     }
   };
-  const clearJournal = () => {
+  const clearRecovery = (source: string, label: string) => {
     assertHeld!();
-    if (existsSync(journalPath)) { unlinkSync(journalPath); syncDirectory(fsyncSync); }
+    if (!existsSync(source)) return;
+    const bytes = readFileSync(source);
+    unlinkSync(source);
+    try {
+      syncDirectory(operations.retireSync ?? fsyncSync);
+    } catch (retirementError) {
+      try {
+        const fd = openSync(source, "wx", 0o600);
+        try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+        syncDirectory(fsyncSync);
+      } catch (restorationError) {
+        throw new Error(`Planning ${label} retirement failed and durable recovery evidence could not be restored`,
+          { cause: restorationError });
+      }
+      throw new Error(`Planning ${label} retirement failed; recovery evidence was restored`,
+        { cause: retirementError });
+    }
   };
+  const clearJournal = () => clearRecovery(journalPath, "journal");
   const publishPending = (record: Recovery) => {
     assertHeld!();
     const temp = `${pendingPath}.${randomUUID()}.tmp`;
@@ -232,10 +250,7 @@ export function fileStore(path: string, operations: {
     if (record && record.phase !== "aborted") throw new Error("Malformed pending planning recovery evidence");
     return record;
   };
-  const clearPending = () => {
-    assertHeld!();
-    if (existsSync(pendingPath)) { unlinkSync(pendingPath); syncDirectory(fsyncSync); }
-  };
+  const clearPending = () => clearRecovery(pendingPath, "pending evidence");
   const writeUnlocked = (state: SlotState, authorize: (() => boolean) | undefined, onRename: () => void) => {
     const temp = `${path}.${randomUUID()}.tmp`;
     let fd: number | undefined;
@@ -828,18 +843,19 @@ export class PlanningSessionClock {
     const state = this.current();
     return state?.due.length ? { owner: this.owner, slots: [...state.due] } : undefined;
   }
-  deliver(claim: Claim, entryId: string): boolean {
+  deliver(claim: Claim, entryId: string, persistedAt: number): boolean {
     let retained: number[] = [];
     try {
+      if (!integer(persistedAt)) return false;
       const state = this.active ? this.current() : undefined;
       if (!state || !sameOwner(claim.owner, this.owner) || !entryId ||
           (state.deliveries ?? (state.delivery ? [state.delivery] : [])).some((receipt) => receipt.entryId === entryId)) return false;
       const slots = claim.slots.filter((slot) => state.due.includes(slot));
       if (!slots.length) return false;
       retained = slots;
-      const at = this.io.now();
-      if (slots.some((slot) => slot > at)) return false;
-      const delivery: DeliveryReceipt = { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) };
+      if (slots.some((slot) => slot > persistedAt)) return false;
+      const delivery: DeliveryReceipt = { entryId, slots, at: persistedAt,
+        lateByMs: Math.max(0, persistedAt - Math.min(...slots)) };
       const deliveries = [...(state.deliveries ?? (state.delivery ? [state.delivery] : [])), delivery];
       const candidate = { ...state, due: state.due.filter((slot) => !slots.includes(slot)), delivery, deliveries };
       this.rememberFailure(slots, candidate);

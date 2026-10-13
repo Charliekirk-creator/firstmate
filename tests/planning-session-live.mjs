@@ -251,6 +251,8 @@ const receiptEntry = session.sessionManager.getEntry(receipt.entryId);
 assert.ok(receiptEntry);
 assert.equal(receiptEntry.message.timestamp, continuationSlot, 'provider timestamp remains on the model message');
 assert.ok(Date.parse(receiptEntry.timestamp) > continuationSlot, 'durable append timestamp determines lateness');
+assert.equal(receipt.at, Date.parse(receiptEntry.timestamp), 'receipt uses the persisted append timestamp');
+assert.equal(receipt.lateByMs, receipt.at - continuationSlot);
 assert.ok(readFileSync(session.sessionManager.getSessionFile(), 'utf8').includes(receipt.entryId));
 console.log(`ok - real Pi ${version} failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery`);
 

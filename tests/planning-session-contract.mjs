@@ -52,11 +52,15 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.deepEqual(clock.claim().slots, [first]); assert.equal(wakes.length, 1, 'reload cannot duplicate slot wake');
     fire(first + HALF_HOUR); assert.equal(samples, 2); assert.deepEqual(store.read().due, [first, first + HALF_HOUR]);
     now += 4000;
-    assert.equal(clock.deliver(claim, 'assistant-one'), true);
+    assert.equal(clock.deliver(claim, 'invalid-timestamp', Number.NaN), false);
+    assert.deepEqual(store.read().due, [first, first + HALF_HOUR], 'invalid persistence time cannot clear due work');
+    assert.equal(clock.deliver(claim, 'assistant-one', first), true);
     assert.deepEqual(store.read().due, [first + HALF_HOUR], 'delivery only acknowledges pre-response slots');
-    assert.equal(store.read().delivery.lateByMs, HALF_HOUR + 4000);
-    assert.equal(clock.deliver(claim, 'assistant-one'), false);
-    assert.equal(clock.deliver(clock.claim(), 'assistant-two'), true);
+    assert.equal(store.read().delivery.at, first);
+    assert.equal(store.read().delivery.lateByMs, 0, 'delayed settlement uses exact-boundary persistence time');
+    assert.equal(clock.deliver(claim, 'assistant-one', now), false);
+    assert.equal(clock.deliver(clock.claim(), 'assistant-two', first + HALF_HOUR + 4000), true);
+    assert.equal(store.read().delivery.lateByMs, 4000, 'late persistence records its actual lateness');
     assert.deepEqual(store.read().due, []);
     assert.deepEqual(store.read().observations.map(receipt => receipt.slot), [first, first + HALF_HOUR]);
     assert.deepEqual(store.read().deliveries.map(receipt => receipt.entryId), ['assistant-one', 'assistant-two']);
@@ -69,7 +73,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     clock.dispose(); clock.resume(); assert.equal(wakes.length, 2, 'reconnection does not burst skipped slots');
     fire(first + 3 * HALF_HOUR);
     assert.deepEqual(store.read().due, [first + 3 * HALF_HOUR]);
-    assert.equal(clock.deliver(clock.claim(), 'assistant-three'), true);
+    assert.equal(clock.deliver(clock.claim(), 'assistant-three', now), true);
     const before = samples;
     fire(first + 5 * HALF_HOUR + OBSERVATION_WINDOW + 1);
     assert.equal(samples, before, 'cannot retroactively sample an unobserved boundary');
@@ -691,7 +695,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const deliveryFailure = new PlanningSessionClock(owner, failureStore, io, deliveryFailures);
     now = old.through + 1000; deliveryFailure.resume();
     const failedClaim = deliveryFailure.claim();
-    assert.throws(() => deliveryFailure.deliver(failedClaim, 'failed-delivery'), /disk full/);
+    assert.throws(() => deliveryFailure.deliver(failedClaim, 'failed-delivery', now), /disk full/);
     assert.equal(callback, undefined); assert.deepEqual(failureState.due, [], 'rename may have uncertainly committed');
     commitBeforeFailure = false; valid = false;
     assert.throws(() => deliveryFailure.ownershipLost(), /disk full/);
@@ -816,6 +820,43 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       assert.equal(readdirSync(lab).includes(`${failure}-cleanup.json.recovery.json`), true,
         `${failure} failure retains durable recovery evidence`);
     }
+
+    const retirementPath = join(lab, 'retirement-cleanup.json');
+    let retirementFails = true;
+    const retirementStore = fileStore(retirementPath, { write: writeFileSync, sync: fsyncSync,
+      retireSync(fd) { if (retirementFails) { retirementFails = false; throw new Error('injected retirement sync failure'); }
+        fsyncSync(fd); } });
+    assert.throws(() => retirementStore.write(old, null), /recover-commit/);
+    const retainedRetirementBytes = readFileSync(`${retirementPath}.recovery.json`);
+    const retirementOperation = JSON.parse(retainedRetirementBytes).operationId;
+    assert.deepEqual(retirementStore.recovery().candidate, old);
+    const retirementClock = new PlanningSessionClock(owner, retirementStore, { ...io, valid: () => true, ownsMain: () => true });
+    retirementClock.recoverCommit(retirementOperation);
+    assert.equal(existsSync(`${retirementPath}.recovery.json`), false);
+    assert.deepEqual(retirementStore.read(), old);
+    retirementClock.dispose();
+
+    const adoptionRetirementPath = join(lab, 'adoption-retirement-cleanup.json');
+    const adoptionSource = { version: 1, generation: 1, owner: transferOwnerA, firstSlot: first, through: first,
+      due: [first], observation: { slot: first, result: 'online' } };
+    const adoptionPreparation = fileStore(adoptionRetirementPath,
+      { write() { throw new Error('injected preparation failure'); }, sync: fsyncSync });
+    assert.throws(() => adoptionPreparation.write(adoptionSource, null), /injected preparation failure/);
+    const foreignJournalBytes = readFileSync(`${adoptionRetirementPath}.recovery.json`);
+    let adoptionRetirementFails = true;
+    const adoptionRetirementStore = fileStore(adoptionRetirementPath, { write: writeFileSync, sync: fsyncSync,
+      retireSync(fd) { if (adoptionRetirementFails) { adoptionRetirementFails = false;
+          throw new Error('injected adoption retirement sync failure'); } fsyncSync(fd); } });
+    const adoptionRetirementClock = new PlanningSessionClock(transferOwnerB, adoptionRetirementStore,
+      { ...io, valid: () => true, ownsMain: () => true });
+    assert.throws(() => adoptionRetirementClock.adopt(first), /recovery evidence was restored/);
+    assert.deepEqual(readFileSync(`${adoptionRetirementPath}.recovery.json`), foreignJournalBytes);
+    assert.equal(adoptionRetirementStore.read().generation, 2);
+    adoptionRetirementClock.adopt(first);
+    assert.equal(existsSync(`${adoptionRetirementPath}.recovery.json`), false);
+    assert.equal(adoptionRetirementStore.read().generation, 2, 'cleanup retry cannot fabricate another receipt');
+    adoptionRetirementClock.dispose();
+
     writeFileSync(join(lab, 'bad.json'), '{'); assert.throws(() => fileStore(join(lab, 'bad.json')).read());
     symlinkSync(join(lab, 'slots.json'), join(lab, 'link.json'));
     assert.throws(() => fileStore(join(lab, 'link.json')).read(), /Unsafe/);
@@ -927,7 +968,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const retainedAfterDeliveryRace = ownershipRace('delivery', 3, ({ raceA, prepare, fire }) => {
       fire();
       const pendingClaim = raceA.claim();
-      prepare(); assert.throws(() => raceA.deliver(pendingClaim, 'raced-delivery'), /ownership changed/);
+      prepare(); assert.throws(() => raceA.deliver(pendingClaim, 'raced-delivery', raceNow), /ownership changed/);
     });
     assert.deepEqual(retainedAfterDeliveryRace.due, [first], 'ownership transfer cannot clear delivery work');
 
