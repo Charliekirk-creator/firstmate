@@ -630,24 +630,26 @@ function visibleMarkdownLines(lines: string[]): string[] {
     }
     return { content: line.slice(cursor.index), containers, cursor };
   };
-  const memberPosition = (line: string, containers: ContainerFrame[]) => {
+  const matchingPrefix = (line: string, containers: ContainerFrame[]) => {
     const cursor: Cursor = { index: 0, column: 0 };
+    let count = 0;
     for (const frame of containers) {
       if (frame.kind === "quote") {
         const quote = /^ {0,3}>[ \t]?/.exec(line.slice(cursor.index));
-        if (!quote) return;
+        if (!quote) break;
         advance(cursor, quote[0]);
       } else {
         const requiredColumn = cursor.column + frame.continuationOffset;
         while (cursor.index < line.length && cursor.column < requiredColumn &&
           (line[cursor.index] === " " || line[cursor.index] === "\t")) advance(cursor, line[cursor.index]);
         if (cursor.column < requiredColumn) {
-          if (!line.slice(cursor.index).trim()) return { content: "", cursor };
-          return;
+          if (!line.slice(cursor.index).trim()) return { count: containers.length, content: "", cursor };
+          break;
         }
       }
+      count += 1;
     }
-    return { content: line.slice(cursor.index), cursor };
+    return { count, content: line.slice(cursor.index), cursor };
   };
   const openingAt = (content: string, containers: ContainerFrame[]): Fence | undefined => {
     const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
@@ -656,26 +658,25 @@ function visibleMarkdownLines(lines: string[]): string[] {
   };
   return lines.map((line) => {
     if (fence) {
-      const member = memberPosition(line, fence.containers);
-      if (member) {
-        const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(member.content);
+      const matched = matchingPrefix(line, fence.containers);
+      if (matched.count === fence.containers.length) {
+        const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(matched.content);
         if (closing && closing[1][0] === fence.marker[0] && closing[1].length >= fence.marker.length) fence = undefined;
         return "";
       }
+      activeListContainers = fence.containers.slice(0, matched.count);
+      if (!activeListContainers.some((frame) => frame.kind === "list")) activeListContainers = undefined;
       fence = undefined;
-      activeListContainers = undefined;
     }
     if (activeListContainers) {
-      const inherited = memberPosition(line, activeListContainers);
-      if (inherited) {
-        const entered = parseContainers(line, inherited.cursor);
-        const containers = [...activeListContainers, ...entered.containers];
-        fence = openingAt(entered.content, containers);
-        if (fence) return "";
-        if (entered.containers.length) activeListContainers = containers;
-        return line;
-      }
-      activeListContainers = undefined;
+      const matched = matchingPrefix(line, activeListContainers);
+      const retained = activeListContainers.slice(0, matched.count);
+      const entered = parseContainers(line, matched.cursor);
+      const containers = [...retained, ...entered.containers];
+      fence = openingAt(entered.content, containers);
+      if (fence) return "";
+      activeListContainers = containers.some((frame) => frame.kind === "list") ? containers : undefined;
+      return line;
     }
     const parsed = parseContainers(line);
     fence = openingAt(parsed.content, parsed.containers);
