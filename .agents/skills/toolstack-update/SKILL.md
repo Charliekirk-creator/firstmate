@@ -96,9 +96,9 @@ It is a **non-executing consistency check**, not an independent authorization so
 Unknown/mismatched evidence, altered commands, stale or batch approvals, changed pins/declarations, and active or unknown affected work refuse preparation.
 Do not spoof or weaken its checkpoint to obtain a command.
 
-If a supported native owner selects mutable `latest`, confirm the reviewed release again immediately before action.
-When a fixed-version guarantee is required and that owner cannot provide it, stop and obtain approval for its documented exact-version route, if any; do not invent flags or silently substitute installers.
-A changed release or dependency footprint requires a new proposal and answer.
+If a supported native owner uses any moving selector, immediately re-resolve it through that owner before action. This includes unpinned selectors and every mutable npm dist-tag, such as `latest` and `next`.
+Compare the resolved release, integrity and provenance, compatibility, affected set, channel evidence, and exact proposed command with the approved proposal. Any difference invalidates the old approval and requires a renewed complete proposal and individual approval; an unchanged selector string never authorizes a later resolved release.
+When a fixed-version guarantee is required and that owner cannot provide it, stop and obtain approval for its documented exact-version route, if any; do not pin, migrate channels, invent flags, or silently substitute installers.
 
 ## Active work and existing owners
 

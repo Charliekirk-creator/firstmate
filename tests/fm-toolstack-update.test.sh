@@ -384,6 +384,28 @@ assert tagged_proposal['dispatch'] == {
     'argv': ['pi', 'update', 'npm:example-extension@next', '--no-approve']}
 assert len(tagged_proposal['affected_resources']) == 2
 assert all(row['pins'] == ['next'] for row in tagged_proposal['affected_resources'])
+for moving_selector in (None, 'latest', 'next', 'beta'):
+    moving = copy.deepcopy(data)
+    moving_source = 'npm:example-extension' + (('@' + moving_selector) if moving_selector else '')
+    moving['observations']['pi']['resources'][0].update(
+        source=moving_source, declarations=[moving_source])
+    moving['observations']['pi']['resources'][0].pop('pins')
+    moving['resource'] = resource_selector(moving['observations']['pi']['resources'][0])
+    unchanged = approved(moving)
+    unchanged_proposal = prepared(unchanged)
+    assert unchanged_proposal['dispatch'] == {
+        'argv': ['pi', 'update', moving_source, '--no-approve']}
+    moved = copy.deepcopy(unchanged)
+    moved['observations']['pi']['resources'][0].update(
+        available='1.2.0', release_evidence='synthetic moved release record')
+    refuse('prepare', moved)
+    moved.pop('approval')
+    moved.pop('checkpoint')
+    renewed_proposal = prepared(approved(moved))
+    assert renewed_proposal['available'] == '1.2.0'
+    assert renewed_proposal['release_evidence'] == 'synthetic moved release record'
+    assert renewed_proposal['dispatch'] == {
+        'argv': ['pi', 'update', moving_source, '--no-approve']}
 for contradictory_status in ('unknown', 'unavailable'):
     contradictory_resource = copy.deepcopy(data)
     contradictory_resource['observations']['pi']['resources'][0]['version_status'] = contradictory_status
