@@ -140,8 +140,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(setextTables), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', '**No material change**')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', 'AT&T migration')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', 'R&amp;D migration')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', 'Unknown &unknown; literal')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', '\u3164Visible change')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
       tables + '\n<br>', '<div>benign context</div>\n\n' + tables,
+      '<div \n' + tables, '<script \n' + tables,
       '<section hidden>\n' + tables + '\n</section>\n\n' + tables, '<!-- benign -->\n' + tables,
       tables.replace('| Task | Ready | Finish | No |', '| Task | Ready |'),
       tables.replace('| Test | Verified |', ''), tables.replace('Completed outcome', 'Outcome'),
@@ -151,8 +156,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       tables.replace('| Test | Verified |', '| ** ** | ` ` |'),
       tables.replace('| Test | Verified |', '| []() | __ __ |'),
       tables.replace('| Test | Verified |', '| &shy; | &#173; |'),
+      tables.replace('| Test | Verified |', '| &NoBreak; | &InvisibleTimes; |'),
       tables.replace('| Test | Verified |', '| \u00ad | \u2060 |'),
-      tables.replace('| Test | Verified |', '| &unknown; | Visible |'),
+      tables.replace('| Test | Verified |', '| \u3164 | \u3164 |'),
+      tables.replace('| Test | Verified |', '| \u115f | \u2064 |'),
       tables + '\n## Ideas\n', '~~~\n' + tables + '\n~~~',
       '```markdown\n```not-a-close\n' + tables + '\n```',
       tables.split('\n').map(line => line.startsWith('|') ? '    ' + line : line).join('\n'),
@@ -200,6 +207,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('- ' + lateDisclosure([first]) + '\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late update someday.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('**Late update** for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('Late&#32;update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('Late&#x20;update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('Late&nbsp;update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables,
       [first], first), false);
     assert.equal(completePlanningTables('`Late update for: 2026-10-12 16:30 HKT.`\n' + tables, [first], first), true);
@@ -222,7 +232,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '1. ' + lateLine + '\n' + tables,
       lateLine + '\n> ' + lateLine + '\n' + tables,
       lateLine + '\n**Late update** for: 2026-10-12 16:30 HKT.\n' + tables,
-      lateLine + '\n[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables]) {
+      lateLine + '\n[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\nLate&#32;update for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\nLate&nbsp;update for: 2026-10-12 16:30 HKT.\n' + tables]) {
       assert.equal(completePlanningTables(disclosure, [first, first + HALF_HOUR], first + HALF_HOUR + 1), false);
     }
     console.log('ok - complete visible tables and exact lateness disclosure required');

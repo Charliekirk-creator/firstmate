@@ -401,30 +401,35 @@ export function wifiLink(power: string, link: string): boolean {
     /^\s*status: active\s*$/m.test(link);
 }
 
-function renderedCellContent(cell: string): string {
+function decodeMarkdownReferences(value: string): { text: string; unresolved: boolean } {
   const named: Record<string, string> = {
-    amp: "&", apos: "'", emsp: " ", ensp: " ", gt: ">", hairsp: " ", lt: "<", mediumspace: " ",
-    nbsp: " ", newline: " ", numsp: " ", puncsp: " ", quot: '"', shy: "", tab: " ", thinsp: " ", verythinspace: " ",
-    zerowidthspace: "", zwnj: "", zwj: "",
+    amp: "&", apos: "'", colon: ":", emsp: " ", ensp: " ", excl: "!", gt: ">", hairsp: " ", lt: "<",
+    applyfunction: "", invisiblecomma: "", invisibletimes: "", lrm: "", mediumspace: " ", nbsp: " ",
+    negativemediumspace: "", negativethickspace: "", negativethinspace: "", negativeverythinspace: "", newline: "\n",
+    nobreak: "", numsp: " ", puncsp: " ", quot: '"', rlm: "", semi: ";", shy: "", tab: "\t", thinsp: " ",
+    verythinspace: " ", zerowidthspace: "", zwnj: "", zwj: "",
   };
   let unresolved = false;
-  const decoded = cell.replace(/&(?:#x([0-9a-f]+)|#([0-9]+)|([a-z][a-z0-9]+));?/gi,
-    (reference, hex, decimal, entity) => {
+  const text = value.replace(/&(?:#x([0-9a-f]{1,6})|#([0-9]{1,7})|([a-z][a-z0-9]{1,31}));/gi,
+    (_reference, hex, decimal, entity) => {
       if (hex || decimal) {
         const point = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
-        if (point >= 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)) return String.fromCodePoint(point);
+        if (point > 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)) return String.fromCodePoint(point);
         unresolved = true;
         return "";
       }
       const replacement = named[String(entity).toLowerCase()];
-      if (replacement !== undefined) return replacement;
-      unresolved = true;
-      return "";
+      return replacement !== undefined ? replacement : _reference;
     });
-  if (unresolved) return "";
-  return decoded.replace(/!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g, "$1")
+  return { text, unresolved };
+}
+
+function renderedCellContent(cell: string): string {
+  const decoded = decodeMarkdownReferences(cell);
+  if (decoded.unresolved) return "";
+  return decoded.text.replace(/!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g, "$1")
     .replace(/\[([^\]]*)\]/g, "$1").replace(/[*_~`]/g, "")
-    .replace(/[\s\u00ad\u034f\u061c\u17b4-\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufe00-\ufe0f\ufeff]|[\u{e0100}-\u{e01ef}]/gu, "");
+    .replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, "");
 }
 
 function cells(line: string): string[] {
@@ -495,7 +500,9 @@ function latenessText(line: string): string | undefined {
   const normalized = maskMarkdownCode(rendered)
     .replace(/!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g, "$1")
     .replace(/\[([^\]]*)\]/g, "$1").replace(/[*_~]/g, "");
-  return /\bLate update(?:\s|:)/.test(normalized) ? rendered : undefined;
+  const decoded = decodeMarkdownReferences(normalized);
+  return /\bLate\s+update(?:\s|:)/.test(decoded.text) || decoded.unresolved && /Late|update/i.test(normalized)
+    ? rendered : undefined;
 }
 
 export function completePlanningTables(text: string, claimedSlots: number[] = [], persistedAt?: number): boolean {
@@ -515,7 +522,10 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
   const markdownSurface = maskMarkdownCode(joined)
     .replace(/<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>/g, "")
     .replace(/<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?>/g, "");
-  if (/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>|<!--|<![A-Z]|<!\[CDATA\[|<\?/is.test(markdownSurface)) return false;
+  const blockTags = "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
+  if (/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>|<!--|<![A-Z]|<!\[CDATA\[|<\?/is.test(markdownSurface) ||
+      new RegExp(`^ {0,3}</?(?:${blockTags})(?:\\s|/?>|$)`, "im").test(markdownSurface) ||
+      /^ {0,3}<(?:script|pre|style|textarea)(?:\s|>|$)/im.test(markdownSurface)) return false;
   if (persistedAt !== undefined) {
     if (!Number.isFinite(persistedAt)) return false;
     const lateSlots = claimedSlots.filter((slot) => persistedAt > slot);
