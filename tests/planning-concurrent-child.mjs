@@ -1,6 +1,6 @@
 // Independent live process fixture. Barriers are explicit file handshakes, not sleeps.
 import { spawnSync } from 'node:child_process';
-import { existsSync, fsyncSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, fsyncSync, readFileSync, readlinkSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileStore, HALF_HOUR, ownerKey, parseFirstSlot, PlanningSessionClock } from '../.pi/extensions/lib/fm-planning-session.ts';
 
@@ -41,6 +41,19 @@ function reset() {
         if (settings.fault === 'after-rename') throw new Error('injected directory fsync failure');
       }
       fsyncSync(fd);
+    },
+    beforeRename() {
+      barrier('authorized');
+      if (settings.fault === 'broker-signal') {
+        const target = readlinkSync(join(directory, '.lock.acquire'));
+        process.kill(Number(readFileSync(join(target, 'pid'), 'utf8')), 'SIGTERM');
+        const end = Date.now() + 2000;
+        while (!readdirSync(directory).some(name => name.startsWith('.planning-transaction.') &&
+          existsSync(join(directory, name, 'signal-deferred')))) {
+          if (Date.now() >= end) throw new Error('broker did not defer the commit-boundary signal');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+      }
     },
   });
   clock = new PlanningSessionClock(owner, store, { now: () => now, valid: authority, ownsMain: authority,

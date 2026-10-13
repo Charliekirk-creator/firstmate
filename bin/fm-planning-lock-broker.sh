@@ -4,7 +4,7 @@
 # The only lock is $STATE/.lock.acquire. No command or lock path is accepted.
 # The caller creates $STATE/.planning-transaction.<nonce> mode 0700 and owns stdin.
 # READY <nonce> <broker-pid> is published there and on stdout after acquisition.
-# Send RELEASE <nonce>, or close stdin, to release. Parent death/signals also release.
+# Send RELEASE <nonce>, or close stdin, to release. Signals defer through COMMIT/END.
 # Orphan recovery and exact-owner release are exclusively fm-wake-lib.sh's protocol.
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,12 +22,22 @@ receipt_dir="$STATE/.planning-transaction.$nonce"
 [ -d "$receipt_dir" ] && [ ! -L "$receipt_dir" ] || exit 2
 lock="$STATE/.lock.acquire"
 held=0
+critical=0
+interrupted=0
 cleanup() {
   if [ "$held" -eq 1 ]; then fm_lock_release "$lock"; held=0; fi
-  rm -f "$receipt_dir/ready"
+  rm -f "$receipt_dir/ready" "$receipt_dir/commit-ready" "$receipt_dir/commit-done" "$receipt_dir/signal-deferred"
+}
+on_signal() {
+  if [ "$critical" -eq 1 ]; then
+    interrupted=1
+    printf 'DEFERRED %s %s\n' "$nonce" "$$" > "$receipt_dir/signal-deferred"
+  else
+    exit 1
+  fi
 }
 trap cleanup EXIT
-trap 'exit 1' HUP INT TERM
+trap on_signal HUP INT TERM
 # Validate evidence without implementing another acquisition/steal algorithm.
 # shellcheck source=bin/fm-session-transaction-lib.sh
 . "$SCRIPT_DIR/fm-session-transaction-lib.sh"
@@ -41,11 +51,28 @@ done
 printf 'READY %s %s\n' "$nonce" "$$" > "$receipt_dir/prepared"
 mv "$receipt_dir/prepared" "$receipt_dir/ready"
 printf 'READY %s %s\n' "$nonce" "$$"
-# This pipe is private to the spawning Node parent. Its death closes the last
-# write end, so blocking read handles both ordinary EOF and abrupt parent loss.
 command=
-if IFS= read -r command; then
-  [ "$command" = "RELEASE $nonce" ] && exit 0
-  exit 2
-fi
+while IFS= read -r command; do
+  case "$command" in
+    "RELEASE $nonce") exit 0 ;;
+    "COMMIT $nonce")
+      critical=1
+      printf 'COMMIT %s %s\n' "$nonce" "$$" > "$receipt_dir/commit-prepared"
+      mv "$receipt_dir/commit-prepared" "$receipt_dir/commit-ready"
+      while ! IFS= read -r command; do
+        if [ "$interrupted" -eq 1 ] && kill -0 "$parent" 2>/dev/null; then
+          continue
+        fi
+        exit 1
+      done
+      [ "$command" = "END $nonce" ] || exit 2
+      rm -f "$receipt_dir/commit-ready"
+      critical=0
+      if [ "$interrupted" -eq 1 ]; then exit 1; fi
+      printf 'DONE %s %s\n' "$nonce" "$$" > "$receipt_dir/done-prepared"
+      mv "$receipt_dir/done-prepared" "$receipt_dir/commit-done"
+      ;;
+    *) exit 2 ;;
+  esac
+done
 exit 0

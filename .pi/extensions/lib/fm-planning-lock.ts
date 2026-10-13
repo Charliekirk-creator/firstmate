@@ -10,7 +10,8 @@ import { fileURLToPath } from "node:url";
 const broker = fileURLToPath(new URL("../../../bin/fm-planning-lock-broker.sh", import.meta.url));
 const sleep = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 
-export function planningTransaction<T>(directory: string, action: (assertHeld: () => void) => T): T {
+export function planningTransaction<T>(directory: string,
+  action: (assertHeld: () => void, commitHeld: <R>(commit: () => R) => R) => T): T {
   const state = realpathSync(directory);
   const nonce = randomBytes(16).toString("hex");
   const channel = resolve(state, `.planning-transaction.${nonce}`);
@@ -27,8 +28,10 @@ export function planningTransaction<T>(directory: string, action: (assertHeld: (
   child.stdin.on("error", () => {});
   child.unref();
   const lock = resolve(state, ".lock.acquire");
+  const commitReady = resolve(channel, "commit-ready");
+  const commitDone = resolve(channel, "commit-done");
   let owner: string | undefined;
-  const assertHeld = () => {
+  const assertEvidence = () => {
     if (!child.pid || !existsSync(ready) || readFileSync(ready, "utf8") !== `READY ${nonce} ${child.pid}\n` ||
         !lstatSync(ready).isFile() || lstatSync(ready).isSymbolicLink() || !lstatSync(lock).isSymbolicLink()) {
       throw new Error("Planning transaction broker lost ownership");
@@ -39,11 +42,45 @@ export function planningTransaction<T>(directory: string, action: (assertHeld: (
         readFileSync(resolve(linked, "pid"), "utf8").trim() !== String(child.pid)) {
       throw new Error("Planning transaction ownership evidence changed");
     }
-    // kill(0) alone accepts zombies while synchronous JS delays the child exit event.
+  };
+  const assertHeld = () => {
+    assertEvidence();
     const processState = spawnSync("ps", ["-o", "stat=", "-p", String(child.pid)], { encoding: "utf8", timeout: 1000 });
     if (processState.status !== 0 || !processState.stdout.trim() || /Z/.test(processState.stdout)) {
       throw new Error("Planning transaction broker exited");
     }
+  };
+  const commitHeld = <R>(commit: () => R): R => {
+    assertEvidence();
+    child.stdin.write(`COMMIT ${nonce}\n`);
+    const deadline = Date.now() + 1500;
+    while (!existsSync(commitReady)) {
+      if (!existsSync(ready) || Date.now() >= deadline) throw new Error("Planning transaction commit handshake failed");
+      sleep();
+    }
+    if (readFileSync(commitReady, "utf8") !== `COMMIT ${nonce} ${child.pid}\n`) {
+      throw new Error("Planning transaction commit receipt is invalid");
+    }
+    assertEvidence();
+    let result: R | undefined;
+    let failure: unknown;
+    let failed = false;
+    try { result = commit(); } catch (error) { failure = error; failed = true; }
+    child.stdin.write(`END ${nonce}\n`);
+    const completionDeadline = Date.now() + 1500;
+    while (!existsSync(commitDone)) {
+      if (!existsSync(ready) || Date.now() >= completionDeadline) {
+        throw new Error("Planning transaction broker exited during canonical commit", { cause: failure });
+      }
+      sleep();
+    }
+    if (readFileSync(commitDone, "utf8") !== `DONE ${nonce} ${child.pid}\n`) {
+      throw new Error("Planning transaction completion receipt is invalid", { cause: failure });
+    }
+    rmSync(commitDone);
+    assertEvidence();
+    if (failed) throw failure;
+    return result as R;
   };
   try {
     const deadline = Date.now() + 6500;
@@ -54,7 +91,7 @@ export function planningTransaction<T>(directory: string, action: (assertHeld: (
       sleep();
     }
     assertHeld();
-    const result = action(assertHeld);
+    const result = action(assertHeld, commitHeld);
     assertHeld();
     return result;
   } finally {

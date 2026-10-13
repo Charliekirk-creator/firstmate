@@ -298,6 +298,22 @@ try {
     assert.equal(existsSync(join(f.directory, '.lock.acquire')), false, 'parent pipe EOF releases its exact lock');
     await f.close(); console.log(`ok - ${phase} parent death, blocked publisher, atomic adoption and successor restart`);
   }
+  {
+    const f = await fixture('broker-signal-at-rename'); await f.publish(f.A); ok(await f.A.call('start'));
+    const original = f.bytes();
+    const transaction = f.A.begin('tick', { slot: first, barrier: 'authorized', fault: 'broker-signal' });
+    await atBarrier(f, f.A);
+    f.preparePublish(f.B); const publication = f.B.begin('publish');
+    await until(() => existsSync(join(f.directory, 'B.attempt')), 'B acquire attempt at authorized rename boundary');
+    assert.equal(publication.completed(), false);
+    assert.equal(f.bytes(), original, 'canonical bytes stay unchanged before the authorized rename');
+    release(f, f.A);
+    assert.match((await transaction.result()).error, /commit uncertain|broker exited/);
+    ok(await publication.result());
+    assert.deepEqual(f.state().due, [first], 'A completes its rename before the deferred signal releases the lock');
+    assert.equal(f.journal().candidate.due[0], first);
+    await f.close(); console.log('ok - broker signal cannot transfer ownership across the canonical rename');
+  }
   // Broker death before rename must abort the caller, not let it write without
   // the lock. Canonical recovery handles primary and nested steal orphans.
   {

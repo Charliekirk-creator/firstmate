@@ -71,11 +71,12 @@ export function validateState(value: unknown): SlotState {
   const validDelivery = (receipt: DeliveryReceipt, index: number) =>
     typeof receipt?.entryId === "string" && !!receipt.entryId &&
     !deliveries.slice(0, index).some((prior) => prior.entryId === receipt.entryId) &&
-    Array.isArray(receipt.slots) && !!receipt.slots.length &&
+    Array.isArray(receipt.slots) && !!receipt.slots.length && integer(receipt.at) && integer(receipt.lateByMs) &&
+    receipt.lateByMs === Math.max(0, receipt.at - Math.min(...receipt.slots)) &&
     receipt.slots.every((slot, slotIndex) => integer(slot) && slot >= s.firstSlot && slot <= s.through &&
       (slot - s.firstSlot) % HALF_HOUR === 0 && slot <= receipt.at && !s.due.includes(slot) &&
       (slotIndex === 0 || slot > receipt.slots[slotIndex - 1]) && !deliveredSlots.has(slot) &&
-      (deliveredSlots.add(slot), true)) && integer(receipt.at) && integer(receipt.lateByMs);
+      (deliveredSlots.add(slot), true));
   if (s?.version !== 1 || !integer(s.generation) || s.generation < 1 || !validOwner(owner) ||
       !integer(s.firstSlot) || s.firstSlot % HALF_HOUR !== 0 || !integer(s.through) ||
       s.through < s.firstSlot - HALF_HOUR || (s.through - s.firstSlot) % HALF_HOUR !== 0 ||
@@ -129,6 +130,7 @@ export function fileStore(path: string, operations: {
   write(fd: number, data: string): void;
   sync(fd: number): void;
   retireSync?(fd: number): void;
+  beforeRename?(): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
   const journalPath = `${path}.recovery.json`;
   const pendingPath = `${path}.pending-recovery.json`;
@@ -157,12 +159,14 @@ export function fileStore(path: string, operations: {
     try { sync(directory); } finally { closeSync(directory); }
   };
   let assertHeld: (() => void) | undefined;
+  let commitHeld: (<T>(commit: () => T) => T) | undefined;
   const locked = <T>(action: () => T): T => {
     if (assertHeld) { assertHeld(); return action(); }
     safeParent();
-    return planningTransaction(dirname(path), (verify) => {
+    return planningTransaction(dirname(path), (verify, commit) => {
       assertHeld = verify;
-      try { return action(); } finally { assertHeld = undefined; }
+      commitHeld = commit;
+      try { return action(); } finally { assertHeld = undefined; commitHeld = undefined; }
     });
   };
   const ledgerBytes = (state: SlotState) => `${JSON.stringify(state)}\n`;
@@ -269,13 +273,17 @@ export function fileStore(path: string, operations: {
       }
       if (failed) throw failure;
       requireAuthorized(authorize);
-      renameSync(temp, path);
-      onRename();
+      commitHeld!(() => {
+        operations.beforeRename?.();
+        requireAuthorized(authorize);
+        renameSync(temp, path);
+        onRename();
+        syncDirectory(operations.sync);
+      });
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}
     }
-    syncDirectory(operations.sync);
   };
   const matchesCandidate = (state: SlotState, candidate: SlotState) => {
     if (sameOwner(state.owner, candidate.owner)) return ledgerBytes(state) === ledgerBytes(candidate);

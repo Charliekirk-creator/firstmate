@@ -797,6 +797,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => validateState({ ...old, observation: { slot: old.through, result: 'connected' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, observation: { slot: old.through, result: 'online' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, due: [old.through], observation: { slot: old.through, result: 'offline' } }), /Malformed/);
+    const falseLateness = { ...old.delivery, lateByMs: old.delivery.lateByMs + 1 };
+    assert.throws(() => validateState({ ...old, delivery: falseLateness,
+      deliveries: [...old.deliveries.slice(0, -1), falseLateness] }), /Malformed/);
     assert.throws(() => validateState({ ...old, generation: 5, adoptions: undefined }), /Malformed adoption history/);
     const firstAdoption = adoptedLedger.adoptions[0];
     const unrelatedOwner = { ...transferOwnerA, sessionId: 'unrelated-history' };
