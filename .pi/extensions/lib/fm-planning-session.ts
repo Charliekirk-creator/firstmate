@@ -627,7 +627,7 @@ function visibleMarkdownLines(lines: string[]): string[] {
       }
       const item = /^ {0,3}([-+*]|\d+[.)])([ \t]+)/.exec(content);
       if (!item) break;
-      const indent = /^\d/.test(item[1]) ? columns(item[1] + item[2]) : columns(item[2]);
+      const indent = columns(item[1] + item[2]);
       containers.push({ kind: "list", indent: Math.max(1, indent), marker: item[1] });
       content = content.slice(item[0].length);
     }

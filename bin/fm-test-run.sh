@@ -1144,8 +1144,12 @@ families_for_changed_path() {
     bin/fm-gate-refuse*|bin/fm-lock*|bin/fm-quota-axi-lib.sh)
       printf '%s\n' session-bootstrap
       ;;
-    bin/fm-sessionstart-run.sh|.claude/settings.json|.codex/hooks.json|\
-    .pi/extensions/fm-primary-planning-session.ts|.pi/extensions/lib/fm-planning-session.ts|tests/planning-session-*.mjs)
+    bin/fm-sessionstart-run.sh|.claude/settings.json|.codex/hooks.json)
+      printf '%s\n' session-bootstrap
+      printf '%s\n' live-harness-optin
+      ;;
+    .pi/extensions/fm-primary-planning-session.ts|.pi/extensions/lib/fm-planning-session.ts|\
+    .pi/extensions/lib/html5-entities.ts|tests/planning-session-*.mjs)
       printf '%s\n' __script__:fm-planning-session.test.sh
       printf '%s\n' __script__:fm-planning-session-live-e2e.test.sh
       printf '%s\n' __script__:fm-pi-primary-types.test.sh

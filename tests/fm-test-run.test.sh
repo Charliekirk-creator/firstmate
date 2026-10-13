@@ -110,6 +110,9 @@ init_changed_fixture_repo() {
     fm-backend.test.sh \
     fm-pr-merge.test.sh \
     fm-pi-watch-extension.test.sh \
+    fm-planning-session.test.sh \
+    fm-planning-session-live-e2e.test.sh \
+    fm-pi-primary-types.test.sh \
     fm-afk-return.test.sh \
     fm-bearings-snapshot.test.sh \
     fm-backend-cmux.test.sh \
@@ -138,11 +141,16 @@ init_changed_fixture_repo() {
   mkdir -p \
     "$repo/.agents/skills/example" \
     "$repo/.agents/skills/harness-adapters/references/common" \
-    "$repo/.claude" "$repo/.pi/extensions" "$repo/docs" "$repo/src"
+    "$repo/.claude" "$repo/.codex" "$repo/.pi/extensions/lib" "$repo/docs" "$repo/src"
   : >"$repo/.agents/skills/example/SKILL.md"
   : >"$repo/.agents/skills/harness-adapters/SKILL.md"
   : >"$repo/.agents/skills/harness-adapters/references/common/dispatch.md"
   : >"$repo/.claude/settings.json"
+  : >"$repo/.codex/hooks.json"
+  : >"$repo/bin/fm-sessionstart-run.sh"
+  : >"$repo/.pi/extensions/fm-primary-planning-session.ts"
+  : >"$repo/.pi/extensions/lib/fm-planning-session.ts"
+  : >"$repo/.pi/extensions/lib/html5-entities.ts"
   : >"$repo/.pi/extensions/fm-primary-pi-watch.ts"
   : >"$repo/.pi/extensions/fm-primary-turnend-guard.ts"
   : >"$repo/docs/fm-test-isolation-proof.md"
@@ -235,8 +243,28 @@ test_changed_dependency_selection_and_unmapped_failure() {
   assert_contains "$listed" "tests/fm-ask-user-authority.test.sh" "skill source selects pure contract coverage"
   assert_contains "$listed" "tests/fm-cd-pretool-check.test.sh" "Claude and Pi source selects hook coverage"
   assert_contains "$listed" "tests/fm-pi-watch-extension.test.sh" "Pi source selects watcher coverage"
+  assert_contains "$listed" "tests/fm-session-start.test.sh" "Claude settings retain session bootstrap coverage"
+  assert_contains "$listed" "tests/fm-afk-pi-herdr-return-e2e.test.sh" "Claude settings retain live harness coverage"
   git -C "$repo" add .agents .claude .pi
   git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm non-bin-source-change
+
+  printf '\n' >>"$repo/bin/fm-sessionstart-run.sh"
+  printf '\n' >>"$repo/.codex/hooks.json"
+  listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
+  assert_contains "$listed" "tests/fm-session-start.test.sh" "sessionstart surfaces retain bootstrap coverage"
+  assert_contains "$listed" "tests/fm-afk-pi-herdr-return-e2e.test.sh" "sessionstart surfaces retain live coverage"
+  git -C "$repo" add bin/fm-sessionstart-run.sh .codex/hooks.json
+  git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm sessionstart-surface-change
+
+  printf '\n' >>"$repo/.pi/extensions/fm-primary-planning-session.ts"
+  printf '\n' >>"$repo/.pi/extensions/lib/fm-planning-session.ts"
+  printf '\n' >>"$repo/.pi/extensions/lib/html5-entities.ts"
+  listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
+  assert_contains "$listed" "tests/fm-planning-session.test.sh" "planning sources select deterministic coverage"
+  assert_contains "$listed" "tests/fm-planning-session-live-e2e.test.sh" "planning sources select lifecycle coverage"
+  assert_contains "$listed" "tests/fm-pi-primary-types.test.sh" "planning sources select primary type coverage"
+  git -C "$repo" add .pi/extensions/fm-primary-planning-session.ts .pi/extensions/lib
+  git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm planning-source-change
 
   printf '\n' >>"$repo/.agents/skills/harness-adapters/references/common/dispatch.md"
   listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
