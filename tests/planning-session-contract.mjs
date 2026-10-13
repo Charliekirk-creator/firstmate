@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, symlinkSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { completePlanningTables, fileStore, HALF_HOUR, OBSERVATION_WINDOW, parseFirstSlot,
+import { completePlanningTables, fileStore, HALF_HOUR, lateDisclosure, OBSERVATION_WINDOW, parseFirstSlot,
   PlanningSessionClock, validateState, wifiInterfaces, wifiLink } from '../.pi/extensions/lib/fm-planning-session.ts';
 
 export const tables = `Captain, planning update.
@@ -130,7 +130,6 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('Note: `<section hidden>`\n' + tables), true);
     assert.equal(completePlanningTables('Note: `` `<section hidden>` ``\n' + tables), true);
     assert.equal(completePlanningTables('\\<section hidden>\n' + tables), true);
-    assert.equal(completePlanningTables('<div style="color: red">\ncontext\n\n' + tables), true);
     assert.equal(completePlanningTables('<details open>\n<summary>Planning</summary>\n\n' + tables + '\n</details>'), true);
     assert.equal(completePlanningTables('<details OPEN="false">\n<summary>Planning</summary>\n\n' + tables + '\n</details>'), true);
     assert.equal(completePlanningTables('<dialog open>\ncontext\n\n' + tables + '\n</dialog>'), true);
@@ -161,6 +160,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '<section hidden>\n' + tables + '\n</section>', '<article aria-hidden="true">\n' + tables + '\n</article>',
       '<custom-panel>\n' + tables + '\n</custom-panel>', '<custom-panel>\n' + tables,
       '<custom-panel hidden>\nraw HTML\n\n' + tables,
+      '<div style="color: red">\ncontext\n\n' + tables,
+      '<div style="opacity:0">\ncontext\n\n' + tables,
       '<div style="display:none">\ncontext\n\n' + tables,
       '<div STYLE=" visibility : HIDDEN ; color: red ">\ncontext\n\n' + tables,
       '<div style="color:red; content-visibility : hidden !important;">\ncontext\n\n' + tables,
@@ -182,7 +183,20 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '<section\n hidden>\n' + tables + '\n</section\n>',
       '<article\n aria-hidden="true">\n' + tables + '\n</article\n>',
       '<![CDATA[\n' + tables + '\n]]>', '```html\n<section hidden>\n' + tables + '\n</section>\n```']) assert.equal(completePlanningTables(text), false);
-    console.log('ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused');
+    const lateLine = lateDisclosure([first, first + HALF_HOUR]);
+    assert.equal(lateLine, 'Late update for: 2026-10-12 16:30 HKT, 2026-10-12 17:00 HKT.');
+    assert.equal(completePlanningTables(tables, [first], first), true, 'exact-boundary persistence is on time');
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
+    assert.equal(completePlanningTables(tables, [first], first + 1), false);
+    assert.equal(completePlanningTables(lateLine + '\n' + tables, [first, first + HALF_HOUR], first + HALF_HOUR + 1), true);
+    for (const disclosure of [lateDisclosure([first]) + '\n' + tables,
+      lateDisclosure([first, first + HALF_HOUR, first + 2 * HALF_HOUR]) + '\n' + tables,
+      '```\n' + lateLine + '\n```\n' + tables,
+      '<div hidden>\n' + lateLine + '\n</div>\n\n' + tables]) {
+      assert.equal(completePlanningTables(disclosure, [first, first + HALF_HOUR], first + HALF_HOUR + 1), false);
+    }
+    console.log('ok - complete visible tables and exact lateness disclosure required');
 
     assert.deepEqual(wifiInterfaces('Hardware Port: Ethernet\nDevice: en1\n\nHardware Port: Wi-Fi\nDevice: en0\n'), ['en0']);
     assert.deepEqual(wifiInterfaces('Hardware Port: Wi-Fi\nDevice: en0;touch bad\n'), []);
@@ -224,6 +238,22 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.deepEqual(wakes.at(-1), [failedBoundary], 'explicit recovery immediately wakes retained due work');
     failureReload.start(first); assert.equal(wakes.length, recoveryWakeCount + 1, 'active restart does not duplicate recovery wake');
     failureReload.dispose();
+
+    failureState = { ...old, stopped: undefined }; storageFails = true; wifi = 'offline';
+    const skippedFailures = new Map();
+    const skipped = new PlanningSessionClock(owner, failureStore, io, skippedFailures);
+    now = old.through + HALF_HOUR - 1000; skipped.resume();
+    const skippedWakeCount = wakes.length;
+    fire(failedBoundary);
+    assert.equal(failureState.through, old.through, 'failed offline write leaves the durable ledger uncertain');
+    storageFails = false; wifi = 'online';
+    const skippedReload = new PlanningSessionClock(owner, failureStore, io, skippedFailures);
+    skippedReload.resume();
+    assert.equal(failureState.stopped, 'ledger-failure'); assert.equal(failureState.through, failedBoundary);
+    assert.equal(failureState.observation.result, 'offline'); assert.deepEqual(failureState.due, old.due);
+    skippedReload.start(first);
+    assert.equal(wakes.length, skippedWakeCount, 'reconnect cannot requalify the retained offline boundary');
+    skippedReload.dispose();
 
     failureState = { ...old, stopped: undefined }; storageFails = true; commitBeforeFailure = true;
     const committedBoundaryFailures = new Map();

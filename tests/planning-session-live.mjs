@@ -17,7 +17,7 @@ const { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManag
   await import(pathToFileURL(`${pkg}/dist/index.js`));
 const { createAssistantMessageEventStream } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`));
 const { Type } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/index.js`));
-const { PlanningSessionClock, PlanningWakeGate } = await import(pathToFileURL(`${code}/.pi/extensions/lib/fm-planning-session.ts`));
+const { lateDisclosure, PlanningSessionClock, PlanningWakeGate } = await import(pathToFileURL(`${code}/.pi/extensions/lib/fm-planning-session.ts`));
 const version = JSON.parse(readFileSync(`${pkg}/package.json`)).version;
 process.chdir(code);
 writeFileSync(`${home}/state/.lock`, String(process.pid));
@@ -151,16 +151,17 @@ writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: slot, through: slo
 await session.prompt('A partial update', { source: 'rpc' });
 assert.deepEqual(state().due, [slot]);
 assert.ok(JSON.stringify(contexts.at(-1)).includes('message-count cadence is superseded'));
-output = tables;
+assert.ok(JSON.stringify(contexts.at(-1)).includes(lateDisclosure([slot])), 'request supplies the immutable claim disclosure');
+output = `${lateDisclosure([slot])}\n${tables}`;
 for (const stop of ['length', 'aborted', 'error']) {
   reason = stop;
   await session.prompt(`Fixture ${stop}`, { source: 'rpc' });
   assert.deepEqual(state().due, [slot], `${stop} must not acknowledge complete-looking text`);
 }
-reason = 'stop'; output = tables.replace('| Test | Verified |', '');
+reason = 'stop'; output = `${lateDisclosure([slot])}\n${tables.replace('| Test | Verified |', '')}`;
 await session.prompt('Missing completed row', { source: 'rpc' }); assert.deepEqual(state().due, [slot]);
 await session.reload(); assert.deepEqual(state().due, [slot]);
-output = tables;
+output = `${lateDisclosure([slot])}\n${tables}`;
 toolSlot = slot + period;
 toolLoop = true;
 const contextStart = contexts.length;
@@ -176,6 +177,7 @@ for (const context of runContexts) {
   assert.ok(!serialized.includes(laterBoundary), 'later slot never expands the active run claim');
 }
 continuationSlot = toolSlot + period;
+output = `${lateDisclosure([toolSlot])}\n${tables}`;
 continueRun = true;
 const continuationContextStart = contexts.length;
 await session.prompt('Complete later update through settlement continuation', { source: 'rpc' });
@@ -189,6 +191,7 @@ for (const context of continuationContexts) {
   assert.ok(serialized.includes(claimedBoundary), 'settlement continuation retains the initial claim');
   assert.ok(!serialized.includes(continuationBoundary), 'settlement continuation cannot expand the claim');
 }
+output = `${lateDisclosure([continuationSlot])}\n${tables}`;
 await session.prompt('Complete retained continuation slot', { source: 'rpc' });
 assert.deepEqual(state().due, []);
 const receipt = state().delivery;
@@ -197,6 +200,7 @@ assert.ok(readFileSync(session.sessionManager.getSessionFile(), 'utf8').includes
 console.log(`ok - real Pi ${version} failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery`);
 
 const deliveryFailureSlot = slot - period;
+output = `${lateDisclosure([deliveryFailureSlot])}\n${tables}`;
 writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: deliveryFailureSlot, due: [deliveryFailureSlot] }));
 let deliveryRelease;
 providerGate = new Promise(resolve => { deliveryRelease = resolve; });

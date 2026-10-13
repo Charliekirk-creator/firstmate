@@ -167,11 +167,14 @@ export class PlanningSessionClock {
       throw new Error("Planning terminal stop does not match a recoverable ledger owner");
     }
     const key = ownerKey(state.owner);
-    const due = [...new Set([...state.due, ...(revoked.due ?? [])])].sort((a, b) => a - b);
+    const candidate = revoked.candidate && sameOwner(revoked.candidate.owner, state.owner) &&
+      revoked.candidate.firstSlot === state.firstSlot ? revoked.candidate : undefined;
+    const due = [...new Set([...state.due, ...(candidate?.due ?? []), ...(revoked.due ?? [])])].sort((a, b) => a - b);
     const delivery = state.delivery?.slots.some((slot) => due.includes(slot)) ? undefined : state.delivery;
-    const through = due.length ? Math.max(state.through, ...due) : state.through;
-    if (!stored || !state.stopped || revoked.due?.length) {
-      this.store.write({ ...state, through, due, delivery, stopped: revoked.reason });
+    const through = Math.max(state.through, candidate?.through ?? state.through, ...(due.length ? due : [state.through]));
+    const observation = candidate?.observation && candidate.through >= state.through ? candidate.observation : state.observation;
+    if (!stored || !state.stopped || revoked.due?.length || candidate?.through !== state.through) {
+      this.store.write({ ...state, through, due, delivery, observation, stopped: revoked.reason });
     }
     this.revocations.delete(key);
     if (sameOwner(state.owner, this.owner)) this.ownsSchedule = false;
@@ -311,9 +314,10 @@ export class PlanningSessionClock {
       if (!this.active) return;
       if (!this.io.valid()) { this.ownershipLost(); return; }
       const due = result === "online" ? [...state.due, slot] : state.due;
-      if (result === "online") this.rememberFailure([slot]);
-      this.store.write({ ...state, through: slot, due, observation: { slot, result } });
-      if (result === "online") this.revocations.delete(ownerKey(this.owner));
+      const candidate: SlotState = { ...state, through: slot, due, observation: { slot, result } };
+      this.rememberFailure(due, candidate);
+      this.store.write(candidate);
+      this.revocations.delete(ownerKey(this.owner));
       if (result === "unknown") this.io.error(new Error("Wi-Fi link could not be verified; this slot was skipped"));
       // Offline and unobserved slots never enqueue catch-up requests.
       if (result === "online") this.io.wake(due);
@@ -448,7 +452,15 @@ function decodeHtmlAttribute(value: string): string | undefined {
   return decoded;
 }
 
-export function completePlanningTables(text: string): boolean {
+export function lateDisclosure(slots: number[]): string {
+  const labels = [...slots].sort((a, b) => a - b).map((slot) => {
+    const hkt = new Date(slot + 8 * 3600000).toISOString();
+    return `${hkt.slice(0, 10)} ${hkt.slice(11, 16)} HKT`;
+  });
+  return `Late update for: ${labels.join(", ")}.`;
+}
+
+export function completePlanningTables(text: string, claimedSlots: number[] = [], persistedAt?: number): boolean {
   const lines = text.split(/\r?\n/);
   let fence: string | undefined;
   const visible = lines.map((line) => {
@@ -529,11 +541,7 @@ export function completePlanningTables(text: string): boolean {
       const parentHidden = stack.some((entry) => entry.hidden);
       const style = /(?:^|\s)style\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'"=<>`]+))/i.exec(match[0]);
       const encodedStyle = style?.[1] ?? style?.[2] ?? style?.[3];
-      const decodedStyle = encodedStyle === undefined ? "" : decodeHtmlAttribute(encodedStyle);
-      const declarations = (decodedStyle ?? "").replace(/\/\*[\s\S]*?\*\//g, "")
-        .split(";").map((part) => part.trim().toLowerCase());
-      const styleHidden = decodedStyle === undefined || decodedStyle.includes("\\") ||
-        declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!\s*important)?$/.test(part));
+      const styleHidden = encodedStyle !== undefined;
       const aria = /(?:^|\s)aria-hidden\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'"=<>`]+))/i.exec(match[0]);
       const encodedAria = aria?.[1] ?? aria?.[2] ?? aria?.[3];
       const decodedAria = encodedAria === undefined ? undefined : decodeHtmlAttribute(encodedAria);
@@ -546,6 +554,14 @@ export function completePlanningTables(text: string): boolean {
   for (const opening of stack) if (opening.hidden) hide(opening.start, joined.length);
   if (activeStylesheet) return false;
   for (const line of hiddenLines) visible[line] = "";
+  if (persistedAt !== undefined) {
+    if (!Number.isFinite(persistedAt)) return false;
+    const lateSlots = claimedSlots.filter((slot) => persistedAt > slot);
+    const disclosures = visible.filter((line) => /^ {0,3}Late update(?:\s|:)/.test(line));
+    if (lateSlots.length) {
+      if (disclosures.length !== 1 || disclosures[0].trim() !== lateDisclosure(lateSlots)) return false;
+    } else if (disclosures.length) return false;
+  }
   const sections: [string, string[]][] = [
     ["Ideas", ["Work", "Meaningful change", "Next step", "Needs you?"]],
     ["To-do list", ["Work", "Meaningful change", "Next step", "Needs you?"]],

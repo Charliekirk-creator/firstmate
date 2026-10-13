@@ -6,8 +6,8 @@ import { dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { completePlanningTables, fileStore, HALF_HOUR, parseFirstSlot, PlanningSessionClock, PlanningWakeGate, wifiInterfaces, wifiLink,
-  type Claim, type Owner, type Revocations } from "./lib/fm-planning-session.ts";
+import { completePlanningTables, fileStore, HALF_HOUR, lateDisclosure, parseFirstSlot, PlanningSessionClock, PlanningWakeGate,
+  wifiInterfaces, wifiLink, type Claim, type Owner, type Revocations } from "./lib/fm-planning-session.ts";
 
 const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "../.."));
 const home = process.env.FM_HOME || root;
@@ -63,7 +63,9 @@ export function macWifi(): "online" | "offline" | "unknown" {
 }
 
 function instructions(slots: number[]): string {
+  const now = Date.now();
   const boundaries = slots.map((slot) => new Date(slot + 8 * 3600000).toISOString().slice(0, 19) + "+08:00");
+  const late = slots.filter((slot) => now > slot);
   return `Automatic session-only planning notification, not captain input. Online slot due: ${boundaries.join(", ")} (Asia/Hong_Kong). ` +
     "Give one consolidated planning update at the next safe point, without interrupting current work. " +
     "Use the planning-capture policy for content, ownership and authority, but its message-count cadence is superseded for this session by aligned half-hour slots. " +
@@ -71,8 +73,9 @@ function instructions(slots: number[]): string {
     "Include three separate Markdown headings and complete tables: Ideas and To-do list each use " +
     "Work | Meaningful change | Next step | Needs you?; Recently completed uses Work | Completed outcome. " +
     "Include a meaningful no-change row when a section is empty. Do not invent outcomes or start project work. " +
-    "If delivery is later than its scheduled boundary, identify the scheduled time and honestly say it is late; never claim an offline or unobserved slot was due. " +
-    "A draft, file, tool result, hidden message, failed response or partial table is not delivery. " +
+    (late.length ? `Because delivery is late, include exactly this visible line: ${lateDisclosure(late)} ` :
+      "If persistence occurs after a boundary, include the canonical Late update for line naming exactly the late claimed slots. ") +
+    "Never claim an offline or unobserved slot was due. A draft, file, tool result, hidden message, failed response or partial table is not delivery. " +
     "Do not reset the slot ledger manually. No external notifications, permissions or additional spend are authorized.";
 }
 
@@ -225,7 +228,8 @@ export default function (pi: ExtensionAPI) {
                 .map((part: { text: string }) => part.text).join("\n") : "";
             if (entries[0]?.type === "session" && entries[0]?.id === snapshot.owner.sessionId &&
                 entry?.type === "message" && JSON.stringify(entry.message) === JSON.stringify(accepted.message) &&
-                ancestor === snapshot.leaf && accepted.entryId !== snapshot.leaf && completePlanningTables(text)) {
+                ancestor === snapshot.leaf && accepted.entryId !== snapshot.leaf &&
+                completePlanningTables(text, snapshot.slots, Number(entry.message.timestamp))) {
               clock?.deliver(snapshot, accepted.entryId);
             }
           }
