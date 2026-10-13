@@ -598,17 +598,9 @@ function markdownLineFacts(source: string, activeList = false, activeParagraph =
 }
 
 function visibleMarkdownLines(lines: string[]): string[] {
-  type Fence = { marker: string; quoteDepth: number; listIndent?: number };
+  type ContainerFrame = { kind: "quote" } | { kind: "list"; indent: number; marker: string };
+  type Fence = { marker: string; containers: ContainerFrame[] };
   let fence: Fence | undefined;
-  const container = (line: string) => {
-    let content = line;
-    let quoteDepth = 0;
-    while (/^ {0,3}>[ \t]?/.test(content)) {
-      content = content.replace(/^ {0,3}>[ \t]?/, "");
-      quoteDepth += 1;
-    }
-    return { content, quoteDepth };
-  };
   const columns = (value: string) => {
     let width = 0;
     for (const character of value) width = character === "\t" ? width + 4 - width % 4 : width + 1;
@@ -623,30 +615,52 @@ function visibleMarkdownLines(lines: string[]): string[] {
     }
     return width >= required ? value.slice(index) : undefined;
   };
-  const opening = (line: string): Fence | undefined => {
-    const parsed = container(line);
-    let content = parsed.content;
-    let listIndent: number | undefined;
-    const item = /^( {0,3}(?:[-+*]|\d+[.)])([ \t]+))/.exec(content);
-    if (item) {
-      listIndent = columns(item[1]);
-      content = content.slice(item[1].length);
+  const parseOpeningContainers = (line: string) => {
+    let content = line;
+    const containers: ContainerFrame[] = [];
+    for (;;) {
+      const quote = /^ {0,3}>[ \t]?/.exec(content);
+      if (quote) {
+        containers.push({ kind: "quote" });
+        content = content.slice(quote[0].length);
+        continue;
+      }
+      const item = /^ {0,3}([-+*]|\d+[.)])([ \t]+)/.exec(content);
+      if (!item) break;
+      const indent = /^\d/.test(item[1]) ? columns(item[1] + item[2]) : columns(item[2]);
+      containers.push({ kind: "list", indent: Math.max(1, indent), marker: item[1] });
+      content = content.slice(item[0].length);
     }
-    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
+    return { content, containers };
+  };
+  const memberContent = (line: string, containers: ContainerFrame[]): string | undefined => {
+    let content = line;
+    for (const frame of containers) {
+      if (frame.kind === "quote") {
+        const quote = /^ {0,3}>[ \t]?/.exec(content);
+        if (!quote) return undefined;
+        content = content.slice(quote[0].length);
+      } else {
+        const indented = stripIndent(content, frame.indent);
+        if (indented === undefined) {
+          if (!content.trim()) return "";
+          return undefined;
+        }
+        content = indented;
+      }
+    }
+    return content;
+  };
+  const opening = (line: string): Fence | undefined => {
+    const parsed = parseOpeningContainers(line);
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(parsed.content);
     if (!match || match[1][0] === "`" && match[2].includes("`")) return undefined;
-    return { marker: match[1], quoteDepth: parsed.quoteDepth, listIndent };
+    return { marker: match[1], containers: parsed.containers };
   };
   return lines.map((line) => {
     if (fence) {
-      const parsed = container(line);
-      let member = parsed.quoteDepth === fence.quoteDepth;
-      let content = parsed.content;
-      if (member && fence.listIndent !== undefined) {
-        const indented = stripIndent(content, fence.listIndent);
-        member = indented !== undefined || !content.trim();
-        content = indented ?? "";
-      }
-      if (member) {
+      const content = memberContent(line, fence.containers);
+      if (content !== undefined) {
         const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(content);
         if (closing && closing[1][0] === fence.marker[0] && closing[1].length >= fence.marker.length) fence = undefined;
         return "";

@@ -276,6 +276,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '> ```\nLate update for: 2026-10-12 16:30 HKT.\n> ```',
       '> > ~~~\n> Late update for: 2026-10-12 16:30 HKT.\n> > ~~~',
       '- ````\nLate update for: 2026-10-12 16:30 HKT.\n  ````',
+      '- > ```\nLate update for: 2026-10-12 16:30 HKT.\n > ```',
+      '- > 1. ~~~\n > Late update for: 2026-10-12 16:30 HKT.\n >  ~~~',
     ]) assert.equal(completePlanningTables(visibleAfterFenceLoss + '\n' + tables, [first], first), false,
       visibleAfterFenceLoss);
     assert.equal(completePlanningTables("Late\\" + '\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
@@ -312,6 +314,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '> ~~~lang\n> Late update for: hidden code\n> ```\n> ~~~',
       '> ```\n>\n> Late update for: hidden code\n> ```',
       '- ~~~~\n\n  Late update for: hidden code\n  ~~~~',
+      '- > ```\n > Late update for: hidden code\n > ```',
+      '> - ~~~\n>  Late update for: hidden code\n>  ~~~',
+      '- > 1. ````\n >    Late update for: hidden code\n >    ````',
+      '-\t> ~~~\n\t> Late update for: hidden code\n\t> ~~~',
     ]) assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + fenced + '\n' + tables,
       [first], first + 1), true, fenced);
     assert.equal(completePlanningTables(lateDisclosure([first]) +
@@ -323,6 +329,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '- ```\nLate update for: another slot.\n  ```',
       '1. ~~~\n Late update for: another slot.\n   ~~~',
       '- ```\n\nLate update for: another slot.\n  ```',
+      '- > ```\nLate update for: another slot.\n > ```',
+      '- > ~~~\n update for: hidden fragment\nLate update for: another slot.\n > ~~~',
+      '- > 1. ````\n > Late update for: another slot.\n >  ````',
     ]) assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + escapedFence + '\n' + tables,
       [first], first + 1), false, escapedFence);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n---\n' + tables, [first], first + 1), false);
