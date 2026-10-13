@@ -560,6 +560,44 @@ function latenessText(line: string): string | undefined {
     ? rendered : undefined;
 }
 
+function latenessClaims(lines: string[]): { rendered: string; source?: string; topLevel: boolean }[] {
+  const claims: { rendered: string; source?: string; topLevel: boolean }[] = [];
+  let block: { parts: string[]; sources: string[]; signature: string; topLevel: boolean } | undefined;
+  const flush = () => {
+    if (!block) return;
+    const rendered = latenessText(block.parts.join(" "));
+    if (rendered !== undefined) claims.push({ rendered, source: block.sources.length === 1 ? block.sources[0] : undefined,
+      topLevel: block.topLevel });
+    block = undefined;
+  };
+  for (const source of lines) {
+    if (!source.trim()) { flush(); continue; }
+    if (/^(?:\t| {4})/.test(source)) { flush(); continue; }
+    let part = source;
+    let quotes = 0;
+    while (/^ {0,3}>[ \t]?/.test(part)) { part = part.replace(/^ {0,3}>[ \t]?/, ""); quotes += 1; }
+    const listed = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(part);
+    if (listed) part = part.replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
+    const structural = /^ {0,3}#{1,6}(?:[ \t]|$)/.test(part) || part.includes("|") ||
+      /^ {0,3}(?:=+|-+)[ \t]*$/.test(part);
+    if (structural) {
+      flush();
+      const rendered = latenessText(part);
+      if (rendered !== undefined) claims.push({ rendered, source, topLevel: quotes === 0 && !listed });
+      continue;
+    }
+    const signature = `${quotes}:${listed ? "list" : "prose"}`;
+    const continuation = !!block && block.signature.endsWith(":list") && !listed && /^ {1,3}\S/.test(source);
+    if (block && latenessText(block.parts.join(" ")) !== undefined) flush();
+    if (!block || listed || block.signature !== signature && !continuation) flush();
+    if (!block) block = { parts: [], sources: [], signature, topLevel: quotes === 0 && !listed };
+    block.parts.push(part.trim());
+    block.sources.push(source);
+  }
+  flush();
+  return claims;
+}
+
 export function completePlanningTables(text: string, claimedSlots: number[] = [], persistedAt?: number): boolean {
   const lines = text.split(/\r?\n/);
   let fence: string | undefined;
@@ -584,13 +622,11 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
   if (persistedAt !== undefined) {
     if (!Number.isFinite(persistedAt)) return false;
     const lateSlots = claimedSlots.filter((slot) => persistedAt > slot);
-    const disclosures = visible.flatMap((line) => {
-      const rendered = latenessText(line);
-      return rendered === undefined ? [] : [{ line, rendered }];
-    });
+    const disclosures = latenessClaims(visible);
     if (lateSlots.length) {
       const expected = lateDisclosure(lateSlots);
-      if (disclosures.length !== 1 || disclosures[0].rendered !== expected || disclosures[0].line.trim() !== expected) return false;
+      if (disclosures.length !== 1 || disclosures[0].rendered !== expected || !disclosures[0].topLevel ||
+          disclosures[0].source?.trim() !== expected) return false;
     } else if (disclosures.length) return false;
   }
   const sections: [string, string[]][] = [
