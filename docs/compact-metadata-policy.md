@@ -9,7 +9,7 @@ Native Pi remains the sole compaction owner.
 ## Input boundary
 
 Each argument must be an ordinary same-realm data record with `Object.prototype`, or a null-prototype data record.
-Only the exact enumerable own string keys below are accepted, with no custom prototype, inherited fields, extra keys, symbols, non-enumerable fields, accessors, or nested values.
+Only the exact enumerable own string keys below are accepted: none may be supplied through inheritance, and custom prototypes, extra keys, symbols, non-enumerable fields, accessors, and nested values are rejected.
 Validation snapshots data descriptors without invoking property getters, coercion, or serialization.
 Invalid inputs and synchronous internal errors return only `unavailable`, never echoed values or error details.
 JavaScript reflective operations can execute hostile Proxy traps; this boundary is not a sandbox for caller code or a compromised process.
