@@ -216,8 +216,15 @@ const incompatibleIso = new Date(future + period + 8 * 3600000).toISOString().sl
 const recoveryIso = new Date(deliveryFailureSlot + 8 * 3600000).toISOString().slice(0, 19) + '+08:00';
 await session.prompt(`/planning-session start ${incompatibleIso}`, { source: 'rpc' });
 assert.equal(state().stopped, 'ledger-failure'); assert.deepEqual(state().due, [deliveryFailureSlot]);
+output = 'Captain, retained work pending.';
+const recoveryRequests = requests;
 await session.prompt(`/planning-session start ${recoveryIso}`, { source: 'rpc' });
-assert.deepEqual(state().due, [deliveryFailureSlot], 'compatible explicit restart preserves due work');
+await session.waitForIdle();
+assert.equal(requests, recoveryRequests + 1, 'compatible explicit restart immediately wakes retained due work');
+assert.deepEqual(state().due, [deliveryFailureSlot], 'incomplete recovery follow-up preserves due work');
+await session.prompt(`/planning-session start ${recoveryIso}`, { source: 'rpc' });
+await session.waitForIdle();
+assert.equal(requests, recoveryRequests + 1, 'active restart does not duplicate the recovery wake');
 
 await session.prompt('/planning-session status', { source: 'rpc' });
 assert.equal(JSON.parse(notices.at(-1)).armed, true, 'timer remains armed before busy follow-up');

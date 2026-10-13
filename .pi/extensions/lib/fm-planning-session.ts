@@ -153,6 +153,15 @@ export class PlanningSessionClock {
     const stored = this.store.read();
     const unresolved = [...this.revocations.values()];
     const revoked = stored ? this.revocations.get(ownerKey(stored.owner)) : unresolved.length === 1 ? unresolved[0] : undefined;
+    if (stored && !revoked && unresolved.length === 1 && !sameOwner(unresolved[0].owner, stored.owner)) {
+      const transition = unresolved[0];
+      if (transition.due?.length || transition.candidate?.due.length) {
+        throw new Error("Cannot transfer retained planning slots between ledger owners");
+      }
+      this.store.write({ ...stored, stopped: "ledger-failure" });
+      this.revocations.delete(ownerKey(transition.owner));
+      return false;
+    }
     const state = stored ?? revoked?.candidate;
     if (!state || !revoked || !sameOwner(revoked.owner, state.owner)) {
       throw new Error("Planning terminal stop does not match a recoverable ledger owner");
@@ -250,6 +259,7 @@ export class PlanningSessionClock {
       throw error;
     }
     this.resume();
+    if (candidate.due.length) this.io.wake([...candidate.due]);
   }
   resume(): void {
     this.dispose();
@@ -387,15 +397,50 @@ export function completePlanningTables(text: string): boolean {
   const lines = text.replace(/<!--[\s\S]*?(?:-->|$)/g, "").split(/\r?\n/);
   let fence: string | undefined;
   const visible = lines.map((line) => {
-    const match = /^ {0,3}(`{3,}|~{3,})/.exec(line);
-    if (match) {
-      if (!fence) fence = match[1];
-      else if (match[1][0] === fence[0] && match[1].length >= fence.length) fence = undefined;
-      return "";
+    if (!fence) {
+      const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+      if (opening) { fence = opening[1]; return ""; }
+      return line;
     }
-    return fence ? "" : line;
+    const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+    if (closing && closing[1][0] === fence[0] && closing[1].length >= fence.length) fence = undefined;
+    return "";
   });
-  if (/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*?)?\/?>|<![A-Za-z][^<>]*>|<!\[[^<>]*>|<\?[^<>]*>/i.test(visible.join("\n"))) return false;
+  const joined = visible.join("\n");
+  const hiddenLines = new Set<number>();
+  const lineAt = (offset: number) => joined.slice(0, offset).split("\n").length - 1;
+  const hide = (start: number, end: number) => {
+    for (let line = lineAt(start); line <= lineAt(end); line += 1) hiddenLines.add(line);
+  };
+  const stack: { name: string; start: number; hidden: boolean }[] = [];
+  const voidElements = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+  const rawBlocks = new Set(["address", "article", "aside", "blockquote", "body", "caption", "center", "details", "dialog", "dir", "div", "dl", "fieldset", "figcaption", "figure", "footer", "form", "frame", "frameset", "head", "header", "html", "iframe", "legend", "li", "main", "menu", "nav", "noframes", "ol", "p", "pre", "script", "search", "section", "style", "summary", "table", "tbody", "td", "textarea", "tfoot", "th", "thead", "title", "tr", "ul"]);
+  const tags = /<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>/gs;
+  for (const match of joined.matchAll(tags)) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length - 1;
+    const name = match[1].toLowerCase();
+    hide(start, end);
+    if (match[0].startsWith("</")) {
+      let opening = -1;
+      for (let i = stack.length - 1; i >= 0; i -= 1) {
+        if (stack[i].name === name) { opening = i; break; }
+      }
+      if (opening >= 0) {
+        hide(stack[opening].start, end);
+        stack.splice(opening);
+      }
+    } else if (!match[0].endsWith("/>") && !voidElements.has(name)) {
+      stack.push({ name, start, hidden: /(?:^|\s)(?:hidden|aria-hidden\s*=\s*["']?true)(?:\s|=|["']|$)/i.test(match[0]) });
+    }
+  }
+  for (const opening of stack) {
+    if (opening.hidden || rawBlocks.has(opening.name)) hide(opening.start, joined.length);
+  }
+  for (const match of joined.matchAll(/<![A-Za-z][^<>]*>|<!\[[^<>]*>|<\?[^<>]*>/gs)) {
+    hide(match.index ?? 0, (match.index ?? 0) + match[0].length - 1);
+  }
+  for (const line of hiddenLines) visible[line] = "";
   const sections: [string, string[]][] = [
     ["Ideas", ["Work", "Meaningful change", "Next step", "Needs you?"]],
     ["To-do list", ["Work", "Meaningful change", "Next step", "Needs you?"]],

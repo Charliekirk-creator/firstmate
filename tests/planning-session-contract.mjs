@@ -120,12 +120,16 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
 
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
+    assert.equal(completePlanningTables(tables + '\n<br>'), true);
+    assert.equal(completePlanningTables('<section hidden>\n' + tables + '\n</section>\n\n' + tables), true);
+    assert.equal(completePlanningTables('```markdown\n```   \n' + tables), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
       tables.replace('| Task | Ready | Finish | No |', '| Task | Ready |'),
       tables.replace('| Test | Verified |', ''), tables.replace('Completed outcome', 'Outcome'),
       tables.replace('| Idea | No material change | Review later | No |', '| Idea | | Review later | No |'),
       tables + '\n## Ideas\n', '~~~\n' + tables + '\n~~~',
+      '```markdown\n```not-a-close\n' + tables + '\n```',
       '<!--\n' + tables + '\n-->', '<div hidden>\n' + tables + '\n</div>',
       '<section hidden>\n' + tables + '\n</section>', '<article aria-hidden="true">\n' + tables + '\n</article>',
       '<custom-panel>\n' + tables + '\n</custom-panel>', '<section\n hidden>\n' + tables + '\n</section\n>',
@@ -168,7 +172,11 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ownership-lost');
     assert.deepEqual(failureState.due, [failedBoundary]);
     assert.throws(() => failureReload.start(first + HALF_HOUR), /retained planning slots/);
-    failureReload.start(first); assert.deepEqual(failureState.due, [failedBoundary]); failureReload.dispose();
+    const recoveryWakeCount = wakes.length;
+    failureReload.start(first); assert.deepEqual(failureState.due, [failedBoundary]);
+    assert.deepEqual(wakes.at(-1), [failedBoundary], 'explicit recovery immediately wakes retained due work');
+    failureReload.start(first); assert.equal(wakes.length, recoveryWakeCount + 1, 'active restart does not duplicate recovery wake');
+    failureReload.dispose();
 
     failureState = { ...old, stopped: undefined }; storageFails = true; commitBeforeFailure = true;
     const committedBoundaryFailures = new Map();
@@ -234,6 +242,22 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     startWriteFails = false; startReload.resume();
     assert.equal(callback, undefined); assert.equal(startState.stopped, 'ledger-failure');
     startReload.start(first); assert.ok(callback); startReload.dispose();
+
+    const previousOwner = { ...owner, sessionId: 'previous-main', sessionFile: join(lab, 'previous.jsonl') };
+    let transitionState = { ...old, owner: previousOwner, stopped: undefined, due: [old.through] };
+    let transitionReadFails = true;
+    const transitionFailures = new Map();
+    const transitionStore = { read: () => {
+      if (transitionReadFails) throw new Error('transition read failed');
+      return transitionState;
+    }, write: state => { transitionState = state; } };
+    const transition = new PlanningSessionClock(owner, transitionStore, io, transitionFailures);
+    assert.throws(() => transition.start(first), /transition read failed/);
+    transitionReadFails = false;
+    const transitionStatus = transition.status();
+    assert.equal(transitionStatus.armed, false); assert.equal(transitionStatus.state.stopped, 'ledger-failure');
+    assert.deepEqual(transitionState.due, [old.through]); assert.equal(transitionFailures.size, 0);
+    assert.throws(() => transition.start(first), /retained planning slots/);
     console.log('ok - boundary, delivery, stop and start failures retain work and require explicit recovery');
 
     for (const path of ['resume', 'claim', 'isArmed', 'status']) {
