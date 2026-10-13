@@ -33,6 +33,7 @@ export const ownerKey = (owner: Owner): string => JSON.stringify([
 ]);
 export type Revocations = Map<string, {
   owner: Owner; reason: "ownership-lost" | "ledger-failure"; due?: number[]; candidate?: SlotState;
+  adoptedGeneration?: number;
 }>;
 
 export function parseFirstSlot(value: string): number {
@@ -64,17 +65,28 @@ export function validateState(value: unknown): SlotState {
         (slot - s.firstSlot) % HALF_HOUR !== 0 || slot > s.delivery!.at || s.due.includes(slot) ||
         (i > 0 && slot <= s.delivery!.slots[i - 1])) ||
       !integer(s.delivery.at) || !integer(s.delivery.lateByMs))) throw new Error("Malformed delivery receipt");
-  if (s.adoptions !== undefined && (!Array.isArray(s.adoptions) || !s.adoptions.length ||
-      s.adoptions.some((receipt, index) => !validOwner(receipt?.formerOwner) || !validOwner(receipt?.successorOwner) ||
-        sameOwner(receipt.formerOwner, receipt.successorOwner) || !integer(receipt.at) ||
-        !integer(receipt.priorGeneration) || receipt.priorGeneration < 1 ||
-        receipt.resultingGeneration !== receipt.priorGeneration + 1 ||
-        (index > 0 && receipt.priorGeneration !== s.adoptions![index - 1].resultingGeneration) ||
-        !Array.isArray(receipt.retainedDue) || receipt.retainedDue.some((slot, i) => !integer(slot) ||
-          slot < s.firstSlot || slot > s.through || (slot - s.firstSlot) % HALF_HOUR !== 0 ||
-          (i > 0 && slot <= receipt.retainedDue[i - 1])) || receipt.dueDigest !== dueDigest(receipt.retainedDue)) ||
-      s.adoptions.at(-1)!.resultingGeneration !== s.generation ||
-      !sameOwner(s.adoptions.at(-1)!.successorOwner, s.owner))) throw new Error("Malformed adoption receipt");
+  if (!s.adoptions && s.generation !== 1) throw new Error("Malformed adoption history");
+  if (s.adoptions !== undefined) {
+    const identities = new Set<string>();
+    if (!Array.isArray(s.adoptions) || !s.adoptions.length || s.generation !== s.adoptions.length + 1 ||
+        s.adoptions.some((receipt, index) => {
+          if (!validOwner(receipt?.formerOwner) || !validOwner(receipt?.successorOwner)) return true;
+          const chained = index === 0 || sameOwner(receipt.formerOwner, s.adoptions![index - 1].successorOwner);
+          const formerKey = ownerKey(receipt.formerOwner);
+          const successorKey = ownerKey(receipt.successorOwner);
+          const ownerSequenceValid = index === 0
+            ? !identities.has(formerKey) && (identities.add(formerKey), true)
+            : identities.has(formerKey) && formerKey === ownerKey(s.adoptions![index - 1].successorOwner);
+          const successorFresh = !identities.has(successorKey);
+          identities.add(successorKey);
+          return sameOwner(receipt.formerOwner, receipt.successorOwner) || !ownerSequenceValid || !successorFresh || !chained ||
+            !integer(receipt.at) || receipt.priorGeneration !== index + 1 ||
+            receipt.resultingGeneration !== index + 2 || !Array.isArray(receipt.retainedDue) ||
+            receipt.retainedDue.some((slot, i) => !integer(slot) || slot < s.firstSlot || slot > s.through ||
+              (slot - s.firstSlot) % HALF_HOUR !== 0 || (i > 0 && slot <= receipt.retainedDue[i - 1])) ||
+            receipt.dueDigest !== dueDigest(receipt.retainedDue);
+        }) || !sameOwner(s.adoptions.at(-1)!.successorOwner, s.owner)) throw new Error("Malformed adoption receipt");
+  }
   return s;
 }
 
@@ -258,6 +270,15 @@ export class PlanningSessionClock {
       throw new Error("Planning terminal stop does not match a recoverable ledger owner");
     }
     const key = ownerKey(state.owner);
+    if (revoked.adoptedGeneration !== undefined) {
+      if (stored && revoked.adoptedGeneration === stored.generation && revoked.candidate &&
+          JSON.stringify(revoked.candidate) === JSON.stringify(stored) &&
+          (revoked.due ?? []).every((slot) => stored.due.includes(slot))) {
+        this.revocations.delete(key);
+        return false;
+      }
+      throw new Error("Adopted planning evidence does not match the durable ledger");
+    }
     const candidate = revoked.candidate && sameOwner(revoked.candidate.owner, state.owner) &&
       revoked.candidate.firstSlot === state.firstSlot ? revoked.candidate : undefined;
     const due = [...new Set([...state.due, ...(candidate?.due ?? []), ...(revoked.due ?? [])])].sort((a, b) => a - b);
@@ -372,15 +393,32 @@ export class PlanningSessionClock {
       this.resume();
       return;
     }
+    const formerKey = ownerKey(prior.owner);
+    const successorKey = ownerKey(this.owner);
+    const formerEvidence = this.revocations.get(formerKey);
+    const successorEvidence = this.revocations.get(successorKey);
+    if (successorEvidence) throw new Error("Successor has unresolved planning evidence");
+    if (formerEvidence && (formerEvidence.adoptedGeneration !== undefined ||
+        (formerEvidence.candidate && JSON.stringify(formerEvidence.candidate) !== JSON.stringify(prior)) ||
+        (formerEvidence.due ?? []).some((slot) => !prior.due.includes(slot)))) {
+      throw new Error("Former owner has planning evidence not represented by the durable ledger");
+    }
     const receipt: AdoptionReceipt = { formerOwner: prior.owner, successorOwner: this.owner, at: this.io.now(),
       priorGeneration: prior.generation, resultingGeneration: prior.generation + 1,
       retainedDue: [...prior.due], dueDigest: dueDigest(prior.due) };
     const adopted: SlotState = { ...prior, generation: receipt.resultingGeneration, owner: this.owner,
       adoptions: [...(prior.adoptions ?? []), receipt] };
     this.store.write(adopted, prior, () => this.io.valid());
+    const committed = this.store.read(() => this.io.valid());
+    if (!committed || JSON.stringify(committed) !== JSON.stringify(adopted)) {
+      throw new Error("Planning adoption commit could not be verified");
+    }
     this.lastState = adopted;
-    this.revocations.delete(ownerKey(prior.owner));
-    this.revocations.delete(ownerKey(this.owner));
+    if (formerEvidence) {
+      this.revocations.delete(formerKey);
+      this.revocations.set(successorKey, { ...formerEvidence, owner: this.owner, candidate: adopted,
+        due: [...(formerEvidence.due ?? [])], adoptedGeneration: adopted.generation });
+    }
     this.resume();
     if (adopted.due.length) this.io.wake([...adopted.due]);
   }

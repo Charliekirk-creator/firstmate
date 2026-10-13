@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { chmodSync, fsyncSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
+import { chmodSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { completePlanningTables, fileStore, HALF_HOUR, lateDisclosure, OBSERVATION_WINDOW, parseFirstSlot,
+import { completePlanningTables, fileStore, HALF_HOUR, lateDisclosure, OBSERVATION_WINDOW, ownerKey, parseFirstSlot,
   PlanningSessionClock, validateState, wifiInterfaces, wifiLink } from '../.pi/extensions/lib/fm-planning-session.ts';
 
 export const tables = `Captain, planning update.
@@ -180,6 +180,45 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => adoptedReload.adopt(first + HALF_HOUR), /anchor/);
     assert.deepEqual(transferredStore.read(), adoptedLedger);
     transferredA.dispose(); transferredB.dispose(); adoptedReload.dispose();
+
+    const evidencePath = join(lab, 'evidence-transfer.json');
+    const evidenceStore = fileStore(evidencePath);
+    evidenceStore.write(persistedTransferredLedger, null);
+    const unrepresentedCandidate = { ...persistedTransferredLedger, through: persistedTransferredLedger.through + HALF_HOUR,
+      due: [...persistedTransferredLedger.due, persistedTransferredLedger.through + HALF_HOUR] };
+    const evidenceRevocations = new Map([[ownerKey(transferOwnerA),
+      { owner: transferOwnerA, reason: 'ledger-failure', due: unrepresentedCandidate.due, candidate: unrepresentedCandidate }]]);
+    const evidenceBefore = readFileSync(evidencePath);
+    const evidenceAdopter = new PlanningSessionClock(transferOwnerB, evidenceStore,
+      { ...io, valid: () => true, ownsMain: () => true }, evidenceRevocations);
+    assert.throws(() => evidenceAdopter.adopt(first), /not represented/);
+    assert.deepEqual(readFileSync(evidencePath), evidenceBefore);
+    assert.equal(evidenceRevocations.size, 1);
+
+    const representedRevocations = new Map([[ownerKey(transferOwnerA),
+      { owner: transferOwnerA, reason: 'ownership-lost', due: [...persistedTransferredLedger.due],
+        candidate: persistedTransferredLedger }]]);
+    const representedAdopter = new PlanningSessionClock(transferOwnerB, evidenceStore,
+      { ...io, valid: () => true, ownsMain: () => true }, representedRevocations);
+    representedAdopter.adopt(first);
+    assert.equal(representedRevocations.size, 0, 'durable adoption settlement clears exactly represented evidence');
+    assert.deepEqual(evidenceStore.read().due, persistedTransferredLedger.due);
+    representedAdopter.dispose();
+
+    const processTransferPath = join(lab, 'process-transfer.json');
+    const processTransferStore = fileStore(processTransferPath);
+    const processTransfer = { ...persistedTransferredLedger,
+      due: [persistedTransferredLedger.through - HALF_HOUR, persistedTransferredLedger.through], delivery: undefined };
+    processTransferStore.write(processTransfer, null);
+    const adoptionProcess = spawnSync(process.execPath,
+      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), processTransferPath, join(lab, 'adopter.jsonl')],
+      { encoding: 'utf8' });
+    assert.equal(adoptionProcess.status, 0, adoptionProcess.stderr);
+    const processAdopted = JSON.parse(adoptionProcess.stdout);
+    assert.equal(processAdopted.generation, processTransfer.generation + 1);
+    assert.deepEqual(processAdopted.due, processTransfer.due);
+    assert.equal(processAdopted.owner.pid > 1, true);
+    assert.deepEqual(processTransferStore.read(), processAdopted);
 
     const emptyTransferStore = fileStore(join(lab, 'empty-transfer.json'));
     const emptyTransfer = { ...persistedTransferredLedger, due: [], delivery: undefined };
@@ -702,6 +741,14 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => validateState({ ...old, due: [first, first] }), /Malformed/);
     assert.throws(() => validateState({ ...old, owner: { ...owner, pid: 0 } }), /Malformed/);
     assert.throws(() => validateState({ ...old, through: old.through + 1 }), /Malformed/);
+    assert.throws(() => validateState({ ...old, generation: 5, adoptions: undefined }), /Malformed adoption history/);
+    const firstAdoption = adoptedLedger.adoptions[0];
+    const unrelatedOwner = { ...transferOwnerA, sessionId: 'unrelated-history' };
+    const malformedSecondAdoption = { ...firstAdoption, formerOwner: unrelatedOwner,
+      successorOwner: { ...transferOwnerB, sessionId: 'third-owner' }, priorGeneration: 2, resultingGeneration: 3 };
+    assert.throws(() => validateState({ ...adoptedLedger, generation: 3,
+      owner: malformedSecondAdoption.successorOwner, adoptions: [firstAdoption, malformedSecondAdoption] }),
+      /Malformed adoption receipt/);
     for (const failure of ['write', 'sync']) {
       const failedPath = join(lab, `${failure}-cleanup.json`);
       const injected = fileStore(failedPath, {
