@@ -238,9 +238,26 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.notEqual(blockedAdoptionProcess.status, 0);
     assert.match(blockedAdoptionProcess.stderr, /due evidence retained/);
     assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
+    const recoveryOperation = JSON.parse(readFileSync(`${journalTransferPath}.recovery.json`, 'utf8')).operationId;
+    const abortedRecovery = spawnSync(process.execPath,
+      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'recoverer.jsonl'),
+        'recovering-main', 'recover', recoveryOperation], { encoding: 'utf8' });
+    assert.equal(abortedRecovery.status, 0, abortedRecovery.stderr);
+    assert.match(abortedRecovery.stdout, /explicit planning adoption/);
+    assert.equal(existsSync(`${journalTransferPath}.recovery.json`), false);
+    assert.equal(existsSync(`${journalTransferPath}.pending-recovery.json`), true);
+    const retriedAdoption = spawnSync(process.execPath,
+      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'retry-adopter.jsonl')],
+      { encoding: 'utf8' });
+    assert.equal(retriedAdoption.status, 0, retriedAdoption.stderr);
+    const retriedState = JSON.parse(retriedAdoption.stdout);
+    assert.deepEqual(retriedState.due, [...persistedTransferredLedger.due,
+      persistedTransferredLedger.through + HALF_HOUR]);
+    assert.equal(existsSync(`${journalTransferPath}.pending-recovery.json`), false);
 
     const emptyTransferStore = fileStore(join(lab, 'empty-transfer.json'));
-    const emptyTransfer = { ...persistedTransferredLedger, due: [], delivery: undefined };
+    const emptyTransfer = { ...persistedTransferredLedger, due: [], delivery: undefined,
+      observation: { slot: persistedTransferredLedger.through, result: 'unknown' } };
     emptyTransferStore.write(emptyTransfer, null);
     const emptyAdopter = new PlanningSessionClock(transferOwnerB, emptyTransferStore,
       { ...io, valid: () => true, ownsMain: () => true });
@@ -763,6 +780,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => validateState({ ...old, observation: { slot: -1, result: 'online' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, observation: { slot: old.through - HALF_HOUR, result: 'offline' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, observation: { slot: old.through, result: 'connected' } }), /Malformed/);
+    assert.throws(() => validateState({ ...old, observation: { slot: old.through, result: 'online' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, due: [old.through], observation: { slot: old.through, result: 'offline' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, generation: 5, adoptions: undefined }), /Malformed adoption history/);
     const firstAdoption = adoptedLedger.adoptions[0];
