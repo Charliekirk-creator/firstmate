@@ -393,6 +393,41 @@ function cells(line: string): string[] {
   parts.push(part.trim());
   return parts;
 }
+function maskMarkdownCode(text: string): string {
+  const masked = text.split("");
+  for (let i = 0; i < text.length;) {
+    if (text[i] === "\\" && i + 1 < text.length && /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/.test(text[i + 1])) {
+      masked[i + 1] = " ";
+      i += 2;
+      continue;
+    }
+    if (text[i] !== "`" || masked[i] === " ") { i += 1; continue; }
+    let length = 1;
+    while (text[i + length] === "`") length += 1;
+    let closing = i + length;
+    while (closing < text.length) {
+      if (text[closing] !== "`") { closing += 1; continue; }
+      let candidate = 1;
+      while (text[closing + candidate] === "`") candidate += 1;
+      if (candidate === length) break;
+      closing += candidate;
+    }
+    if (closing >= text.length) { i += length; continue; }
+    for (let j = i; j < closing + length; j += 1) if (text[j] !== "\n") masked[j] = " ";
+    i = closing + length;
+  }
+  return masked.join("");
+}
+
+function atxHeading(line: string): string | undefined {
+  const match = /^ {0,3}#{1,6}(?:[ \t]+(.*)|[ \t]*)$/.exec(line);
+  if (!match) return undefined;
+  let content = (match[1] ?? "").replace(/[ \t]+$/, "");
+  const closing = /^(.*?)[ \t]+#+[ \t]*$/.exec(content);
+  if (closing) content = closing[1].replace(/[ \t]+$/, "");
+  return content.replace(/^[ \t]+/, "");
+}
+
 export function completePlanningTables(text: string): boolean {
   const lines = text.split(/\r?\n/);
   let fence: string | undefined;
@@ -407,6 +442,8 @@ export function completePlanningTables(text: string): boolean {
     return "";
   });
   const joined = visible.join("\n");
+  const htmlSource = maskMarkdownCode(joined);
+  const htmlLines = htmlSource.split("\n");
   const hiddenLines = new Set<number>();
   const lineAt = (offset: number) => joined.slice(0, offset).split("\n").length - 1;
   const hide = (start: number, end: number) => {
@@ -417,7 +454,7 @@ export function completePlanningTables(text: string): boolean {
   let rawOpaque = false;
   const opaqueLines = new Set<number>();
   for (let i = 0; i < visible.length; i += 1) {
-    const line = visible[i];
+    const line = htmlLines[i];
     if (rawEnd === "blank") {
       if (!line.trim()) rawEnd = undefined;
       else hiddenLines.add(i);
@@ -446,7 +483,8 @@ export function completePlanningTables(text: string): boolean {
   const stack: { name: string; start: number; hidden: boolean }[] = [];
   const voidElements = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
   const tags = /<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>/gs;
-  for (const match of joined.matchAll(tags)) {
+  const intrinsicallyHidden = new Set(["details", "head", "script", "style", "template", "title"]);
+  for (const match of htmlSource.matchAll(tags)) {
     const start = match.index ?? 0;
     const end = start + match[0].length - 1;
     const name = match[1].toLowerCase();
@@ -463,7 +501,12 @@ export function completePlanningTables(text: string): boolean {
       }
     } else if (!match[0].endsWith("/>") && !voidElements.has(name)) {
       const parentHidden = stack.some((entry) => entry.hidden);
-      stack.push({ name, start, hidden: parentHidden || /(?:^|\s)(?:hidden(?=\s|=|\/?>)|aria-hidden\s*=\s*(?:"true"|'true'|true)(?=\s|\/?>))/i.test(match[0]) });
+      const style = /(?:^|\s)style\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'"=<>`]+))/i.exec(match[0]);
+      const declarations = (style?.[1] ?? style?.[2] ?? style?.[3] ?? "").replace(/\/\*[\s\S]*?\*\//g, "")
+        .split(";").map((part) => part.trim().toLowerCase());
+      const styleHidden = declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!important)?$/.test(part));
+      const hidden = /(?:^|\s)(?:hidden(?=\s|=|\/?>)|aria-hidden\s*=\s*(?:"true"|'true'|true)(?=\s|\/?>))/i.test(match[0]);
+      stack.push({ name, start, hidden: parentHidden || hidden || styleHidden || intrinsicallyHidden.has(name) });
     }
   }
   for (const opening of stack) if (opening.hidden) hide(opening.start, joined.length);
@@ -476,7 +519,7 @@ export function completePlanningTables(text: string): boolean {
   return sections.every(([name, header]) => {
     const headings: { line: number; end: number }[] = [];
     for (let i = 0; i < visible.length; i += 1) {
-      if (new RegExp(`^ {0,3}#{1,6} ${name}\\s*#*\\s*$`).test(visible[i])) headings.push({ line: i, end: i });
+      if (atxHeading(visible[i]) === name) headings.push({ line: i, end: i });
       else if (new RegExp(`^ {0,3}${name}[ \\t]*$`).test(visible[i]) && /^ {0,3}(?:=+|-+)[ \t]*$/.test(visible[i + 1] ?? "")) {
         headings.push({ line: i, end: i + 1 });
       }
