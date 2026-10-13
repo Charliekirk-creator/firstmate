@@ -404,20 +404,27 @@ export function wifiLink(power: string, link: string): boolean {
 function renderedCellContent(cell: string): string {
   const named: Record<string, string> = {
     amp: "&", apos: "'", emsp: " ", ensp: " ", gt: ">", hairsp: " ", lt: "<", mediumspace: " ",
-    nbsp: " ", newline: " ", numsp: " ", puncsp: " ", quot: '"', tab: " ", thinsp: " ", verythinspace: " ",
+    nbsp: " ", newline: " ", numsp: " ", puncsp: " ", quot: '"', shy: "", tab: " ", thinsp: " ", verythinspace: " ",
     zerowidthspace: "", zwnj: "", zwj: "",
   };
+  let unresolved = false;
   const decoded = cell.replace(/&(?:#x([0-9a-f]+)|#([0-9]+)|([a-z][a-z0-9]+));?/gi,
     (reference, hex, decimal, entity) => {
       if (hex || decimal) {
         const point = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
-        return point >= 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)
-          ? String.fromCodePoint(point) : reference;
+        if (point >= 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)) return String.fromCodePoint(point);
+        unresolved = true;
+        return "";
       }
-      return named[String(entity).toLowerCase()] ?? reference;
+      const replacement = named[String(entity).toLowerCase()];
+      if (replacement !== undefined) return replacement;
+      unresolved = true;
+      return "";
     });
-  return decoded.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/[*_~`]/g, "").replace(/[\s\u200b-\u200f\u2060\ufeff]/gu, "");
+  if (unresolved) return "";
+  return decoded.replace(/!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g, "$1")
+    .replace(/\[([^\]]*)\]/g, "$1").replace(/[*_~`]/g, "")
+    .replace(/[\s\u00ad\u034f\u061c\u17b4-\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufe00-\ufe0f\ufeff]|[\u{e0100}-\u{e01ef}]/gu, "");
 }
 
 function cells(line: string): string[] {
@@ -485,7 +492,10 @@ function latenessText(line: string): string | undefined {
       .replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
   } while (rendered !== prior);
   rendered = rendered.replace(/^ {1,3}(?=\S)/, "");
-  return /\bLate update(?:\s|:)/.test(rendered) ? rendered : undefined;
+  const normalized = maskMarkdownCode(rendered)
+    .replace(/!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g, "$1")
+    .replace(/\[([^\]]*)\]/g, "$1").replace(/[*_~]/g, "");
+  return /\bLate update(?:\s|:)/.test(normalized) ? rendered : undefined;
 }
 
 export function completePlanningTables(text: string, claimedSlots: number[] = [], persistedAt?: number): boolean {
@@ -502,79 +512,10 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
     return "";
   });
   const joined = visible.join("\n");
-  const htmlSource = maskMarkdownCode(joined);
-  const htmlLines = htmlSource.split("\n");
-  const inlineTags = /<\/?(?:span|b|i|em|strong|u|small|mark|s|sub|sup)>/gi;
-  const inlineLatenessClaim = htmlLines.some((line) => {
-    const tags = line.match(/<\/?[A-Za-z][^<>]*>/g);
-    return !!tags?.length && tags.every((tag) => new RegExp(`^${inlineTags.source}$`, "i").test(tag)) &&
-      latenessText(line.replace(inlineTags, "")) !== undefined;
-  });
-  const hiddenLines = new Set<number>();
-  const lineAt = (offset: number) => joined.slice(0, offset).split("\n").length - 1;
-  const hide = (start: number, end: number) => {
-    for (let line = lineAt(start); line <= lineAt(end); line += 1) hiddenLines.add(line);
-  };
-  const blockTags = "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
-  let rawEnd: RegExp | "blank" | undefined;
-  let rawOpaque = false;
-  let activeStylesheet = false;
-  const opaqueLines = new Set<number>();
-  for (let i = 0; i < visible.length; i += 1) {
-    const line = htmlLines[i];
-    if (rawEnd === "blank") {
-      if (!line.trim()) rawEnd = undefined;
-      else hiddenLines.add(i);
-      continue;
-    }
-    if (rawEnd) {
-      hiddenLines.add(i);
-      if (rawOpaque) opaqueLines.add(i);
-      if (rawEnd.test(line)) { rawEnd = undefined; rawOpaque = false; }
-      continue;
-    }
-    const script = /^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i.exec(line);
-    if (script) {
-      rawEnd = new RegExp(`</${script[1]}\\s*>`, "i");
-      rawOpaque = true;
-      if (script[1].toLowerCase() === "style") activeStylesheet = true;
-    }
-    else if (/^ {0,3}<!--/.test(line)) { rawEnd = /-->/; rawOpaque = true; }
-    else if (/^ {0,3}<\?/.test(line)) { rawEnd = /\?>/; rawOpaque = true; }
-    else if (/^ {0,3}<![A-Z]/.test(line)) { rawEnd = />/; rawOpaque = true; }
-    else if (/^ {0,3}<!\[CDATA\[/.test(line)) { rawEnd = /\]\]>/; rawOpaque = true; }
-    else if (new RegExp(`^ {0,3}</?(?:${blockTags})(?:\\s|/?>|$)`, "i").test(line)) rawEnd = "blank";
-    else if (/^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>[ \t]*$/.test(line)) rawEnd = "blank";
-    if (rawEnd) {
-      hiddenLines.add(i);
-      if (rawOpaque) opaqueLines.add(i);
-      if (rawEnd !== "blank" && rawEnd.test(line.slice(1))) { rawEnd = undefined; rawOpaque = false; }
-    }
-  }
-  const stack: { name: string; start: number }[] = [];
-  const voidElements = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
-  const tags = /<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>/gs;
-  for (const match of htmlSource.matchAll(tags)) {
-    const start = match.index ?? 0;
-    const end = start + match[0].length - 1;
-    const name = match[1].toLowerCase();
-    if (opaqueLines.has(lineAt(start))) continue;
-    if (name === "style" && !match[0].startsWith("</")) activeStylesheet = true;
-    hide(start, end);
-    if (match[0].startsWith("</")) {
-      let opening = -1;
-      for (let i = stack.length - 1; i >= 0; i -= 1) {
-        if (stack[i].name === name) { opening = i; break; }
-      }
-      if (opening >= 0) {
-        hide(stack[opening].start, end);
-        stack.splice(opening);
-      }
-    } else if (!match[0].endsWith("/>") && !voidElements.has(name)) stack.push({ name, start });
-  }
-  for (const opening of stack) hide(opening.start, joined.length);
-  if (activeStylesheet) return false;
-  for (const line of hiddenLines) visible[line] = "";
+  const markdownSurface = maskMarkdownCode(joined)
+    .replace(/<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>/g, "")
+    .replace(/<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?>/g, "");
+  if (/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>|<!--|<![A-Z]|<!\[CDATA\[|<\?/is.test(markdownSurface)) return false;
   if (persistedAt !== undefined) {
     if (!Number.isFinite(persistedAt)) return false;
     const lateSlots = claimedSlots.filter((slot) => persistedAt > slot);
@@ -582,7 +523,6 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
       const rendered = latenessText(line);
       return rendered === undefined ? [] : [{ line, rendered }];
     });
-    if (inlineLatenessClaim) return false;
     if (lateSlots.length) {
       const expected = lateDisclosure(lateSlots);
       if (disclosures.length !== 1 || disclosures[0].rendered !== expected || disclosures[0].line.trim() !== expected) return false;

@@ -120,12 +120,11 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
 
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
-    assert.equal(completePlanningTables(tables + '\n<br>'), true);
-    assert.equal(completePlanningTables('<section hidden>\n' + tables + '\n</section>\n\n' + tables), true);
+    assert.equal(completePlanningTables(tables + '\n<captain@example.invalid>'), true);
+
     assert.equal(completePlanningTables('```markdown\n```   \n' + tables), true);
     assert.equal(completePlanningTables(tables.split('\n').map(line => line.startsWith('|') ? '   ' + line : line).join('\n')), true);
-    assert.equal(completePlanningTables('<div>benign context</div>\n\n' + tables), true);
-    assert.equal(completePlanningTables('<!-- <div hidden> -->\n' + tables), true);
+
     assert.equal(completePlanningTables('Note: `<section hidden>`\n' + tables), true);
     assert.equal(completePlanningTables('Note: `` `<section hidden>` ``\n' + tables), true);
     assert.equal(completePlanningTables('\\<section hidden>\n' + tables), true);
@@ -142,6 +141,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', '**No material change**')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
+      tables + '\n<br>', '<div>benign context</div>\n\n' + tables,
+      '<section hidden>\n' + tables + '\n</section>\n\n' + tables, '<!-- benign -->\n' + tables,
       tables.replace('| Task | Ready | Finish | No |', '| Task | Ready |'),
       tables.replace('| Test | Verified |', ''), tables.replace('Completed outcome', 'Outcome'),
       tables.replace('| Idea | No material change | Review later | No |', '| Idea | | Review later | No |'),
@@ -149,6 +150,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       tables.replace('| Task | Ready | Finish | No |', '| &#160; | &#xA0; | &#32; | &Tab; |'),
       tables.replace('| Test | Verified |', '| ** ** | ` ` |'),
       tables.replace('| Test | Verified |', '| []() | __ __ |'),
+      tables.replace('| Test | Verified |', '| &shy; | &#173; |'),
+      tables.replace('| Test | Verified |', '| \u00ad | \u2060 |'),
+      tables.replace('| Test | Verified |', '| &unknown; | Visible |'),
       tables + '\n## Ideas\n', '~~~\n' + tables + '\n~~~',
       '```markdown\n```not-a-close\n' + tables + '\n```',
       tables.split('\n').map(line => line.startsWith('|') ? '    ' + line : line).join('\n'),
@@ -195,13 +199,17 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('> ' + lateDisclosure([first]) + '\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('- ' + lateDisclosure([first]) + '\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late update someday.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('**Late update** for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables,
+      [first], first), false);
+    assert.equal(completePlanningTables('`Late update for: 2026-10-12 16:30 HKT.`\n' + tables, [first], first), true);
     assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
     assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n<span>' + lateDisclosure([first]) + '</span>\n' + tables,
       [first], first + 1), false);
     assert.equal(completePlanningTables('<span hidden>' + lateDisclosure([first]) + '</span>\n' +
-      lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
+      lateDisclosure([first]) + '\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.NaN), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.POSITIVE_INFINITY), false);
@@ -212,7 +220,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '<div hidden>\n' + lateLine + '\n</div>\n\n' + tables,
       '> ' + lateLine + '\n' + tables,
       '1. ' + lateLine + '\n' + tables,
-      lateLine + '\n> ' + lateLine + '\n' + tables]) {
+      lateLine + '\n> ' + lateLine + '\n' + tables,
+      lateLine + '\n**Late update** for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\n[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables]) {
       assert.equal(completePlanningTables(disclosure, [first, first + HALF_HOUR], first + HALF_HOUR + 1), false);
     }
     console.log('ok - complete visible tables and exact lateness disclosure required');
