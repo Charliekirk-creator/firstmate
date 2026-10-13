@@ -497,13 +497,17 @@ function renderedCellContent(cell: string): string {
 
 function cells(line: string): string[] {
   let text = line.trim();
+  const escaped = (at: number) => {
+    let slashes = 0;
+    for (let i = at - 1; i >= 0 && text[i] === "\\"; i -= 1) slashes += 1;
+    return slashes % 2 === 1;
+  };
   if (text.startsWith("|")) text = text.slice(1);
-  if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1);
+  if (text.endsWith("|") && !escaped(text.length - 1)) text = text.slice(0, -1);
   const parts: string[] = [];
   let part = "";
   for (let i = 0; i < text.length; i += 1) {
-    if (text[i] === "\\" && i + 1 < text.length) { part += text[i] + text[++i]; continue; }
-    if (text[i] === "|") { parts.push(part.trim()); part = ""; } else part += text[i];
+    if (text[i] === "|" && !escaped(i)) { parts.push(part.trim()); part = ""; } else part += text[i];
   }
   parts.push(part.trim());
   return parts;
@@ -583,6 +587,7 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
     let part = activeList ? source.trimStart() : source;
     let quotes = 0;
     while (/^ {0,3}>[ \t]?/.test(part)) { part = part.replace(/^ {0,3}>[ \t]?/, ""); quotes += 1; }
+    if (/^(?:\t| {4})/.test(part) && !activeList) { flush(); continue; }
     const listed = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(part);
     if (listed) part = part.replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
     const setext = /^ {0,3}(?:=+|-+)[ \t]*$/.test(part);
@@ -595,7 +600,8 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
       continue;
     }
     const signature = `${quotes}:${listed ? "list" : "prose"}`;
-    const listContinuation = activeList && !listed && quotes === 0;
+    const listQuoteDepth = activeList ? Number(block?.signature.split(":", 1)[0]) : -1;
+    const listContinuation = activeList && !listed && (quotes === listQuoteDepth || quotes === 0);
     const lazyQuoteContinuation = !!block && /^[1-9]\d*:/.test(block.signature) && quotes === 0 && !listed;
     const continuation = listContinuation || lazyQuoteContinuation;
     if (block && latenessText(block.parts.join(" ")) !== undefined) flush();
