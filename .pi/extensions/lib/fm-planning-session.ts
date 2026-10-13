@@ -1,9 +1,10 @@
-// Session-local scheduling and slot receipts. No process, service, or model calls.
+// Session-local scheduling and durable slot receipts. No network or model calls.
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, readlinkSync, realpathSync,
-  renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync,
+  renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute } from "node:path";
 import { html5Entities } from "./html5-entities.ts";
+import { planningTransaction } from "./fm-planning-lock.ts";
 
 export const HALF_HOUR = 30 * 60 * 1000;
 // A suspended event loop cannot establish historical Wi-Fi connectivity.
@@ -24,9 +25,13 @@ export type Claim = { owner: Owner; slots: number[] };
 export type Store = {
   read(authorize?: () => boolean): SlotState | undefined;
   write(state: SlotState, expected: SlotState | null, authorize?: () => boolean): void;
-  reconcile?(authorize?: () => boolean, operationId?: string):
+  reconcile?(authorize: () => boolean, operationId: string, owner: Owner,
+    validateEvidence?: (candidate: SlotState, canonical?: SlotState) => void):
     { outcome: "none" | "committed" | "aborted"; state?: SlotState; operationId?: string };
   pending?(authorize?: () => boolean): SlotState | undefined;
+  recovery?(): { operationId: string; phase: string; candidate: SlotState } | undefined;
+  transaction?<T>(authorize: () => boolean, action: () => T): T;
+  adopt?(state: SlotState, expected: SlotState | null, authorize: () => boolean): void;
 };
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0;
 export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && a.sessionFile === b.sessionFile &&
@@ -104,7 +109,6 @@ export function fileStore(path: string, operations: {
   write(fd: number, data: string): void;
   sync(fd: number): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
-  const lockPath = resolve(realpathSync(dirname(path)), ".lock.acquire");
   const journalPath = `${path}.recovery.json`;
   const pendingPath = `${path}.pending-recovery.json`;
   const safeParent = () => {
@@ -131,141 +135,88 @@ export function fileStore(path: string, operations: {
     const directory = openSync(dirname(path), "r");
     try { sync(directory); } finally { closeSync(directory); }
   };
+  let assertHeld: (() => void) | undefined;
   const locked = <T>(action: () => T): T => {
+    if (assertHeld) { assertHeld(); return action(); }
     safeParent();
-    const ownerDirectory = mkdtempSync(`${lockPath}.owner.`);
-    const ownerPid = resolve(ownerDirectory, "pid");
-    let fd: number | undefined;
-    let acquired = false;
-    try {
-      fd = openSync(ownerPid, "wx", 0o600);
-      writeFileSync(fd, `${process.pid}\n`);
-      fsyncSync(fd);
-      closeSync(fd);
-      fd = undefined;
-      try { symlinkSync(ownerDirectory, lockPath); acquired = true; }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        let staleOwner: string | undefined;
-        let stalePid: number | undefined;
-        try {
-          staleOwner = readlinkSync(lockPath);
-          if (!staleOwner.startsWith(`${lockPath}.owner.`) || !lstatSync(staleOwner).isDirectory() ||
-              lstatSync(staleOwner).isSymbolicLink() || !lstatSync(resolve(staleOwner, "pid")).isFile() ||
-              lstatSync(resolve(staleOwner, "pid")).isSymbolicLink() ||
-              Date.now() - statSync(staleOwner).mtimeMs < 2000) throw new Error("ambiguous");
-          const pidText = readFileSync(resolve(staleOwner, "pid"), "utf8").trim();
-          if (!/^[0-9]+$/.test(pidText)) throw new Error("ambiguous");
-          stalePid = Number(pidText);
-          try { process.kill(stalePid, 0); throw new Error("live"); }
-          catch (problem) { if ((problem as NodeJS.ErrnoException).code !== "ESRCH") throw problem; }
-        } catch { throw new Error("Planning ledger lock is busy or ambiguous"); }
-        const stealPath = `${lockPath}.steal`;
-        const stealOwner = mkdtempSync(`${stealPath}.owner.`);
-        try {
-          writeFileSync(resolve(stealOwner, "pid"), `${process.pid}\n`, { mode: 0o600 });
-          try { symlinkSync(stealOwner, stealPath); } catch { throw new Error("Planning ledger lock recovery is busy"); }
-          if (readlinkSync(lockPath) !== staleOwner || readFileSync(resolve(staleOwner, "pid"), "utf8").trim() !== String(stalePid)) {
-            throw new Error("Planning ledger lock changed during recovery");
-          }
-          try { process.kill(stalePid!, 0); throw new Error("Planning ledger owner revived"); }
-          catch (problem) { if ((problem as NodeJS.ErrnoException).code !== "ESRCH") throw problem; }
-          unlinkSync(lockPath); unlinkSync(resolve(staleOwner, "pid")); rmdirSync(staleOwner);
-          symlinkSync(ownerDirectory, lockPath); acquired = true;
-        } finally {
-          try { if (existsSync(stealPath) && readlinkSync(stealPath) === stealOwner) unlinkSync(stealPath); } catch {}
-          try { if (existsSync(resolve(stealOwner, "pid"))) unlinkSync(resolve(stealOwner, "pid")); } catch {}
-          try { rmdirSync(stealOwner); } catch {}
-        }
-      }
-      if (!lstatSync(lockPath).isSymbolicLink() || readlinkSync(lockPath) !== ownerDirectory ||
-          readFileSync(ownerPid, "utf8") !== `${process.pid}\n`) {
-        throw new Error("Planning ledger lock evidence is missing or corrupt");
-      }
-      return action();
-    } finally {
-      if (fd !== undefined) { try { closeSync(fd); } catch {} }
-      if (acquired) {
-        let validLock = false;
-        try {
-          validLock = lstatSync(lockPath).isSymbolicLink() && readlinkSync(lockPath) === ownerDirectory &&
-            lstatSync(ownerPid).isFile() && !lstatSync(ownerPid).isSymbolicLink() &&
-            readFileSync(ownerPid, "utf8") === `${process.pid}\n`;
-        } catch {}
-        if (!validLock) throw new Error("Planning ledger lock evidence is missing or corrupt");
-        unlinkSync(lockPath);
-        unlinkSync(ownerPid);
-        rmdirSync(ownerDirectory);
-        syncDirectory(fsyncSync);
-      } else {
-        try { if (existsSync(ownerPid)) unlinkSync(ownerPid); } catch {}
-        try { rmdirSync(ownerDirectory); } catch {}
-      }
-    }
+    return planningTransaction(dirname(path), (verify) => {
+      assertHeld = verify;
+      try { return action(); } finally { assertHeld = undefined; }
+    });
   };
   const ledgerBytes = (state: SlotState) => `${JSON.stringify(state)}\n`;
   const bytesHash = (bytes: string | undefined) => createHash("sha256")
     .update(bytes === undefined ? "missing" : bytes).digest("hex");
-  const readJournal = (): { operationId: string; phase: "prepared" | "aborted" | "committed"; expectedHash: string;
-    intendedHash: string; expectedOwner: Owner | null; candidate: SlotState } | undefined => {
-    if (!existsSync(journalPath)) return undefined;
-    const stat = lstatSync(journalPath);
+  type Recovery = { operationId: string; phase: "prepared" | "aborted" | "committed"; expectedHash: string;
+    intendedHash: string; expectedOwner: Owner | null; expectedVersion: number | null;
+    expectedGeneration: number | null; candidate: SlotState; consumesPendingHash?: string };
+  const readRecovery = (source: string): Recovery | undefined => {
+    let stat;
+    try { stat = lstatSync(source); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) {
       throw new Error("Unsafe planning recovery journal");
     }
-    const record = JSON.parse(readFileSync(journalPath, "utf8"));
-    if (!record || typeof record.operationId !== "string" || !record.operationId ||
+    const record = JSON.parse(readFileSync(source, "utf8"));
+    if (!record || typeof record.operationId !== "string" || !/^[a-f0-9-]{36}$/.test(record.operationId) ||
         !["prepared", "aborted", "committed"].includes(record.phase) || !/^[a-f0-9]{64}$/.test(record.expectedHash) ||
         !/^[a-f0-9]{64}$/.test(record.intendedHash) ||
         (record.expectedOwner !== null && !validOwner(record.expectedOwner)) ||
+        (record.expectedOwner === null ? record.expectedVersion !== null || record.expectedGeneration !== null :
+          record.expectedVersion !== 1 || !Number.isSafeInteger(record.expectedGeneration) || record.expectedGeneration < 1) ||
+        (record.consumesPendingHash !== undefined && !/^[a-f0-9]{64}$/.test(record.consumesPendingHash)) ||
         bytesHash(ledgerBytes(validateState(record.candidate))) !== record.intendedHash) {
       throw new Error("Malformed planning recovery journal");
     }
     return record;
   };
-  const publishJournal = (record: object) => {
+  const readJournal = () => readRecovery(journalPath);
+  const requireAuthorized = (authorize?: () => boolean) => {
+    assertHeld!();
+    if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
+  };
+  const publishJournal = (record: Recovery) => {
+    assertHeld!();
     const temp = `${journalPath}.${randomUUID()}.tmp`;
     let fd: number | undefined;
     try {
       fd = openSync(temp, "wx", 0o600);
       writeFileSync(fd, `${JSON.stringify(record)}\n`);
       fsyncSync(fd); closeSync(fd); fd = undefined;
-      renameSync(temp, journalPath); syncDirectory(fsyncSync);
+      assertHeld!(); renameSync(temp, journalPath); syncDirectory(fsyncSync);
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}
     }
   };
   const clearJournal = () => {
+    assertHeld!();
     if (existsSync(journalPath)) { unlinkSync(journalPath); syncDirectory(fsyncSync); }
   };
-  const publishPending = (record: object) => {
+  const publishPending = (record: Recovery) => {
+    assertHeld!();
     const temp = `${pendingPath}.${randomUUID()}.tmp`;
     let fd: number | undefined;
     try {
       fd = openSync(temp, "wx", 0o600); writeFileSync(fd, `${JSON.stringify(record)}\n`); fsyncSync(fd);
-      closeSync(fd); fd = undefined; renameSync(temp, pendingPath); syncDirectory(fsyncSync);
+      closeSync(fd); fd = undefined; assertHeld!(); renameSync(temp, pendingPath); syncDirectory(fsyncSync);
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}
     }
   };
-  const readPending = (): SlotState | undefined => {
-    if (!existsSync(pendingPath)) return undefined;
-    const stat = lstatSync(pendingPath);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) {
-      throw new Error("Unsafe pending planning recovery evidence");
-    }
-    const record = JSON.parse(readFileSync(pendingPath, "utf8"));
-    if (!record || record.status !== "aborted" || typeof record.operationId !== "string") {
-      throw new Error("Malformed pending planning recovery evidence");
-    }
-    return validateState(record.candidate);
+  const readPending = (): Recovery | undefined => {
+    const record = readRecovery(pendingPath);
+    if (record && record.phase !== "aborted") throw new Error("Malformed pending planning recovery evidence");
+    return record;
   };
   const clearPending = () => {
+    assertHeld!();
     if (existsSync(pendingPath)) { unlinkSync(pendingPath); syncDirectory(fsyncSync); }
   };
-  const writeUnlocked = (state: SlotState) => {
+  const writeUnlocked = (state: SlotState, authorize: (() => boolean) | undefined, onRename: () => void) => {
     const temp = `${path}.${randomUUID()}.tmp`;
     let fd: number | undefined;
     let failure: unknown;
@@ -282,95 +233,126 @@ export function fileStore(path: string, operations: {
         fd = undefined;
       }
       if (failed) throw failure;
+      requireAuthorized(authorize);
       renameSync(temp, path);
+      onRename();
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}
     }
     syncDirectory(operations.sync);
   };
-  return {
-    read(authorize) { return locked(() => {
-      if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
-      return readUnlocked();
-    }); },
-    write(state, expected, authorize) {
-      validateState(state);
-      locked(() => {
-        if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
-        if (readJournal()) throw new Error("Planning recovery journal requires explicit reconciliation");
-        const pending = readPending();
-        const current = readUnlocked();
-        if (expected !== undefined && JSON.stringify(current) !== JSON.stringify(expected ?? undefined)) {
-          throw new Error("Planning ledger changed before the update could commit");
-        }
-        if (pending) {
-          const represented = pending.firstSlot === state.firstSlot && pending.through <= state.through &&
-            pending.due.every((slot) => state.due.includes(slot) || (state.delivery?.slots.includes(slot) ?? false)) &&
-            (sameOwner(pending.owner, state.owner) ||
-              !!state.adoptions?.some((receipt) => sameOwner(receipt.formerOwner, pending.owner)));
-          if (!represented) throw new Error("Pending planning recovery evidence is not represented by this update");
-        }
-        const record = { operationId: randomUUID(), phase: "prepared" as const,
-          expectedHash: bytesHash(readBytesUnlocked()), intendedHash: bytesHash(ledgerBytes(state)),
-          expectedOwner: current?.owner ?? null, candidate: state };
-        publishJournal(record);
-        try { writeUnlocked(state); }
-        catch (error) {
-          let committed = false;
-          try { committed = bytesHash(readBytesUnlocked()) === record.intendedHash; } catch {}
-          if (committed) throw new Error(`Planning commit uncertain; run recover-commit ${record.operationId}`);
-          throw error;
-        }
-        if (authorize && !authorize()) throw new Error(`Planning commit uncertain; run recover-commit ${record.operationId}`);
-        if (bytesHash(readBytesUnlocked()) !== record.intendedHash) {
-          throw new Error(`Planning commit uncertain; run recover-commit ${record.operationId}`);
-        }
+  const matchesCandidate = (state: SlotState, candidate: SlotState) => {
+    if (sameOwner(state.owner, candidate.owner)) return ledgerBytes(state) === ledgerBytes(candidate);
+    const receipt = state.adoptions?.at(-1);
+    return !!receipt && sameOwner(receipt.formerOwner, candidate.owner) &&
+      receipt.priorGeneration === (candidate.generation ?? 1) &&
+      JSON.stringify(receipt.retainedDue) === JSON.stringify(candidate.due) &&
+      ledgerBytes({ ...state, owner: candidate.owner, generation: candidate.generation,
+        adoptions: candidate.adoptions }) === ledgerBytes(candidate);
+  };
+  const retireRepresentedPending = (record: Recovery) => {
+    const pending = readPending();
+    if (!pending) return;
+    if (!record.consumesPendingHash || bytesHash(readFileSync(pendingPath, "utf8")) !== record.consumesPendingHash ||
+        !matchesCandidate(record.candidate, pending.candidate)) {
+      throw new Error("Pending planning recovery evidence does not match this commit");
+    }
+    clearPending();
+  };
+  const commit = (state: SlotState, expected: SlotState | null | undefined, authorize?: () => boolean, retry = false) => {
+    validateState(state);
+    locked(() => {
+      requireAuthorized(authorize);
+      if (readJournal()) throw new Error("Planning recovery journal requires explicit recover-commit reconciliation");
+      const pending = readPending();
+      const current = readUnlocked();
+      if (expected !== undefined && JSON.stringify(current) !== JSON.stringify(expected ?? undefined)) {
+        throw new Error("Planning ledger changed before the update could commit");
+      }
+      if (pending && (!retry || bytesHash(readBytesUnlocked()) !== pending.expectedHash ||
+          !matchesCandidate(state, pending.candidate))) {
+        throw new Error("Pending planning recovery evidence requires an exact explicit adoption retry");
+      }
+      const record: Recovery = { operationId: randomUUID(), phase: "prepared",
+        expectedHash: bytesHash(readBytesUnlocked()), intendedHash: bytesHash(ledgerBytes(state)),
+        expectedOwner: current?.owner ?? null, expectedVersion: current?.version ?? null,
+        expectedGeneration: current ? current.generation ?? 1 : null, candidate: state,
+        ...(pending ? { consumesPendingHash: bytesHash(readFileSync(pendingPath, "utf8")) } : {}) };
+      publishJournal(record);
+      let renamed = false;
+      try {
+        writeUnlocked(state, authorize, () => { renamed = true; });
+        requireAuthorized(authorize);
+        if (bytesHash(readBytesUnlocked()) !== record.intendedHash) throw new Error("Canonical bytes changed");
+        retireRepresentedPending(record);
         clearJournal();
-        if (pending) clearPending();
-      });
-    },
-    reconcile(authorize, operationId) {
+      } catch (error) {
+        if (renamed) throw new Error(`Planning commit uncertain; run recover-commit ${record.operationId}`, { cause: error });
+        throw error;
+      }
+    });
+  };
+  return {
+    transaction(authorize, action) { return locked(() => { requireAuthorized(authorize); return action(); }); },
+    read(authorize) { return locked(() => { requireAuthorized(authorize); return readUnlocked(); }); },
+    write: commit,
+    adopt(state, expected, authorize) { commit(state, expected, authorize, true); },
+    reconcile(authorize, operationId, owner, validateEvidence) {
       return locked(() => {
-        if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
+        requireAuthorized(authorize);
         const record = readJournal();
         if (!record) return { outcome: "none" as const };
-        if (operationId !== undefined && record.operationId !== operationId) {
-          throw new Error("Planning recovery operation id does not match");
-        }
+        if (record.operationId !== operationId) throw new Error("Planning recovery operation id does not match");
+        if (!sameOwner(record.candidate.owner, owner)) throw new Error("Planning recovery candidate belongs to another owner");
         const current = readUnlocked();
         const hash = bytesHash(readBytesUnlocked());
+        validateEvidence?.(record.candidate, current);
         if (hash === record.intendedHash) {
+          if (!current || !sameOwner(current.owner, owner)) throw new Error("Planning committed owner does not match");
           const fd = openSync(path, "r");
           try { fsyncSync(fd); } finally { closeSync(fd); }
           syncDirectory(fsyncSync);
-          if (authorize && !authorize()) throw new Error("Planning Main ownership changed during recovery");
+          requireAuthorized(authorize);
+          if (bytesHash(readBytesUnlocked()) !== record.intendedHash) throw new Error("Planning committed recovery verification failed");
+          retireRepresentedPending(record);
           publishJournal({ ...record, phase: "committed" });
           clearJournal();
-          if (bytesHash(readBytesUnlocked()) !== record.intendedHash || readJournal()) {
-            throw new Error("Planning committed recovery verification failed");
-          }
           return { outcome: "committed" as const, state: current, operationId: record.operationId };
         }
         if (hash === record.expectedHash) {
-          if (operationId === undefined) {
-            throw new Error(`Planning commit ${record.operationId} aborted; due evidence retained for retry`);
+          if (current ? !record.expectedOwner || !sameOwner(current.owner, record.expectedOwner) ||
+              current.version !== record.expectedVersion || (current.generation ?? 1) !== record.expectedGeneration :
+              record.expectedOwner !== null) throw new Error("Planning prior owner/version does not match");
+          const pending = readPending();
+          if (pending && pending.operationId !== record.operationId &&
+              (bytesHash(readFileSync(pendingPath, "utf8")) !== record.consumesPendingHash ||
+              !matchesCandidate(record.candidate, pending.candidate))) {
+            throw new Error("Pending planning recovery evidence belongs to another operation");
           }
+          requireAuthorized(authorize);
           publishJournal({ ...record, phase: "aborted" });
-          publishPending({ status: "aborted", operationId: record.operationId, candidate: record.candidate });
+          publishPending({ ...record, phase: "aborted" });
           clearJournal();
-          if (!readPending() || readJournal() || bytesHash(readBytesUnlocked()) !== record.expectedHash) {
-            throw new Error("Planning aborted recovery verification failed");
-          }
           return { outcome: "aborted" as const, state: current, operationId: record.operationId };
         }
         throw new Error("Planning recovery journal does not match canonical ledger bytes");
       });
     },
+    recovery() {
+      return locked(() => {
+        const journal = readJournal();
+        if (journal) return { operationId: journal.operationId, phase: journal.phase, candidate: journal.candidate };
+        const pending = readPending();
+        return pending ? { operationId: pending.operationId, phase: "pending", candidate: pending.candidate } : undefined;
+      });
+    },
     pending(authorize) {
       return locked(() => {
-        if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
-        return readPending();
+        requireAuthorized(authorize);
+        const journal = readJournal();
+        if (journal) throw new Error(`Planning recovery journal requires explicit recover-commit ${journal.operationId}`);
+        return readPending()?.candidate;
       });
     },
   };
@@ -503,7 +485,13 @@ export class PlanningSessionClock {
     this.dispose();
     this.rememberFailure(due, candidate);
   }
+  private requireSettledStore(): void {
+    try {
+      if (this.store.pending?.()) throw new Error("Pending planning recovery requires explicit adoption retry");
+    } catch (error) { this.dispose(); throw error; }
+  }
   private current(): SlotState | undefined {
+    this.requireSettledStore();
     try {
       if (this.reconcileRevocation()) return undefined;
       if (!this.io.valid()) { this.ownershipLost(); return undefined; }
@@ -523,6 +511,7 @@ export class PlanningSessionClock {
       firstSlot + Math.floor((this.io.now() - firstSlot) / HALF_HOUR) * HALF_HOUR);
     const fresh: SlotState = { version: 1, generation: 1, owner: this.owner, firstSlot, through, due: [] };
     let prior: SlotState | undefined;
+    this.requireSettledStore();
     try {
       this.reconcileRevocation();
       prior = this.store.read(() => this.io.valid());
@@ -555,72 +544,80 @@ export class PlanningSessionClock {
     this.resume();
     if (candidate.due.length) this.io.wake([...candidate.due]);
   }
+  private transaction(action: () => void): void {
+    try {
+      if (this.store.transaction) this.store.transaction(() => this.io.valid(), action);
+      else action();
+    } catch (error) { this.dispose(); throw error; }
+  }
+  private representedEvidence(candidate: SlotState, canonical?: SlotState): string[] {
+    const keys: string[] = [];
+    for (const [key, evidence] of this.revocations) {
+      if (key !== ownerKey(candidate.owner) || evidence.adoptedGeneration !== undefined ||
+          (evidence.candidate && JSON.stringify(evidence.candidate) !== JSON.stringify(candidate) &&
+            JSON.stringify(evidence.candidate) !== JSON.stringify(canonical)) ||
+          (evidence.due ?? []).some((slot) => !candidate.due.includes(slot) && !candidate.delivery?.slots.includes(slot))) {
+        throw new Error("Unresolved planning evidence is not represented by the durable candidate");
+      }
+      keys.push(key);
+    }
+    return keys;
+  }
   recoverCommit(operationId: string): void {
     if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may recover a planning commit");
     if (!/^[0-9a-f-]{36}$/.test(operationId)) throw new Error("Invalid planning recovery operation id");
     if (!this.store.reconcile) throw new Error("Planning store does not support durable commit recovery");
-    const recovery = this.store.reconcile(() => this.io.valid(), operationId);
-    if (recovery.outcome === "aborted") {
-      this.dispose();
-      throw new Error("Planning commit was not committed; run explicit planning adoption to retry retained evidence");
-    }
-    if (recovery.outcome !== "committed" || !recovery.state || !sameOwner(recovery.state.owner, this.owner)) {
-      throw new Error("Planning commit recovery does not belong to the current Main owner");
-    }
-    for (const [key, evidence] of this.revocations) {
-      if (evidence.candidate && JSON.stringify(evidence.candidate) === JSON.stringify(recovery.state) &&
-          (evidence.due ?? []).every((slot) => recovery.state!.due.includes(slot) ||
-            (recovery.state!.delivery?.slots.includes(slot) ?? false))) this.revocations.delete(key);
-    }
-    if (this.revocations.size) throw new Error("Unsettled planning evidence remains after commit recovery");
-    this.lastState = recovery.state;
-    this.resume();
+    this.transaction(() => {
+      let represented: string[] = [];
+      const recovery = this.store.reconcile!(() => this.io.valid(), operationId, this.owner, (candidate, canonical) => {
+        represented = this.representedEvidence(candidate, canonical);
+      });
+      if (recovery.outcome === "aborted") {
+        throw new Error("Planning commit was not committed; run explicit planning adoption to retry retained evidence");
+      }
+      if (recovery.outcome !== "committed" || !recovery.state) {
+        throw new Error("Planning commit recovery does not belong to the current Main owner");
+      }
+      for (const key of represented) this.revocations.delete(key);
+      this.lastState = recovery.state;
+      this.resume();
+    });
   }
   adopt(firstSlot: number): void {
     if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may adopt planning updates");
-    this.store.reconcile?.(() => this.io.valid());
-    const durable = this.store.read(() => this.io.valid());
-    if (!durable) throw new Error("No planning schedule exists to adopt");
-    const pending = this.store.pending?.(() => this.io.valid());
-    if (pending && (pending.firstSlot !== durable.firstSlot || pending.generation !== durable.generation ||
-        !sameOwner(pending.owner, durable.owner) || pending.through < durable.through ||
-        durable.due.some((slot) => !pending.due.includes(slot) && !(pending.delivery?.slots.includes(slot) ?? false)))) {
-      throw new Error("Pending planning recovery evidence cannot be reconciled with the ledger");
-    }
-    const prior = pending ?? durable;
-    if (prior.firstSlot !== firstSlot) throw new Error("Planning adoption anchor does not match the ledger");
-    if (prior.stopped) throw new Error("Stopped planning schedules cannot be adopted");
-    if (sameOwner(prior.owner, this.owner)) {
-      const receipt = prior.adoptions?.at(-1);
-      if (!receipt || !sameOwner(receipt.successorOwner, this.owner) ||
-          receipt.resultingGeneration !== prior.generation) throw new Error("Current-owner planning schedules cannot be adopted");
+    this.transaction(() => {
+      const pending = this.store.pending?.(() => this.io.valid());
+      const durable = this.store.read(() => this.io.valid());
+      const prior = pending ?? durable;
+      if (!prior) throw new Error("No planning schedule exists to adopt");
+      if (prior.firstSlot !== firstSlot) throw new Error("Planning adoption anchor does not match the ledger");
+      if (prior.stopped && !pending) throw new Error("Stopped planning schedules cannot be adopted");
+      const represented = this.representedEvidence(prior, durable);
+      let adopted = prior;
+      if (sameOwner(prior.owner, this.owner)) {
+        if (!pending) {
+          const receipt = prior.adoptions?.at(-1);
+          if (!receipt || !sameOwner(receipt.successorOwner, this.owner) || represented.length) {
+            throw new Error("Current-owner planning schedules cannot be adopted");
+          }
+          this.resume();
+          return;
+        }
+        // A same-owner retry applies the exact candidate, not a fictitious transfer.
+      } else {
+        const receipt: AdoptionReceipt = { formerOwner: prior.owner, successorOwner: this.owner, at: this.io.now(),
+          priorGeneration: prior.generation, resultingGeneration: prior.generation + 1,
+          retainedDue: [...prior.due], dueDigest: dueDigest(prior.due) };
+        adopted = { ...prior, generation: receipt.resultingGeneration, owner: this.owner,
+          adoptions: [...(prior.adoptions ?? []), receipt] };
+      }
+      if (this.store.adopt) this.store.adopt(adopted, durable ?? null, () => this.io.valid());
+      else this.store.write(adopted, durable ?? null, () => this.io.valid());
+      this.lastState = adopted;
+      for (const key of represented) this.revocations.delete(key);
       this.resume();
-      return;
-    }
-    const formerKey = ownerKey(prior.owner);
-    const successorKey = ownerKey(this.owner);
-    const formerEvidence = this.revocations.get(formerKey);
-    const successorEvidence = this.revocations.get(successorKey);
-    if (successorEvidence) throw new Error("Successor has unresolved planning evidence");
-    if (formerEvidence && (formerEvidence.adoptedGeneration !== undefined ||
-        (formerEvidence.candidate && JSON.stringify(formerEvidence.candidate) !== JSON.stringify(prior)) ||
-        (formerEvidence.due ?? []).some((slot) => !prior.due.includes(slot)))) {
-      throw new Error("Former owner has planning evidence not represented by the durable ledger");
-    }
-    const receipt: AdoptionReceipt = { formerOwner: prior.owner, successorOwner: this.owner, at: this.io.now(),
-      priorGeneration: prior.generation, resultingGeneration: prior.generation + 1,
-      retainedDue: [...prior.due], dueDigest: dueDigest(prior.due) };
-    const adopted: SlotState = { ...prior, generation: receipt.resultingGeneration, owner: this.owner,
-      adoptions: [...(prior.adoptions ?? []), receipt] };
-    this.store.write(adopted, durable, () => this.io.valid());
-    this.lastState = adopted;
-    if (formerEvidence) {
-      this.revocations.delete(formerKey);
-      this.revocations.set(successorKey, { ...formerEvidence, owner: this.owner, candidate: adopted,
-        due: [...(formerEvidence.due ?? [])], adoptedGeneration: adopted.generation });
-    }
-    this.resume();
-    if (adopted.due.length) this.io.wake([...adopted.due]);
+      if (!adopted.stopped && adopted.due.length) this.io.wake([...adopted.due]);
+    });
   }
   resume(): void {
     this.dispose();
@@ -685,8 +682,11 @@ export class PlanningSessionClock {
   isArmed(): boolean {
     return this.active && this.cancel !== undefined && this.current() !== undefined;
   }
-  status(): { armed: boolean; state: SlotState | undefined } {
+  status(): { armed: boolean; state: SlotState | undefined;
+    recovery?: { operationId: string; phase: string; candidate: SlotState } } {
     try {
+      const recovery = this.store.recovery?.();
+      if (recovery) { this.dispose(); return { armed: false, state: this.store.read(), recovery }; }
       const reconciled = this.reconcileRevocation();
       const armed = !reconciled && this.isArmed();
       const state = this.store.read();
@@ -715,10 +715,10 @@ export class PlanningSessionClock {
       retained = slots;
       const at = this.io.now();
       if (slots.some((slot) => slot > at)) return false;
-      this.rememberFailure(slots);
-      this.store.write({ ...state, due: state.due.filter((slot) => !slots.includes(slot)),
-        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } }, state,
-        () => this.io.valid());
+      const candidate = { ...state, due: state.due.filter((slot) => !slots.includes(slot)),
+        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } };
+      this.rememberFailure(slots, candidate);
+      this.store.write(candidate, state, () => this.io.valid());
       this.revocations.delete(ownerKey(this.owner));
       return true;
     } catch (error) {

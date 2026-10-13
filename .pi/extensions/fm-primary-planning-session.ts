@@ -113,7 +113,7 @@ export default function (pi: ExtensionAPI) {
       { triggerTurn: true, deliverAs: "followUp" });
   });
 
-  const setup = (context: ExtensionContext) => {
+  const setup = (context: ExtensionContext, resume = true) => {
     instances.get(key)?.dispose();
     instances.set(key, lifecycle);
     ctx = context;
@@ -143,7 +143,7 @@ export default function (pi: ExtensionAPI) {
       error,
     }, revocations);
     if (!live) { clock.ownershipLost(true); return; }
-    clock.resume();
+    if (resume) clock.resume();
   };
 
   pi.registerCommand("planning-session", {
@@ -154,8 +154,8 @@ export default function (pi: ExtensionAPI) {
           clock?.ownershipLost(true);
           throw new Error("Planning slots require the lock-owning Main session with persistent history");
         }
-        if (!live || !clock) setup(context);
         const [action, value, extra] = args.trim().split(/\s+/);
+        if (!live || !clock) setup(context, !["adopt", "recover-commit", "status"].includes(action));
         if (action === "start" && value && !extra) {
           clock!.start(parseFirstSlot(value));
           context.ui.notify("Planning slots armed for this session only. Earlier unobserved slots are skipped.", "info");
@@ -169,9 +169,10 @@ export default function (pi: ExtensionAPI) {
           clock!.stop("command");
           context.ui.notify("Planning slots stopped for this session.", "info");
         } else if (action === "status" && !value) {
-          const { armed, state } = clock!.status();
+          const { armed, state, recovery } = clock!.status();
           context.ui.notify(JSON.stringify({ armed,
-            nextSlot: armed && state ? state.through + HALF_HOUR : null, ledger: state ?? null }), "info");
+            nextSlot: armed && state ? state.through + HALF_HOUR : null, ledger: state ?? null,
+            recovery: recovery ?? null }), "info");
         } else throw new Error("Usage: /planning-session start|adopt 2026-10-12T16:30:00+08:00 | recover-commit <operation-id> | status | stop");
       } catch (problem) {
         context.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");

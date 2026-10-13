@@ -236,23 +236,17 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'blocked-adopter.jsonl')],
       { encoding: 'utf8' });
     assert.notEqual(blockedAdoptionProcess.status, 0);
-    assert.match(blockedAdoptionProcess.stderr, /due evidence retained/);
+    assert.match(blockedAdoptionProcess.stderr, /explicit recover-commit/);
     assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
     const recoveryOperation = JSON.parse(readFileSync(`${journalTransferPath}.recovery.json`, 'utf8')).operationId;
     const abortedRecovery = spawnSync(process.execPath,
       [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'recoverer.jsonl'),
         'recovering-main', 'recover', recoveryOperation], { encoding: 'utf8' });
     assert.equal(abortedRecovery.status, 0, abortedRecovery.stderr);
-    assert.match(abortedRecovery.stdout, /explicit planning adoption/);
-    assert.equal(existsSync(`${journalTransferPath}.recovery.json`), false);
-    assert.equal(existsSync(`${journalTransferPath}.pending-recovery.json`), true);
-    const retriedAdoption = spawnSync(process.execPath,
-      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'retry-adopter.jsonl')],
-      { encoding: 'utf8' });
-    assert.equal(retriedAdoption.status, 0, retriedAdoption.stderr);
-    const retriedState = JSON.parse(retriedAdoption.stdout);
-    assert.deepEqual(retriedState.due, [...persistedTransferredLedger.due,
-      persistedTransferredLedger.through + HALF_HOUR]);
+    assert.match(abortedRecovery.stdout, /another owner/);
+    assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
+    assert.equal(existsSync(`${journalTransferPath}.recovery.json`), true,
+      'a successor cannot retire the former process recovery journal');
     assert.equal(existsSync(`${journalTransferPath}.pending-recovery.json`), false);
 
     const emptyTransferStore = fileStore(join(lab, 'empty-transfer.json'));

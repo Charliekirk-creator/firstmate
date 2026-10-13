@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, fsyncSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import http from 'node:http';
@@ -17,7 +17,7 @@ const { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManag
   await import(pathToFileURL(`${pkg}/dist/index.js`));
 const { createAssistantMessageEventStream } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`));
 const { Type } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/index.js`));
-const { lateDisclosure, PlanningSessionClock, PlanningWakeGate } = await import(pathToFileURL(`${code}/.pi/extensions/lib/fm-planning-session.ts`));
+const { fileStore, lateDisclosure, PlanningSessionClock, PlanningWakeGate } = await import(pathToFileURL(`${code}/.pi/extensions/lib/fm-planning-session.ts`));
 const version = JSON.parse(readFileSync(`${pkg}/package.json`)).version;
 process.chdir(code);
 writeFileSync(`${home}/state/.lock`, String(process.pid));
@@ -131,6 +131,42 @@ assert.deepEqual(state().adoptions.at(-1).retainedDue, []);
 const adoptedState = state();
 await session.prompt(`/planning-session adopt ${iso}`, { source: 'rpc' });
 assert.deepEqual(state(), adoptedState, 'same-successor native adoption is idempotent');
+for (const failure of ['before-rename', 'after-rename']) {
+  const current = state(), candidate = { ...current, stopped: 'command' };
+  let syncs = 0;
+  const injected = fileStore(ledger, {
+    write(fd, data) {
+      if (failure === 'before-rename') throw new Error('injected pre-rename failure');
+      writeFileSync(fd, data);
+    },
+    sync(fd) {
+      if (++syncs === 2) throw new Error('injected directory sync failure');
+      fsyncSync(fd);
+    },
+  });
+  assert.throws(() => injected.write(candidate, current, () => true));
+  const operationId = JSON.parse(readFileSync(`${ledger}.recovery.json`, 'utf8')).operationId;
+  await session.reload();
+  await session.prompt('/planning-session status', { source: 'rpc' });
+  const recoveryStatus = JSON.parse(notices.at(-1));
+  assert.equal(recoveryStatus.armed, false);
+  assert.equal(recoveryStatus.recovery.operationId, operationId);
+  assert.deepEqual(recoveryStatus.recovery.candidate, candidate);
+  await session.prompt(`/planning-session recover-commit ${operationId}`, { source: 'rpc' });
+  if (failure === 'before-rename') {
+    assert.ok(notices.at(-1).includes('explicit planning adoption'));
+    await session.reload();
+    await session.prompt('/planning-session status', { source: 'rpc' });
+    assert.equal(JSON.parse(notices.at(-1)).recovery.phase, 'pending');
+    await session.prompt(`/planning-session adopt ${iso}`, { source: 'rpc' });
+  } else assert.ok(notices.at(-1).includes('recovery verified'));
+  assert.deepEqual(state(), candidate);
+  assert.equal(existsSync(`${ledger}.recovery.json`), false);
+  assert.equal(existsSync(`${ledger}.pending-recovery.json`), false);
+  await session.prompt(`/planning-session start ${iso}`, { source: 'rpc' });
+  assert.deepEqual(state(), adoptedState, 'explicit start preserves recovery and adoption history');
+}
+console.log(`ok - real Pi ${version} recovery commands remain usable after journal/pending reload failures`);
 const readableLedger = readFileSync(ledger);
 writeFileSync(ledger, '{');
 await session.prompt('/planning-session status', { source: 'rpc' });

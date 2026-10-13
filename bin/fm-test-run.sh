@@ -1148,8 +1148,13 @@ families_for_changed_path() {
       printf '%s\n' session-bootstrap
       printf '%s\n' live-harness-optin
       ;;
-    .pi/extensions/fm-primary-planning-session.ts|.pi/extensions/lib/fm-planning-session.ts|\
-    .pi/extensions/lib/html5-entities.ts|tests/planning-session-*.mjs)
+    bin/fm-session-transaction-lib.sh)
+      printf '%s\n' session-bootstrap
+      printf '%s\n' __script__:fm-planning-session.test.sh
+      ;;
+    .pi/extensions/fm-primary-planning-session.ts|.pi/extensions/lib/fm-planning-*.ts|\
+    bin/fm-planning-lock-broker.sh|.pi/extensions/lib/html5-entities.ts|tests/planning-session-*.mjs|\
+    tests/planning-concurrent-child.mjs|tests/planning-adoption-child.mjs)
       printf '%s\n' __script__:fm-planning-session.test.sh
       printf '%s\n' __script__:fm-planning-session-live-e2e.test.sh
       printf '%s\n' __script__:fm-pi-primary-types.test.sh

@@ -55,18 +55,10 @@ release_claim_lock() {
 trap release_claim_lock EXIT
 trap 'exit 1' HUP INT TERM
 
+# shellcheck source=bin/fm-session-transaction-lib.sh
+. "$SCRIPT_DIR/fm-session-transaction-lib.sh"
 claim_lock_evidence_valid() {
-  local owner pid claim_abs
-  [ -e "$CLAIM_LOCK" ] || [ -L "$CLAIM_LOCK" ] || return 0
-  [ -L "$CLAIM_LOCK" ] || return 1
-  owner=$(fm_lock_link_owner "$CLAIM_LOCK" 2>/dev/null) || return 1
-  claim_abs=$(fm_lock_abs_path "$CLAIM_LOCK") || return 1
-  case "$owner" in "$claim_abs".owner.*) ;; *) return 1 ;; esac
-  [ -d "$owner" ] && [ ! -L "$owner" ] || return 1
-  [ -f "$owner/pid" ] && [ ! -L "$owner/pid" ] || return 1
-  pid=$(cat "$owner/pid" 2>/dev/null) || return 1
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$pid" -gt 1 ]
+  fm_session_transaction_evidence_valid "$CLAIM_LOCK"
 }
 
 if ! claim_lock_evidence_valid; then

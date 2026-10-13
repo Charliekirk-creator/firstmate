@@ -50,13 +50,26 @@ The Pi extension `.pi/extensions/fm-primary-planning-session.ts` is inert until 
 That authorized Asia/Hong_Kong boundary is the immutable schedule anchor; subsequent boundaries are thirty minutes apart, not thirty minutes after the last response.
 Starting after a boundary skips its unobserved slot rather than reconstructing past connectivity.
 `/planning-session status` reports the current runtime `armed` flag, next boundary, owner, generation, retained slots, and durable delivery/adoption receipts; `/planning-session stop` ends the schedule for that session.
-After an authoritative Main transfer leaves an active foreign-owner ledger, `/planning-session adopt 2026-10-12T16:30:00+08:00` is the only supported adoption path. It advances the generation while preserving every boundary, observation, receipt, and retained due slot; ordinary start, reload, and timer callbacks never adopt automatically.
-Ledger mutations first persist a private `state/planning-session.json.recovery.json` record under the shared ownership transaction. A represented post-rename commit can be settled with `/planning-session recover-commit <operation-id>`. If the exact prior bytes remain, recovery durably retires the active operation into `state/planning-session.json.pending-recovery.json`, does not arm, and requires explicit adoption; adoption must incorporate that candidate and its due evidence before retiring the pending record. A third byte hash remains blocked unchanged. If even the recovery journal cannot be written, no crash-durable evidence exists: the clock fails stopped and can retain that evidence only while its process remains alive.
+After an authoritative Main transfer leaves an active foreign-owner ledger, `/planning-session adopt 2026-10-12T16:30:00+08:00` is the only supported adoption path.
+It advances the generation while preserving every boundary, observation, receipt, and retained due slot; ordinary start, reload, and timer callbacks never adopt automatically.
+Ledger mutations first persist a private `state/planning-session.json.recovery.json` record under the shared ownership transaction.
+A represented post-rename commit can be settled with `/planning-session recover-commit <operation-id>` only by its recorded candidate owner while that session remains authoritative Main.
+A successor cannot retire a foreign owner's unresolved journal.
+If the exact prior bytes remain, recovery durably retires the active operation into `state/planning-session.json.pending-recovery.json`, does not arm, and requires explicit adoption.
+Adoption applies the exact pending candidate even when the canonical ledger is absent or the candidate already belongs to Main, preserving delivered facts separately from due slots.
+Only an actual owner transfer adds an adoption receipt; a same-owner retry does not.
+Ordinary resume and writes remain blocked while recovery evidence is pending.
+A third byte hash, wrong operation ID, or mismatched owner remains blocked unchanged.
+Status exposes the recovery operation, phase, and complete retained candidate even after reload, without consuming that evidence.
+If even the recovery journal cannot be written, no crash-durable evidence exists: the clock fails stopped and can retain that evidence only while its process remains alive.
 Retire any temporary timer through its existing owner before activating this schedule, so two timers do not request the same update.
 Shipping the code does not activate a schedule, reload Main, or replace the existing planning policy globally.
 The command must be available in the running Pi extension set before use; loading new code into a running Main requires separately authorized lifecycle handling.
 
 The timer uses Pi's native session lifecycle and an unreferenced in-process timeout, with no independent service or process-event registration.
+Each ledger transaction briefly spawns the fixed-purpose `bin/fm-planning-lock-broker.sh`, which shares `fm-wake-lib.sh`'s canonical `.lock.acquire` protocol with Main ownership publication.
+The broker accepts no command or lock path, holds the lock over its private parent pipe, and releases on completion, EOF, signal, or parent death.
+Broker loss aborts the transaction; canonical lock recovery, not a separate TypeScript algorithm, handles stale primary and nested steal locks.
 Its private ledger binds the session ID, session file, PID, and process start time, recording processed slots, pending online slots, and the last persisted delivery receipt.
 Reload can resume only the same still-open process and session; quit, new, resume, fork, loss of Main ownership, or a different process cannot inherit the schedule.
 A schedule cannot keep Pi alive or run after its process exits.

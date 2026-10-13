@@ -33,6 +33,8 @@ cp "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" "$TMP_ROOT/fm-primary-pi-watch.
 cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$TMP_ROOT/fm-primary-turnend-guard.ts"
 cp "$ROOT/.pi/extensions/fm-primary-planning-session.ts" "$TMP_ROOT/fm-primary-planning-session.ts"
 cp "$ROOT/.pi/extensions/lib/fm-planning-session.ts" "$TMP_ROOT/lib/fm-planning-session.ts"
+cp "$ROOT/.pi/extensions/lib/fm-planning-lock.ts" "$TMP_ROOT/lib/fm-planning-lock.ts"
+cp "$ROOT/.pi/extensions/lib/html5-entities.ts" "$TMP_ROOT/lib/html5-entities.ts"
 cp "$ROOT/.pi/extensions/lib/fm-branch-dispatch.ts" "$TMP_ROOT/lib/fm-branch-dispatch.ts"
 cp "$ROOT/.pi/extensions/lib/fm-branch-model-picker.ts" "$TMP_ROOT/lib/fm-branch-model-picker.ts"
 cp "$ROOT/.pi/extensions/lib/fm-calm-assistant-layout.ts" "$TMP_ROOT/lib/fm-calm-assistant-layout.ts"

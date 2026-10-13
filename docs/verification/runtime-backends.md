@@ -1060,7 +1060,7 @@ The extension executes inside the signed CLI's own runtime, so a CLI upgrade can
 The operator contract is [Session-only planning slots](../configuration.md#session-only-planning-slots-stateplanning-sessionjson).
 The implementation uses native Pi timeouts, session events, hidden follow-ups, and persisted assistant-entry IDs; it does not replace fleet monitoring or use backend lifecycle commands.
 
-Verification on 2026-10-12 with Node 26.7.0 and the installed importable Pi 0.87.1 SDK:
+Verification on 2026-10-13 with Node 26.7.0 and the installed importable Pi 0.87.1 SDK:
 
 ```sh
 bash tests/fm-planning-session.test.sh
@@ -1072,22 +1072,40 @@ bash tests/fm-pi-primary-types.test.sh
 ok - Hong Kong 16:30 alignment, 30-minute boundaries, durable dedup, reload and pre-response delivery
 ok - offline skip, no reconnect burst, suspended-loop skip and unknown Wi-Fi refusal
 ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit restart and Main-closed stop
-ok - failed ownership revocation survives reload, retries durably and requires explicit restart
+ok - failed ownership revocation survives reload and explicit adoption preserves transferred work
 ok - complete visible tables and exact lateness disclosure required
 ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability
 ok - boundary, delivery, stop and start failures retain work and require explicit recovery
 ok - active ledger read failures fail stopped across resume, claim, armed status and reload
 ok - storage failure never wakes falsely, malformed state preserved, unsafe links refused, late activation does not backfill
+ok - live A/B delivery-publication barrier, immutable claim, stale callbacks and successor reload
+ok - live A/B transaction-read barrier and stale revocation refusal
+ok - live adoption/publication barrier and non-reused owner-chain enforcement
+ok - live revocation/publication barrier retains stopped due work
+ok - before-rename adoption, foreign-owner refusal, exact aborted retry
+ok - after-rename adoption, foreign-owner refusal, exact committed recovery
+ok - absent canonical ledger, lossless due evidence and same-owner retry without fake receipt
+ok - explicit successor adoption consumes absent-ledger pending evidence with one receipt
+ok - pending delivery retry preserves delivered versus due facts
+ok - abrupt parent death releases broker and preserves foreign uncertain commit
+ok - broker loss aborts commit; canonical primary/nested-steal orphan recovery
+ok - rejected recovery/adoption preserve canonical bytes, journal, pending and cache evidence
+ok - real Pi 0.87.1 recovery commands remain usable after journal/pending reload failures
 ok - real Pi 0.87.1 failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery
 ok - real Pi 0.87.1 busy response, one post-settlement follow-up, canonical bytes unchanged, timer does not keep process alive
 skip: tsc not found for Pi extension typecheck
 ```
 
 The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects, terminal boundary/delivery/stop/start/read failures, uncertain-commit due union retention, compatible restart preservation, visible Markdown validation, and explicit recovery rather than implementation-source text.
+The same focused entry point also runs `tests/planning-session-concurrent.mjs`, which asynchronously spawns two simultaneously live processes and coordinates explicit transaction, pre-rename, post-rename, and release barriers.
+It executes real `fm-lock.sh` publication and the planning broker against one isolated canonical lock, substituting only scratch harness identity evidence.
+A competing publisher must attempt the held lock and remain blocked until release or parent death; the suite checks exact old/new bytes, both recovery outcomes, unresolved-evidence retention, stale commands, multiple due/delivered slots, successor reload, and recursive primary/nested-steal orphan recovery.
+All process and barrier waits are bounded, and the existing runner and review-fix time limits are unchanged.
 The vendored `html5-entities.ts` lookup is the complete semicolon-terminated named-reference set from the WHATWG [named character reference data](https://html.spec.whatwg.org/entities.json); runtime validation performs no network lookup.
 The real-SDK test uses a temporary primary repository, isolated Main home and agent directory, and an in-process fixture provider with networking denied.
 It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command and status paths, multi-call tool and settlement-continuation context, response-persistence, failed ownership/delivery/stop/read persistence, storage recovery, reload, explicit restart, and one post-settlement busy follow-up.
-Neither test activates a timer in the operator's Main or contacts a model provider.
+Its recovery-command coverage proves that journal or pending-evidence errors during reload do not prevent native status, explicit commit recovery, or exact-candidate adoption retry.
+None of these tests activates a timer in the operator's Main or contacts a model provider.
 The strict typecheck skip is missing verification, not a passing type verdict; rerun it with an already available supported TypeScript compiler before relying on that evidence.
 
 A read-only native macOS probe used `/usr/sbin/networksetup -listallhardwareports`, `/usr/sbin/networksetup -getairportpower en0`, and `/sbin/ifconfig en0` after the first command identified `en0` as Wi-Fi.
