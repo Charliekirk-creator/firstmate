@@ -73,8 +73,8 @@ function instructions(slots: number[]): string {
     "Include three separate Markdown headings and complete tables: Ideas and To-do list each use " +
     "Work | Meaningful change | Next step | Needs you?; Recently completed uses Work | Completed outcome. " +
     "Include a meaningful no-change row when a section is empty. Do not invent outcomes or start project work. " +
-    (late.length ? `Because delivery is late, include exactly this visible line: ${lateDisclosure(late)} ` :
-      "If persistence occurs after a boundary, include the canonical Late update for line naming exactly the late claimed slots. ") +
+    (late.length ? `Because delivery is late, include exactly this visible line as its own paragraph: ${lateDisclosure(late)} ` :
+      "If persistence occurs after a boundary, include the canonical Late update for line naming exactly the late claimed slots as its own paragraph. ") +
     "Never claim an offline or unobserved slot was due. A draft, file, tool result, hidden message, failed response or partial table is not delivery. " +
     "Do not reset the slot ledger manually. No external notifications, permissions or additional spend are authorized.";
 }

@@ -284,8 +284,12 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       [first], first), false);
     assert.equal(completePlanningTables('`Late update for: 2026-10-12 16:30 HKT.`\n' + tables, [first], first), true);
     assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first), false);
-    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
+    const headingTables = tables.slice(tables.indexOf('## Ideas'));
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\nAdditional explanation\n' + headingTables,
+      [first], first + 1), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + tables, [first], first + 1), true);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + headingTables, [first], first + 1), true);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n---\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n===\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first + 1), false);
@@ -296,7 +300,16 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.NaN), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.POSITIVE_INFINITY), false);
-    assert.equal(completePlanningTables(lateLine + '\n' + tables, [first, first + HALF_HOUR], first + HALF_HOUR + 1), true);
+    assert.equal(completePlanningTables(lateLine + '\n\n' + tables,
+      [first, first + HALF_HOUR], first + HALF_HOUR + 1), true);
+    const splitCellClaim = tables.replace('| Idea | No material change | Review later | No |',
+      '| Late | update for: 2026-10-12 16:30 HKT. | Review later | No |');
+    assert.equal(completePlanningTables(splitCellClaim, [first], first), true);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + splitCellClaim, [first], first + 1), true);
+    const singleCellClaim = tables.replace('No material change', 'Late update for: 2026-10-12 16:30 HKT.');
+    assert.equal(completePlanningTables(singleCellClaim, [first], first), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + singleCellClaim,
+      [first], first + 1), false);
     for (const disclosure of [lateDisclosure([first]) + '\n' + tables,
       lateDisclosure([first, first + HALF_HOUR, first + 2 * HALF_HOUR]) + '\n' + tables,
       '```\n' + lateLine + '\n```\n' + tables,

@@ -636,8 +636,12 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
     if (facts.code) { flush(); continue; }
     if (tableLines.has(index) || facts.atx) {
       flush();
-      const rendered = latenessText(facts.content);
-      if (rendered !== undefined) claims.push({ rendered, source, topLevel: facts.quoteDepth === 0 && !facts.listed });
+      const fragments = tableLines.has(index) ? cells(facts.content) : [facts.content];
+      for (const fragment of fragments) {
+        const rendered = latenessText(fragment);
+        if (rendered !== undefined) claims.push({ rendered, source,
+          topLevel: !tableLines.has(index) && facts.quoteDepth === 0 && !facts.listed });
+      }
       continue;
     }
     if (facts.setext || facts.thematic) {
@@ -646,7 +650,6 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
       continue;
     }
     const continuation = !!block && !facts.listed && facts.quoteDepth <= block.quoteDepth;
-    if (block && latenessText(block.parts.join(" ")) !== undefined) flush();
     if (!block || facts.listed || !continuation) flush();
     if (!block) block = { parts: [], sources: [], quoteDepth: facts.quoteDepth, listed: facts.listed,
       topLevel: facts.quoteDepth === 0 && !facts.listed };
