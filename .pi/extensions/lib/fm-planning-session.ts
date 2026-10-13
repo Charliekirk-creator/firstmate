@@ -428,6 +428,26 @@ function atxHeading(line: string): string | undefined {
   return content.replace(/^[ \t]+/, "");
 }
 
+function decodeHtmlAttribute(value: string): string | undefined {
+  let unresolved = false;
+  const named: Record<string, string> = {
+    amp: "&", apos: "'", colon: ":", excl: "!", gt: ">", lt: "<", newline: "\n", nbsp: " ", quot: '"', semi: ";", tab: "\t",
+  };
+  const decoded = value.replace(/&(?:#x([0-9a-f]+)|#([0-9]+)|([a-z][a-z0-9]+));?/gi, (_reference, hex, decimal, entity) => {
+    if (hex || decimal) {
+      const point = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
+      if (point > 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)) return String.fromCodePoint(point);
+      unresolved = true;
+      return "";
+    }
+    const replacement = named[String(entity).toLowerCase()];
+    if (replacement === undefined) { unresolved = true; return ""; }
+    return replacement;
+  });
+  if (unresolved || decoded.includes("&")) return undefined;
+  return decoded;
+}
+
 export function completePlanningTables(text: string): boolean {
   const lines = text.split(/\r?\n/);
   let fence: string | undefined;
@@ -483,7 +503,7 @@ export function completePlanningTables(text: string): boolean {
   const stack: { name: string; start: number; hidden: boolean }[] = [];
   const voidElements = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
   const tags = /<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>/gs;
-  const intrinsicallyHidden = new Set(["details", "head", "script", "style", "template", "title"]);
+  const intrinsicallyHidden = new Set(["head", "script", "style", "template", "title"]);
   for (const match of htmlSource.matchAll(tags)) {
     const start = match.index ?? 0;
     const end = start + match[0].length - 1;
@@ -502,11 +522,14 @@ export function completePlanningTables(text: string): boolean {
     } else if (!match[0].endsWith("/>") && !voidElements.has(name)) {
       const parentHidden = stack.some((entry) => entry.hidden);
       const style = /(?:^|\s)style\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'"=<>`]+))/i.exec(match[0]);
-      const declarations = (style?.[1] ?? style?.[2] ?? style?.[3] ?? "").replace(/\/\*[\s\S]*?\*\//g, "")
+      const encodedStyle = style?.[1] ?? style?.[2] ?? style?.[3];
+      const decodedStyle = encodedStyle === undefined ? "" : decodeHtmlAttribute(encodedStyle);
+      const declarations = (decodedStyle ?? "").replace(/\/\*[\s\S]*?\*\//g, "")
         .split(";").map((part) => part.trim().toLowerCase());
-      const styleHidden = declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!important)?$/.test(part));
+      const styleHidden = decodedStyle === undefined || declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!important)?$/.test(part));
       const hidden = /(?:^|\s)(?:hidden(?=\s|=|\/?>)|aria-hidden\s*=\s*(?:"true"|'true'|true)(?=\s|\/?>))/i.test(match[0]);
-      stack.push({ name, start, hidden: parentHidden || hidden || styleHidden || intrinsicallyHidden.has(name) });
+      const closedDetails = name === "details" && !/(?:^|\s)open(?=\s|=|\/?>)/i.test(match[0]);
+      stack.push({ name, start, hidden: parentHidden || hidden || styleHidden || closedDetails || intrinsicallyHidden.has(name) });
     }
   }
   for (const opening of stack) if (opening.hidden) hide(opening.start, joined.length);
