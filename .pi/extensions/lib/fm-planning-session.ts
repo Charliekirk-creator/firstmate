@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
+import { html5Entities } from "./html5-entities.ts";
 
 export const HALF_HOUR = 30 * 60 * 1000;
 // A suspended event loop cannot establish historical Wi-Fi connectivity.
@@ -402,14 +403,6 @@ export function wifiLink(power: string, link: string): boolean {
 }
 
 function decodeMarkdownReferences(value: string): { text: string; unresolved: boolean } {
-  const named: Record<string, string> = {
-    AMP: "&", ApplyFunction: "", InvisibleComma: "", InvisibleTimes: "", NegativeMediumSpace: "",
-    NegativeThickSpace: "", NegativeThinSpace: "", NegativeVeryThinSpace: "", NewLine: "\n", NoBreak: "",
-    NonBreakingSpace: " ", Tab: "\t", ThickSpace: " ", VeryThinSpace: " ", ZeroWidthSpace: "", amp: "&",
-    apos: "'", colon: ":", emsp: " ", ensp: " ", excl: "!", gt: ">", hairsp: " ", lrm: "", lt: "<",
-    mediumspace: " ", nbsp: " ", numsp: " ", puncsp: " ", quot: '"', rlm: "", semi: ";", shy: "",
-    thinsp: " ", zwnj: "", zwj: "",
-  };
   let unresolved = false;
   const text = value.replace(/&(?:#x([0-9a-f]{1,6})|#([0-9]{1,7})|([a-z][a-z0-9]{1,31}));/gi,
     (_reference, hex, decimal, entity) => {
@@ -419,10 +412,8 @@ function decodeMarkdownReferences(value: string): { text: string; unresolved: bo
         unresolved = true;
         return "";
       }
-      const replacement = named[String(entity)];
-      if (replacement !== undefined) return replacement;
-      unresolved = true;
-      return "";
+      const name = String(entity);
+      return Object.prototype.hasOwnProperty.call(html5Entities, name) ? html5Entities[name] : _reference;
     });
   return { text, unresolved };
 }

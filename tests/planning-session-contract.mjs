@@ -143,6 +143,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables.replace('No material change', 'AT&T migration')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', 'R&amp;D migration')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', 'R&AMP;D migration')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', 'Copyright &copy; and Registered &reg;')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', 'Roadmap &unknown; details')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', 'Literal &COPY; name')), true);
     assert.equal(completePlanningTables(tables.replace('| Test | Verified |', '| [Test](x_(y)) | [Verified](x_\\(y\\)) |')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', '\u3164Visible change')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
@@ -159,8 +162,6 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       tables.replace('| Test | Verified |', '| &shy; | &#173; |'),
       tables.replace('| Test | Verified |', '| &NoBreak; | &InvisibleTimes; |'),
       tables.replace('| Test | Verified |', '| &ThickSpace; | &ThickSpace; |'),
-      tables.replace('| Test | Verified |', '| &thickspace; | &THICKSPACE; |'),
-      tables.replace('| Test | Verified |', '| Unknown &unknown; | Visible |'),
       tables.replace('| Test | Verified |', '| [](x_(y)) | [](x_\\(y\\)) |'),
       tables.replace('| Test | Verified |', '| \u00ad | \u2060 |'),
       tables.replace('| Test | Verified |', '| \u3164 | \u3164 |'),

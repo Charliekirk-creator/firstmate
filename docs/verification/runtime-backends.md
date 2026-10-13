@@ -1073,7 +1073,7 @@ ok - Hong Kong 16:30 alignment, 30-minute boundaries, durable dedup, reload and 
 ok - offline skip, no reconnect burst, suspended-loop skip and unknown Wi-Fi refusal
 ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit restart and Main-closed stop
 ok - failed ownership revocation survives reload, retries durably and requires explicit restart
-ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused
+ok - complete visible tables and exact lateness disclosure required
 ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability
 ok - boundary, delivery, stop and start failures retain work and require explicit recovery
 ok - active ledger read failures fail stopped across resume, claim, armed status and reload
@@ -1084,6 +1084,7 @@ skip: tsc not found for Pi extension typecheck
 ```
 
 The deterministic test drives the actual scheduler with an injected clock and timer interface, exercising persisted ledger effects, terminal boundary/delivery/stop/start/read failures, uncertain-commit due union retention, compatible restart preservation, visible Markdown validation, and explicit recovery rather than implementation-source text.
+The vendored `html5-entities.ts` lookup is the complete semicolon-terminated named-reference set from the WHATWG [named character reference data](https://html.spec.whatwg.org/entities.json); runtime validation performs no network lookup.
 The real-SDK test uses a temporary primary repository, isolated Main home and agent directory, and an in-process fixture provider with networking denied.
 It seeds qualified online slots instead of waiting thirty minutes, then exercises Pi's real command and status paths, multi-call tool and settlement-continuation context, response-persistence, failed ownership/delivery/stop/read persistence, storage recovery, reload, explicit restart, and one post-settlement busy follow-up.
 Neither test activates a timer in the operator's Main or contacts a model provider.
