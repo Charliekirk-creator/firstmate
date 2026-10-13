@@ -142,7 +142,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables.replace('No material change', '**No material change**')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', 'AT&T migration')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', 'R&amp;D migration')), true);
-    assert.equal(completePlanningTables(tables.replace('No material change', 'Unknown &unknown; literal')), true);
+    assert.equal(completePlanningTables(tables.replace('No material change', 'R&AMP;D migration')), true);
+    assert.equal(completePlanningTables(tables.replace('| Test | Verified |', '| [Test](x_(y)) | [Verified](x_\\(y\\)) |')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', '\u3164Visible change')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
       tables + '\n<br>', '<div>benign context</div>\n\n' + tables,
@@ -157,6 +158,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       tables.replace('| Test | Verified |', '| []() | __ __ |'),
       tables.replace('| Test | Verified |', '| &shy; | &#173; |'),
       tables.replace('| Test | Verified |', '| &NoBreak; | &InvisibleTimes; |'),
+      tables.replace('| Test | Verified |', '| &ThickSpace; | &ThickSpace; |'),
+      tables.replace('| Test | Verified |', '| &thickspace; | &THICKSPACE; |'),
+      tables.replace('| Test | Verified |', '| Unknown &unknown; | Visible |'),
+      tables.replace('| Test | Verified |', '| [](x_(y)) | [](x_\\(y\\)) |'),
       tables.replace('| Test | Verified |', '| \u00ad | \u2060 |'),
       tables.replace('| Test | Verified |', '| \u3164 | \u3164 |'),
       tables.replace('| Test | Verified |', '| \u115f | \u2064 |'),
@@ -210,6 +215,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('Late&#32;update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late&#x20;update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late&nbsp;update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('Late&ThickSpace;update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('late update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('LaTe UpDaTe for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables,
       [first], first), false);
     assert.equal(completePlanningTables('`Late update for: 2026-10-12 16:30 HKT.`\n' + tables, [first], first), true);
@@ -234,7 +242,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       lateLine + '\n**Late update** for: 2026-10-12 16:30 HKT.\n' + tables,
       lateLine + '\n[Late update](https://example.invalid) for: 2026-10-12 16:30 HKT.\n' + tables,
       lateLine + '\nLate&#32;update for: 2026-10-12 16:30 HKT.\n' + tables,
-      lateLine + '\nLate&nbsp;update for: 2026-10-12 16:30 HKT.\n' + tables]) {
+      lateLine + '\nLate&nbsp;update for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\nLATE UPDATE for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\nlAtE UpDaTe for: 2026-10-12 16:30 HKT.\n' + tables]) {
       assert.equal(completePlanningTables(disclosure, [first, first + HALF_HOUR], first + HALF_HOUR + 1), false);
     }
     console.log('ok - complete visible tables and exact lateness disclosure required');

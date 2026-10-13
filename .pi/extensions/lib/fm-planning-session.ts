@@ -403,11 +403,12 @@ export function wifiLink(power: string, link: string): boolean {
 
 function decodeMarkdownReferences(value: string): { text: string; unresolved: boolean } {
   const named: Record<string, string> = {
-    amp: "&", apos: "'", colon: ":", emsp: " ", ensp: " ", excl: "!", gt: ">", hairsp: " ", lt: "<",
-    applyfunction: "", invisiblecomma: "", invisibletimes: "", lrm: "", mediumspace: " ", nbsp: " ",
-    negativemediumspace: "", negativethickspace: "", negativethinspace: "", negativeverythinspace: "", newline: "\n",
-    nobreak: "", numsp: " ", puncsp: " ", quot: '"', rlm: "", semi: ";", shy: "", tab: "\t", thinsp: " ",
-    verythinspace: " ", zerowidthspace: "", zwnj: "", zwj: "",
+    AMP: "&", ApplyFunction: "", InvisibleComma: "", InvisibleTimes: "", NegativeMediumSpace: "",
+    NegativeThickSpace: "", NegativeThinSpace: "", NegativeVeryThinSpace: "", NewLine: "\n", NoBreak: "",
+    NonBreakingSpace: " ", Tab: "\t", ThickSpace: " ", VeryThinSpace: " ", ZeroWidthSpace: "", amp: "&",
+    apos: "'", colon: ":", emsp: " ", ensp: " ", excl: "!", gt: ">", hairsp: " ", lrm: "", lt: "<",
+    mediumspace: " ", nbsp: " ", numsp: " ", puncsp: " ", quot: '"', rlm: "", semi: ";", shy: "",
+    thinsp: " ", zwnj: "", zwj: "",
   };
   let unresolved = false;
   const text = value.replace(/&(?:#x([0-9a-f]{1,6})|#([0-9]{1,7})|([a-z][a-z0-9]{1,31}));/gi,
@@ -418,17 +419,53 @@ function decodeMarkdownReferences(value: string): { text: string; unresolved: bo
         unresolved = true;
         return "";
       }
-      const replacement = named[String(entity).toLowerCase()];
-      return replacement !== undefined ? replacement : _reference;
+      const replacement = named[String(entity)];
+      if (replacement !== undefined) return replacement;
+      unresolved = true;
+      return "";
     });
   return { text, unresolved };
+}
+
+function renderedMarkdownLabels(value: string): string {
+  let rendered = "";
+  for (let i = 0; i < value.length;) {
+    const image = value[i] === "!" && value[i + 1] === "[";
+    if (value[i] !== "[" && !image) { rendered += value[i++]; continue; }
+    const opening = i + (image ? 1 : 0);
+    let labelEnd = opening + 1;
+    let labelDepth = 1;
+    for (; labelEnd < value.length && labelDepth; labelEnd += 1) {
+      if (value[labelEnd] === "\\") { labelEnd += 1; continue; }
+      if (value[labelEnd] === "[") labelDepth += 1;
+      else if (value[labelEnd] === "]") labelDepth -= 1;
+    }
+    if (labelDepth) { rendered += value[i++]; continue; }
+    const label = value.slice(opening + 1, labelEnd - 1);
+    let end = labelEnd;
+    if (value[end] === "(") {
+      let depth = 1;
+      for (end += 1; end < value.length && depth; end += 1) {
+        if (value[end] === "\\") { end += 1; continue; }
+        if (value[end] === "(") depth += 1;
+        else if (value[end] === ")") depth -= 1;
+      }
+      if (depth) { rendered += value[i++]; continue; }
+    } else if (value[end] === "[") {
+      const referenceEnd = value.indexOf("]", end + 1);
+      if (referenceEnd < 0) { rendered += value[i++]; continue; }
+      end = referenceEnd + 1;
+    } else { rendered += value.slice(i, labelEnd); i = labelEnd; continue; }
+    rendered += renderedMarkdownLabels(label);
+    i = end;
+  }
+  return rendered;
 }
 
 function renderedCellContent(cell: string): string {
   const decoded = decodeMarkdownReferences(cell);
   if (decoded.unresolved) return "";
-  return decoded.text.replace(/!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g, "$1")
-    .replace(/\[([^\]]*)\]/g, "$1").replace(/[*_~`]/g, "")
+  return renderedMarkdownLabels(decoded.text).replace(/[*_~`]/g, "")
     .replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, "");
 }
 
@@ -497,11 +534,9 @@ function latenessText(line: string): string | undefined {
       .replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
   } while (rendered !== prior);
   rendered = rendered.replace(/^ {1,3}(?=\S)/, "");
-  const normalized = maskMarkdownCode(rendered)
-    .replace(/!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])/g, "$1")
-    .replace(/\[([^\]]*)\]/g, "$1").replace(/[*_~]/g, "");
+  const normalized = renderedMarkdownLabels(maskMarkdownCode(rendered)).replace(/[*_~]/g, "");
   const decoded = decodeMarkdownReferences(normalized);
-  return /\bLate\s+update(?:\s|:)/.test(decoded.text) || decoded.unresolved && /Late|update/i.test(normalized)
+  return /\blate\s+update(?:\s|:)/i.test(decoded.text) || decoded.unresolved && /late|update/i.test(normalized)
     ? rendered : undefined;
 }
 
