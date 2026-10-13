@@ -268,6 +268,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       'Late |\nnot-a-delimiter |\nupdate for: 2026-10-12 16:30 HKT.',
       '    Late\n    update for: 2026-10-12 16:30 HKT.',
       '`Late`\n`update for: 2026-10-12 16:30 HKT.`',
+      '> ```\n> Late update for: hidden code\n> ```',
+      '- ~~~\n  Late update for: hidden code\n  ~~~',
+      '> > - ```\n> >   Late update for: hidden code\n> >   ```',
     ]) assert.equal(completePlanningTables(separated + '\n' + tables, [first], first), true, separated);
     assert.equal(completePlanningTables("Late\\" + '\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late  \nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
@@ -287,9 +290,24 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const headingTables = tables.slice(tables.indexOf('## Ideas'));
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\nAdditional explanation\n' + headingTables,
       [first], first + 1), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n    Additional explanation\n' + headingTables,
+      [first], first + 1), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\tAdditional explanation\n' + headingTables,
+      [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + tables, [first], first + 1), true);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + headingTables, [first], first + 1), true);
+    assert.equal(completePlanningTables(lateDisclosure([first]) +
+      '\n\n    Late update for: hidden code\n\n' + tables, [first], first + 1), true);
+    for (const fenced of [
+      '> ```\n> Late update for: hidden code\n> ```',
+      '- ~~~\n  Late update for: hidden code\n  ~~~',
+      '> > - ````\n> >   Late update for: hidden code\n> >   ```\n> >   ````',
+      '> ~~~lang\n> Late update for: hidden code\n> ```\n> ~~~',
+    ]) assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + fenced + '\n' + tables,
+      [first], first + 1), true, fenced);
+    assert.equal(completePlanningTables(lateDisclosure([first]) +
+      '\n\n> ````\n> ignored\n> ```\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n---\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n===\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first + 1), false);

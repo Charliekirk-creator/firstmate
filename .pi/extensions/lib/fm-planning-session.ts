@@ -581,20 +581,37 @@ type MarkdownLineFacts = {
   thematic: boolean;
 };
 
-function markdownLineFacts(source: string, activeList = false): MarkdownLineFacts {
+function markdownLineFacts(source: string, activeList = false, activeParagraph = false): MarkdownLineFacts {
   let content = activeList ? source.trimStart() : source;
   let quoteDepth = 0;
   while (/^ {0,3}>[ \t]?/.test(content)) {
     content = content.replace(/^ {0,3}>[ \t]?/, "");
     quoteDepth += 1;
   }
-  const code = /^(?:\t| {4})/.test(content) && !activeList;
+  const code = /^(?:\t| {4})/.test(content) && !activeList && !activeParagraph;
   const thematic = /^ {0,3}([*_-])(?:[ \t]*\1){2,}[ \t]*$/.test(content);
   const setext = /^ {0,3}(?:=+|-+)[ \t]*$/.test(content);
   const listed = !thematic && /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(content);
   if (listed) content = content.replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
   return { source, content, quoteDepth, listed, code,
     atx: /^ {0,3}#{1,6}(?:[ \t]|$)/.test(content), setext, thematic };
+}
+
+function visibleMarkdownLines(lines: string[]): string[] {
+  let fence: { marker: string; quoteDepth: number; listed: boolean } | undefined;
+  return lines.map((line) => {
+    const facts = markdownLineFacts(line, !!fence?.listed);
+    if (fence) {
+      const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(facts.content);
+      if (closing && closing[1][0] === fence.marker[0] && closing[1].length >= fence.marker.length &&
+          facts.quoteDepth === fence.quoteDepth) fence = undefined;
+      return "";
+    }
+    const opening = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(facts.content);
+    if (!opening || opening[1][0] === "`" && opening[2].includes("`")) return line;
+    fence = { marker: opening[1], quoteDepth: facts.quoteDepth, listed: facts.listed };
+    return "";
+  });
 }
 
 function markdownTableLines(lines: string[]): Set<number> {
@@ -632,7 +649,7 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
   for (let index = 0; index < lines.length; index += 1) {
     const source = lines[index];
     if (!source.trim()) { flush(); continue; }
-    const facts = markdownLineFacts(source, !!block?.listed);
+    const facts = markdownLineFacts(source, !!block?.listed, !!block);
     if (facts.code) { flush(); continue; }
     if (tableLines.has(index) || facts.atx) {
       flush();
@@ -664,17 +681,7 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
 
 export function completePlanningTables(text: string, claimedSlots: number[] = [], persistedAt?: number): boolean {
   const lines = text.split(/\r?\n/);
-  let fence: string | undefined;
-  const visible = lines.map((line) => {
-    if (!fence) {
-      const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line);
-      if (opening) { fence = opening[1]; return ""; }
-      return line;
-    }
-    const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
-    if (closing && closing[1][0] === fence[0] && closing[1].length >= fence.length) fence = undefined;
-    return "";
-  });
+  const visible = visibleMarkdownLines(lines);
   const joined = visible.join("\n");
   const markdownSurface = maskMarkdownCode(joined)
     .replace(/<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>/g, "")
