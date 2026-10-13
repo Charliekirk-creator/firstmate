@@ -124,17 +124,12 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('<section hidden>\n' + tables + '\n</section>\n\n' + tables), true);
     assert.equal(completePlanningTables('```markdown\n```   \n' + tables), true);
     assert.equal(completePlanningTables(tables.split('\n').map(line => line.startsWith('|') ? '   ' + line : line).join('\n')), true);
-    assert.equal(completePlanningTables('<custom-panel>\nraw HTML\n\n' + tables), true);
-    assert.equal(completePlanningTables('<div>\nraw HTML\n\n' + tables), true);
+    assert.equal(completePlanningTables('<div>benign context</div>\n\n' + tables), true);
     assert.equal(completePlanningTables('<!-- <div hidden> -->\n' + tables), true);
     assert.equal(completePlanningTables('Note: `<section hidden>`\n' + tables), true);
     assert.equal(completePlanningTables('Note: `` `<section hidden>` ``\n' + tables), true);
     assert.equal(completePlanningTables('\\<section hidden>\n' + tables), true);
-    assert.equal(completePlanningTables('<details open>\n<summary>Planning</summary>\n\n' + tables + '\n</details>'), true);
-    assert.equal(completePlanningTables('<details OPEN="false">\n<summary>Planning</summary>\n\n' + tables + '\n</details>'), true);
-    assert.equal(completePlanningTables('<dialog open>\ncontext\n\n' + tables + '\n</dialog>'), true);
-    assert.equal(completePlanningTables('<dialog OPEN="false">\ncontext\n\n' + tables + '\n</dialog>'), true);
-    assert.equal(completePlanningTables('<div aria-hidden="f&#97;lse">\ncontext\n\n' + tables + '\n</div>'), true);
+
     assert.equal(completePlanningTables('Note: `<style>table { display:none }</style>`\n' + tables), true);
     assert.equal(completePlanningTables('\\<style>table { display:none }\\</style>\n' + tables), true);
     assert.equal(completePlanningTables('```html\n<style>table { display:none }</style>\n```\n' + tables), true);
@@ -159,6 +154,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '<!--\n' + tables, '<!--\n' + tables + '\n-->', '<div hidden>\n' + tables + '\n</div>',
       '<section hidden>\n' + tables + '\n</section>', '<article aria-hidden="true">\n' + tables + '\n</article>',
       '<custom-panel>\n' + tables + '\n</custom-panel>', '<custom-panel>\n' + tables,
+      '<custom-panel>\nraw HTML\n\n' + tables, '<div>\nraw HTML\n\n' + tables,
+      '<iframe>\ncontext\n\n' + tables + '\n</iframe>',
+      '<details open>\n<summary>Planning</summary>\n\n' + tables + '\n</details>',
+      '<details>\n<summary>Planning</summary>\n\n' + tables + '\n</details>',
+      '<dialog open>\ncontext\n\n' + tables + '\n</dialog>',
+      '<dialog>\ncontext\n\n' + tables + '\n</dialog>',
+      '<div aria-hidden="false">\ncontext\n\n' + tables + '\n</div>',
       '<custom-panel hidden>\nraw HTML\n\n' + tables,
       '<div style="color: red">\ncontext\n\n' + tables,
       '<div style="opacity:0">\ncontext\n\n' + tables,
@@ -178,8 +180,6 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '<div aria-hidden="&unknown;">\ncontext\n\n' + tables,
       '<style>table { display: none }</style>\n' + tables,
       '<style>nothing relevant</style>\n' + tables,
-      '<details>\n<summary>Planning</summary>\n\n' + tables + '\n</details>',
-      '<dialog>\ncontext\n\n' + tables + '\n</dialog>',
       '<section\n hidden>\n' + tables + '\n</section\n>',
       '<article\n aria-hidden="true">\n' + tables + '\n</article\n>',
       '<![CDATA[\n' + tables + '\n]]>', '```html\n<section hidden>\n' + tables + '\n</section>\n```']) assert.equal(completePlanningTables(text), false);
@@ -187,6 +187,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(lateLine, 'Late update for: 2026-10-12 16:30 HKT, 2026-10-12 17:00 HKT.');
     assert.equal(completePlanningTables(tables, [first], first), true, 'exact-boundary persistence is on time');
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('> ' + lateDisclosure([first]) + '\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('- ' + lateDisclosure([first]) + '\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('Late update someday.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
     assert.equal(completePlanningTables(tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.NaN), false);
@@ -195,7 +198,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     for (const disclosure of [lateDisclosure([first]) + '\n' + tables,
       lateDisclosure([first, first + HALF_HOUR, first + 2 * HALF_HOUR]) + '\n' + tables,
       '```\n' + lateLine + '\n```\n' + tables,
-      '<div hidden>\n' + lateLine + '\n</div>\n\n' + tables]) {
+      '<div hidden>\n' + lateLine + '\n</div>\n\n' + tables,
+      '> ' + lateLine + '\n' + tables,
+      '1. ' + lateLine + '\n' + tables,
+      lateLine + '\n> ' + lateLine + '\n' + tables]) {
       assert.equal(completePlanningTables(disclosure, [first, first + HALF_HOUR], first + HALF_HOUR + 1), false);
     }
     console.log('ok - complete visible tables and exact lateness disclosure required');

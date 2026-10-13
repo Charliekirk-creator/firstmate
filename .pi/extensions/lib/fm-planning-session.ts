@@ -449,26 +449,6 @@ function atxHeading(line: string): string | undefined {
   return content.replace(/^[ \t]+/, "");
 }
 
-function decodeHtmlAttribute(value: string): string | undefined {
-  let unresolved = false;
-  const named: Record<string, string> = {
-    amp: "&", apos: "'", colon: ":", excl: "!", gt: ">", lt: "<", newline: "\n", nbsp: " ", quot: '"', semi: ";", tab: "\t",
-  };
-  const decoded = value.replace(/&(?:#x([0-9a-f]+)|#([0-9]+)|([a-z][a-z0-9]+));?/gi, (_reference, hex, decimal, entity) => {
-    if (hex || decimal) {
-      const point = Number.parseInt(hex ?? decimal, hex ? 16 : 10);
-      if (point > 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)) return String.fromCodePoint(point);
-      unresolved = true;
-      return "";
-    }
-    const replacement = named[String(entity).toLowerCase()];
-    if (replacement === undefined) { unresolved = true; return ""; }
-    return replacement;
-  });
-  if (unresolved || decoded.includes("&")) return undefined;
-  return decoded;
-}
-
 export function lateDisclosure(slots: number[]): string {
   const labels = [...slots].sort((a, b) => a - b).map((slot) => {
     const hkt = new Date(slot + 8 * 3600000).toISOString();
@@ -534,10 +514,9 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
       if (rawEnd !== "blank" && rawEnd.test(line.slice(1))) { rawEnd = undefined; rawOpaque = false; }
     }
   }
-  const stack: { name: string; start: number; hidden: boolean }[] = [];
+  const stack: { name: string; start: number }[] = [];
   const voidElements = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
   const tags = /<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>/gs;
-  const intrinsicallyHidden = new Set(["head", "script", "style", "template", "title"]);
   for (const match of htmlSource.matchAll(tags)) {
     const start = match.index ?? 0;
     const end = start + match[0].length - 1;
@@ -551,32 +530,31 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
         if (stack[i].name === name) { opening = i; break; }
       }
       if (opening >= 0) {
-        if (stack[opening].hidden) hide(stack[opening].start, end);
+        hide(stack[opening].start, end);
         stack.splice(opening);
       }
-    } else if (!match[0].endsWith("/>") && !voidElements.has(name)) {
-      const parentHidden = stack.some((entry) => entry.hidden);
-      const style = /(?:^|\s)style\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'"=<>`]+))/i.exec(match[0]);
-      const encodedStyle = style?.[1] ?? style?.[2] ?? style?.[3];
-      const styleHidden = encodedStyle !== undefined;
-      const aria = /(?:^|\s)aria-hidden\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'"=<>`]+))/i.exec(match[0]);
-      const encodedAria = aria?.[1] ?? aria?.[2] ?? aria?.[3];
-      const decodedAria = encodedAria === undefined ? undefined : decodeHtmlAttribute(encodedAria);
-      const ariaHidden = encodedAria !== undefined && (decodedAria === undefined || decodedAria.trim().toLowerCase() === "true");
-      const hidden = /(?:^|\s)hidden(?=\s|=|\/?>)/i.test(match[0]) || ariaHidden;
-      const closedDisclosure = (name === "details" || name === "dialog") && !/(?:^|\s)open(?=\s|=|\/?>)/i.test(match[0]);
-      stack.push({ name, start, hidden: parentHidden || hidden || styleHidden || closedDisclosure || intrinsicallyHidden.has(name) });
-    }
+    } else if (!match[0].endsWith("/>") && !voidElements.has(name)) stack.push({ name, start });
   }
-  for (const opening of stack) if (opening.hidden) hide(opening.start, joined.length);
+  for (const opening of stack) hide(opening.start, joined.length);
   if (activeStylesheet) return false;
   for (const line of hiddenLines) visible[line] = "";
   if (persistedAt !== undefined) {
     if (!Number.isFinite(persistedAt)) return false;
     const lateSlots = claimedSlots.filter((slot) => persistedAt > slot);
-    const disclosures = visible.filter((line) => /^ {0,3}Late update(?:\s|:)/.test(line));
+    const disclosures = visible.flatMap((line) => {
+      let rendered = line;
+      let prior: string;
+      do {
+        prior = rendered;
+        rendered = rendered.replace(/^ {0,3}>[ \t]?/, "")
+          .replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
+      } while (rendered !== prior);
+      rendered = rendered.replace(/^ {1,3}(?=\S)/, "");
+      return /\bLate update(?:\s|:)/.test(rendered) ? [{ line, rendered }] : [];
+    });
     if (lateSlots.length) {
-      if (disclosures.length !== 1 || disclosures[0].trim() !== lateDisclosure(lateSlots)) return false;
+      const expected = lateDisclosure(lateSlots);
+      if (disclosures.length !== 1 || disclosures[0].rendered !== expected || disclosures[0].line.trim() !== expected) return false;
     } else if (disclosures.length) return false;
   }
   const sections: [string, string[]][] = [
