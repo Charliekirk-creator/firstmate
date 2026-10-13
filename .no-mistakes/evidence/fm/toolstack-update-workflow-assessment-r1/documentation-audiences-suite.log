@@ -1,0 +1,11 @@
+FM_TEST_BEGIN 2026-10-13T04:57:59Z tests/fm-documentation-audiences.test.sh family=pure-contract-unit expected_gate_skip=none
+ok - documentation inventory classifies every maintained prose surface exactly once
+ok - classification, setup routing, and maintained-prose scope fail safely
+ok - required documentation owner pointers cannot silently disappear
+ok - local links resolve while dates, versions, commands, and incident prose remain semantically reviewed
+FM_TEST_END 2026-10-13T04:58:33Z tests/fm-documentation-audiences.test.sh exit=0 duration_ms=32952 gate_skip=false
+FM_TEST_SUMMARY total=1 failed=0 skipped_gate=0 duration_ms=36432
+FM_TEST_SUMMARY_FAMILY family=pure-contract-unit count=1 duration_ms=32952 failed=0
+FM_TEST_SLOWEST rank=1 script=tests/fm-documentation-audiences.test.sh duration_ms=32952
+fm-test-run: wrote timing artifact: /Users/gigachad/.no-mistakes/worktrees/9fe8f75cf8ab/01M4SNYHM6DJ5X3N7TEP437K39/.no-mistakes/test-55c128e8/documentation-audiences.json
+FM_TEST_BUDGET max_wall_ms=330000 duration_ms=36432
