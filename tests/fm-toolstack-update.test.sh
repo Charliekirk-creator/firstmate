@@ -14,11 +14,13 @@ PYTHON=$(command -v python3) || fail 'python3 required for proposal tests'
 
 PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$TMP_ROOT/python-cache" PYTHONNOUSERSITE=1 PYTHONPATH='' \
   "$PYTHON" - "$HELPER" "$TMP_ROOT" <<'PY'
+import contextlib
 import copy
+import io
 import json
 import os
 from pathlib import Path
-import subprocess
+import runpy
 import sys
 
 helper = Path(sys.argv[1])
@@ -30,51 +32,60 @@ for name in ['.pi/agent/auth.json', '.no-mistakes/config.yaml', '.env']:
     path = home / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(secret)
-launcher = root / 'audit.py'
-launcher.write_text('''import os, runpy, sys
-home = os.path.abspath(sys.argv[1])
-script = sys.argv[2]
-sys.argv = [script] + sys.argv[3:]
+# Run every case through the helper's real __main__ entry point in this one
+# audited interpreter. Spawning a fresh macOS system Python for each of the
+# hundreds of cases made filesystem pressure, rather than helper behavior, the
+# suite's dominant and nondeterministic runtime.
+os.environ.update(HOME=str(home), PI_CODING_AGENT_DIR=str(home / '.pi/agent'),
+                  TYPESAFE_API_KEY=secret, OPENAI_API_KEY=secret,
+                  PYTHONDONTWRITEBYTECODE='1', PYTHONPYCACHEPREFIX=str(root / 'python-cache'),
+                  PYTHONNOUSERSITE='1', PYTHONPATH='')
 effects = []
+auditing_helper = False
 def audit(event, args):
+    if not auditing_helper:
+        return
     blocked = event.startswith('socket.') or event in {
         'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.exec', 'os.fork',
         'os.forkpty', 'urllib.Request', 'os.mkdir', 'os.remove', 'os.rmdir',
         'os.rename', 'os.symlink', 'os.link', 'os.chmod', 'os.chown', 'os.utime'}
     if event in {'open', 'os.listdir', 'os.scandir'} and args and isinstance(args[0], (str, bytes)):
         path = os.path.abspath(os.fsdecode(args[0]))
-        blocked = blocked or path == home or path.startswith(home + os.sep)
+        blocked = blocked or path == str(home) or path.startswith(str(home) + os.sep)
         if event == 'open':
-            trusted = path == script or path.startswith(sys.base_prefix + os.sep) or '/python-cache/' in path
+            trusted = path == str(helper) or path.startswith(sys.base_prefix + os.sep) or '/python-cache/' in path
             flags = args[2] if len(args) > 2 else 0
             blocked = blocked or not trusted or bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
     if blocked:
         effects.append(event + (':' + os.fsdecode(args[0]) if event == 'open' else ''))
         raise RuntimeError('forbidden helper effect: ' + event)
 sys.addaudithook(audit)
-try:
-    runpy.run_path(script, run_name='__main__')
-finally:
-    if effects:
-        print('Forbidden events: ' + ', '.join(effects), file=sys.stderr)
-        raise SystemExit(91)
-''')
-env = dict(os.environ, HOME=str(home), PI_CODING_AGENT_DIR=str(home / '.pi/agent'),
-           TYPESAFE_API_KEY=secret, OPENAI_API_KEY=secret, PYTHONDONTWRITEBYTECODE='1',
-           PYTHONPYCACHEPREFIX=str(root / 'python-cache'), PYTHONNOUSERSITE='1', PYTHONPATH='')
 
 def invoke(command=None, data=None, raw=None, extra=(), forbidden=()):
-    args = [sys.executable, '-B', str(launcher), str(home), str(helper)]
-    if command is not None:
-        args.append(command)
-    args.extend(extra)
-    result = subprocess.run(args, input=raw if raw is not None else json.dumps(data or {}),
-                            text=True, capture_output=True, env=env, timeout=30)
-    assert secret not in result.stdout + result.stderr, 'credential input leaked'
-    assert all(value not in result.stdout + result.stderr for value in forbidden), 'input credential leaked'
-    assert result.returncode != 91, ('helper attempted execution, network, or protected reads', result.stderr)
-    body = json.loads(result.stdout) if result.stdout else None
-    return result.returncode, body
+    old_argv, old_stdin = sys.argv, sys.stdin
+    stdout, stderr = io.StringIO(), io.StringIO()
+    sys.argv = [str(helper)] + ([] if command is None else [command]) + list(extra)
+    stdin_bytes = io.BytesIO((raw if raw is not None else json.dumps(data or {})).encode())
+    sys.stdin = io.TextIOWrapper(stdin_bytes)
+    code = 0
+    global auditing_helper
+    auditing_helper = True
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                runpy.run_path(str(helper), run_name='__main__')
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    finally:
+        auditing_helper = False
+        sys.argv, sys.stdin = old_argv, old_stdin
+    output = stdout.getvalue()
+    diagnostic = stderr.getvalue()
+    assert secret not in output + diagnostic, 'credential input leaked'
+    assert all(value not in output + diagnostic for value in forbidden), 'input credential leaked'
+    assert not effects, ('helper attempted execution, network, or protected reads', effects)
+    body = json.loads(output) if output else None
+    return code, body
 
 
 def refuse(command, data=None, raw=None, extra=()):
