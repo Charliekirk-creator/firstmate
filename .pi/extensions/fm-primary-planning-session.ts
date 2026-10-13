@@ -229,7 +229,8 @@ export default function (pi: ExtensionAPI) {
             if (entries[0]?.type === "session" && entries[0]?.id === snapshot.owner.sessionId &&
                 entry?.type === "message" && JSON.stringify(entry.message) === JSON.stringify(accepted.message) &&
                 ancestor === snapshot.leaf && accepted.entryId !== snapshot.leaf &&
-                completePlanningTables(text, snapshot.slots, Number(entry.message.timestamp))) {
+                completePlanningTables(text, snapshot.slots,
+                  typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : Number.NaN)) {
               clock?.deliver(snapshot, accepted.entryId);
             }
           }

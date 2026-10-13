@@ -24,7 +24,7 @@ writeFileSync(`${home}/state/.lock`, String(process.pid));
 const canonical = `${home}/data/planning/planning.md`, canonicalBefore = readFileSync(canonical);
 const state = () => JSON.parse(readFileSync(ledger, 'utf8'));
 let output = 'Captain, partial response.', reason = 'stop', requests = 0, providerGate, entered, requestTarget, requestTargetReached;
-let savedPi, toolLoop = false, toolSlot, continueRun = false, continuationSlot;
+let providerTimestamp, savedPi, toolLoop = false, toolSlot, continueRun = false, continuationSlot;
 let busyClock, busyGate, busyTimer, busyNow, busyState;
 const contexts = [];
 const modelSpec = { id: 'offline', name: 'Offline fixture', reasoning: false, input: ['text'],
@@ -52,9 +52,10 @@ function fixture(pi) {
       requests++; contexts.push(context);
       const requestNumber = requests;
       const stream = createAssistantMessageEventStream(), text = output, stopReason = toolLoop ? 'toolUse' : reason,
-        wait = providerGate, useTool = toolLoop;
+        wait = providerGate, useTool = toolLoop, messageTimestamp = providerTimestamp ?? Date.now();
       toolLoop = false;
       providerGate = undefined;
+      providerTimestamp = undefined;
       entered?.(); entered = undefined;
       void (async () => {
         await wait;
@@ -65,7 +66,7 @@ function fixture(pi) {
         const content = useTool ? [{ type: 'toolCall', id: `fixture-${requests}`, name: 'planning_fixture', arguments: {} }]
           : [{ type: 'text', text }];
         const message = { role: 'assistant', api: model.api, provider: model.provider, model: model.id,
-          content, timestamp: Date.now(), stopReason,
+          content, timestamp: messageTimestamp, stopReason,
           usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
         stream.push({ type: 'start', partial: message });
@@ -192,10 +193,14 @@ for (const context of continuationContexts) {
   assert.ok(!serialized.includes(continuationBoundary), 'settlement continuation cannot expand the claim');
 }
 output = `${lateDisclosure([continuationSlot])}\n${tables}`;
+providerTimestamp = continuationSlot;
 await session.prompt('Complete retained continuation slot', { source: 'rpc' });
 assert.deepEqual(state().due, []);
 const receipt = state().delivery;
-assert.ok(session.sessionManager.getEntry(receipt.entryId));
+const receiptEntry = session.sessionManager.getEntry(receipt.entryId);
+assert.ok(receiptEntry);
+assert.equal(receiptEntry.message.timestamp, continuationSlot, 'provider timestamp remains on the model message');
+assert.ok(Date.parse(receiptEntry.timestamp) > continuationSlot, 'durable append timestamp determines lateness');
 assert.ok(readFileSync(session.sessionManager.getSessionFile(), 'utf8').includes(receipt.entryId));
 console.log(`ok - real Pi ${version} failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery`);
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { completePlanningTables, fileStore, HALF_HOUR, lateDisclosure, OBSERVATION_WINDOW, parseFirstSlot,
@@ -189,6 +189,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
     assert.equal(completePlanningTables(tables, [first], first + 1), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.NaN), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], Number.POSITIVE_INFINITY), false);
     assert.equal(completePlanningTables(lateLine + '\n' + tables, [first, first + HALF_HOUR], first + HALF_HOUR + 1), true);
     for (const disclosure of [lateDisclosure([first]) + '\n' + tables,
       lateDisclosure([first, first + HALF_HOUR, first + 2 * HALF_HOUR]) + '\n' + tables,
@@ -370,6 +372,19 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => validateState({ ...old, due: [first, first] }), /Malformed/);
     assert.throws(() => validateState({ ...old, owner: { ...owner, pid: 0 } }), /Malformed/);
     assert.throws(() => validateState({ ...old, through: old.through + 1 }), /Malformed/);
+    for (const failure of ['write', 'sync']) {
+      const failedPath = join(lab, `${failure}-cleanup.json`);
+      const injected = fileStore(failedPath, {
+        write(fd, data) {
+          if (failure === 'write') throw new Error('injected write failure');
+          writeFileSync(fd, data);
+        },
+        sync() { throw new Error('injected sync failure'); },
+      });
+      assert.throws(() => injected.write(old), new RegExp(`injected ${failure} failure`));
+      assert.equal(readdirSync(lab).some(name => name.startsWith(`${failure}-cleanup.json.`)), false,
+        `${failure} failure cleans its private ledger temp path`);
+    }
     writeFileSync(join(lab, 'bad.json'), '{'); assert.throws(() => fileStore(join(lab, 'bad.json')).read());
     symlinkSync(join(lab, 'slots.json'), join(lab, 'link.json'));
     assert.throws(() => fileStore(join(lab, 'link.json')).read(), /Unsafe/);

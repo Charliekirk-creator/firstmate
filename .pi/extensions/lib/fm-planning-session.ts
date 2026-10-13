@@ -58,7 +58,10 @@ export function validateState(value: unknown): SlotState {
   return s;
 }
 
-export function fileStore(path: string): Store {
+export function fileStore(path: string, operations: {
+  write(fd: number, data: string): void;
+  sync(fd: number): void;
+} = { write: writeFileSync, sync: fsyncSync }): Store {
   const safeParent = () => {
     const stat = lstatSync(dirname(path));
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe planning-session directory");
@@ -85,14 +88,28 @@ export function fileStore(path: string): Store {
       safeParent();
       safeFile();
       const temp = `${path}.${randomUUID()}.tmp`;
-      const fd = openSync(temp, "wx", 0o600);
+      let fd: number | undefined;
+      let failure: unknown;
+      let failed = false;
       try {
-        writeFileSync(fd, `${JSON.stringify(state)}\n`);
-        fsyncSync(fd);
-      } finally { closeSync(fd); }
-      try { renameSync(temp, path); } finally { if (existsSync(temp)) unlinkSync(temp); }
+        try {
+          fd = openSync(temp, "wx", 0o600);
+          operations.write(fd, `${JSON.stringify(state)}\n`);
+          operations.sync(fd);
+        } catch (error) { failure = error; failed = true; }
+        if (fd !== undefined) {
+          try { closeSync(fd); }
+          catch (error) { if (!failed) { failure = error; failed = true; } }
+          fd = undefined;
+        }
+        if (failed) throw failure;
+        renameSync(temp, path);
+      } finally {
+        if (fd !== undefined) { try { closeSync(fd); } catch {} }
+        try { if (existsSync(temp)) unlinkSync(temp); } catch {}
+      }
       const directory = openSync(dirname(path), "r");
-      try { fsyncSync(directory); } finally { closeSync(directory); }
+      try { operations.sync(directory); } finally { closeSync(directory); }
     },
   };
 }
