@@ -148,6 +148,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables.replace('No material change', 'Literal &COPY; name')), true);
     assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
       '| &#0; | &#xD800; | &#1114112; | Problem &#0; remains |')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| Idea&#1; | Change&#x7F; | Next&#129; | No&#31; |')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| &#128; | &#130; | &#153; | &#159; |')), true);
     assert.equal(completePlanningTables(tables.replace('| Test | Verified |', '| [Test](x_(y)) | [Verified](x_\\(y\\)) |')), true);
     assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
       '| \\* | \\_ | \\~ | \\` |')), true);
@@ -174,6 +178,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       tables.replace('| Test | Verified |', '| &shy; | &#173; |'),
       tables.replace('| Test | Verified |', '| &NoBreak; | &InvisibleTimes; |'),
       tables.replace('| Test | Verified |', '| &ThickSpace; | &ThickSpace; |'),
+      tables.replace('| Idea | No material change | Review later | No |', '| &#1; | &#x7F; | &#129; | &#31; |'),
+      tables.replace('| Idea | No material change | Review later | No |', '| \u0001 | \u007f | \u0081 | \u001f |'),
       tables.replace('| Test | Verified |', '| [](x_(y)) | [](x_\\(y\\)) |'),
       tables.replace('| Test | Verified |', '| \u00ad | \u2060 |'),
       tables.replace('| Test | Verified |', '| \u3164 | \u3164 |'),

@@ -492,7 +492,7 @@ function renderedCellContent(cell: string): string {
   const decoded = decodeMarkdownReferences(source);
   if (decoded.unresolved) return "";
   const rendered = decoded.text.replace(/\u0001(\d+)\u0002/g, (_match, index) => literals[Number(index)] ?? "");
-  return rendered.replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, "");
+  return rendered.replace(/[\s\p{Cc}\p{Default_Ignorable_Code_Point}]/gu, "");
 }
 
 function cells(line: string): string[] {
