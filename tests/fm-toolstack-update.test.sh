@@ -951,14 +951,16 @@ independent_project['declarations'] = [{'source': 'npm:example-extension', 'skil
 independent_scope['observations']['pi']['resources'].append(independent_project)
 independent_proposal = prepared(approved(independent_scope))
 assert {(row['scope'], row['path']) for row in independent_proposal['affected_resources']} == {
-    ('user', 'extensions/example.ts'), ('project', 'skills/project-filter/SKILL.md')}
+    ('user', 'extensions/example.ts')}
+assert independent_proposal['dispatch'] == {
+    'argv': ['pi', 'update', 'npm:example-extension', '--no-approve']}
 missing_independent_evidence = copy.deepcopy(independent_scope)
 del missing_independent_evidence['observations']['pi']['resources'][1]['compatibility_evidence']
-refuse('propose', missing_independent_evidence)
+assert len(prepared(approved(missing_independent_evidence))['affected_resources']) == 1
 changed_independent_scope = approved(independent_scope)
 changed_independent_scope['observations']['pi']['resources'][1]['declarations'][0]['skills'] = [
     'skills/changed/SKILL.md']
-refuse('prepare', changed_independent_scope)
+assert len(prepared(changed_independent_scope)['affected_resources']) == 1
 project_only = copy.deepcopy(data)
 project_only['observations']['pi']['resources'][0]['scope'] = 'project'
 project_only['resource'] = resource_selector(project_only['observations']['pi']['resources'][0])

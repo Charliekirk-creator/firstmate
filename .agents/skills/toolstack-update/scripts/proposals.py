@@ -9,7 +9,7 @@ A supplied approval is a caller's assertion, not proof of captain authority.
 
 Commands: catalog; inspect (default); propose; prepare.
 Resource source records can retain credential-free npm, Git, and local sources;
-only unpinned or latest npm user packages have a preparable resource action.
+only unpinned or mutable dist-tag npm user packages have a preparable resource action.
 inspect takes {observations: {target: observation}} and always returns the full
 catalog. propose adds target and optionally resource (a Pi resource identity object).
 prepare additionally needs approval equal to the current proposal and checkpoint.
@@ -672,6 +672,12 @@ def bound_context(row):
              "observed_at")}
 
 
+def is_project_filter_delta(row):
+    declarations = row.get("declarations")
+    return (row.get("scope") == "project" and isinstance(declarations, list) and len(declarations) == 1 and
+            isinstance(declarations[0], dict) and declarations[0].get("autoload") is False)
+
+
 def proposal(data, rows):
     target = data.get("target")
     if target not in TARGETS:
@@ -702,7 +708,9 @@ def proposal(data, rows):
     if selected is not None:
         identity = update_identity(selected["source"])
         affected = [copy.deepcopy(resource) for resource in row["resources"] if
-                    update_identity(resource.get("source")) == identity]
+                    update_identity(resource.get("source")) == identity and
+                    (resource.get("scope") == selected["scope"] or
+                     (selected["scope"] == "user" and is_project_filter_delta(resource)))]
         if any(resource.get("owner") != "pi-package" for resource in affected):
             raise Invalid("Every resource affected by a package update must retain its verified package owner.")
         npm_sources = [npm_declaration(resource["source"]) for resource in affected]
