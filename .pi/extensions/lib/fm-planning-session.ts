@@ -564,15 +564,64 @@ function latenessText(line: string): string | undefined {
       .replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
   } while (rendered !== prior);
   rendered = rendered.replace(/^ {1,3}(?=\S)/, "");
-  const normalized = renderedMarkdownLabels(maskMarkdownCode(rendered)).replace(/[*_~]/g, "");
+  const normalized = renderedMarkdownLabels(maskMarkdownCode(rendered)).replace(/[*_~]/g, "").replace(/\|/g, " ");
   const decoded = decodeMarkdownReferences(normalized);
   return /\blate\s+update(?:\s|:)/i.test(decoded.text) || decoded.unresolved && /late|update/i.test(normalized)
     ? rendered : undefined;
 }
 
+type MarkdownLineFacts = {
+  source: string;
+  content: string;
+  quoteDepth: number;
+  listed: boolean;
+  code: boolean;
+  atx: boolean;
+  setext: boolean;
+  thematic: boolean;
+};
+
+function markdownLineFacts(source: string, activeList = false): MarkdownLineFacts {
+  let content = activeList ? source.trimStart() : source;
+  let quoteDepth = 0;
+  while (/^ {0,3}>[ \t]?/.test(content)) {
+    content = content.replace(/^ {0,3}>[ \t]?/, "");
+    quoteDepth += 1;
+  }
+  const code = /^(?:\t| {4})/.test(content) && !activeList;
+  const thematic = /^ {0,3}([*_-])(?:[ \t]*\1){2,}[ \t]*$/.test(content);
+  const setext = /^ {0,3}(?:=+|-+)[ \t]*$/.test(content);
+  const listed = !thematic && /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(content);
+  if (listed) content = content.replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
+  return { source, content, quoteDepth, listed, code,
+    atx: /^ {0,3}#{1,6}(?:[ \t]|$)/.test(content), setext, thematic };
+}
+
+function markdownTableLines(lines: string[]): Set<number> {
+  const structural = new Set<number>();
+  const facts = lines.map((line) => markdownLineFacts(line));
+  const delimiter = (line: MarkdownLineFacts) => {
+    if (line.code || line.listed || !line.content.includes("|")) return false;
+    const columns = cells(line.content);
+    return columns.length > 0 && columns.every((cell) => /^:?-{3,}:?$/.test(cell));
+  };
+  for (let i = 1; i < facts.length; i += 1) {
+    if (!delimiter(facts[i]) || facts[i - 1].quoteDepth !== facts[i].quoteDepth ||
+        facts[i - 1].code || !facts[i - 1].content.includes("|") ||
+        cells(facts[i - 1].content).length !== cells(facts[i].content).length) continue;
+    structural.add(i - 1);
+    structural.add(i);
+    for (let row = i + 1; row < facts.length && facts[row].quoteDepth === facts[i].quoteDepth &&
+      !facts[row].code && facts[row].content.includes("|") &&
+      cells(facts[row].content).length === cells(facts[i].content).length; row += 1) structural.add(row);
+  }
+  return structural;
+}
+
 function latenessClaims(lines: string[]): { rendered: string; source?: string; topLevel: boolean }[] {
   const claims: { rendered: string; source?: string; topLevel: boolean }[] = [];
-  let block: { parts: string[]; sources: string[]; signature: string; topLevel: boolean } | undefined;
+  const tableLines = markdownTableLines(lines);
+  let block: { parts: string[]; sources: string[]; quoteDepth: number; listed: boolean; topLevel: boolean } | undefined;
   const flush = () => {
     if (!block) return;
     const rendered = latenessText(block.parts.join(" "));
@@ -580,36 +629,30 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
       topLevel: block.topLevel });
     block = undefined;
   };
-  for (const source of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const source = lines[index];
     if (!source.trim()) { flush(); continue; }
-    const activeList = !!block?.signature.endsWith(":list");
-    if (/^(?:\t| {4})/.test(source) && !activeList) { flush(); continue; }
-    let part = activeList ? source.trimStart() : source;
-    let quotes = 0;
-    while (/^ {0,3}>[ \t]?/.test(part)) { part = part.replace(/^ {0,3}>[ \t]?/, ""); quotes += 1; }
-    if (/^(?:\t| {4})/.test(part) && !activeList) { flush(); continue; }
-    const listed = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(part);
-    if (listed) part = part.replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, "");
-    const setext = /^ {0,3}(?:=+|-+)[ \t]*$/.test(part);
-    const structural = /^ {0,3}#{1,6}(?:[ \t]|$)/.test(part) || part.includes("|") || setext;
-    if (structural) {
-      if (setext && block) block.topLevel = false;
+    const facts = markdownLineFacts(source, !!block?.listed);
+    if (facts.code) { flush(); continue; }
+    if (tableLines.has(index) || facts.atx) {
       flush();
-      const rendered = latenessText(part);
-      if (rendered !== undefined) claims.push({ rendered, source, topLevel: quotes === 0 && !listed });
+      const rendered = latenessText(facts.content);
+      if (rendered !== undefined) claims.push({ rendered, source, topLevel: facts.quoteDepth === 0 && !facts.listed });
       continue;
     }
-    const signature = `${quotes}:${listed ? "list" : "prose"}`;
-    const listQuoteDepth = activeList ? Number(block?.signature.split(":", 1)[0]) : -1;
-    const listContinuation = activeList && !listed && (quotes === listQuoteDepth || quotes === 0);
-    const lazyQuoteContinuation = !!block && /^[1-9]\d*:/.test(block.signature) && quotes === 0 && !listed;
-    const continuation = listContinuation || lazyQuoteContinuation;
+    if (facts.setext || facts.thematic) {
+      if (facts.setext && block) block.topLevel = false;
+      flush();
+      continue;
+    }
+    const continuation = !!block && !facts.listed && facts.quoteDepth <= block.quoteDepth;
     if (block && latenessText(block.parts.join(" ")) !== undefined) flush();
-    if (!block || listed || block.signature !== signature && !continuation) flush();
-    if (!block) block = { parts: [], sources: [], signature, topLevel: quotes === 0 && !listed };
-    const trailingSlashes = /\\+$/.exec(part.trimEnd())?.[0].length ?? 0;
+    if (!block || facts.listed || !continuation) flush();
+    if (!block) block = { parts: [], sources: [], quoteDepth: facts.quoteDepth, listed: facts.listed,
+      topLevel: facts.quoteDepth === 0 && !facts.listed };
+    const trailingSlashes = /\\+$/.exec(facts.content.trimEnd())?.[0].length ?? 0;
     const hardBreak = trailingSlashes % 2 === 1;
-    block.parts.push((hardBreak ? part.trimEnd().slice(0, -1) : part).trim());
+    block.parts.push((hardBreak ? facts.content.trimEnd().slice(0, -1) : facts.content).trim());
     block.sources.push(source);
   }
   flush();
