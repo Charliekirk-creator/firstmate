@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, fsyncSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
+import { chmodSync, fsyncSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -689,6 +689,31 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const published = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
     assert.equal(published.status, 0, published.stderr);
     assert.match(published.stdout, /lock acquired: harness pid/);
+
+    rmSync(join(barrierState, '.lock'));
+    const orphanLock = join(realpathSync(barrierState), '.lock.acquire');
+    const orphanOwner = `${orphanLock}.owner.crashed`;
+    const crashed = spawnSync('bash', ['-c', 'mkdir "$1" && printf "%s\\n" "$$" > "$1/pid" && ln -s "$1" "$2"',
+      'crash-fixture', orphanOwner, orphanLock], { encoding: 'utf8' });
+    assert.equal(crashed.status, 0, crashed.stderr);
+    const orphanRefusal = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
+    assert.notEqual(orphanRefusal.status, 0);
+    assert.match(orphanRefusal.stderr, /timed out waiting for the session ownership transaction/);
+    assert.equal(readdirSync(barrierState).includes('.lock.acquire'), true, 'dead owner evidence is never stolen');
+    assert.equal(readdirSync(barrierState).includes('.lock'), false, 'orphan refusal cannot publish ownership');
+    rmSync(orphanLock); rmSync(orphanOwner, { recursive: true });
+
+    const malformedOwner = `${orphanLock}.owner.malformed`;
+    mkdirSync(malformedOwner);
+    writeFileSync(join(barrierState, 'foreign-pid'), '999999\n');
+    symlinkSync(join(barrierState, 'foreign-pid'), join(malformedOwner, 'pid'));
+    symlinkSync(malformedOwner, orphanLock);
+    const malformedRefusal = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
+    assert.notEqual(malformedRefusal.status, 0);
+    assert.match(malformedRefusal.stderr, /transaction evidence is malformed/);
+    assert.equal(readdirSync(barrierState).includes('.lock.acquire'), true, 'symlinked evidence is never removed');
+    assert.equal(readdirSync(barrierState).includes('.lock'), false, 'malformed evidence cannot publish ownership');
+    rmSync(orphanLock); rmSync(malformedOwner, { recursive: true });
 
     const serializedPath = join(lab, 'serialized.json');
     const processAStore = fileStore(serializedPath);

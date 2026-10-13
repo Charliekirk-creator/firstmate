@@ -1,7 +1,7 @@
 // Session-local scheduling and slot receipts. No process, service, or model calls.
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, readlinkSync, renameSync,
-  rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, readlinkSync, realpathSync,
+  renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { html5Entities } from "./html5-entities.ts";
 
@@ -67,7 +67,7 @@ export function fileStore(path: string, operations: {
   write(fd: number, data: string): void;
   sync(fd: number): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
-  const lockPath = resolve(dirname(path), ".lock.acquire");
+  const lockPath = resolve(realpathSync(dirname(path)), ".lock.acquire");
   const safeParent = () => {
     const stat = lstatSync(dirname(path));
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe planning-session directory");
