@@ -682,6 +682,43 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     rmSync(`${serializedPath}.lock`);
     assert.deepEqual(processAStore.read(), persistedProcessBState, 'explicit lock cleanup permits restart');
 
+    const ownershipRace = (name, transferCheck, action) => {
+      const path = join(lab, `ownership-${name}.json`);
+      const raceStore = fileStore(path);
+      const raceOwnerA = { ...owner, sessionId: `race-a-${name}` };
+      const raceOwnerB = { ...owner, sessionId: `race-b-${name}` };
+      let authority = 'a', armedTransfer = false, checks = 0, raceNow = first - 1000, raceCallback;
+      const raceIo = { now: () => raceNow, valid: () => {
+        if (authority !== 'a') return false;
+        if (armedTransfer && ++checks === transferCheck) { authority = 'b'; return false; }
+        return true;
+      }, wifi: () => 'online', later(fn) { raceCallback = fn; return () => { if (raceCallback === fn) raceCallback = undefined; }; },
+      wake() {}, error() {} };
+      const raceA = new PlanningSessionClock(raceOwnerA, raceStore, raceIo);
+      raceA.start(first);
+      const prepare = () => { armedTransfer = true; checks = 0; };
+      action({ raceA, prepare, fire() { raceNow = first; const fn = raceCallback; raceCallback = undefined; fn(); } });
+      const afterA = raceStore.read();
+      assert.equal(afterA.owner.sessionId, raceOwnerA.sessionId);
+      const raceB = new PlanningSessionClock(raceOwnerB, raceStore, { ...raceIo, valid: () => authority === 'b' });
+      if (!afterA.due.length) {
+        raceB.start(first);
+        assert.equal(raceStore.read().owner.sessionId, raceOwnerB.sessionId, `${name} cannot block the new owner`);
+      }
+      raceA.dispose(); raceB.dispose();
+      return afterA;
+    };
+    ownershipRace('boundary', 4, ({ prepare, fire }) => { prepare(); fire(); });
+    ownershipRace('stop', 3, ({ raceA, prepare }) => {
+      prepare(); assert.throws(() => raceA.stop('quit'), /ownership changed/);
+    });
+    const retainedAfterDeliveryRace = ownershipRace('delivery', 3, ({ raceA, prepare, fire }) => {
+      fire();
+      const pendingClaim = raceA.claim();
+      prepare(); assert.throws(() => raceA.deliver(pendingClaim, 'raced-delivery'), /ownership changed/);
+    });
+    assert.deepEqual(retainedAfterDeliveryRace.due, [first], 'ownership transfer cannot clear delivery work');
+
     const lateStore = fileStore(join(lab, 'late.json'));
     now = first + HALF_HOUR + 60000;
     const late = new PlanningSessionClock(owner, lateStore, io); late.start(first);

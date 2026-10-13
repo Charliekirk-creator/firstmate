@@ -16,8 +16,8 @@ export type SlotState = {
 };
 export type Claim = { owner: Owner; slots: number[] };
 export type Store = {
-  read(): SlotState | undefined;
-  write(state: SlotState, expected: SlotState | null): void;
+  read(authorize?: () => boolean): SlotState | undefined;
+  write(state: SlotState, expected: SlotState | null, authorize?: () => boolean): void;
 };
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0;
 export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && a.sessionFile === b.sessionFile &&
@@ -145,10 +145,14 @@ export function fileStore(path: string, operations: {
     syncDirectory(operations.sync);
   };
   return {
-    read() { return locked(readUnlocked); },
-    write(state, expected) {
+    read(authorize) { return locked(() => {
+      if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
+      return readUnlocked();
+    }); },
+    write(state, expected, authorize) {
       validateState(state);
       locked(() => {
+        if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
         const current = readUnlocked();
         if (expected !== undefined && JSON.stringify(current) !== JSON.stringify(expected ?? undefined)) {
           throw new Error("Planning ledger changed before the update could commit");
@@ -242,8 +246,8 @@ export class PlanningSessionClock {
     if (sameOwner(state.owner, this.owner)) this.ownsSchedule = false;
     return sameOwner(state.owner, this.owner);
   }
-  private ownedState(): SlotState | undefined {
-    const state = this.store.read();
+  private ownedState(authorize = false): SlotState | undefined {
+    const state = this.store.read(authorize ? () => this.io.valid() : undefined);
     if (state && !sameOwner(state.owner, this.owner) && this.ownsSchedule) {
       throw new Error("Planning ledger owner changed while the schedule was active");
     }
@@ -281,7 +285,7 @@ export class PlanningSessionClock {
     try {
       if (this.reconcileRevocation()) return undefined;
       if (!this.io.valid()) { this.ownershipLost(); return undefined; }
-      const state = this.ownedState();
+      const state = this.ownedState(true);
       return state && !state.stopped ? state : undefined;
     } catch (error) {
       this.failStopped(this.lastState?.due ?? [], this.lastState);
@@ -299,7 +303,7 @@ export class PlanningSessionClock {
     let prior: SlotState | undefined;
     try {
       this.reconcileRevocation();
-      prior = this.store.read();
+      prior = this.store.read(() => this.io.valid());
     } catch (error) {
       this.failStopped([], fresh);
       throw error;
@@ -316,7 +320,7 @@ export class PlanningSessionClock {
     const candidate: SlotState = compatible && prior ? { ...prior, stopped: undefined } : fresh;
     this.rememberFailure(candidate.due, candidate);
     try {
-      this.store.write(candidate, prior ?? null);
+      this.store.write(candidate, prior ?? null, () => this.io.valid());
       this.lastState = candidate;
       this.revocations.delete(ownerKey(this.owner));
     } catch (error) {
@@ -343,7 +347,7 @@ export class PlanningSessionClock {
     try {
       const state = this.current();
       if (state) {
-        this.store.write({ ...state, stopped: reason }, state);
+        this.store.write({ ...state, stopped: reason }, state, () => this.io.valid());
         this.ownsSchedule = false;
       }
     } catch (error) {
@@ -378,7 +382,7 @@ export class PlanningSessionClock {
       const due = result === "online" ? [...state.due, slot] : state.due;
       const candidate: SlotState = { ...state, through: slot, due, observation: { slot, result } };
       this.rememberFailure(due, candidate);
-      this.store.write(candidate, state);
+      this.store.write(candidate, state, () => this.io.valid());
       this.revocations.delete(ownerKey(this.owner));
       if (result === "unknown") this.io.error(new Error("Wi-Fi link could not be verified; this slot was skipped"));
       // Offline and unobserved slots never enqueue catch-up requests.
@@ -421,7 +425,8 @@ export class PlanningSessionClock {
       if (slots.some((slot) => slot > at)) return false;
       this.rememberFailure(slots);
       this.store.write({ ...state, due: state.due.filter((slot) => !slots.includes(slot)),
-        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } }, state);
+        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } }, state,
+        () => this.io.valid());
       this.revocations.delete(ownerKey(this.owner));
       return true;
     } catch (error) {
