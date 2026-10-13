@@ -146,6 +146,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables.replace('No material change', 'Copyright &copy; and Registered &reg;')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', 'Roadmap &unknown; details')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', 'Literal &COPY; name')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| &#0; | &#xD800; | &#1114112; | Problem &#0; remains |')), true);
     assert.equal(completePlanningTables(tables.replace('| Test | Verified |', '| [Test](x_(y)) | [Verified](x_\\(y\\)) |')), true);
     assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
       '| \\* | \\_ | \\~ | \\` |')), true);
@@ -232,6 +234,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('Late\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('**Late**\n_update_ for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('> Late\n> update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('> Late\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables("Late\\" + '\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
+    assert.equal(completePlanningTables('Late  \nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('- Late\n  update for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), false);
     assert.equal(completePlanningTables('Late\n\nupdate for: 2026-10-12 16:30 HKT.\n' + tables, [first], first), true);
     assert.equal(completePlanningTables('Late\n```text\nunrelated\n```\nupdate for: 2026-10-12 16:30 HKT.\n' + tables,
@@ -241,6 +246,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('`Late update for: 2026-10-12 16:30 HKT.`\n' + tables, [first], first), true);
     assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n' + tables, [first], first + 1), true);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + tables, [first], first + 1), true);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n---\n' + tables, [first], first + 1), false);
+    assert.equal(completePlanningTables(lateDisclosure([first]) + '\n===\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables('<span>' + lateDisclosure([first]) + '</span>\n' + tables, [first], first + 1), false);
     assert.equal(completePlanningTables(lateDisclosure([first]) + '\n<span>' + lateDisclosure([first]) + '</span>\n' + tables,
       [first], first + 1), false);
@@ -264,6 +272,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       lateLine + '\nLATE UPDATE for: 2026-10-12 16:30 HKT.\n' + tables,
       lateLine + '\nlAtE UpDaTe for: 2026-10-12 16:30 HKT.\n' + tables,
       lateLine + '\nLate\nupdate for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\n> Late\nupdate for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\n' + "Late\\" + '\nupdate for: 2026-10-12 16:30 HKT.\n' + tables,
+      lateLine + '\nLate  \nupdate for: 2026-10-12 16:30 HKT.\n' + tables,
       lateLine + '\n**Late**\n_update_ for: 2026-10-12 16:30 HKT.\n' + tables]) {
       assert.equal(completePlanningTables(disclosure, [first, first + HALF_HOUR], first + HALF_HOUR + 1), false);
     }
