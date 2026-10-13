@@ -147,6 +147,16 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables.replace('No material change', 'Roadmap &unknown; details')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', 'Literal &COPY; name')), true);
     assert.equal(completePlanningTables(tables.replace('| Test | Verified |', '| [Test](x_(y)) | [Verified](x_\\(y\\)) |')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| \\* | \\_ | \\~ | \\` |')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| &ast; | &lowbar; | &tilde; | &grave; |')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| &#42; | &#95; | &#126; | &#96; |')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| `*` | `_` | `~` | `` ` `` |')), true);
+    assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
+      '| * | _ | ~ | ` |')), true);
     assert.equal(completePlanningTables(tables.replace('No material change', '\u3164Visible change')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
       tables + '\n<br>', '<div>benign context</div>\n\n' + tables,

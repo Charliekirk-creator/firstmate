@@ -454,10 +454,39 @@ function renderedMarkdownLabels(value: string): string {
 }
 
 function renderedCellContent(cell: string): string {
-  const decoded = decodeMarkdownReferences(cell);
+  const literals: string[] = [];
+  const stash = (literal: string) => `\u0001${literals.push(literal) - 1}\u0002`;
+  let source = cell.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, (_match, literal) => stash(literal));
+  for (let i = 0; i < source.length;) {
+    if (source[i] !== "`") { i += 1; continue; }
+    let length = 1;
+    while (source[i + length] === "`") length += 1;
+    let closing = i + length;
+    while (closing < source.length) {
+      if (source[closing] !== "`") { closing += 1; continue; }
+      let candidate = 1;
+      while (source[closing + candidate] === "`") candidate += 1;
+      if (candidate === length) break;
+      closing += candidate;
+    }
+    if (closing >= source.length) { i += length; continue; }
+    let literal = source.slice(i + length, closing).replace(/\r?\n/g, " ");
+    if (/^ .* $/.test(literal) && literal.trim()) literal = literal.slice(1, -1);
+    const token = stash(literal);
+    source = source.slice(0, i) + token + source.slice(closing + length);
+    i += token.length;
+  }
+  source = renderedMarkdownLabels(source);
+  let prior: string;
+  do {
+    prior = source;
+    source = source.replace(/(\*\*|__|~~)([\s\S]+?)\1/g, "$2")
+      .replace(/([*_])([\s\S]+?)\1/g, "$2");
+  } while (source !== prior);
+  const decoded = decodeMarkdownReferences(source);
   if (decoded.unresolved) return "";
-  return renderedMarkdownLabels(decoded.text).replace(/[*_~`]/g, "")
-    .replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, "");
+  const rendered = decoded.text.replace(/\u0001(\d+)\u0002/g, (_match, index) => literals[Number(index)] ?? "");
+  return rendered.replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, "");
 }
 
 function cells(line: string): string[] {
@@ -467,7 +496,7 @@ function cells(line: string): string[] {
   const parts: string[] = [];
   let part = "";
   for (let i = 0; i < text.length; i += 1) {
-    if (text[i] === "\\" && i + 1 < text.length) { part += text[++i]; continue; }
+    if (text[i] === "\\" && i + 1 < text.length) { part += text[i] + text[++i]; continue; }
     if (text[i] === "|") { parts.push(part.trim()); part = ""; } else part += text[i];
   }
   parts.push(part.trim());
