@@ -116,18 +116,47 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(revocationState.stopped, 'ownership-lost'); assert.equal(revocations.size, 0);
     recovered.start(first); assert.ok(callback, 'explicit start follows durable reconciliation');
     recovered.dispose();
-    console.log('ok - failed ownership revocation survives reload, retries durably and requires explicit restart');
+
+    const staleOwner = { ...owner, sessionId: 'stale-main' };
+    const freshOwner = { ...owner, sessionId: 'fresh-main' };
+    let sharedState = { ...old, owner: staleOwner, due: [], stopped: undefined };
+    let rejectStaleWrite = true;
+    const sharedStore = { read: () => sharedState, write: (state) => {
+      if (rejectStaleWrite && state.owner.sessionId === staleOwner.sessionId) throw new Error('stale write failed');
+      sharedState = state;
+    } };
+    const staleRevocations = new Map();
+    const staleClock = new PlanningSessionClock(staleOwner, sharedStore, io, staleRevocations);
+    valid = true; staleClock.resume(); valid = false;
+    assert.throws(() => staleClock.ownershipLost(), /stale write failed/);
+    assert.equal(staleRevocations.size, 1);
+    rejectStaleWrite = false; valid = true;
+    const freshClock = new PlanningSessionClock(freshOwner, sharedStore, io, new Map());
+    freshClock.start(first);
+    const freshSchedule = structuredClone(sharedState);
+    valid = false; staleClock.ownershipLost();
+    assert.deepEqual(sharedState, freshSchedule, 'late stale revocation cannot stop the fresh owner');
+    assert.equal(staleRevocations.size, 0);
+    freshClock.dispose(); valid = true;
+    console.log('ok - failed ownership revocation survives reload, respects a fresh owner and requires explicit restart');
 
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
     assert.equal(completePlanningTables(tables + '\n<captain@example.invalid>'), true);
-    for (const literal of ['-not a list', '+value', '*emphasis*', '1.not a list', '2)not a list'])
+    for (const literal of ['-not a list', '+value', '*emphasis*', '1.not a list', '2)not a list',
+      '1234567890. ordinary prose', '1234567890) ordinary prose', '[private] : visible prose'])
       assert.equal(completePlanningTables(literal + '\n' + tables), true, literal);
-    for (const marker of ['-', '+', '*', '1.', '2)', '   -', '  +', ' *', '   10.', '  12)']) {
+    for (const marker of ['-', '+', '*', '1.', '2)', '   -', '  +', ' *', '   10.', '  12)',
+      '123456789. item', '987654321) item']) {
       assert.equal(completePlanningTables(marker + '\n' + tables), false, marker);
       const nestedTables = tables.split('\n').map((line) => line ? '   ' + line : line).join('\n');
       assert.equal(completePlanningTables(marker + '\n' + nestedTables), false, marker + ' with content');
     }
+    for (const code of ['\thidden code', ' \thidden code', '  \thidden code', '   \thidden code', ' \t code'])
+      assert.equal(completePlanningTables(code + '\n' + tables), false, JSON.stringify(code));
+    for (const definition of ['[private]: https://example.invalid', ' [private]: <https://example.invalid>',
+      '   [private]: /relative "title"', '[pri\\]vate]: destination'])
+      assert.equal(completePlanningTables(definition + '\n' + tables), false, definition);
 
     assert.equal(completePlanningTables('```markdown\n```   \n' + tables), false);
     assert.equal(completePlanningTables(tables.split('\n').map(line => line.startsWith('|') ? '   ' + line : line).join('\n')), true);
@@ -576,7 +605,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => transition.start(first), /transition read failed/);
     transitionReadFails = false;
     const transitionStatus = transition.status();
-    assert.equal(transitionStatus.armed, false); assert.equal(transitionStatus.state.stopped, 'ledger-failure');
+    assert.equal(transitionStatus.armed, false); assert.equal(transitionStatus.state.stopped, undefined);
     assert.deepEqual(transitionState.due, [old.through]); assert.equal(transitionFailures.size, 0);
     assert.throws(() => transition.start(first), /retained planning slots/);
     console.log('ok - boundary, delivery, stop and start failures retain work and require explicit recovery');

@@ -176,8 +176,8 @@ export class PlanningSessionClock {
       if (transition.due?.length || transition.candidate?.due.length) {
         throw new Error("Cannot transfer retained planning slots between ledger owners");
       }
-      this.store.write({ ...stored, stopped: "ledger-failure" });
       this.revocations.delete(ownerKey(transition.owner));
+      if (sameOwner(transition.owner, this.owner)) this.ownsSchedule = false;
       return false;
     }
     const state = stored ?? revoked?.candidate;
@@ -618,15 +618,26 @@ function markdownTableLines(lines: string[]): Set<number> {
   return structural;
 }
 
+function markdownIndent(line: string): number {
+  let column = 0;
+  for (const character of line) {
+    if (character === " ") column += 1;
+    else if (character === "\t") column += 4 - column % 4;
+    else break;
+  }
+  return column;
+}
+
 function supportedMarkdownSurface(lines: string[]): boolean {
   const tableLines = markdownTableLines(lines);
   return lines.every((line, index) => {
     if (!line.trim()) return true;
     const setext = /^ {0,3}(?:=+|-+)[ \t]*$/.test(line) && index > 0 &&
       /^(?:Ideas|To-do list|Recently completed)$/.test(lines[index - 1].trim());
-    if (/^ {0,3}>/.test(line) || /^(?:\t| {4})/.test(line) ||
+    if (/^ {0,3}>/.test(line) || markdownIndent(line) >= 4 ||
         /^ {0,3}(?:`{3,}|~{3,})/.test(line) ||
-        /^ {0,3}(?:[-+*]|\d+[.)])(?:[ \t]+|$)/.test(line) ||
+        /^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)/.test(line) ||
+        /^ {0,3}\[(?:\\.|[^\\\]])+\]:/.test(line) ||
         !setext && /^ {0,3}([*_-])(?:[ \t]*\1){2,}[ \t]*$/.test(line)) return false;
     if (maskMarkdownCode(line).includes("|") && !tableLines.has(index)) return false;
     return true;
