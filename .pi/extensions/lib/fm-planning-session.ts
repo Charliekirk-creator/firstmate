@@ -610,8 +610,8 @@ function visibleMarkdownLines(lines: string[]): string[] {
       cursor.index += 1;
     }
   };
-  const parseOpeningContainers = (line: string) => {
-    const cursor: Cursor = { index: 0, column: 0 };
+  const parseContainers = (line: string, initial: Cursor = { index: 0, column: 0 }) => {
+    const cursor: Cursor = { ...initial };
     const containers: ContainerFrame[] = [];
     for (;;) {
       const content = line.slice(cursor.index);
@@ -628,26 +628,26 @@ function visibleMarkdownLines(lines: string[]): string[] {
       containers.push({ kind: "list", startColumn, contentColumn: cursor.column,
         continuationOffset: cursor.column - startColumn, marker: item[1] });
     }
-    return { content: line.slice(cursor.index), containers };
+    return { content: line.slice(cursor.index), containers, cursor };
   };
-  const memberContent = (line: string, containers: ContainerFrame[]): string | undefined => {
+  const memberPosition = (line: string, containers: ContainerFrame[]) => {
     const cursor: Cursor = { index: 0, column: 0 };
     for (const frame of containers) {
       if (frame.kind === "quote") {
         const quote = /^ {0,3}>[ \t]?/.exec(line.slice(cursor.index));
-        if (!quote) return undefined;
+        if (!quote) return;
         advance(cursor, quote[0]);
       } else {
         const requiredColumn = cursor.column + frame.continuationOffset;
         while (cursor.index < line.length && cursor.column < requiredColumn &&
           (line[cursor.index] === " " || line[cursor.index] === "\t")) advance(cursor, line[cursor.index]);
         if (cursor.column < requiredColumn) {
-          if (!line.slice(cursor.index).trim()) return "";
-          return undefined;
+          if (!line.slice(cursor.index).trim()) return { content: "", cursor };
+          return;
         }
       }
     }
-    return line.slice(cursor.index);
+    return { content: line.slice(cursor.index), cursor };
   };
   const openingAt = (content: string, containers: ContainerFrame[]): Fence | undefined => {
     const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
@@ -656,9 +656,9 @@ function visibleMarkdownLines(lines: string[]): string[] {
   };
   return lines.map((line) => {
     if (fence) {
-      const content = memberContent(line, fence.containers);
-      if (content !== undefined) {
-        const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(content);
+      const member = memberPosition(line, fence.containers);
+      if (member) {
+        const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(member.content);
         if (closing && closing[1][0] === fence.marker[0] && closing[1].length >= fence.marker.length) fence = undefined;
         return "";
       }
@@ -666,16 +666,18 @@ function visibleMarkdownLines(lines: string[]): string[] {
       activeListContainers = undefined;
     }
     if (activeListContainers) {
-      const inheritedContent = memberContent(line, activeListContainers);
-      if (inheritedContent !== undefined) {
-        fence = openingAt(inheritedContent, activeListContainers);
+      const inherited = memberPosition(line, activeListContainers);
+      if (inherited) {
+        const entered = parseContainers(line, inherited.cursor);
+        const containers = [...activeListContainers, ...entered.containers];
+        fence = openingAt(entered.content, containers);
         if (fence) return "";
-        if (!line.trim()) return line;
+        if (entered.containers.length) activeListContainers = containers;
         return line;
       }
       activeListContainers = undefined;
     }
-    const parsed = parseOpeningContainers(line);
+    const parsed = parseContainers(line);
     fence = openingAt(parsed.content, parsed.containers);
     if (fence) return "";
     activeListContainers = parsed.containers.some((frame) => frame.kind === "list") ? parsed.containers : undefined;
