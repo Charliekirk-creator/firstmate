@@ -1,7 +1,7 @@
 // Session-local scheduling and slot receipts. No process, service, or model calls.
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, readlinkSync, realpathSync,
-  renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+  renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { html5Entities } from "./html5-entities.ts";
 
@@ -24,6 +24,7 @@ export type Claim = { owner: Owner; slots: number[] };
 export type Store = {
   read(authorize?: () => boolean): SlotState | undefined;
   write(state: SlotState, expected: SlotState | null, authorize?: () => boolean): void;
+  reconcile?(authorize?: () => boolean, operationId?: string): void;
 };
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0;
 export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && a.sessionFile === b.sessionFile &&
@@ -56,7 +57,11 @@ export function validateState(value: unknown): SlotState {
       s.through < s.firstSlot - HALF_HOUR || (s.through - s.firstSlot) % HALF_HOUR !== 0 ||
       !Array.isArray(s.due) || s.due.some((slot, i) => !integer(slot) || slot < s.firstSlot ||
         slot > s.through || (slot - s.firstSlot) % HALF_HOUR !== 0 || (i > 0 && slot <= s.due[i - 1])) ||
-      (s.stopped !== undefined && (typeof s.stopped !== "string" || !s.stopped))) {
+      (s.stopped !== undefined && (typeof s.stopped !== "string" || !s.stopped)) ||
+      (s.observation !== undefined && (!integer(s.observation.slot) || s.observation.slot !== s.through ||
+        s.observation.slot < s.firstSlot || (s.observation.slot - s.firstSlot) % HALF_HOUR !== 0 ||
+        !["online", "offline", "unknown", "unobserved"].includes(s.observation.result) ||
+        (s.observation.result !== "online" && s.due.includes(s.observation.slot))))) {
     throw new Error("Malformed planning-session ledger; refusing to replace it");
   }
   if (s.delivery && (typeof s.delivery.entryId !== "string" || !s.delivery.entryId ||
@@ -95,6 +100,7 @@ export function fileStore(path: string, operations: {
   sync(fd: number): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
   const lockPath = resolve(realpathSync(dirname(path)), ".lock.acquire");
+  const journalPath = `${path}.recovery.json`;
   const safeParent = () => {
     const stat = lstatSync(dirname(path));
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe planning-session directory");
@@ -130,8 +136,38 @@ export function fileStore(path: string, operations: {
       fd = undefined;
       try { symlinkSync(ownerDirectory, lockPath); acquired = true; }
       catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Planning ledger lock is busy");
-        throw error;
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        let staleOwner: string | undefined;
+        let stalePid: number | undefined;
+        try {
+          staleOwner = readlinkSync(lockPath);
+          if (!staleOwner.startsWith(`${lockPath}.owner.`) || !lstatSync(staleOwner).isDirectory() ||
+              lstatSync(staleOwner).isSymbolicLink() || !lstatSync(resolve(staleOwner, "pid")).isFile() ||
+              lstatSync(resolve(staleOwner, "pid")).isSymbolicLink() ||
+              Date.now() - statSync(staleOwner).mtimeMs < 2000) throw new Error("ambiguous");
+          const pidText = readFileSync(resolve(staleOwner, "pid"), "utf8").trim();
+          if (!/^[0-9]+$/.test(pidText)) throw new Error("ambiguous");
+          stalePid = Number(pidText);
+          try { process.kill(stalePid, 0); throw new Error("live"); }
+          catch (problem) { if ((problem as NodeJS.ErrnoException).code !== "ESRCH") throw problem; }
+        } catch { throw new Error("Planning ledger lock is busy or ambiguous"); }
+        const stealPath = `${lockPath}.steal`;
+        const stealOwner = mkdtempSync(`${stealPath}.owner.`);
+        try {
+          writeFileSync(resolve(stealOwner, "pid"), `${process.pid}\n`, { mode: 0o600 });
+          try { symlinkSync(stealOwner, stealPath); } catch { throw new Error("Planning ledger lock recovery is busy"); }
+          if (readlinkSync(lockPath) !== staleOwner || readFileSync(resolve(staleOwner, "pid"), "utf8").trim() !== String(stalePid)) {
+            throw new Error("Planning ledger lock changed during recovery");
+          }
+          try { process.kill(stalePid!, 0); throw new Error("Planning ledger owner revived"); }
+          catch (problem) { if ((problem as NodeJS.ErrnoException).code !== "ESRCH") throw problem; }
+          unlinkSync(lockPath); unlinkSync(resolve(staleOwner, "pid")); rmdirSync(staleOwner);
+          symlinkSync(ownerDirectory, lockPath); acquired = true;
+        } finally {
+          try { if (existsSync(stealPath) && readlinkSync(stealPath) === stealOwner) unlinkSync(stealPath); } catch {}
+          try { if (existsSync(resolve(stealOwner, "pid"))) unlinkSync(resolve(stealOwner, "pid")); } catch {}
+          try { rmdirSync(stealOwner); } catch {}
+        }
       }
       if (!lstatSync(lockPath).isSymbolicLink() || readlinkSync(lockPath) !== ownerDirectory ||
           readFileSync(ownerPid, "utf8") !== `${process.pid}\n`) {
@@ -157,6 +193,39 @@ export function fileStore(path: string, operations: {
         try { rmdirSync(ownerDirectory); } catch {}
       }
     }
+  };
+  const stateHash = (state: SlotState | undefined) => createHash("sha256")
+    .update(state === undefined ? "missing" : JSON.stringify(state)).digest("hex");
+  const readJournal = (): { operationId: string; phase: "prepared" | "aborted"; expectedHash: string;
+    intendedHash: string; expectedOwner: Owner | null; candidate: SlotState } | undefined => {
+    if (!existsSync(journalPath)) return undefined;
+    const stat = lstatSync(journalPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) {
+      throw new Error("Unsafe planning recovery journal");
+    }
+    const record = JSON.parse(readFileSync(journalPath, "utf8"));
+    if (!record || typeof record.operationId !== "string" || !record.operationId ||
+        !["prepared", "aborted"].includes(record.phase) || !/^[a-f0-9]{64}$/.test(record.expectedHash) ||
+        !/^[a-f0-9]{64}$/.test(record.intendedHash) ||
+        (record.expectedOwner !== null && !validOwner(record.expectedOwner)) ||
+        stateHash(validateState(record.candidate)) !== record.intendedHash) throw new Error("Malformed planning recovery journal");
+    return record;
+  };
+  const publishJournal = (record: object) => {
+    const temp = `${journalPath}.${randomUUID()}.tmp`;
+    let fd: number | undefined;
+    try {
+      fd = openSync(temp, "wx", 0o600);
+      writeFileSync(fd, `${JSON.stringify(record)}\n`);
+      fsyncSync(fd); closeSync(fd); fd = undefined;
+      renameSync(temp, journalPath); syncDirectory(fsyncSync);
+    } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch {} }
+      try { if (existsSync(temp)) unlinkSync(temp); } catch {}
+    }
+  };
+  const clearJournal = () => {
+    if (existsSync(journalPath)) { unlinkSync(journalPath); syncDirectory(fsyncSync); }
   };
   const writeUnlocked = (state: SlotState) => {
     const temp = `${path}.${randomUUID()}.tmp`;
@@ -191,11 +260,51 @@ export function fileStore(path: string, operations: {
       validateState(state);
       locked(() => {
         if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
+        if (readJournal()) throw new Error("Planning recovery journal requires explicit reconciliation");
         const current = readUnlocked();
         if (expected !== undefined && JSON.stringify(current) !== JSON.stringify(expected ?? undefined)) {
           throw new Error("Planning ledger changed before the update could commit");
         }
-        writeUnlocked(state);
+        const record = { operationId: randomUUID(), phase: "prepared" as const, expectedHash: stateHash(current),
+          intendedHash: stateHash(state), expectedOwner: current?.owner ?? null, candidate: state };
+        publishJournal(record);
+        try { writeUnlocked(state); }
+        catch (error) {
+          let committed = false;
+          try { committed = stateHash(readUnlocked()) === record.intendedHash; } catch {}
+          if (committed) throw new Error(`Planning commit uncertain; run recover-commit ${record.operationId}`);
+          throw error;
+        }
+        if (authorize && !authorize()) throw new Error(`Planning commit uncertain; run recover-commit ${record.operationId}`);
+        if (stateHash(readUnlocked()) !== record.intendedHash) {
+          throw new Error(`Planning commit uncertain; run recover-commit ${record.operationId}`);
+        }
+        clearJournal();
+      });
+    },
+    reconcile(authorize, operationId) {
+      locked(() => {
+        if (authorize && !authorize()) throw new Error("Planning Main ownership changed before the transaction");
+        const record = readJournal();
+        if (!record) return;
+        if (operationId !== undefined && record.operationId !== operationId) {
+          throw new Error("Planning recovery operation id does not match");
+        }
+        const current = readUnlocked();
+        const hash = stateHash(current);
+        if (hash === record.intendedHash) {
+          const fd = openSync(path, "r");
+          try { fsyncSync(fd); } finally { closeSync(fd); }
+          syncDirectory(fsyncSync);
+          if (authorize && !authorize()) throw new Error("Planning Main ownership changed during recovery");
+          clearJournal();
+          return;
+        }
+        if (hash === record.expectedHash) {
+          if (operationId !== undefined) publishJournal({ ...record, phase: "aborted" });
+          throw new Error(`Planning commit ${record.operationId} aborted; due evidence retained for retry`);
+        }
+        throw new Error("Planning recovery journal does not match canonical ledger bytes");
       });
     },
   };
@@ -380,8 +489,16 @@ export class PlanningSessionClock {
     this.resume();
     if (candidate.due.length) this.io.wake([...candidate.due]);
   }
+  recoverCommit(operationId: string): void {
+    if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may recover a planning commit");
+    if (!/^[0-9a-f-]{36}$/.test(operationId)) throw new Error("Invalid planning recovery operation id");
+    if (!this.store.reconcile) throw new Error("Planning store does not support durable commit recovery");
+    this.store.reconcile(() => this.io.valid(), operationId);
+    this.resume();
+  }
   adopt(firstSlot: number): void {
     if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may adopt planning updates");
+    this.store.reconcile?.(() => this.io.valid());
     const prior = this.store.read(() => this.io.valid());
     if (!prior) throw new Error("No planning schedule exists to adopt");
     if (prior.firstSlot !== firstSlot) throw new Error("Planning adoption anchor does not match the ledger");
@@ -409,10 +526,6 @@ export class PlanningSessionClock {
     const adopted: SlotState = { ...prior, generation: receipt.resultingGeneration, owner: this.owner,
       adoptions: [...(prior.adoptions ?? []), receipt] };
     this.store.write(adopted, prior, () => this.io.valid());
-    const committed = this.store.read(() => this.io.valid());
-    if (!committed || JSON.stringify(committed) !== JSON.stringify(adopted)) {
-      throw new Error("Planning adoption commit could not be verified");
-    }
     this.lastState = adopted;
     if (formerEvidence) {
       this.revocations.delete(formerKey);

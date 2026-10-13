@@ -73,7 +73,7 @@ if ! claim_lock_evidence_valid; then
   echo "error: session ownership transaction evidence is malformed; operate read-only until resolved" >&2
   exit 1
 fi
-if ! fm_lock_try_create "$CLAIM_LOCK"; then
+if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
   sweep_pid=$(sed -n 's/^pid=//p' "$STATE/.startup-network.status" 2>/dev/null | tail -1)
   if [ -n "${FM_LOCK_HELD_PID:-}" ] && [ "$FM_LOCK_HELD_PID" = "$sweep_pid" ]; then
     echo "error: the prior session's bounded startup sweep is finishing; operate read-only until it releases the fleet lock" >&2
@@ -88,7 +88,7 @@ if ! fm_lock_try_create "$CLAIM_LOCK"; then
       echo "error: session ownership transaction evidence is malformed; operate read-only until resolved" >&2
       exit 1
     fi
-    if fm_lock_try_create "$CLAIM_LOCK"; then break; fi
+    if fm_lock_try_acquire "$CLAIM_LOCK"; then break; fi
     claim_attempt=$((claim_attempt + 1))
   done
   if [ -z "${FM_LOCK_OWNER_DIR:-}" ]; then

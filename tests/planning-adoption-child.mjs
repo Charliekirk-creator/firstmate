@@ -1,6 +1,17 @@
-import { fileStore, parseFirstSlot, PlanningSessionClock } from '../.pi/extensions/lib/fm-planning-session.ts';
+import { fileStore, HALF_HOUR, parseFirstSlot, PlanningSessionClock } from '../.pi/extensions/lib/fm-planning-session.ts';
 
-const [ledger, sessionFile, sessionId = 'adopting-main'] = process.argv.slice(2);
+const [ledger, sessionFile, sessionId = 'adopting-main', mode = 'adopt'] = process.argv.slice(2);
+if (mode === 'prepare-failed-boundary') {
+  const current = fileStore(ledger).read();
+  const slot = current.through + HALF_HOUR;
+  const candidate = { ...current, through: slot, due: [...current.due, slot], observation: { slot, result: 'online' } };
+  const failing = fileStore(ledger, { write() { throw new Error('injected candidate failure'); }, sync() {} });
+  try { failing.write(candidate, current, () => true); } catch (error) {
+    process.stdout.write(`${String(error)}\n`);
+    process.exit(0);
+  }
+  process.exit(2);
+}
 const owner = { sessionId, sessionFile, pid: process.pid, processStart: 1 };
 const store = fileStore(ledger);
 const io = { now: Date.now, valid: () => true, ownsMain: () => true, wifi: () => 'offline',

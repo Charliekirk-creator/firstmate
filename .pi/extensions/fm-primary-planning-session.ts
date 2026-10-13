@@ -162,6 +162,9 @@ export default function (pi: ExtensionAPI) {
         } else if (action === "adopt" && value && !extra) {
           clock!.adopt(parseFirstSlot(value));
           context.ui.notify("Planning slots adopted with retained due work preserved.", "info");
+        } else if (action === "recover-commit" && value && !extra) {
+          clock!.recoverCommit(value);
+          context.ui.notify("Planning commit recovery verified.", "info");
         } else if (action === "stop" && !value) {
           clock!.stop("command");
           context.ui.notify("Planning slots stopped for this session.", "info");
@@ -169,7 +172,7 @@ export default function (pi: ExtensionAPI) {
           const { armed, state } = clock!.status();
           context.ui.notify(JSON.stringify({ armed,
             nextSlot: armed && state ? state.through + HALF_HOUR : null, ledger: state ?? null }), "info");
-        } else throw new Error("Usage: /planning-session start|adopt 2026-10-12T16:30:00+08:00 | status | stop");
+        } else throw new Error("Usage: /planning-session start|adopt 2026-10-12T16:30:00+08:00 | recover-commit <operation-id> | status | stop");
       } catch (problem) {
         context.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");
       }

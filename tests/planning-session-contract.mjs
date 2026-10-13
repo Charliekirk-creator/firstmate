@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
+import { chmodSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync, utimesSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -147,7 +147,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const transferredStore = fileStore(transferredPath);
     const transferOwnerA = { ...owner, sessionId: 'transfer-a' };
     const transferOwnerB = { ...owner, sessionId: 'transfer-b' };
-    const transferredLedger = { ...old, owner: transferOwnerA, due: [old.through], stopped: undefined };
+    const transferredLedger = { ...old, owner: transferOwnerA, due: [old.through], stopped: undefined,
+      observation: { slot: old.through, result: 'online' } };
     transferredStore.write(transferredLedger, null);
     const persistedTransferredLedger = transferredStore.read();
     let authoritativeOwner = 'a';
@@ -219,6 +220,24 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.deepEqual(processAdopted.due, processTransfer.due);
     assert.equal(processAdopted.owner.pid > 1, true);
     assert.deepEqual(processTransferStore.read(), processAdopted);
+
+    const journalTransferPath = join(lab, 'journal-transfer.json');
+    const journalTransferStore = fileStore(journalTransferPath);
+    journalTransferStore.write(persistedTransferredLedger, null);
+    const journalOriginalBytes = readFileSync(journalTransferPath);
+    const failedCandidateProcess = spawnSync(process.execPath,
+      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'former.jsonl'),
+        'former-main', 'prepare-failed-boundary'], { encoding: 'utf8' });
+    assert.equal(failedCandidateProcess.status, 0, failedCandidateProcess.stderr);
+    assert.match(failedCandidateProcess.stdout, /injected candidate failure/);
+    assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
+    assert.equal(existsSync(`${journalTransferPath}.recovery.json`), true);
+    const blockedAdoptionProcess = spawnSync(process.execPath,
+      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'blocked-adopter.jsonl')],
+      { encoding: 'utf8' });
+    assert.notEqual(blockedAdoptionProcess.status, 0);
+    assert.match(blockedAdoptionProcess.stderr, /due evidence retained/);
+    assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
 
     const emptyTransferStore = fileStore(join(lab, 'empty-transfer.json'));
     const emptyTransfer = { ...persistedTransferredLedger, due: [], delivery: undefined };
@@ -741,6 +760,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => validateState({ ...old, due: [first, first] }), /Malformed/);
     assert.throws(() => validateState({ ...old, owner: { ...owner, pid: 0 } }), /Malformed/);
     assert.throws(() => validateState({ ...old, through: old.through + 1 }), /Malformed/);
+    assert.throws(() => validateState({ ...old, observation: { slot: -1, result: 'online' } }), /Malformed/);
+    assert.throws(() => validateState({ ...old, observation: { slot: old.through - HALF_HOUR, result: 'offline' } }), /Malformed/);
+    assert.throws(() => validateState({ ...old, observation: { slot: old.through, result: 'connected' } }), /Malformed/);
+    assert.throws(() => validateState({ ...old, due: [old.through], observation: { slot: old.through, result: 'offline' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, generation: 5, adoptions: undefined }), /Malformed adoption history/);
     const firstAdoption = adoptedLedger.adoptions[0];
     const unrelatedOwner = { ...transferOwnerA, sessionId: 'unrelated-history' };
@@ -759,8 +782,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
         sync() { throw new Error('injected sync failure'); },
       });
       assert.throws(() => injected.write(old, null), new RegExp(`injected ${failure} failure`));
-      assert.equal(readdirSync(lab).some(name => name.startsWith(`${failure}-cleanup.json.`)), false,
+      assert.equal(readdirSync(lab).some(name => name.startsWith(`${failure}-cleanup.json.`) && name.endsWith('.tmp')), false,
         `${failure} failure cleans its private ledger temp path`);
+      assert.equal(readdirSync(lab).includes(`${failure}-cleanup.json.recovery.json`), true,
+        `${failure} failure retains durable recovery evidence`);
     }
     writeFileSync(join(lab, 'bad.json'), '{'); assert.throws(() => fileStore(join(lab, 'bad.json')).read());
     symlinkSync(join(lab, 'slots.json'), join(lab, 'link.json'));
@@ -801,12 +826,12 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const crashed = spawnSync('bash', ['-c', 'mkdir "$1" && printf "%s\\n" "$$" > "$1/pid" && ln -s "$1" "$2"',
       'crash-fixture', orphanOwner, orphanLock], { encoding: 'utf8' });
     assert.equal(crashed.status, 0, crashed.stderr);
-    const orphanRefusal = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
-    assert.notEqual(orphanRefusal.status, 0);
-    assert.match(orphanRefusal.stderr, /timed out waiting for the session ownership transaction/);
-    assert.equal(readdirSync(barrierState).includes('.lock.acquire'), true, 'dead owner evidence is never stolen');
-    assert.equal(readdirSync(barrierState).includes('.lock'), false, 'orphan refusal cannot publish ownership');
-    rmSync(orphanLock); rmSync(orphanOwner, { recursive: true });
+    utimesSync(orphanOwner, new Date(0), new Date(0));
+    const orphanRecovery = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
+    assert.equal(orphanRecovery.status, 0, orphanRecovery.stderr);
+    assert.equal(readdirSync(barrierState).includes('.lock.acquire'), false, 'proven dead owner is recovered');
+    assert.equal(readdirSync(barrierState).includes('.lock'), true, 'recovery publishes verified ownership');
+    rmSync(join(barrierState, '.lock'));
 
     const malformedOwner = `${orphanLock}.owner.malformed`;
     mkdirSync(malformedOwner);
