@@ -36,6 +36,8 @@ export type Store = {
   recovery?(): { operationId: string; phase: string; candidate: SlotState } | undefined;
   transaction?<T>(authorize: () => boolean, action: () => T): T;
   adopt?(state: SlotState, expected: SlotState | null, authorize: () => boolean): void;
+  adoptRecovery?(operationId: string, successor: Owner, at: number, authorize: () => boolean,
+    validateEvidence?: (candidate: SlotState, canonical?: SlotState) => void): SlotState;
 };
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0;
 export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && a.sessionFile === b.sessionFile &&
@@ -269,6 +271,18 @@ export function fileStore(path: string, operations: {
       ledgerBytes({ ...state, owner: candidate.owner, generation: candidate.generation,
         adoptions: candidate.adoptions }) === ledgerBytes(candidate);
   };
+  const representsCandidate = (state: SlotState, candidate: SlotState) => {
+    let represented = state;
+    while (represented.generation > candidate.generation) {
+      const receipt = represented.adoptions?.at(-1);
+      if (!receipt || !sameOwner(receipt.successorOwner, represented.owner) ||
+          receipt.resultingGeneration !== represented.generation ||
+          JSON.stringify(receipt.retainedDue) !== JSON.stringify(represented.due)) return false;
+      represented = { ...represented, owner: receipt.formerOwner, generation: receipt.priorGeneration,
+        adoptions: represented.adoptions!.length > 1 ? represented.adoptions!.slice(0, -1) : undefined };
+    }
+    return ledgerBytes(represented) === ledgerBytes(candidate);
+  };
   const retireRepresentedPending = (record: Recovery) => {
     const pending = readPending();
     if (!pending) return;
@@ -316,6 +330,67 @@ export function fileStore(path: string, operations: {
     read(authorize) { return locked(() => { requireAuthorized(authorize); return readUnlocked(); }); },
     write: commit,
     adopt(state, expected, authorize) { commit(state, expected, authorize, true); },
+    adoptRecovery(operationId, successor, at, authorize, validateEvidence) {
+      if (!validOwner(successor) || !integer(at)) throw new Error("Invalid planning recovery adoption");
+      return locked(() => {
+        requireAuthorized(authorize);
+        const record = readJournal();
+        if (!record || record.operationId !== operationId) {
+          throw new Error("Planning recovery operation id does not match");
+        }
+        const current = readUnlocked();
+        const hash = bytesHash(readBytesUnlocked());
+        validateEvidence?.(record.candidate, current);
+        let base = record.candidate;
+        if (hash === record.expectedHash) {
+          if (current ? !record.expectedOwner || !sameOwner(current.owner, record.expectedOwner) ||
+              current.version !== record.expectedVersion || current.generation !== record.expectedGeneration :
+              record.expectedOwner !== null) throw new Error("Planning prior owner/version does not match");
+        } else if (hash === record.intendedHash) {
+          if (!current || !sameOwner(current.owner, record.candidate.owner)) {
+            throw new Error("Planning committed owner does not match");
+          }
+        } else if (current && representsCandidate(current, record.candidate)) {
+          base = current;
+        } else {
+          throw new Error("Planning recovery journal does not match canonical ledger bytes");
+        }
+        let target = base;
+        if (!sameOwner(base.owner, successor)) {
+          const receipt: AdoptionReceipt = { formerOwner: base.owner, successorOwner: successor, at,
+            priorGeneration: base.generation, resultingGeneration: base.generation + 1,
+            retainedDue: [...base.due], dueDigest: dueDigest(base.due) };
+          target = { ...base, generation: receipt.resultingGeneration, owner: successor,
+            adoptions: [...(base.adoptions ?? []), receipt] };
+        }
+        validateState(target);
+        const targetHash = bytesHash(ledgerBytes(target));
+        if (hash !== targetHash) {
+          let renamed = false;
+          try {
+            writeUnlocked(target, authorize, () => { renamed = true; });
+            requireAuthorized(authorize);
+            if (bytesHash(readBytesUnlocked()) !== targetHash) {
+              throw new Error("Planning adopted recovery verification failed");
+            }
+          } catch (error) {
+            if (renamed) throw new Error(`Planning commit uncertain; retry explicit planning adoption`, { cause: error });
+            throw error;
+          }
+        } else {
+          const fd = openSync(path, "r");
+          try { fsyncSync(fd); } finally { closeSync(fd); }
+          syncDirectory(fsyncSync);
+          requireAuthorized(authorize);
+          if (bytesHash(readBytesUnlocked()) !== targetHash) {
+            throw new Error("Planning adopted recovery verification failed");
+          }
+        }
+        retireRepresentedPending(record);
+        clearJournal();
+        return readUnlocked()!;
+      });
+    },
     reconcile(authorize, operationId, owner, validateEvidence) {
       return locked(() => {
         requireAuthorized(authorize);
@@ -614,15 +689,21 @@ export class PlanningSessionClock {
   adopt(firstSlot: number): void {
     if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may adopt planning updates");
     this.transaction(() => {
-      let settledJournal = false;
       const recovery = this.store.recovery?.();
       if (recovery && recovery.phase !== "pending") {
-        if (!this.store.reconcile) throw new Error("Planning store does not support durable commit recovery");
+        if (!this.store.adoptRecovery) throw new Error("Planning store does not support durable recovery adoption");
         if (recovery.candidate.firstSlot !== firstSlot) throw new Error("Planning adoption anchor does not match the ledger");
         if (recovery.candidate.stopped) throw new Error("Stopped planning schedules cannot be adopted");
-        this.store.reconcile(() => this.io.valid(), recovery.operationId, recovery.candidate.owner,
-          (candidate, canonical) => { this.representedEvidence(candidate, canonical); });
-        settledJournal = true;
+        let represented: string[] = [];
+        const settled = this.store.adoptRecovery(recovery.operationId, this.owner, this.io.now(),
+          () => this.io.valid(), (candidate, canonical) => {
+            represented = this.representedEvidence(candidate, canonical);
+          });
+        for (const key of represented) this.revocations.delete(key);
+        this.lastState = settled;
+        this.resume();
+        if (!settled.stopped && settled.due.length) this.io.wake([...settled.due]);
+        return;
       }
       const pending = this.store.pending?.(() => this.io.valid());
       const durable = this.store.read(() => this.io.valid());
@@ -635,7 +716,7 @@ export class PlanningSessionClock {
       if (sameOwner(prior.owner, this.owner)) {
         if (!pending) {
           const receipt = prior.adoptions?.at(-1);
-          if (!settledJournal && (!receipt || !sameOwner(receipt.successorOwner, this.owner) || represented.length)) {
+          if (!receipt || !sameOwner(receipt.successorOwner, this.owner) || represented.length) {
             throw new Error("Current-owner planning schedules cannot be adopted");
           }
           for (const key of represented) this.revocations.delete(key);

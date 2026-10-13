@@ -99,27 +99,38 @@ async function publisherBlocked(f, writer, publisher, command) {
 }
 try {
   // Delivery linearizes before ownership transfer. Its immutable claim cannot
-  // swallow a later boundary; B retains that due slot and the delivery receipt.
+  // swallow later boundaries; B retains complete due and delivery histories.
   {
     const f = await fixture('delivery-and-transfer');
     await f.publish(f.A); ok(await f.A.call('start'));
     ok(await f.A.call('tick', { slot: first })); ok(await f.A.call('claim'));
-    ok(await f.A.call('tick', { slot: first + HALF_HOUR }));
-    const delivery = f.A.begin('deliver', { barrier: 'before-rename' });
+    ok(await f.A.call('deliver', { entryId: 'delivered-one' }));
+    ok(await f.A.call('tick', { slot: first + HALF_HOUR })); ok(await f.A.call('claim'));
+    ok(await f.A.call('deliver', { entryId: 'delivered-two' }));
+    ok(await f.A.call('tick', { slot: first + 2 * HALF_HOUR })); ok(await f.A.call('claim'));
+    ok(await f.A.call('tick', { slot: first + 3 * HALF_HOUR }));
+    ok(await f.A.call('tick', { slot: first + 4 * HALF_HOUR }));
+    const delivery = f.A.begin('deliver', { barrier: 'before-rename', entryId: 'delivered-three' });
     await publisherBlocked(f, f.A, f.B, delivery);
     ok(await f.B.call('adopt'));
-    assert.deepEqual(f.state().due, [first + HALF_HOUR]);
-    assert.deepEqual(f.state().delivery.slots, [first]);
+    assert.deepEqual(f.state().due, [first + 3 * HALF_HOUR, first + 4 * HALF_HOUR]);
+    assert.deepEqual(f.state().deliveries.map(receipt => receipt.entryId),
+      ['delivered-one', 'delivered-two', 'delivered-three']);
+    assert.deepEqual(f.state().deliveries.map(receipt => receipt.slots),
+      [[first], [first + HALF_HOUR], [first + 2 * HALF_HOUR]]);
     assert.equal(f.state().generation, 2);
     const preserved = f.artifacts();
     for (const command of ['tick', 'deliver', 'stop', 'revoke']) {
-      await f.A.call(command, { slot: first + 2 * HALF_HOUR });
+      await f.A.call(command, { slot: first + 5 * HALF_HOUR });
       assert.deepEqual(f.artifacts(), preserved, `stale A ${command} cannot mutate B's ledger`);
     }
     ok(await f.B.call('reset')); ok(await f.B.call('resume'));
-    assert.deepEqual(f.state().due, [first + HALF_HOUR], 'successor reload retains due');
+    assert.deepEqual(f.state().due, [first + 3 * HALF_HOUR, first + 4 * HALF_HOUR],
+      'successor restart retains every due slot');
+    assert.deepEqual(f.state().deliveries.map(receipt => receipt.entryId),
+      ['delivered-one', 'delivered-two', 'delivered-three'], 'successor restart retains every delivery');
     await f.close();
-    console.log('ok - live A/B delivery-publication barrier, immutable claim, stale callbacks and successor reload');
+    console.log('ok - live A/B transfer preserves multiple due and delivered slots across successor restart');
   }
   // A holds a read/decision transaction; B cannot publish until it leaves.
   // Once publication wins, A may not revoke a subsequently adopted ledger.
@@ -243,13 +254,12 @@ try {
     assert.deepEqual(f.state().due, [first + HALF_HOUR]); assert.deepEqual(f.state().delivery.slots, [first]);
     await f.close(); console.log('ok - pending delivery retry preserves delivered versus due facts');
   }
-  // A dies inside an actual transaction after rename, with B independently
-  // waiting to publish. EOF releases the broker but never retires A's journal.
-  {
-    const f = await fixture('parent-death'); await f.publish(f.A); ok(await f.A.call('start'));
-    f.A.begin('tick', { slot: first, barrier: 'after-rename' }); await atBarrier(f, f.A);
+  for (const phase of ['before-rename', 'after-rename']) {
+    const f = await fixture(`parent-death-${phase}`); await f.publish(f.A); ok(await f.A.call('start'));
+    const original = f.bytes();
+    f.A.begin('tick', { slot: first, barrier: phase }); await atBarrier(f, f.A);
     f.preparePublish(f.B); const publication = f.B.begin('publish');
-    await until(() => existsSync(join(f.directory, 'B.attempt')), 'B concurrent acquire during A failure');
+    await until(() => existsSync(join(f.directory, 'B.attempt')), `B concurrent acquire during ${phase} parent failure`);
     assert.equal(publication.completed(), false);
     const retained = f.artifacts();
     f.A.child.kill('SIGKILL');
@@ -257,13 +267,36 @@ try {
     const operationId = f.journal().operationId;
     assert.match((await f.B.call('recover', { operationId })).error, /another owner/);
     assert.deepEqual(f.artifacts(), retained);
-    ok(await f.B.call('adopt'));
-    assert.equal(f.state().owner.pid, f.B.child.pid);
-    assert.equal(f.state().generation, 2);
+    ok(await f.B.call('reset'));
+    const rejected = await f.B.call('adopt', { fault: 'before-rename' });
+    assert.match(rejected.error, /pre-rename/);
+    assert.deepEqual(f.artifacts(), retained, 'failed successor adoption preserves the foreign journal byte-for-byte');
+    ok(await f.B.call('reset'));
+    let successor = f.B, expectedGeneration = 2;
+    if (phase === 'after-rename') {
+      const uncertain = await f.B.call('adopt', { fault: 'after-rename' });
+      assert.match(uncertain.error, /commit uncertain/);
+      assert.equal(f.artifacts()[1], retained[1], 'uncertain successor adoption retains the exact foreign journal');
+      f.B.child.kill('SIGKILL');
+      await until(() => !children.has(f.B.child), 'uncertain successor exits');
+      successor = await worker(f.directory, 'C'); expectedGeneration = 3;
+      await f.publish(successor);
+      assert.match((await successor.call('resume')).error, /recovery/,
+        'a restarted process cannot inherit an unsettled transition automatically');
+    }
+    ok(await successor.call('adopt'));
+    assert.equal(f.state().owner.pid, successor.child.pid);
+    assert.equal(f.state().generation, expectedGeneration);
     assert.deepEqual(f.state().due, [first]);
     assert.equal(existsSync(`${f.ledger}.recovery.json`), false);
+    if (phase === 'before-rename') assert.notEqual(f.bytes(), original);
+    ok(await successor.call('reset')); ok(await successor.call('resume'));
+    assert.deepEqual(f.state().due, [first], 'successor restart retains recovered work');
+    if (successor !== f.B) {
+      successor.child.kill(); await until(() => !children.has(successor.child), 'restarted successor exits');
+    }
     assert.equal(existsSync(join(f.directory, '.lock.acquire')), false, 'parent pipe EOF releases its exact lock');
-    await f.close(); console.log('ok - abrupt parent death releases broker and explicit successor adoption settles recovery');
+    await f.close(); console.log(`ok - ${phase} parent death, blocked publisher, atomic adoption and successor restart`);
   }
   // Broker death before rename must abort the caller, not let it write without
   // the lock. Canonical recovery handles primary and nested steal orphans.
