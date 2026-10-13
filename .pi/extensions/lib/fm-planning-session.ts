@@ -626,7 +626,7 @@ function supportedMarkdownSurface(lines: string[]): boolean {
       /^(?:Ideas|To-do list|Recently completed)$/.test(lines[index - 1].trim());
     if (/^ {0,3}>/.test(line) || /^(?:\t| {4})/.test(line) ||
         /^ {0,3}(?:`{3,}|~{3,})/.test(line) ||
-        /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(line) ||
+        /^ {0,3}(?:[-+*]|\d+[.)])(?:[ \t]+|$)/.test(line) ||
         !setext && /^ {0,3}([*_-])(?:[ \t]*\1){2,}[ \t]*$/.test(line)) return false;
     if (maskMarkdownCode(line).includes("|") && !tableLines.has(index)) return false;
     return true;

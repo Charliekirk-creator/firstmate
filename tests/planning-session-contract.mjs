@@ -121,6 +121,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
     assert.equal(completePlanningTables(tables + '\n<captain@example.invalid>'), true);
+    for (const literal of ['-not a list', '+value', '*emphasis*', '1.not a list', '2)not a list'])
+      assert.equal(completePlanningTables(literal + '\n' + tables), true, literal);
+    for (const marker of ['-', '+', '*', '1.', '2)', '   -', '  +', ' *', '   10.', '  12)']) {
+      assert.equal(completePlanningTables(marker + '\n' + tables), false, marker);
+      const nestedTables = tables.split('\n').map((line) => line ? '   ' + line : line).join('\n');
+      assert.equal(completePlanningTables(marker + '\n' + nestedTables), false, marker + ' with content');
+    }
 
     assert.equal(completePlanningTables('```markdown\n```   \n' + tables), false);
     assert.equal(completePlanningTables(tables.split('\n').map(line => line.startsWith('|') ? '   ' + line : line).join('\n')), true);
