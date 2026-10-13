@@ -598,58 +598,53 @@ function markdownLineFacts(source: string, activeList = false, activeParagraph =
 }
 
 function visibleMarkdownLines(lines: string[]): string[] {
-  type ContainerFrame = { kind: "quote" } | { kind: "list"; indent: number; marker: string };
+  type ContainerFrame = { kind: "quote" } |
+    { kind: "list"; startColumn: number; contentColumn: number; marker: string };
   type Fence = { marker: string; containers: ContainerFrame[] };
+  type Cursor = { index: number; column: number };
   let fence: Fence | undefined;
-  const columns = (value: string) => {
-    let width = 0;
-    for (const character of value) width = character === "\t" ? width + 4 - width % 4 : width + 1;
-    return width;
-  };
-  const stripIndent = (value: string, required: number): string | undefined => {
-    let width = 0;
-    let index = 0;
-    while (index < value.length && width < required && (value[index] === " " || value[index] === "\t")) {
-      width = value[index] === "\t" ? width + 4 - width % 4 : width + 1;
-      index += 1;
+  const advance = (cursor: Cursor, value: string) => {
+    for (const character of value) {
+      cursor.column = character === "\t" ? cursor.column + 4 - cursor.column % 4 : cursor.column + 1;
+      cursor.index += 1;
     }
-    return width >= required ? value.slice(index) : undefined;
   };
   const parseOpeningContainers = (line: string) => {
-    let content = line;
+    const cursor: Cursor = { index: 0, column: 0 };
     const containers: ContainerFrame[] = [];
     for (;;) {
+      const content = line.slice(cursor.index);
       const quote = /^ {0,3}>[ \t]?/.exec(content);
       if (quote) {
         containers.push({ kind: "quote" });
-        content = content.slice(quote[0].length);
+        advance(cursor, quote[0]);
         continue;
       }
       const item = /^ {0,3}([-+*]|\d+[.)])([ \t]+)/.exec(content);
       if (!item) break;
-      const indent = columns(item[1] + item[2]);
-      containers.push({ kind: "list", indent: Math.max(1, indent), marker: item[1] });
-      content = content.slice(item[0].length);
+      const startColumn = cursor.column;
+      advance(cursor, item[0]);
+      containers.push({ kind: "list", startColumn, contentColumn: cursor.column, marker: item[1] });
     }
-    return { content, containers };
+    return { content: line.slice(cursor.index), containers };
   };
   const memberContent = (line: string, containers: ContainerFrame[]): string | undefined => {
-    let content = line;
+    const cursor: Cursor = { index: 0, column: 0 };
     for (const frame of containers) {
       if (frame.kind === "quote") {
-        const quote = /^ {0,3}>[ \t]?/.exec(content);
+        const quote = /^ {0,3}>[ \t]?/.exec(line.slice(cursor.index));
         if (!quote) return undefined;
-        content = content.slice(quote[0].length);
+        advance(cursor, quote[0]);
       } else {
-        const indented = stripIndent(content, frame.indent);
-        if (indented === undefined) {
-          if (!content.trim()) return "";
+        while (cursor.index < line.length && cursor.column < frame.contentColumn &&
+          (line[cursor.index] === " " || line[cursor.index] === "\t")) advance(cursor, line[cursor.index]);
+        if (cursor.column < frame.contentColumn) {
+          if (!line.slice(cursor.index).trim()) return "";
           return undefined;
         }
-        content = indented;
       }
     }
-    return content;
+    return line.slice(cursor.index);
   };
   const opening = (line: string): Fence | undefined => {
     const parsed = parseOpeningContainers(line);
