@@ -4,7 +4,9 @@ const [ledger, sessionFile, sessionId = 'adopting-main', mode = 'adopt', operati
 if (mode === 'prepare-failed-boundary') {
   const current = fileStore(ledger).read();
   const slot = current.through + HALF_HOUR;
-  const candidate = { ...current, through: slot, due: [...current.due, slot], observation: { slot, result: 'online' } };
+  const observation = { slot, result: 'online' };
+  const candidate = { ...current, through: slot, due: [...current.due, slot], observation,
+    observations: [...(current.observations ?? (current.observation ? [current.observation] : [])), observation] };
   const failing = fileStore(ledger, { write() { throw new Error('injected candidate failure'); }, sync() {} });
   try { failing.write(candidate, current, () => true); } catch (error) {
     process.stdout.write(`${String(error)}\n`);

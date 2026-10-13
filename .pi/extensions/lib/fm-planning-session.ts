@@ -14,11 +14,15 @@ export type AdoptionReceipt = {
   formerOwner: Owner; successorOwner: Owner; at: number; priorGeneration: number;
   resultingGeneration: number; retainedDue: number[]; dueDigest: string;
 };
+export type ObservationReceipt = { slot: number; result: "online" | "offline" | "unknown" | "unobserved" };
+export type DeliveryReceipt = { entryId: string; slots: number[]; at: number; lateByMs: number };
 export type SlotState = {
   version: 1; generation: number; owner: Owner; firstSlot: number; through: number; due: number[];
   stopped?: string;
-  observation?: { slot: number; result: "online" | "offline" | "unknown" | "unobserved" };
-  delivery?: { entryId: string; slots: number[]; at: number; lateByMs: number };
+  observation?: ObservationReceipt;
+  observations?: ObservationReceipt[];
+  delivery?: DeliveryReceipt;
+  deliveries?: DeliveryReceipt[];
   adoptions?: AdoptionReceipt[];
 };
 export type Claim = { owner: Owner; slots: number[] };
@@ -59,27 +63,41 @@ const validOwner = (owner: Owner | undefined) => !!owner && typeof owner.session
 export function validateState(value: unknown): SlotState {
   const s = value as SlotState;
   const owner = s?.owner;
+  const observations = s?.observations ?? (s?.observation ? [s.observation] : []);
+  const deliveries = s?.deliveries ?? (s?.delivery ? [s.delivery] : []);
+  const deliveredSlots = new Set<number>();
+  const validDelivery = (receipt: DeliveryReceipt, index: number) =>
+    typeof receipt?.entryId === "string" && !!receipt.entryId &&
+    !deliveries.slice(0, index).some((prior) => prior.entryId === receipt.entryId) &&
+    Array.isArray(receipt.slots) && !!receipt.slots.length &&
+    receipt.slots.every((slot, slotIndex) => integer(slot) && slot >= s.firstSlot && slot <= s.through &&
+      (slot - s.firstSlot) % HALF_HOUR === 0 && slot <= receipt.at && !s.due.includes(slot) &&
+      (slotIndex === 0 || slot > receipt.slots[slotIndex - 1]) && !deliveredSlots.has(slot) &&
+      (deliveredSlots.add(slot), true)) && integer(receipt.at) && integer(receipt.lateByMs);
   if (s?.version !== 1 || !integer(s.generation) || s.generation < 1 || !validOwner(owner) ||
       !integer(s.firstSlot) || s.firstSlot % HALF_HOUR !== 0 || !integer(s.through) ||
       s.through < s.firstSlot - HALF_HOUR || (s.through - s.firstSlot) % HALF_HOUR !== 0 ||
       !Array.isArray(s.due) || s.due.some((slot, i) => !integer(slot) || slot < s.firstSlot ||
         slot > s.through || (slot - s.firstSlot) % HALF_HOUR !== 0 || (i > 0 && slot <= s.due[i - 1])) ||
       (s.stopped !== undefined && (typeof s.stopped !== "string" || !s.stopped)) ||
-      (s.observation !== undefined && (!integer(s.observation.slot) || s.observation.slot !== s.through ||
-        s.observation.slot < s.firstSlot || (s.observation.slot - s.firstSlot) % HALF_HOUR !== 0 ||
-        !["online", "offline", "unknown", "unobserved"].includes(s.observation.result) || (() => {
-          const evidence = Number(s.due.includes(s.observation!.slot)) +
-            Number(s.delivery?.slots.includes(s.observation!.slot) ?? false);
-          return s.observation!.result === "online" ? evidence !== 1 : evidence !== 0;
-        })()))) {
+      (s.observations !== undefined && (!Array.isArray(s.observations) || !s.observations.length)) ||
+      (s.deliveries !== undefined && (!Array.isArray(s.deliveries) || !s.deliveries.length)) ||
+      (s.observation !== undefined && (!observations.length ||
+        JSON.stringify(s.observation) !== JSON.stringify(observations.at(-1)))) ||
+      (s.delivery !== undefined && (!deliveries.length ||
+        JSON.stringify(s.delivery) !== JSON.stringify(deliveries.at(-1)))) ||
+      deliveries.some((receipt, index) => !validDelivery(receipt, index)) ||
+      observations.some((observation, index) => !integer(observation?.slot) ||
+        observation.slot < s.firstSlot || observation.slot > s.through ||
+        (observation.slot - s.firstSlot) % HALF_HOUR !== 0 ||
+        (index > 0 && observation.slot <= observations[index - 1].slot) ||
+        !["online", "offline", "unknown", "unobserved"].includes(observation.result) ||
+        (observation.result === "online"
+          ? Number(s.due.includes(observation.slot)) + Number(deliveredSlots.has(observation.slot)) !== 1
+          : s.due.includes(observation.slot) || deliveredSlots.has(observation.slot))) ||
+      (observations.length > 0 && observations.at(-1)!.slot !== s.through)) {
     throw new Error("Malformed planning-session ledger; refusing to replace it");
   }
-  if (s.delivery && (typeof s.delivery.entryId !== "string" || !s.delivery.entryId ||
-      !Array.isArray(s.delivery.slots) || !s.delivery.slots.length ||
-      s.delivery.slots.some((slot, i) => !integer(slot) || slot < s.firstSlot || slot > s.through ||
-        (slot - s.firstSlot) % HALF_HOUR !== 0 || slot > s.delivery!.at || s.due.includes(slot) ||
-        (i > 0 && slot <= s.delivery!.slots[i - 1])) ||
-      !integer(s.delivery.at) || !integer(s.delivery.lateByMs))) throw new Error("Malformed delivery receipt");
   if (!s.adoptions && s.generation !== 1) throw new Error("Malformed adoption history");
   if (s.adoptions !== undefined) {
     const identities = new Set<string>();
@@ -439,11 +457,19 @@ export class PlanningSessionClock {
     const candidate = revoked.candidate && sameOwner(revoked.candidate.owner, state.owner) &&
       revoked.candidate.firstSlot === state.firstSlot ? revoked.candidate : undefined;
     const due = [...new Set([...state.due, ...(candidate?.due ?? []), ...(revoked.due ?? [])])].sort((a, b) => a - b);
-    const delivery = state.delivery?.slots.some((slot) => due.includes(slot)) ? undefined : state.delivery;
+    const candidateObservations = candidate?.observations ?? (candidate?.observation ? [candidate.observation] : []);
+    const stateObservations = state.observations ?? (state.observation ? [state.observation] : []);
+    const observations = candidateObservations.length >= stateObservations.length ? candidateObservations : stateObservations;
+    const candidateDeliveries = candidate?.deliveries ?? (candidate?.delivery ? [candidate.delivery] : []);
+    const stateDeliveries = state.deliveries ?? (state.delivery ? [state.delivery] : []);
+    const deliveries = (candidateDeliveries.length >= stateDeliveries.length ? candidateDeliveries : stateDeliveries)
+      .filter((receipt) => !receipt.slots.some((slot) => due.includes(slot)));
     const through = Math.max(state.through, candidate?.through ?? state.through, ...(due.length ? due : [state.through]));
-    const observation = candidate?.observation && candidate.through >= state.through ? candidate.observation : state.observation;
+    const observation = observations.at(-1);
+    const delivery = deliveries.at(-1);
     if (!stored || !state.stopped || revoked.due?.length || candidate?.through !== state.through) {
-      this.store.write({ ...state, through, due, delivery, observation, stopped: revoked.reason }, stored ?? null,
+      this.store.write({ ...state, through, due, delivery, deliveries: deliveries.length ? deliveries : undefined,
+        observation, observations: observations.length ? observations : undefined, stopped: revoked.reason }, stored ?? null,
         () => this.io.ownsMain?.() ?? this.io.valid());
     }
     this.revocations.delete(key);
@@ -556,7 +582,9 @@ export class PlanningSessionClock {
       if (key !== ownerKey(candidate.owner) || evidence.adoptedGeneration !== undefined ||
           (evidence.candidate && JSON.stringify(evidence.candidate) !== JSON.stringify(candidate) &&
             JSON.stringify(evidence.candidate) !== JSON.stringify(canonical)) ||
-          (evidence.due ?? []).some((slot) => !candidate.due.includes(slot) && !candidate.delivery?.slots.includes(slot))) {
+          (evidence.due ?? []).some((slot) => !candidate.due.includes(slot) &&
+            !(candidate.deliveries ?? (candidate.delivery ? [candidate.delivery] : []))
+              .some((receipt) => receipt.slots.includes(slot)))) {
         throw new Error("Unresolved planning evidence is not represented by the durable candidate");
       }
       keys.push(key);
@@ -586,6 +614,16 @@ export class PlanningSessionClock {
   adopt(firstSlot: number): void {
     if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may adopt planning updates");
     this.transaction(() => {
+      let settledJournal = false;
+      const recovery = this.store.recovery?.();
+      if (recovery && recovery.phase !== "pending") {
+        if (!this.store.reconcile) throw new Error("Planning store does not support durable commit recovery");
+        if (recovery.candidate.firstSlot !== firstSlot) throw new Error("Planning adoption anchor does not match the ledger");
+        if (recovery.candidate.stopped) throw new Error("Stopped planning schedules cannot be adopted");
+        this.store.reconcile(() => this.io.valid(), recovery.operationId, recovery.candidate.owner,
+          (candidate, canonical) => { this.representedEvidence(candidate, canonical); });
+        settledJournal = true;
+      }
       const pending = this.store.pending?.(() => this.io.valid());
       const durable = this.store.read(() => this.io.valid());
       const prior = pending ?? durable;
@@ -597,13 +635,15 @@ export class PlanningSessionClock {
       if (sameOwner(prior.owner, this.owner)) {
         if (!pending) {
           const receipt = prior.adoptions?.at(-1);
-          if (!receipt || !sameOwner(receipt.successorOwner, this.owner) || represented.length) {
+          if (!settledJournal && (!receipt || !sameOwner(receipt.successorOwner, this.owner) || represented.length)) {
             throw new Error("Current-owner planning schedules cannot be adopted");
           }
+          for (const key of represented) this.revocations.delete(key);
+          this.lastState = prior;
           this.resume();
+          if (!prior.stopped && prior.due.length) this.io.wake([...prior.due]);
           return;
         }
-        // A same-owner retry applies the exact candidate, not a fictitious transfer.
       } else {
         const receipt: AdoptionReceipt = { formerOwner: prior.owner, successorOwner: this.owner, at: this.io.now(),
           priorGeneration: prior.generation, resultingGeneration: prior.generation + 1,
@@ -669,7 +709,9 @@ export class PlanningSessionClock {
       if (!this.active) return;
       if (!this.io.valid()) { this.ownershipLost(); return; }
       const due = result === "online" ? [...state.due, slot] : state.due;
-      const candidate: SlotState = { ...state, through: slot, due, observation: { slot, result } };
+      const observation: ObservationReceipt = { slot, result };
+      const observations = [...(state.observations ?? (state.observation ? [state.observation] : [])), observation];
+      const candidate: SlotState = { ...state, through: slot, due, observation, observations };
       this.rememberFailure(due, candidate);
       this.store.write(candidate, state, () => this.io.valid());
       this.revocations.delete(ownerKey(this.owner));
@@ -709,14 +751,16 @@ export class PlanningSessionClock {
     let retained: number[] = [];
     try {
       const state = this.active ? this.current() : undefined;
-      if (!state || !sameOwner(claim.owner, this.owner) || !entryId || state.delivery?.entryId === entryId) return false;
+      if (!state || !sameOwner(claim.owner, this.owner) || !entryId ||
+          (state.deliveries ?? (state.delivery ? [state.delivery] : [])).some((receipt) => receipt.entryId === entryId)) return false;
       const slots = claim.slots.filter((slot) => state.due.includes(slot));
       if (!slots.length) return false;
       retained = slots;
       const at = this.io.now();
       if (slots.some((slot) => slot > at)) return false;
-      const candidate = { ...state, due: state.due.filter((slot) => !slots.includes(slot)),
-        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } };
+      const delivery: DeliveryReceipt = { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) };
+      const deliveries = [...(state.deliveries ?? (state.delivery ? [state.delivery] : [])), delivery];
+      const candidate = { ...state, due: state.due.filter((slot) => !slots.includes(slot)), delivery, deliveries };
       this.rememberFailure(slots, candidate);
       this.store.write(candidate, state, () => this.io.valid());
       this.revocations.delete(ownerKey(this.owner));
@@ -1062,6 +1106,8 @@ export function completePlanningTables(text: string, claimedSlots: number[] = []
       if (atxHeading(visible[i]) === name) headings.push({ line: i, end: i });
       else if (new RegExp(`^ {0,3}${name}[ \\t]*$`).test(visible[i]) && /^ {0,3}(?:=+|-+)[ \t]*$/.test(visible[i + 1] ?? "")) {
         headings.push({ line: i, end: i + 1 });
+      } else if (new RegExp(`^ {0,3}${name}[ \\t]*$`).test(visible[i])) {
+        headings.push({ line: i, end: i });
       }
     }
     if (headings.length !== 1) return false;

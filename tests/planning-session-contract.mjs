@@ -58,6 +58,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(clock.deliver(claim, 'assistant-one'), false);
     assert.equal(clock.deliver(clock.claim(), 'assistant-two'), true);
     assert.deepEqual(store.read().due, []);
+    assert.deepEqual(store.read().observations.map(receipt => receipt.slot), [first, first + HALF_HOUR]);
+    assert.deepEqual(store.read().deliveries.map(receipt => receipt.entryId), ['assistant-one', 'assistant-two']);
+    assert.deepEqual(store.read().deliveries[0].slots, [first], 'S1 delivery remains after S2 is delivered');
     console.log('ok - Hong Kong 16:30 alignment, 30-minute boundaries, durable dedup, reload and pre-response delivery');
 
     wifi = 'offline'; fire(first + 2 * HALF_HOUR);
@@ -147,8 +150,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const transferredStore = fileStore(transferredPath);
     const transferOwnerA = { ...owner, sessionId: 'transfer-a' };
     const transferOwnerB = { ...owner, sessionId: 'transfer-b' };
+    const transferredObservation = { slot: old.through, result: 'online' };
     const transferredLedger = { ...old, owner: transferOwnerA, due: [old.through], stopped: undefined,
-      observation: { slot: old.through, result: 'online' } };
+      observation: transferredObservation,
+      observations: [...old.observations.slice(0, -1), transferredObservation] };
     transferredStore.write(transferredLedger, null);
     const persistedTransferredLedger = transferredStore.read();
     let authoritativeOwner = 'a';
@@ -208,8 +213,11 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
 
     const processTransferPath = join(lab, 'process-transfer.json');
     const processTransferStore = fileStore(processTransferPath);
-    const processTransfer = { ...persistedTransferredLedger,
-      due: [persistedTransferredLedger.through - HALF_HOUR, persistedTransferredLedger.through], delivery: undefined };
+    const processTransferSlots = [persistedTransferredLedger.through - HALF_HOUR, persistedTransferredLedger.through];
+    const processTransferObservations = persistedTransferredLedger.observations.map(receipt =>
+      processTransferSlots.includes(receipt.slot) ? { slot: receipt.slot, result: 'online' } : receipt);
+    const processTransfer = { ...persistedTransferredLedger, due: processTransferSlots, delivery: undefined,
+      observation: processTransferObservations.at(-1), observations: processTransferObservations };
     processTransferStore.write(processTransfer, null);
     const adoptionProcess = spawnSync(process.execPath,
       [join(process.cwd(), 'tests/planning-adoption-child.mjs'), processTransferPath, join(lab, 'adopter.jsonl')],
@@ -232,26 +240,30 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.match(failedCandidateProcess.stdout, /injected candidate failure/);
     assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
     assert.equal(existsSync(`${journalTransferPath}.recovery.json`), true);
-    const blockedAdoptionProcess = spawnSync(process.execPath,
-      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'blocked-adopter.jsonl')],
-      { encoding: 'utf8' });
-    assert.notEqual(blockedAdoptionProcess.status, 0);
-    assert.match(blockedAdoptionProcess.stderr, /explicit recover-commit/);
-    assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
-    const recoveryOperation = JSON.parse(readFileSync(`${journalTransferPath}.recovery.json`, 'utf8')).operationId;
-    const abortedRecovery = spawnSync(process.execPath,
+    const recoveryRecord = JSON.parse(readFileSync(`${journalTransferPath}.recovery.json`, 'utf8'));
+    const recoveryOperation = recoveryRecord.operationId;
+    const rejectedRecovery = spawnSync(process.execPath,
       [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'recoverer.jsonl'),
         'recovering-main', 'recover', recoveryOperation], { encoding: 'utf8' });
-    assert.equal(abortedRecovery.status, 0, abortedRecovery.stderr);
-    assert.match(abortedRecovery.stdout, /another owner/);
+    assert.equal(rejectedRecovery.status, 0, rejectedRecovery.stderr);
+    assert.match(rejectedRecovery.stdout, /another owner/);
     assert.deepEqual(readFileSync(journalTransferPath), journalOriginalBytes);
     assert.equal(existsSync(`${journalTransferPath}.recovery.json`), true,
-      'a successor cannot retire the former process recovery journal');
+      'a successor cannot retire the former process recovery journal through recover-commit');
+    const successorAdoption = spawnSync(process.execPath,
+      [join(process.cwd(), 'tests/planning-adoption-child.mjs'), journalTransferPath, join(lab, 'successor-adopter.jsonl')],
+      { encoding: 'utf8' });
+    assert.equal(successorAdoption.status, 0, successorAdoption.stderr);
+    const successorState = JSON.parse(successorAdoption.stdout);
+    assert.deepEqual(successorState.due, recoveryRecord.candidate.due);
+    assert.equal(successorState.generation, persistedTransferredLedger.generation + 1);
+    assert.equal(existsSync(`${journalTransferPath}.recovery.json`), false);
     assert.equal(existsSync(`${journalTransferPath}.pending-recovery.json`), false);
 
     const emptyTransferStore = fileStore(join(lab, 'empty-transfer.json'));
-    const emptyTransfer = { ...persistedTransferredLedger, due: [], delivery: undefined,
-      observation: { slot: persistedTransferredLedger.through, result: 'unknown' } };
+    const emptyObservation = { slot: persistedTransferredLedger.through, result: 'unknown' };
+    const emptyTransfer = { ...persistedTransferredLedger, due: [], delivery: undefined, deliveries: undefined,
+      observation: emptyObservation, observations: [emptyObservation] };
     emptyTransferStore.write(emptyTransfer, null);
     const emptyAdopter = new PlanningSessionClock(transferOwnerB, emptyTransferStore,
       { ...io, valid: () => true, ownsMain: () => true });
@@ -303,6 +315,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const setextTables = tables.replace('## Ideas', 'Ideas\n=====').replace('## To-do list', 'To-do list\n---')
       .replace('## Recently completed', 'Recently completed\n=====');
     assert.equal(completePlanningTables(setextTables), true);
+    const plainTables = tables.replace('## Ideas', 'Ideas').replace('## To-do list', 'To-do list')
+      .replace('## Recently completed', 'Recently completed');
+    assert.equal(completePlanningTables(plainTables), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
     assert.equal(completePlanningTables(tables.replace('| Idea | No material change | Review later | No |',
       `| Idea | No material change | Review later | No${"\\".repeat(2)}|`)), true);
@@ -692,7 +707,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     storageFails = false; commitBeforeFailure = false; deliveryReload.resume();
     assert.equal(callback, undefined); assert.equal(failureState.stopped, 'ownership-lost');
     assert.deepEqual(failureState.due, [old.through], 'recovery restores every unproved delivery slot');
-    assert.equal(failureState.delivery, undefined);
+    assert.equal(failureState.delivery.entryId, 'assistant-three');
+    assert.deepEqual(failureState.deliveries.map(receipt => receipt.entryId),
+      ['assistant-one', 'assistant-two', 'assistant-three'], 'recovery removes only the unproved delivery receipt');
     deliveryReload.start(first); assert.ok(callback); deliveryReload.dispose();
 
     failureState = { ...old, stopped: undefined }; storageFails = true;

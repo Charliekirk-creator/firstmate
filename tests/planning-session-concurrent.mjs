@@ -254,10 +254,16 @@ try {
     const retained = f.artifacts();
     f.A.child.kill('SIGKILL');
     ok(await publication.result());
-    assert.match((await f.B.call('recover', { operationId: f.journal().operationId })).error, /another owner/);
+    const operationId = f.journal().operationId;
+    assert.match((await f.B.call('recover', { operationId })).error, /another owner/);
     assert.deepEqual(f.artifacts(), retained);
+    ok(await f.B.call('adopt'));
+    assert.equal(f.state().owner.pid, f.B.child.pid);
+    assert.equal(f.state().generation, 2);
+    assert.deepEqual(f.state().due, [first]);
+    assert.equal(existsSync(`${f.ledger}.recovery.json`), false);
     assert.equal(existsSync(join(f.directory, '.lock.acquire')), false, 'parent pipe EOF releases its exact lock');
-    await f.close(); console.log('ok - abrupt parent death releases broker and preserves foreign uncertain commit');
+    await f.close(); console.log('ok - abrupt parent death releases broker and explicit successor adoption settles recovery');
   }
   // Broker death before rename must abort the caller, not let it write without
   // the lock. Canonical recovery handles primary and nested steal orphans.
