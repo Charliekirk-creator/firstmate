@@ -526,10 +526,11 @@ export function completePlanningTables(text: string): boolean {
       const decodedStyle = encodedStyle === undefined ? "" : decodeHtmlAttribute(encodedStyle);
       const declarations = (decodedStyle ?? "").replace(/\/\*[\s\S]*?\*\//g, "")
         .split(";").map((part) => part.trim().toLowerCase());
-      const styleHidden = decodedStyle === undefined || declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!important)?$/.test(part));
+      const styleHidden = decodedStyle === undefined || decodedStyle.includes("\\") ||
+        declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!important)?$/.test(part));
       const hidden = /(?:^|\s)(?:hidden(?=\s|=|\/?>)|aria-hidden\s*=\s*(?:"true"|'true'|true)(?=\s|\/?>))/i.test(match[0]);
-      const closedDetails = name === "details" && !/(?:^|\s)open(?=\s|=|\/?>)/i.test(match[0]);
-      stack.push({ name, start, hidden: parentHidden || hidden || styleHidden || closedDetails || intrinsicallyHidden.has(name) });
+      const closedDisclosure = (name === "details" || name === "dialog") && !/(?:^|\s)open(?=\s|=|\/?>)/i.test(match[0]);
+      stack.push({ name, start, hidden: parentHidden || hidden || styleHidden || closedDisclosure || intrinsicallyHidden.has(name) });
     }
   }
   for (const opening of stack) if (opening.hidden) hide(opening.start, joined.length);

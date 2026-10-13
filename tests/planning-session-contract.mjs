@@ -133,6 +133,8 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('<div style="color: red">\ncontext\n\n' + tables), true);
     assert.equal(completePlanningTables('<details open>\n<summary>Planning</summary>\n\n' + tables + '\n</details>'), true);
     assert.equal(completePlanningTables('<details OPEN="false">\n<summary>Planning</summary>\n\n' + tables + '\n</details>'), true);
+    assert.equal(completePlanningTables('<dialog open>\ncontext\n\n' + tables + '\n</dialog>'), true);
+    assert.equal(completePlanningTables('<dialog OPEN="false">\ncontext\n\n' + tables + '\n</dialog>'), true);
     const tabAtxTables = tables.replace('## Ideas', '##\tIdeas').replace('## To-do list', '###\tTo-do list ###')
       .replace('## Recently completed', '#\tRecently completed\t####');
     assert.equal(completePlanningTables(tabAtxTables), true);
@@ -162,7 +164,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '<div style="display&#x3A;none">\ncontext\n\n' + tables,
       '<div style="display&colon;none&semi;color:red">\ncontext\n\n' + tables,
       '<div style="display&unknown;none">\ncontext\n\n' + tables,
+      '<div style="display:\\6e one">\ncontext\n\n' + tables,
+      '<div style="d\\69 splay:none">\ncontext\n\n' + tables,
       '<details>\n<summary>Planning</summary>\n\n' + tables + '\n</details>',
+      '<dialog>\ncontext\n\n' + tables + '\n</dialog>',
       '<section\n hidden>\n' + tables + '\n</section\n>',
       '<article\n aria-hidden="true">\n' + tables + '\n</article\n>',
       '<![CDATA[\n' + tables + '\n]]>', '```html\n<section hidden>\n' + tables + '\n</section>\n```']) assert.equal(completePlanningTables(text), false);

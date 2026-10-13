@@ -218,8 +218,13 @@ await session.prompt(`/planning-session start ${incompatibleIso}`, { source: 'rp
 assert.equal(state().stopped, 'ledger-failure'); assert.deepEqual(state().due, [deliveryFailureSlot]);
 output = 'Captain, retained work pending.';
 const recoveryRequests = requests;
+const recoverySettled = new Promise(resolve => {
+  const unsubscribe = session.subscribe(event => {
+    if (event.type === 'agent_settled') { unsubscribe(); resolve(); }
+  });
+});
 await session.prompt(`/planning-session start ${recoveryIso}`, { source: 'rpc' });
-await session.waitForIdle();
+await recoverySettled; await session.waitForIdle();
 assert.equal(requests, recoveryRequests + 1, 'compatible explicit restart immediately wakes retained due work');
 assert.deepEqual(state().due, [deliveryFailureSlot], 'incomplete recovery follow-up preserves due work');
 await session.prompt(`/planning-session start ${recoveryIso}`, { source: 'rpc' });
