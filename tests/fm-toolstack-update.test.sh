@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Executable behavior tests for the toolstack-update proposal helper.
 # Only selected synthetic observations enter its stdin interface. An audit
-# launcher rejects tool execution, network calls, and reads of the fixture home,
+# hook rejects tool execution, network calls, and reads of the fixture home,
 # even for a valid prepared proposal. No real installation/session is inspected.
 # An optional installed-Pi pure skill-loader check validates metadata/scope;
 # it never creates an agent/session, loads extensions, or makes a model call.

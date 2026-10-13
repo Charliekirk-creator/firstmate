@@ -96,8 +96,10 @@ It is a **non-executing consistency check**, not an independent authorization so
 Unknown/mismatched evidence, altered commands, stale or batch approvals, changed pins/declarations, and active or unknown affected work refuse preparation.
 Do not spoof or weaken its checkpoint to obtain a command.
 
-If a supported native owner uses any moving selector, immediately re-resolve it through that owner before action. This includes unpinned selectors and every mutable npm dist-tag, such as `latest` and `next`.
-Compare the resolved release, integrity and provenance, compatibility, affected set, channel evidence, and exact proposed command with the approved proposal. Any difference invalidates the old approval and requires a renewed complete proposal and individual approval; an unchanged selector string never authorizes a later resolved release.
+If a supported native owner uses any moving selector, immediately re-resolve it through that owner before action.
+This includes unpinned selectors and every mutable npm dist-tag, such as `latest` and `next`.
+Compare the resolved release, integrity and provenance, compatibility, affected set, channel evidence, and exact proposed command with the approved proposal.
+Any difference invalidates the old approval and requires a renewed complete proposal and individual approval; an unchanged selector string never authorizes a later resolved release.
 When a fixed-version guarantee is required and that owner cannot provide it, stop and obtain approval for its documented exact-version route, if any; do not pin, migrate channels, invent flags, or silently substitute installers.
 
 ## Active work and existing owners
@@ -118,7 +120,10 @@ For other targets, use only the inspected tool's supported owner command.
 The helper describes reviewed common owners and refuses unknown ones instead of guessing.
 Load current owner help before action and preserve the selected source, scope, pins, and installation method.
 `tasks-axi update` edits a task, not the CLI; do not use it as a self-updater.
-A pinned Pi package stays pinned; project package operations require proven project-only owner isolation, not the assumption that a personal operation is project-local.
+Exact-version Pi packages stay pinned, while unsupported range, Git, local, and project-only resource routes defer to their existing owner.
+For a supported user package, preserve the exact `pi update <source> --no-approve` route and its explicit untrusted-project override, which clears effective project settings rather than changing trust.
+Its affected set includes every matching user-scope resource and each project `autoload:false` filter delta that consumes or changes exposure of that user installation, but excludes independently installed project declarations.
+If those effects, trust semantics, isolation, enumeration, or ownership cannot be proved, defer rather than preparing the action.
 Locally maintained extensions, skills, and templates need their actual source owner's separately reviewed change, not a package-manager sweep.
 No blanket package-manager updates, all-package Pi updates, all-skill pulls, or channel switches are permitted.
 
