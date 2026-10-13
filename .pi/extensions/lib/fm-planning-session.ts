@@ -599,7 +599,7 @@ function markdownLineFacts(source: string, activeList = false, activeParagraph =
 
 function visibleMarkdownLines(lines: string[]): string[] {
   type ContainerFrame = { kind: "quote" } |
-    { kind: "list"; startColumn: number; contentColumn: number; marker: string };
+    { kind: "list"; startColumn: number; contentColumn: number; continuationOffset: number; marker: string };
   type Fence = { marker: string; containers: ContainerFrame[] };
   type Cursor = { index: number; column: number };
   let fence: Fence | undefined;
@@ -624,7 +624,8 @@ function visibleMarkdownLines(lines: string[]): string[] {
       if (!item) break;
       const startColumn = cursor.column;
       advance(cursor, item[0]);
-      containers.push({ kind: "list", startColumn, contentColumn: cursor.column, marker: item[1] });
+      containers.push({ kind: "list", startColumn, contentColumn: cursor.column,
+        continuationOffset: cursor.column - startColumn, marker: item[1] });
     }
     return { content: line.slice(cursor.index), containers };
   };
@@ -636,9 +637,10 @@ function visibleMarkdownLines(lines: string[]): string[] {
         if (!quote) return undefined;
         advance(cursor, quote[0]);
       } else {
-        while (cursor.index < line.length && cursor.column < frame.contentColumn &&
+        const requiredColumn = cursor.column + frame.continuationOffset;
+        while (cursor.index < line.length && cursor.column < requiredColumn &&
           (line[cursor.index] === " " || line[cursor.index] === "\t")) advance(cursor, line[cursor.index]);
-        if (cursor.column < frame.contentColumn) {
+        if (cursor.column < requiredColumn) {
           if (!line.slice(cursor.index).trim()) return "";
           return undefined;
         }

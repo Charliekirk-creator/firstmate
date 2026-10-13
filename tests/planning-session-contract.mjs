@@ -324,6 +324,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '10. ```\n    Late update for: hidden code\n    ```',
       '- - ````\n    Late update for: hidden code\n    ````',
       '>  - ```\n>    Late update for: hidden code\n>    ```',
+      '> - ```\n >   Late update for: hidden code\n >   ```',
+      '> - ```\n  >   Late update for: hidden code\n  >    ```',
+      '> - ```\n   >   Late update for: hidden code\n   >   ```',
+      '> -\t~~~\n >  \tLate update for: hidden code\n >  \t~~~',
     ]) assert.equal(completePlanningTables(lateDisclosure([first]) + '\n\n' + fenced + '\n' + tables,
       [first], first + 1), true, fenced);
     assert.equal(completePlanningTables(lateDisclosure([first]) +
@@ -338,6 +342,11 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '10. ```\n   Late update for: another slot.\n    ```',
       '- - ````\n   Late update for: another slot.\n    ````',
       '>  - ```\n>   Late update for: another slot.\n>    ```',
+      '> - ```\n >  Late update for: another slot.\n >   ```',
+      '> - ```\n  >  Late update for: another slot.\n  >   ```',
+      '> - ```\n   >  Late update for: another slot.\n   >   ```',
+      '> 10. ~~~\n >    Late update for: another slot.\n >     ~~~',
+      '> -\t~~~\n >\tLate update for: another slot.\n > \t~~~',
       '1. ~~~\n Late update for: another slot.\n   ~~~',
       '- ```\n\nLate update for: another slot.\n  ```',
       '- > ```\nLate update for: another slot.\n > ```',
