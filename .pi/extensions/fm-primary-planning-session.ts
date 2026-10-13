@@ -131,6 +131,8 @@ export default function (pi: ExtensionAPI) {
       now: Date.now,
       valid: () => live && instances.get(key) === lifecycle && !!ctx && main(ctx) &&
         ctx.sessionManager.getSessionId() === owner.sessionId && ctx.sessionManager.getSessionFile() === owner.sessionFile,
+      ownsMain: () => !!ctx && main(ctx) && ctx.sessionManager.getSessionId() === owner.sessionId &&
+        ctx.sessionManager.getSessionFile() === owner.sessionFile,
       wifi: macWifi,
       later(callback, delay) {
         const timer = setTimeout(callback, delay);
@@ -145,7 +147,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.registerCommand("planning-session", {
-    description: "Explicitly start this Main session's half-hour planning slots: start <Hong-Kong ISO time>, status, or stop",
+    description: "Start the authorized Main planning schedule, report status, or stop it",
     handler: async (args, context) => {
       try {
         if (!main(context)) {
@@ -164,7 +166,7 @@ export default function (pi: ExtensionAPI) {
           const { armed, state } = clock!.status();
           context.ui.notify(JSON.stringify({ armed,
             nextSlot: armed && state ? state.through + HALF_HOUR : null, ledger: state ?? null }), "info");
-        } else throw new Error("Usage: /planning-session start YYYY-MM-DDTHH:MM:00+08:00 | status | stop");
+        } else throw new Error("Usage: /planning-session start 2026-10-12T16:30:00+08:00 | status | stop");
       } catch (problem) {
         context.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");
       }

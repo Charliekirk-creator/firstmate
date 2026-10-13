@@ -25,14 +25,16 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
   try {
     const first = parseFirstSlot('2026-10-12T16:30:00+08:00');
     assert.equal(new Date(first).toISOString(), '2026-10-12T08:30:00.000Z');
-    for (const bad of ['2026-10-12T16:31:00+08:00', '2026-02-30T16:30:00+08:00', '2026-10-12T16:30:00Z', 'garbage']) {
+    for (const bad of ['2026-10-12T16:00:00+08:00', '2026-10-12T17:00:00+08:00',
+      '2026-10-13T16:30:00+08:00', '2026-10-12T16:31:00+08:00', '2026-02-30T16:30:00+08:00',
+      '2026-10-12T16:30:00Z', '2026-10-12T16:30:00+09:00', 'garbage']) {
       assert.throws(() => parseFirstSlot(bad));
     }
     const owner = { sessionId: 'main-a', sessionFile: join(lab, 'session.jsonl'), pid: process.pid, processStart: 100 };
     let now = first - 20 * 60000, valid = true, wifi = 'online', callback, delay, samples = 0;
     const wakes = [], errors = [];
     const store = fileStore(join(lab, 'slots.json'));
-    const io = { now: () => now, valid: () => valid, wifi: () => { samples++; return wifi; },
+    const io = { now: () => now, valid: () => valid, ownsMain: () => true, wifi: () => { samples++; return wifi; },
       later(fn, ms) { callback = fn; delay = ms; return () => { if (callback === fn) callback = undefined; }; },
       wake(slots) { wakes.push([...slots]); }, error(error) { errors.push(String(error)); } };
     const fire = (time) => { now = time; const fn = callback; assert.ok(fn); callback = undefined; fn(); };
@@ -135,11 +137,33 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const freshClock = new PlanningSessionClock(freshOwner, sharedStore, io, new Map());
     freshClock.start(first);
     const freshSchedule = structuredClone(sharedState);
-    valid = false; staleClock.ownershipLost();
+    valid = false;
+    assert.throws(() => staleClock.ownershipLost(), /owner changed before revocation recovery/);
     assert.deepEqual(sharedState, freshSchedule, 'late stale revocation cannot stop the fresh owner');
-    assert.equal(staleRevocations.size, 0);
+    assert.equal(staleRevocations.size, 1, 'stale recovery evidence remains available for explicit resolution');
     freshClock.dispose(); valid = true;
-    console.log('ok - failed ownership revocation survives reload, respects a fresh owner and requires explicit restart');
+
+    const transferredPath = join(lab, 'transferred-revocation.json');
+    const transferredStore = fileStore(transferredPath);
+    const transferOwnerA = { ...owner, sessionId: 'transfer-a' };
+    const transferOwnerB = { ...owner, sessionId: 'transfer-b' };
+    const transferredLedger = { ...old, owner: transferOwnerA, due: [old.through], stopped: undefined };
+    transferredStore.write(transferredLedger, null);
+    const persistedTransferredLedger = transferredStore.read();
+    let authoritativeOwner = 'a';
+    const transferRevocations = new Map();
+    const transferredA = new PlanningSessionClock(transferOwnerA, transferredStore,
+      { ...io, valid: () => authoritativeOwner === 'a', ownsMain: () => authoritativeOwner === 'a' }, transferRevocations);
+    transferredA.resume(); authoritativeOwner = 'b';
+    assert.throws(() => transferredA.ownershipLost(), /Main ownership changed before the transaction/);
+    assert.deepEqual(transferredStore.read(), persistedTransferredLedger, 'revocation after transfer preserves the owner ledger');
+    assert.equal(transferRevocations.size, 1);
+    const transferredB = new PlanningSessionClock(transferOwnerB, transferredStore,
+      { ...io, valid: () => authoritativeOwner === 'b', ownsMain: () => authoritativeOwner === 'b' });
+    assert.throws(() => transferredB.start(first), /retained planning slots/);
+    assert.deepEqual(transferredStore.read(), persistedTransferredLedger, 'new owner must explicitly resolve retained foreign work');
+    transferredA.dispose(); transferredB.dispose();
+    console.log('ok - failed ownership revocation survives reload, preserves transferred work and requires explicit recovery');
 
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
@@ -605,10 +629,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const transition = new PlanningSessionClock(owner, transitionStore, io, transitionFailures);
     assert.throws(() => transition.start(first), /transition read failed/);
     transitionReadFails = false;
-    const transitionStatus = transition.status();
-    assert.equal(transitionStatus.armed, false); assert.equal(transitionStatus.state.stopped, undefined);
-    assert.deepEqual(transitionState.due, [old.through]); assert.equal(transitionFailures.size, 0);
-    assert.throws(() => transition.start(first), /retained planning slots/);
+    assert.throws(() => transition.status(), /owner changed before revocation recovery/);
+    assert.deepEqual(transitionState.due, [old.through]); assert.equal(transitionFailures.size, 1);
+    assert.throws(() => transition.start(first), /owner changed before revocation recovery/);
     console.log('ok - boundary, delivery, stop and start failures retain work and require explicit recovery');
 
     for (const path of ['resume', 'claim', 'isArmed', 'status']) {

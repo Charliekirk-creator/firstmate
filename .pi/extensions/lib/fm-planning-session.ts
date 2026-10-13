@@ -31,14 +31,10 @@ export type Revocations = Map<string, {
 }>;
 
 export function parseFirstSlot(value: string): number {
-  if (!/^\d{4}-\d\d-\d\dT\d\d:(00|30):00\+08:00$/.test(value)) {
-    throw new Error("Use an aligned Asia/Hong_Kong time, for example YYYY-MM-DDT16:30:00+08:00");
+  if (value !== "2026-10-12T16:30:00+08:00") {
+    throw new Error("Use the authorized first slot 2026-10-12T16:30:00+08:00");
   }
-  const time = Date.parse(value);
-  if (!integer(time) || new Date(time + 8 * 3600000).toISOString().slice(0, 19) !== value.slice(0, 19)) {
-    throw new Error("Invalid first slot");
-  }
-  return time;
+  return Date.parse(value);
 }
 
 export function validateState(value: unknown): SlotState {
@@ -203,6 +199,7 @@ export class PlanningWakeGate {
 export type ClockIO = {
   now(): number;
   valid(): boolean;
+  ownsMain?(): boolean;
   wifi(): "online" | "offline" | "unknown";
   later(callback: () => void, delay: number): () => void;
   wake(slots: number[]): void;
@@ -235,9 +232,7 @@ export class PlanningSessionClock {
       if (transition.due?.length || transition.candidate?.due.length) {
         throw new Error("Cannot transfer retained planning slots between ledger owners");
       }
-      this.revocations.delete(ownerKey(transition.owner));
-      if (sameOwner(transition.owner, this.owner)) this.ownsSchedule = false;
-      return false;
+      throw new Error("Planning ledger owner changed before revocation recovery");
     }
     const state = stored ?? revoked?.candidate;
     if (!state || !revoked || !sameOwner(revoked.owner, state.owner)) {
@@ -251,7 +246,8 @@ export class PlanningSessionClock {
     const through = Math.max(state.through, candidate?.through ?? state.through, ...(due.length ? due : [state.through]));
     const observation = candidate?.observation && candidate.through >= state.through ? candidate.observation : state.observation;
     if (!stored || !state.stopped || revoked.due?.length || candidate?.through !== state.through) {
-      this.store.write({ ...state, through, due, delivery, observation, stopped: revoked.reason }, stored ?? null);
+      this.store.write({ ...state, through, due, delivery, observation, stopped: revoked.reason }, stored ?? null,
+        () => this.io.ownsMain?.() ?? this.io.valid());
     }
     this.revocations.delete(key);
     if (sameOwner(state.owner, this.owner)) this.ownsSchedule = false;

@@ -46,8 +46,8 @@ Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, whil
 
 ## Session-only planning slots (state/planning-session.json)
 
-The Pi extension `.pi/extensions/fm-primary-planning-session.ts` is inert until an operator explicitly invokes `/planning-session start YYYY-MM-DDTHH:MM:00+08:00` in lock-owning Main with persistent conversation history.
-The supplied first boundary must be at `:00` or `:30` in Asia/Hong_Kong; subsequent boundaries are thirty minutes apart, not thirty minutes after the last response.
+The Pi extension `.pi/extensions/fm-primary-planning-session.ts` is inert until an operator explicitly invokes `/planning-session start 2026-10-12T16:30:00+08:00` in lock-owning Main with persistent conversation history.
+That authorized Asia/Hong_Kong boundary is the immutable schedule anchor; subsequent boundaries are thirty minutes apart, not thirty minutes after the last response.
 Starting after a boundary skips its unobserved slot rather than reconstructing past connectivity.
 `/planning-session status` reports the current runtime `armed` flag, next boundary, and durable receipt; `/planning-session stop` ends the schedule for that session.
 Retire any temporary timer through its existing owner before activating this schedule, so two timers do not request the same update.

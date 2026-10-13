@@ -102,7 +102,8 @@ await session.bindExtensions({ mode: 'rpc', uiContext: { notify: (message) => no
   onError: (error) => errors.push(error) });
 assert.equal(existsSync(ledger), false, 'loading the extension is not activation');
 const period = 1800000, future = Math.ceil((Date.now() + 1000) / period) * period;
-const iso = new Date(future + 8 * 3600000).toISOString().slice(0, 19) + '+08:00';
+const iso = '2026-10-12T16:30:00+08:00';
+const anchor = Date.parse(iso);
 process.env.FM_SUPERVISION_ACTOR = 'branch';
 await session.prompt(`/planning-session start ${iso}`, { source: 'rpc' });
 assert.equal(existsSync(ledger), false, 'branch cannot arm the Main timer');
@@ -115,7 +116,7 @@ assert.equal(requests, 0, 'arming and verification are not model turns');
 assert.equal(state().owner.pid, process.pid);
 assert.equal(state().owner.processStart, Math.floor(performance.timeOrigin));
 assert.equal(state().owner.sessionId, session.sessionManager.getSessionId());
-assert.equal(state().firstSlot, future);
+assert.equal(state().firstSlot, anchor);
 assert.deepEqual(state().due, []);
 const readableLedger = readFileSync(ledger);
 writeFileSync(ledger, '{');
@@ -148,7 +149,7 @@ assert.equal(state().stopped, undefined, 'fresh explicit start follows durable r
 // Seed an online observation as the deterministic clock test does; native Pi
 // lifecycle, persistence and delivery remain real. No wall-clock waiting.
 const slot = future - 3 * period;
-writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: slot, through: slot, due: [slot] }));
+writeFileSync(ledger, JSON.stringify({ ...state(), through: slot, due: [slot] }));
 await session.prompt('A partial update', { source: 'rpc' });
 assert.deepEqual(state().due, [slot]);
 assert.ok(JSON.stringify(contexts.at(-1)).includes('message-count cadence is superseded'));
@@ -206,7 +207,7 @@ console.log(`ok - real Pi ${version} failed ownership revocation recovery, expli
 
 const deliveryFailureSlot = slot - period;
 output = `${lateDisclosure([deliveryFailureSlot])}\n\n${tables}`;
-writeFileSync(ledger, JSON.stringify({ ...state(), firstSlot: deliveryFailureSlot, due: [deliveryFailureSlot] }));
+writeFileSync(ledger, JSON.stringify({ ...state(), due: [deliveryFailureSlot] }));
 let deliveryRelease;
 providerGate = new Promise(resolve => { deliveryRelease = resolve; });
 const deliveryArrived = new Promise(resolve => { entered = resolve; });
@@ -222,7 +223,7 @@ assert.deepEqual(state().due, [deliveryFailureSlot]);
 await session.prompt('/planning-session status', { source: 'rpc' });
 assert.equal(JSON.parse(notices.at(-1)).armed, false);
 const incompatibleIso = new Date(future + period + 8 * 3600000).toISOString().slice(0, 19) + '+08:00';
-const recoveryIso = new Date(deliveryFailureSlot + 8 * 3600000).toISOString().slice(0, 19) + '+08:00';
+const recoveryIso = iso;
 await session.prompt(`/planning-session start ${incompatibleIso}`, { source: 'rpc' });
 assert.equal(state().stopped, 'ledger-failure'); assert.deepEqual(state().due, [deliveryFailureSlot]);
 output = 'Captain, retained work pending.';
