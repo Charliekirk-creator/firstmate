@@ -603,6 +603,7 @@ function visibleMarkdownLines(lines: string[]): string[] {
   type Fence = { marker: string; containers: ContainerFrame[] };
   type Cursor = { index: number; column: number };
   let fence: Fence | undefined;
+  let activeListContainers: ContainerFrame[] | undefined;
   const advance = (cursor: Cursor, value: string) => {
     for (const character of value) {
       cursor.column = character === "\t" ? cursor.column + 4 - cursor.column % 4 : cursor.column + 1;
@@ -648,11 +649,10 @@ function visibleMarkdownLines(lines: string[]): string[] {
     }
     return line.slice(cursor.index);
   };
-  const opening = (line: string): Fence | undefined => {
-    const parsed = parseOpeningContainers(line);
-    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(parsed.content);
+  const openingAt = (content: string, containers: ContainerFrame[]): Fence | undefined => {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
     if (!match || match[1][0] === "`" && match[2].includes("`")) return undefined;
-    return { marker: match[1], containers: parsed.containers };
+    return { marker: match[1], containers };
   };
   return lines.map((line) => {
     if (fence) {
@@ -663,9 +663,23 @@ function visibleMarkdownLines(lines: string[]): string[] {
         return "";
       }
       fence = undefined;
+      activeListContainers = undefined;
     }
-    fence = opening(line);
-    return fence ? "" : line;
+    if (activeListContainers) {
+      const inheritedContent = memberContent(line, activeListContainers);
+      if (inheritedContent !== undefined) {
+        fence = openingAt(inheritedContent, activeListContainers);
+        if (fence) return "";
+        if (!line.trim()) return line;
+        return line;
+      }
+      activeListContainers = undefined;
+    }
+    const parsed = parseOpeningContainers(line);
+    fence = openingAt(parsed.content, parsed.containers);
+    if (fence) return "";
+    activeListContainers = parsed.containers.some((frame) => frame.kind === "list") ? parsed.containers : undefined;
+    return line;
   });
 }
 
