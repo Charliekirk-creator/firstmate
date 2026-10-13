@@ -604,6 +604,7 @@ function visibleMarkdownLines(lines: string[]): string[] {
   type Cursor = { index: number; column: number };
   let fence: Fence | undefined;
   let activeListContainers: ContainerFrame[] | undefined;
+  let activeListParagraph = false;
   const advance = (cursor: Cursor, value: string) => {
     for (const character of value) {
       cursor.column = character === "\t" ? cursor.column + 4 - cursor.column % 4 : cursor.column + 1;
@@ -633,24 +634,31 @@ function visibleMarkdownLines(lines: string[]): string[] {
   const matchingPrefix = (line: string, containers: ContainerFrame[]) => {
     const cursor: Cursor = { index: 0, column: 0 };
     let count = 0;
+    let indentationCredit = 0;
     for (const frame of containers) {
       if (frame.kind === "quote") {
         const quote = /^ {0,3}>[ \t]?/.exec(line.slice(cursor.index));
         if (!quote) break;
         advance(cursor, quote[0]);
+        indentationCredit = 0;
       } else {
-        const requiredColumn = cursor.column + frame.continuationOffset;
+        const needed = Math.max(0, frame.continuationOffset - indentationCredit);
+        const requiredColumn = cursor.column + needed;
         while (cursor.index < line.length && cursor.column < requiredColumn &&
           (line[cursor.index] === " " || line[cursor.index] === "\t")) advance(cursor, line[cursor.index]);
         if (cursor.column < requiredColumn) {
           if (!line.slice(cursor.index).trim()) return { count: containers.length, content: "", cursor };
           break;
         }
+        indentationCredit = Math.max(0, indentationCredit - frame.continuationOffset) +
+          Math.max(0, cursor.column - requiredColumn);
       }
       count += 1;
     }
     return { count, content: line.slice(cursor.index), cursor };
   };
+  const lazyParagraph = (line: string) => !!line.trim() && !/^(?:\t| {4})/.test(line) &&
+    !/^ {0,3}(?:#{1,6}(?:[ \t]|$)|`{3,}|~{3,}|(?:[*_-][ \t]*){3,})/.test(line);
   const openingAt = (content: string, containers: ContainerFrame[]): Fence | undefined => {
     const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
     if (!match || match[1][0] === "`" && match[2].includes("`")) return undefined;
@@ -666,22 +674,26 @@ function visibleMarkdownLines(lines: string[]): string[] {
       }
       activeListContainers = fence.containers.slice(0, matched.count);
       if (!activeListContainers.some((frame) => frame.kind === "list")) activeListContainers = undefined;
+      activeListParagraph = false;
       fence = undefined;
     }
     if (activeListContainers) {
       const matched = matchingPrefix(line, activeListContainers);
+      if (matched.count < activeListContainers.length && activeListParagraph && lazyParagraph(line)) return line;
       const retained = activeListContainers.slice(0, matched.count);
       const entered = parseContainers(line, matched.cursor);
       const containers = [...retained, ...entered.containers];
       fence = openingAt(entered.content, containers);
-      if (fence) return "";
+      if (fence) { activeListParagraph = false; return ""; }
       activeListContainers = containers.some((frame) => frame.kind === "list") ? containers : undefined;
+      activeListParagraph = !!activeListContainers && !!entered.content.trim();
       return line;
     }
     const parsed = parseContainers(line);
     fence = openingAt(parsed.content, parsed.containers);
-    if (fence) return "";
+    if (fence) { activeListParagraph = false; return ""; }
     activeListContainers = parsed.containers.some((frame) => frame.kind === "list") ? parsed.containers : undefined;
+    activeListParagraph = !!activeListContainers && !!parsed.content.trim();
     return line;
   });
 }
