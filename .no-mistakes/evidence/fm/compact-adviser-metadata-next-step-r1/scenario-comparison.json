@@ -1,0 +1,41 @@
+{
+  "notice": "Synthetic predeclared comparison only; not evidence of real-world semantic safety or superiority.",
+  "rows": [
+    {
+      "name": "recorded idle checkpoint",
+      "predeclaredCheckpoint": true,
+      "pressureOnly": true,
+      "explicitPolicy": "recorded_checkpoint_opportunity"
+    },
+    {
+      "name": "action still owed",
+      "predeclaredCheckpoint": false,
+      "pressureOnly": true,
+      "explicitPolicy": "pressure_only"
+    },
+    {
+      "name": "record missing",
+      "predeclaredCheckpoint": false,
+      "pressureOnly": true,
+      "explicitPolicy": "pressure_only"
+    },
+    {
+      "name": "action unknown",
+      "predeclaredCheckpoint": false,
+      "pressureOnly": true,
+      "explicitPolicy": "pressure_only"
+    },
+    {
+      "name": "record unknown",
+      "predeclaredCheckpoint": false,
+      "pressureOnly": true,
+      "explicitPolicy": "pressure_only"
+    },
+    {
+      "name": "both unknown",
+      "predeclaredCheckpoint": false,
+      "pressureOnly": true,
+      "explicitPolicy": "pressure_only"
+    }
+  ]
+}

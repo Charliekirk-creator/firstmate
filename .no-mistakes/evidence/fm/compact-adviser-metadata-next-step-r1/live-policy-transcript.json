@@ -1,0 +1,21 @@
+{
+  "interface": "evaluateMetadata",
+  "cases": {
+    "exact_threshold_opportunity": "recorded_checkpoint_opportunity",
+    "above_window_opportunity": "recorded_checkpoint_opportunity",
+    "owed_step_suppresses_checkpoint": "pressure_only",
+    "missing_record_suppresses_checkpoint": "pressure_only",
+    "unknown_fields_suppress_checkpoint": "pressure_only",
+    "stale_declaration_suppresses_checkpoint": "pressure_only",
+    "active_work_is_unavailable": "unavailable",
+    "queued_input_is_unavailable": "unavailable",
+    "unavailable_usage_is_unavailable": "unavailable",
+    "below_threshold": "below_threshold",
+    "extra_key_rejected": "unavailable",
+    "accessor_record_rejected": "unavailable",
+    "null_prototype_record_accepted": "recorded_checkpoint_opportunity",
+    "missing_thresholds_no_defaults": "unavailable"
+  },
+  "accessorTouches": 0,
+  "forbiddenGetterTouches": 0
+}
