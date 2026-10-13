@@ -1,7 +1,8 @@
 // Session-local scheduling and slot receipts. No process, service, or model calls.
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, readlinkSync, renameSync,
+  rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { html5Entities } from "./html5-entities.ts";
 
 export const HALF_HOUR = 30 * 60 * 1000;
@@ -66,7 +67,7 @@ export function fileStore(path: string, operations: {
   write(fd: number, data: string): void;
   sync(fd: number): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
-  const lockPath = `${path}.lock`;
+  const lockPath = resolve(dirname(path), ".lock.acquire");
   const safeParent = () => {
     const stat = lstatSync(dirname(path));
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe planning-session directory");
@@ -90,33 +91,43 @@ export function fileStore(path: string, operations: {
   };
   const locked = <T>(action: () => T): T => {
     safeParent();
-    const token = randomUUID();
-    const evidence = `${JSON.stringify({ version: 1, token, pid: process.pid })}\n`;
+    const ownerDirectory = mkdtempSync(`${lockPath}.owner.`);
+    const ownerPid = resolve(ownerDirectory, "pid");
     let fd: number | undefined;
     let acquired = false;
     try {
-      try { fd = openSync(lockPath, "wx", 0o600); acquired = true; }
+      fd = openSync(ownerPid, "wx", 0o600);
+      writeFileSync(fd, `${process.pid}\n`);
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      try { symlinkSync(ownerDirectory, lockPath); acquired = true; }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Planning ledger lock is busy");
         throw error;
       }
-      writeFileSync(fd, evidence);
-      fsyncSync(fd);
-      closeSync(fd);
-      fd = undefined;
+      if (!lstatSync(lockPath).isSymbolicLink() || readlinkSync(lockPath) !== ownerDirectory ||
+          readFileSync(ownerPid, "utf8") !== `${process.pid}\n`) {
+        throw new Error("Planning ledger lock evidence is missing or corrupt");
+      }
       return action();
     } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch {} }
       if (acquired) {
-        if (fd !== undefined) { try { closeSync(fd); } catch {} }
         let validLock = false;
         try {
-          const stat = lstatSync(lockPath);
-          validLock = stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size <= 4096 &&
-            readFileSync(lockPath, "utf8") === evidence;
+          validLock = lstatSync(lockPath).isSymbolicLink() && readlinkSync(lockPath) === ownerDirectory &&
+            lstatSync(ownerPid).isFile() && !lstatSync(ownerPid).isSymbolicLink() &&
+            readFileSync(ownerPid, "utf8") === `${process.pid}\n`;
         } catch {}
         if (!validLock) throw new Error("Planning ledger lock evidence is missing or corrupt");
         unlinkSync(lockPath);
+        unlinkSync(ownerPid);
+        rmdirSync(ownerDirectory);
         syncDirectory(fsyncSync);
+      } else {
+        try { if (existsSync(ownerPid)) unlinkSync(ownerPid); } catch {}
+        try { rmdirSync(ownerDirectory); } catch {}
       }
     }
   };

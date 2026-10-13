@@ -55,9 +55,51 @@ release_claim_lock() {
 trap release_claim_lock EXIT
 trap 'exit 1' HUP INT TERM
 
+claim_lock_evidence_valid() {
+  local owner pid
+  [ -e "$CLAIM_LOCK" ] || [ -L "$CLAIM_LOCK" ] || return 0
+  [ -L "$CLAIM_LOCK" ] || return 1
+  owner=$(fm_lock_link_owner "$CLAIM_LOCK" 2>/dev/null) || return 1
+  case "$owner" in "$CLAIM_LOCK".owner.*) ;; *) return 1 ;; esac
+  [ -d "$owner" ] && [ ! -L "$owner" ] || return 1
+  pid=$(cat "$owner/pid" 2>/dev/null) || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 1 ]
+}
+
+if ! claim_lock_evidence_valid; then
+  echo "error: session ownership transaction evidence is malformed; operate read-only until resolved" >&2
+  exit 1
+fi
+if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
+  sweep_pid=$(sed -n 's/^pid=//p' "$STATE/.startup-network.status" 2>/dev/null | tail -1)
+  if [ -n "${FM_LOCK_HELD_PID:-}" ] && [ "$FM_LOCK_HELD_PID" = "$sweep_pid" ]; then
+    echo "error: the prior session's bounded startup sweep is finishing; operate read-only until it releases the fleet lock" >&2
+    exit 1
+  fi
+  claim_attempt=1
+  claim_attempts=${FM_SESSION_CLAIM_LOCK_ATTEMPTS:-50}
+  case "$claim_attempts" in ''|*[!0-9]*|0) claim_attempts=50 ;; esac
+  while [ "$claim_attempt" -lt "$claim_attempts" ]; do
+    sleep 0.1
+    if ! claim_lock_evidence_valid; then
+      echo "error: session ownership transaction evidence is malformed; operate read-only until resolved" >&2
+      exit 1
+    fi
+    if fm_lock_try_acquire "$CLAIM_LOCK"; then break; fi
+    claim_attempt=$((claim_attempt + 1))
+  done
+  if [ -z "${FM_LOCK_OWNER_DIR:-}" ]; then
+    echo "error: timed out waiting for the session ownership transaction; operate read-only until resolved" >&2
+    exit 1
+  fi
+fi
+CLAIM_LOCK_HELD=1
+
 if [ -f "$LOCK" ] && [ ! -L "$LOCK" ]; then
   old=$(cat "$LOCK" 2>/dev/null || true)
   if [ "$old" = "$me" ]; then
+    release_claim_lock
     echo "lock acquired: harness pid $me"
     exit 0
   fi
@@ -66,16 +108,6 @@ if [ -f "$LOCK" ] && [ ! -L "$LOCK" ]; then
     exit 1
   fi
 fi
-
-if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
-  sweep_pid=$(sed -n 's/^pid=//p' "$STATE/.startup-network.status" 2>/dev/null | tail -1)
-  if [ -n "${FM_LOCK_HELD_PID:-}" ] && [ "$FM_LOCK_HELD_PID" = "$sweep_pid" ]; then
-    echo "error: the prior session's bounded startup sweep is finishing; operate read-only until it releases the fleet lock" >&2
-    exit 1
-  fi
-  fm_lock_acquire_wait "$CLAIM_LOCK"
-fi
-CLAIM_LOCK_HELD=1
 
 if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
   if [ ! -f "$LOCK" ] || [ -L "$LOCK" ]; then

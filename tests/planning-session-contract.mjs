@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
+import { chmodSync, fsyncSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, statSync, readdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { completePlanningTables, fileStore, HALF_HOUR, lateDisclosure, OBSERVATION_WINDOW, parseFirstSlot,
@@ -664,6 +665,31 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => fileStore(join(lab, 'dangling.json')).read(), /Unsafe/);
     assert.throws(() => fileStore(join(lab, 'dangling.json')).write(old, null), /Unsafe/);
 
+    const barrierHome = join(lab, 'barrier-home');
+    const barrierState = join(barrierHome, 'state');
+    const fakeBin = join(barrierHome, 'fakebin');
+    mkdirSync(barrierState, { recursive: true }); mkdirSync(fakeBin);
+    const fakePs = join(fakeBin, 'ps');
+    writeFileSync(fakePs, `#!/bin/sh\ncase "$*" in *comm=*) echo pi;; *args=*) echo pi;; *ppid=*) echo 1;; esac\n`);
+    chmodSync(fakePs, 0o755);
+    const lockEnv = { ...process.env, FM_HOME: barrierHome, FM_STATE_OVERRIDE: barrierState,
+      FM_SESSION_CLAIM_LOCK_ATTEMPTS: '1', PATH: `${fakeBin}:${process.env.PATH}` };
+    let blockedPublication;
+    const barrierStore = fileStore(join(barrierState, 'planning-session.json'), {
+      write(fd, data) {
+        blockedPublication = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
+        writeFileSync(fd, data);
+      }, sync: fsyncSync,
+    });
+    barrierStore.write(old, null);
+    assert.notEqual(blockedPublication.status, 0);
+    assert.match(blockedPublication.stderr, /timed out waiting for the session ownership transaction/);
+    assert.equal(readdirSync(barrierState).includes('.lock'), false,
+      'ownership cannot publish during a planning commit');
+    const published = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
+    assert.equal(published.status, 0, published.stderr);
+    assert.match(published.stdout, /lock acquired: harness pid/);
+
     const serializedPath = join(lab, 'serialized.json');
     const processAStore = fileStore(serializedPath);
     const processBStore = fileStore(serializedPath);
@@ -676,10 +702,11 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => processAStore.write({ ...processAState, stopped: 'quit' }, staleSnapshot),
       /changed before the update/);
     assert.deepEqual(processBStore.read(), persistedProcessBState, 'a stale owner cannot overwrite the newest owner');
-    writeFileSync(`${serializedPath}.lock`, '{"version":1,"orphan":true}\n');
+    const sharedOwnershipLock = join(lab, '.lock.acquire');
+    writeFileSync(sharedOwnershipLock, '{"version":1,"orphan":true}\n');
     assert.throws(() => processAStore.read(), /lock is busy/);
-    assert.equal(readdirSync(lab).includes('serialized.json.lock'), true, 'ambiguous lock is never stolen');
-    rmSync(`${serializedPath}.lock`);
+    assert.equal(readdirSync(lab).includes('.lock.acquire'), true, 'ambiguous lock is never stolen');
+    rmSync(sharedOwnershipLock);
     assert.deepEqual(processAStore.read(), persistedProcessBState, 'explicit lock cleanup permits restart');
 
     const ownershipRace = (name, transferCheck, action) => {
