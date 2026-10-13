@@ -394,7 +394,7 @@ function cells(line: string): string[] {
   return parts;
 }
 export function completePlanningTables(text: string): boolean {
-  const lines = text.replace(/<!--[\s\S]*?(?:-->|$)/g, "").split(/\r?\n/);
+  const lines = text.split(/\r?\n/);
   let fence: string | undefined;
   const visible = lines.map((line) => {
     if (!fence) {
@@ -412,14 +412,45 @@ export function completePlanningTables(text: string): boolean {
   const hide = (start: number, end: number) => {
     for (let line = lineAt(start); line <= lineAt(end); line += 1) hiddenLines.add(line);
   };
+  const blockTags = "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
+  let rawEnd: RegExp | "blank" | undefined;
+  let rawOpaque = false;
+  const opaqueLines = new Set<number>();
+  for (let i = 0; i < visible.length; i += 1) {
+    const line = visible[i];
+    if (rawEnd === "blank") {
+      if (!line.trim()) rawEnd = undefined;
+      else hiddenLines.add(i);
+      continue;
+    }
+    if (rawEnd) {
+      hiddenLines.add(i);
+      if (rawOpaque) opaqueLines.add(i);
+      if (rawEnd.test(line)) { rawEnd = undefined; rawOpaque = false; }
+      continue;
+    }
+    const script = /^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i.exec(line);
+    if (script) { rawEnd = new RegExp(`</${script[1]}\\s*>`, "i"); rawOpaque = true; }
+    else if (/^ {0,3}<!--/.test(line)) { rawEnd = /-->/; rawOpaque = true; }
+    else if (/^ {0,3}<\?/.test(line)) { rawEnd = /\?>/; rawOpaque = true; }
+    else if (/^ {0,3}<![A-Z]/.test(line)) { rawEnd = />/; rawOpaque = true; }
+    else if (/^ {0,3}<!\[CDATA\[/.test(line)) { rawEnd = /\]\]>/; rawOpaque = true; }
+    else if (new RegExp(`^ {0,3}</?(?:${blockTags})(?:\\s|/?>|$)`, "i").test(line)) rawEnd = "blank";
+    else if (/^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>[ \t]*$/.test(line)) rawEnd = "blank";
+    if (rawEnd) {
+      hiddenLines.add(i);
+      if (rawOpaque) opaqueLines.add(i);
+      if (rawEnd !== "blank" && rawEnd.test(line.slice(1))) { rawEnd = undefined; rawOpaque = false; }
+    }
+  }
   const stack: { name: string; start: number; hidden: boolean }[] = [];
   const voidElements = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
-  const rawBlocks = new Set(["address", "article", "aside", "blockquote", "body", "caption", "center", "details", "dialog", "dir", "div", "dl", "fieldset", "figcaption", "figure", "footer", "form", "frame", "frameset", "head", "header", "html", "iframe", "legend", "li", "main", "menu", "nav", "noframes", "ol", "p", "pre", "script", "search", "section", "style", "summary", "table", "tbody", "td", "textarea", "tfoot", "th", "thead", "title", "tr", "ul"]);
   const tags = /<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?\s*\/?>/gs;
   for (const match of joined.matchAll(tags)) {
     const start = match.index ?? 0;
     const end = start + match[0].length - 1;
     const name = match[1].toLowerCase();
+    if (opaqueLines.has(lineAt(start))) continue;
     hide(start, end);
     if (match[0].startsWith("</")) {
       let opening = -1;
@@ -427,19 +458,15 @@ export function completePlanningTables(text: string): boolean {
         if (stack[i].name === name) { opening = i; break; }
       }
       if (opening >= 0) {
-        hide(stack[opening].start, end);
+        if (stack[opening].hidden) hide(stack[opening].start, end);
         stack.splice(opening);
       }
     } else if (!match[0].endsWith("/>") && !voidElements.has(name)) {
-      stack.push({ name, start, hidden: /(?:^|\s)(?:hidden|aria-hidden\s*=\s*["']?true)(?:\s|=|["']|$)/i.test(match[0]) });
+      const parentHidden = stack.some((entry) => entry.hidden);
+      stack.push({ name, start, hidden: parentHidden || /(?:^|\s)(?:hidden(?=\s|=|\/?>)|aria-hidden\s*=\s*(?:"true"|'true'|true)(?=\s|\/?>))/i.test(match[0]) });
     }
   }
-  for (const opening of stack) {
-    if (opening.hidden || rawBlocks.has(opening.name)) hide(opening.start, joined.length);
-  }
-  for (const match of joined.matchAll(/<![A-Za-z][^<>]*>|<!\[[^<>]*>|<\?[^<>]*>/gs)) {
-    hide(match.index ?? 0, (match.index ?? 0) + match[0].length - 1);
-  }
+  for (const opening of stack) if (opening.hidden) hide(opening.start, joined.length);
   for (const line of hiddenLines) visible[line] = "";
   const sections: [string, string[]][] = [
     ["Ideas", ["Work", "Meaningful change", "Next step", "Needs you?"]],
@@ -447,15 +474,24 @@ export function completePlanningTables(text: string): boolean {
     ["Recently completed", ["Work", "Completed outcome"]],
   ];
   return sections.every(([name, header]) => {
-    const indices = visible.flatMap((line, i) => new RegExp(`^ {0,3}#{1,6} ${name}\\s*#*\\s*$`).test(line) ? [i] : []);
-    if (indices.length !== 1) return false;
-    let i = indices[0] + 1;
+    const headings: { line: number; end: number }[] = [];
+    for (let i = 0; i < visible.length; i += 1) {
+      if (new RegExp(`^ {0,3}#{1,6} ${name}\\s*#*\\s*$`).test(visible[i])) headings.push({ line: i, end: i });
+      else if (new RegExp(`^ {0,3}${name}[ \\t]*$`).test(visible[i]) && /^ {0,3}(?:=+|-+)[ \t]*$/.test(visible[i + 1] ?? "")) {
+        headings.push({ line: i, end: i + 1 });
+      }
+    }
+    if (headings.length !== 1) return false;
+    let i = headings[0].end + 1;
     while (i < visible.length && !visible[i].trim()) i += 1;
-    if (JSON.stringify(cells(visible[i] ?? "")) !== JSON.stringify(header)) return false;
-    const separator = cells(visible[++i] ?? "");
-    if (separator.length !== header.length || separator.some((cell) => !/^:?-{3,}:?$/.test(cell))) return false;
+    const tableSyntax = (line: string) => /^ {0,3}\S/.test(line);
+    if (!tableSyntax(visible[i] ?? "") || JSON.stringify(cells(visible[i] ?? "")) !== JSON.stringify(header)) return false;
+    const separatorLine = visible[++i] ?? "";
+    const separator = cells(separatorLine);
+    if (!tableSyntax(separatorLine) || separator.length !== header.length || separator.some((cell) => !/^:?-{3,}:?$/.test(cell))) return false;
     let rows = 0;
     while (++i < visible.length && visible[i].trim() && visible[i].includes("|")) {
+      if (!tableSyntax(visible[i])) return false;
       const row = cells(visible[i]);
       if (row.length !== header.length || row.some((cell) => !cell)) return false;
       rows += 1;

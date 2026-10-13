@@ -123,6 +123,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables(tables + '\n<br>'), true);
     assert.equal(completePlanningTables('<section hidden>\n' + tables + '\n</section>\n\n' + tables), true);
     assert.equal(completePlanningTables('```markdown\n```   \n' + tables), true);
+    assert.equal(completePlanningTables(tables.split('\n').map(line => line.startsWith('|') ? '   ' + line : line).join('\n')), true);
+    assert.equal(completePlanningTables('<custom-panel>\nraw HTML\n\n' + tables), true);
+    assert.equal(completePlanningTables('<div>\nraw HTML\n\n' + tables), true);
+    assert.equal(completePlanningTables('<!-- <div hidden> -->\n' + tables), true);
+    const setextTables = tables.replace('## Ideas', 'Ideas\n=====').replace('## To-do list', 'To-do list\n---')
+      .replace('## Recently completed', 'Recently completed\n=====');
+    assert.equal(completePlanningTables(setextTables), true);
     assert.equal(completePlanningTables(tables.replace('Idea |', 'Idea \\| detail |')), true);
     for (const text of [tables.split('## Recently')[0], '```markdown\n' + tables + '\n```',
       tables.replace('| Task | Ready | Finish | No |', '| Task | Ready |'),
@@ -130,9 +137,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       tables.replace('| Idea | No material change | Review later | No |', '| Idea | | Review later | No |'),
       tables + '\n## Ideas\n', '~~~\n' + tables + '\n~~~',
       '```markdown\n```not-a-close\n' + tables + '\n```',
-      '<!--\n' + tables + '\n-->', '<div hidden>\n' + tables + '\n</div>',
+      tables.split('\n').map(line => line.startsWith('|') ? '    ' + line : line).join('\n'),
+      tables.split('\n').map(line => line.startsWith('|') ? '\t' + line : line).join('\n'),
+      setextTables.replace('Ideas\n=====', 'Ideas\n= ='), setextTables.replace('To-do list\n---', 'To-do list\n-- x'),
+      '<!--\n' + tables, '<!--\n' + tables + '\n-->', '<div hidden>\n' + tables + '\n</div>',
       '<section hidden>\n' + tables + '\n</section>', '<article aria-hidden="true">\n' + tables + '\n</article>',
-      '<custom-panel>\n' + tables + '\n</custom-panel>', '<section\n hidden>\n' + tables + '\n</section\n>',
+      '<custom-panel>\n' + tables + '\n</custom-panel>', '<custom-panel>\n' + tables,
+      '<custom-panel hidden>\nraw HTML\n\n' + tables, '<section\n hidden>\n' + tables + '\n</section\n>',
       '<article\n aria-hidden="true">\n' + tables + '\n</article\n>',
       '<![CDATA[\n' + tables + '\n]]>', '```html\n<section hidden>\n' + tables + '\n</section>\n```']) assert.equal(completePlanningTables(text), false);
     console.log('ok - complete tables accepted; missing, malformed, empty, duplicated and fenced tables refused');
