@@ -578,8 +578,9 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
   };
   for (const source of lines) {
     if (!source.trim()) { flush(); continue; }
-    if (/^(?:\t| {4})/.test(source)) { flush(); continue; }
-    let part = source;
+    const activeList = !!block?.signature.endsWith(":list");
+    if (/^(?:\t| {4})/.test(source) && !activeList) { flush(); continue; }
+    let part = activeList ? source.trimStart() : source;
     let quotes = 0;
     while (/^ {0,3}>[ \t]?/.test(part)) { part = part.replace(/^ {0,3}>[ \t]?/, ""); quotes += 1; }
     const listed = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.test(part);
@@ -594,7 +595,7 @@ function latenessClaims(lines: string[]): { rendered: string; source?: string; t
       continue;
     }
     const signature = `${quotes}:${listed ? "list" : "prose"}`;
-    const listContinuation = !!block && block.signature.endsWith(":list") && !listed && /^ {1,3}\S/.test(source);
+    const listContinuation = activeList && !listed && quotes === 0;
     const lazyQuoteContinuation = !!block && /^[1-9]\d*:/.test(block.signature) && quotes === 0 && !listed;
     const continuation = listContinuation || lazyQuoteContinuation;
     if (block && latenessText(block.parts.join(" ")) !== undefined) flush();
