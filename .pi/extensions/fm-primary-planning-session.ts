@@ -147,7 +147,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.registerCommand("planning-session", {
-    description: "Start the authorized Main planning schedule, report status, or stop it",
+    description: "Start or adopt the authorized Main planning schedule, report status, or stop it",
     handler: async (args, context) => {
       try {
         if (!main(context)) {
@@ -159,6 +159,9 @@ export default function (pi: ExtensionAPI) {
         if (action === "start" && value && !extra) {
           clock!.start(parseFirstSlot(value));
           context.ui.notify("Planning slots armed for this session only. Earlier unobserved slots are skipped.", "info");
+        } else if (action === "adopt" && value && !extra) {
+          clock!.adopt(parseFirstSlot(value));
+          context.ui.notify("Planning slots adopted with retained due work preserved.", "info");
         } else if (action === "stop" && !value) {
           clock!.stop("command");
           context.ui.notify("Planning slots stopped for this session.", "info");
@@ -166,7 +169,7 @@ export default function (pi: ExtensionAPI) {
           const { armed, state } = clock!.status();
           context.ui.notify(JSON.stringify({ armed,
             nextSlot: armed && state ? state.through + HALF_HOUR : null, ledger: state ?? null }), "info");
-        } else throw new Error("Usage: /planning-session start 2026-10-12T16:30:00+08:00 | status | stop");
+        } else throw new Error("Usage: /planning-session start|adopt 2026-10-12T16:30:00+08:00 | status | stop");
       } catch (problem) {
         context.ui.notify(`Planning timer: ${problem instanceof Error ? problem.message : String(problem)}`, "error");
       }

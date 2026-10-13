@@ -1,5 +1,5 @@
 // Session-local scheduling and slot receipts. No process, service, or model calls.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, readlinkSync, realpathSync,
   renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -9,11 +9,16 @@ export const HALF_HOUR = 30 * 60 * 1000;
 // A suspended event loop cannot establish historical Wi-Fi connectivity.
 export const OBSERVATION_WINDOW = 5000;
 export type Owner = { sessionId: string; sessionFile: string; pid: number; processStart: number };
+export type AdoptionReceipt = {
+  formerOwner: Owner; successorOwner: Owner; at: number; priorGeneration: number;
+  resultingGeneration: number; retainedDue: number[]; dueDigest: string;
+};
 export type SlotState = {
-  version: 1; owner: Owner; firstSlot: number; through: number; due: number[];
+  version: 1; generation: number; owner: Owner; firstSlot: number; through: number; due: number[];
   stopped?: string;
   observation?: { slot: number; result: "online" | "offline" | "unknown" | "unobserved" };
   delivery?: { entryId: string; slots: number[]; at: number; lateByMs: number };
+  adoptions?: AdoptionReceipt[];
 };
 export type Claim = { owner: Owner; slots: number[] };
 export type Store = {
@@ -37,12 +42,15 @@ export function parseFirstSlot(value: string): number {
   return Date.parse(value);
 }
 
+const dueDigest = (due: number[]) => createHash("sha256").update(JSON.stringify(due)).digest("hex");
+const validOwner = (owner: Owner | undefined) => !!owner && typeof owner.sessionId === "string" && !!owner.sessionId &&
+  typeof owner.sessionFile === "string" && isAbsolute(owner.sessionFile) && integer(owner.pid) && owner.pid > 1 &&
+  integer(owner.processStart);
+
 export function validateState(value: unknown): SlotState {
   const s = value as SlotState;
   const owner = s?.owner;
-  if (s?.version !== 1 || !owner || typeof owner.sessionId !== "string" || !owner.sessionId ||
-      typeof owner.sessionFile !== "string" || !isAbsolute(owner.sessionFile) ||
-      !integer(owner.pid) || owner.pid <= 1 || !integer(owner.processStart) ||
+  if (s?.version !== 1 || !integer(s.generation) || s.generation < 1 || !validOwner(owner) ||
       !integer(s.firstSlot) || s.firstSlot % HALF_HOUR !== 0 || !integer(s.through) ||
       s.through < s.firstSlot - HALF_HOUR || (s.through - s.firstSlot) % HALF_HOUR !== 0 ||
       !Array.isArray(s.due) || s.due.some((slot, i) => !integer(slot) || slot < s.firstSlot ||
@@ -56,6 +64,17 @@ export function validateState(value: unknown): SlotState {
         (slot - s.firstSlot) % HALF_HOUR !== 0 || slot > s.delivery!.at || s.due.includes(slot) ||
         (i > 0 && slot <= s.delivery!.slots[i - 1])) ||
       !integer(s.delivery.at) || !integer(s.delivery.lateByMs))) throw new Error("Malformed delivery receipt");
+  if (s.adoptions !== undefined && (!Array.isArray(s.adoptions) || !s.adoptions.length ||
+      s.adoptions.some((receipt, index) => !validOwner(receipt?.formerOwner) || !validOwner(receipt?.successorOwner) ||
+        sameOwner(receipt.formerOwner, receipt.successorOwner) || !integer(receipt.at) ||
+        !integer(receipt.priorGeneration) || receipt.priorGeneration < 1 ||
+        receipt.resultingGeneration !== receipt.priorGeneration + 1 ||
+        (index > 0 && receipt.priorGeneration !== s.adoptions![index - 1].resultingGeneration) ||
+        !Array.isArray(receipt.retainedDue) || receipt.retainedDue.some((slot, i) => !integer(slot) ||
+          slot < s.firstSlot || slot > s.through || (slot - s.firstSlot) % HALF_HOUR !== 0 ||
+          (i > 0 && slot <= receipt.retainedDue[i - 1])) || receipt.dueDigest !== dueDigest(receipt.retainedDue)) ||
+      s.adoptions.at(-1)!.resultingGeneration !== s.generation ||
+      !sameOwner(s.adoptions.at(-1)!.successorOwner, s.owner))) throw new Error("Malformed adoption receipt");
   return s;
 }
 
@@ -306,7 +325,7 @@ export class PlanningSessionClock {
     }
     const through = Math.max(firstSlot - HALF_HOUR,
       firstSlot + Math.floor((this.io.now() - firstSlot) / HALF_HOUR) * HALF_HOUR);
-    const fresh: SlotState = { version: 1, owner: this.owner, firstSlot, through, due: [] };
+    const fresh: SlotState = { version: 1, generation: 1, owner: this.owner, firstSlot, through, due: [] };
     let prior: SlotState | undefined;
     try {
       this.reconcileRevocation();
@@ -316,6 +335,9 @@ export class PlanningSessionClock {
       throw error;
     }
     const compatible = !!prior && sameOwner(prior.owner, this.owner) && prior.firstSlot === firstSlot;
+    if (prior && !sameOwner(prior.owner, this.owner) && !prior.stopped) {
+      throw new Error("Active foreign-owner planning schedules require explicit adoption");
+    }
     if (prior?.due.length && !compatible) {
       throw new Error("Cannot replace a schedule with retained planning slots");
     }
@@ -336,6 +358,31 @@ export class PlanningSessionClock {
     }
     this.resume();
     if (candidate.due.length) this.io.wake([...candidate.due]);
+  }
+  adopt(firstSlot: number): void {
+    if (!this.io.valid()) throw new Error("Only the live lock-owning Main session may adopt planning updates");
+    const prior = this.store.read(() => this.io.valid());
+    if (!prior) throw new Error("No planning schedule exists to adopt");
+    if (prior.firstSlot !== firstSlot) throw new Error("Planning adoption anchor does not match the ledger");
+    if (prior.stopped) throw new Error("Stopped planning schedules cannot be adopted");
+    if (sameOwner(prior.owner, this.owner)) {
+      const receipt = prior.adoptions?.at(-1);
+      if (!receipt || !sameOwner(receipt.successorOwner, this.owner) ||
+          receipt.resultingGeneration !== prior.generation) throw new Error("Current-owner planning schedules cannot be adopted");
+      this.resume();
+      return;
+    }
+    const receipt: AdoptionReceipt = { formerOwner: prior.owner, successorOwner: this.owner, at: this.io.now(),
+      priorGeneration: prior.generation, resultingGeneration: prior.generation + 1,
+      retainedDue: [...prior.due], dueDigest: dueDigest(prior.due) };
+    const adopted: SlotState = { ...prior, generation: receipt.resultingGeneration, owner: this.owner,
+      adoptions: [...(prior.adoptions ?? []), receipt] };
+    this.store.write(adopted, prior, () => this.io.valid());
+    this.lastState = adopted;
+    this.revocations.delete(ownerKey(prior.owner));
+    this.revocations.delete(ownerKey(this.owner));
+    this.resume();
+    if (adopted.due.length) this.io.wake([...adopted.due]);
   }
   resume(): void {
     this.dispose();

@@ -135,7 +135,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(staleRevocations.size, 1);
     rejectStaleWrite = false; valid = true;
     const freshClock = new PlanningSessionClock(freshOwner, sharedStore, io, new Map());
-    freshClock.start(first);
+    freshClock.adopt(first);
     const freshSchedule = structuredClone(sharedState);
     valid = false;
     assert.throws(() => staleClock.ownershipLost(), /owner changed before revocation recovery/);
@@ -160,10 +160,45 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(transferRevocations.size, 1);
     const transferredB = new PlanningSessionClock(transferOwnerB, transferredStore,
       { ...io, valid: () => authoritativeOwner === 'b', ownsMain: () => authoritativeOwner === 'b' });
-    assert.throws(() => transferredB.start(first), /retained planning slots/);
-    assert.deepEqual(transferredStore.read(), persistedTransferredLedger, 'new owner must explicitly resolve retained foreign work');
-    transferredA.dispose(); transferredB.dispose();
-    console.log('ok - failed ownership revocation survives reload, preserves transferred work and requires explicit recovery');
+    assert.throws(() => transferredB.start(first), /explicit adoption/);
+    assert.deepEqual(transferredStore.read(), persistedTransferredLedger, 'start cannot automatically adopt foreign work');
+    transferredB.adopt(first);
+    const adoptedLedger = transferredStore.read();
+    assert.equal(adoptedLedger.generation, persistedTransferredLedger.generation + 1);
+    assert.deepEqual(adoptedLedger.owner, transferOwnerB);
+    assert.deepEqual(adoptedLedger.due, persistedTransferredLedger.due);
+    assert.deepEqual(adoptedLedger.observation, persistedTransferredLedger.observation);
+    assert.deepEqual(adoptedLedger.delivery, persistedTransferredLedger.delivery);
+    assert.deepEqual(adoptedLedger.adoptions.at(-1).formerOwner, transferOwnerA);
+    assert.deepEqual(adoptedLedger.adoptions.at(-1).successorOwner, transferOwnerB);
+    assert.deepEqual(adoptedLedger.adoptions.at(-1).retainedDue, persistedTransferredLedger.due);
+    transferredB.adopt(first);
+    assert.deepEqual(transferredStore.read(), adoptedLedger, 'same-successor adoption is idempotent');
+    const adoptedReload = new PlanningSessionClock(transferOwnerB, transferredStore,
+      { ...io, valid: () => authoritativeOwner === 'b', ownsMain: () => authoritativeOwner === 'b' });
+    adoptedReload.resume(); assert.deepEqual(adoptedReload.claim().slots, persistedTransferredLedger.due);
+    assert.throws(() => adoptedReload.adopt(first + HALF_HOUR), /anchor/);
+    assert.deepEqual(transferredStore.read(), adoptedLedger);
+    transferredA.dispose(); transferredB.dispose(); adoptedReload.dispose();
+
+    const emptyTransferStore = fileStore(join(lab, 'empty-transfer.json'));
+    const emptyTransfer = { ...persistedTransferredLedger, due: [], delivery: undefined };
+    emptyTransferStore.write(emptyTransfer, null);
+    const emptyAdopter = new PlanningSessionClock(transferOwnerB, emptyTransferStore,
+      { ...io, valid: () => true, ownsMain: () => true });
+    emptyAdopter.adopt(first);
+    assert.deepEqual(emptyTransferStore.read().adoptions.at(-1).retainedDue, []);
+    emptyAdopter.dispose();
+
+    const stoppedTransferStore = fileStore(join(lab, 'stopped-transfer.json'));
+    const stoppedTransfer = { ...persistedTransferredLedger, stopped: 'quit' };
+    stoppedTransferStore.write(stoppedTransfer, null);
+    const stoppedBytes = structuredClone(stoppedTransferStore.read());
+    const stoppedAdopter = new PlanningSessionClock(transferOwnerB, stoppedTransferStore,
+      { ...io, valid: () => true, ownsMain: () => true });
+    assert.throws(() => stoppedAdopter.adopt(first), /Stopped/);
+    assert.deepEqual(stoppedTransferStore.read(), stoppedBytes);
+    console.log('ok - failed ownership revocation survives reload and explicit adoption preserves transferred work');
 
     assert.equal(completePlanningTables(tables), true);
     assert.equal(completePlanningTables(tables + '\n<https://example.invalid>'), true);
@@ -777,8 +812,9 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       assert.equal(afterA.owner.sessionId, raceOwnerA.sessionId);
       const raceB = new PlanningSessionClock(raceOwnerB, raceStore, { ...raceIo, valid: () => authority === 'b' });
       if (!afterA.due.length) {
-        raceB.start(first);
-        assert.equal(raceStore.read().owner.sessionId, raceOwnerB.sessionId, `${name} cannot block the new owner`);
+        assert.throws(() => raceB.start(first), /explicit adoption/);
+        raceB.adopt(first);
+        assert.equal(raceStore.read().owner.sessionId, raceOwnerB.sessionId, `${name} supports explicit adoption`);
       }
       raceA.dispose(); raceB.dispose();
       return afterA;

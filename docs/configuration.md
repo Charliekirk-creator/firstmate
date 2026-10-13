@@ -49,7 +49,8 @@ Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, whil
 The Pi extension `.pi/extensions/fm-primary-planning-session.ts` is inert until an operator explicitly invokes `/planning-session start 2026-10-12T16:30:00+08:00` in lock-owning Main with persistent conversation history.
 That authorized Asia/Hong_Kong boundary is the immutable schedule anchor; subsequent boundaries are thirty minutes apart, not thirty minutes after the last response.
 Starting after a boundary skips its unobserved slot rather than reconstructing past connectivity.
-`/planning-session status` reports the current runtime `armed` flag, next boundary, and durable receipt; `/planning-session stop` ends the schedule for that session.
+`/planning-session status` reports the current runtime `armed` flag, next boundary, owner, generation, retained slots, and durable delivery/adoption receipts; `/planning-session stop` ends the schedule for that session.
+After an authoritative Main transfer leaves an active foreign-owner ledger, `/planning-session adopt 2026-10-12T16:30:00+08:00` is the only supported adoption path. It advances the generation while preserving every boundary, observation, receipt, and retained due slot; ordinary start, reload, and timer callbacks never adopt automatically.
 Retire any temporary timer through its existing owner before activating this schedule, so two timers do not request the same update.
 Shipping the code does not activate a schedule, reload Main, or replace the existing planning policy globally.
 The command must be available in the running Pi extension set before use; loading new code into a running Main requires separately authorized lifecycle handling.
