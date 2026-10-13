@@ -472,6 +472,7 @@ export function completePlanningTables(text: string): boolean {
   const blockTags = "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
   let rawEnd: RegExp | "blank" | undefined;
   let rawOpaque = false;
+  let activeStylesheet = false;
   const opaqueLines = new Set<number>();
   for (let i = 0; i < visible.length; i += 1) {
     const line = htmlLines[i];
@@ -487,7 +488,11 @@ export function completePlanningTables(text: string): boolean {
       continue;
     }
     const script = /^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i.exec(line);
-    if (script) { rawEnd = new RegExp(`</${script[1]}\\s*>`, "i"); rawOpaque = true; }
+    if (script) {
+      rawEnd = new RegExp(`</${script[1]}\\s*>`, "i");
+      rawOpaque = true;
+      if (script[1].toLowerCase() === "style") activeStylesheet = true;
+    }
     else if (/^ {0,3}<!--/.test(line)) { rawEnd = /-->/; rawOpaque = true; }
     else if (/^ {0,3}<\?/.test(line)) { rawEnd = /\?>/; rawOpaque = true; }
     else if (/^ {0,3}<![A-Z]/.test(line)) { rawEnd = />/; rawOpaque = true; }
@@ -509,6 +514,7 @@ export function completePlanningTables(text: string): boolean {
     const end = start + match[0].length - 1;
     const name = match[1].toLowerCase();
     if (opaqueLines.has(lineAt(start))) continue;
+    if (name === "style" && !match[0].startsWith("</")) activeStylesheet = true;
     hide(start, end);
     if (match[0].startsWith("</")) {
       let opening = -1;
@@ -527,13 +533,18 @@ export function completePlanningTables(text: string): boolean {
       const declarations = (decodedStyle ?? "").replace(/\/\*[\s\S]*?\*\//g, "")
         .split(";").map((part) => part.trim().toLowerCase());
       const styleHidden = decodedStyle === undefined || decodedStyle.includes("\\") ||
-        declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!important)?$/.test(part));
-      const hidden = /(?:^|\s)(?:hidden(?=\s|=|\/?>)|aria-hidden\s*=\s*(?:"true"|'true'|true)(?=\s|\/?>))/i.test(match[0]);
+        declarations.some((part) => /^(?:display\s*:\s*none|(?:content-)?visibility\s*:\s*hidden)(?:\s*!\s*important)?$/.test(part));
+      const aria = /(?:^|\s)aria-hidden\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s'"=<>`]+))/i.exec(match[0]);
+      const encodedAria = aria?.[1] ?? aria?.[2] ?? aria?.[3];
+      const decodedAria = encodedAria === undefined ? undefined : decodeHtmlAttribute(encodedAria);
+      const ariaHidden = encodedAria !== undefined && (decodedAria === undefined || decodedAria.trim().toLowerCase() === "true");
+      const hidden = /(?:^|\s)hidden(?=\s|=|\/?>)/i.test(match[0]) || ariaHidden;
       const closedDisclosure = (name === "details" || name === "dialog") && !/(?:^|\s)open(?=\s|=|\/?>)/i.test(match[0]);
       stack.push({ name, start, hidden: parentHidden || hidden || styleHidden || closedDisclosure || intrinsicallyHidden.has(name) });
     }
   }
   for (const opening of stack) if (opening.hidden) hide(opening.start, joined.length);
+  if (activeStylesheet) return false;
   for (const line of hiddenLines) visible[line] = "";
   const sections: [string, string[]][] = [
     ["Ideas", ["Work", "Meaningful change", "Next step", "Needs you?"]],

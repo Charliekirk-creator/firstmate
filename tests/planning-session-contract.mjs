@@ -135,6 +135,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(completePlanningTables('<details OPEN="false">\n<summary>Planning</summary>\n\n' + tables + '\n</details>'), true);
     assert.equal(completePlanningTables('<dialog open>\ncontext\n\n' + tables + '\n</dialog>'), true);
     assert.equal(completePlanningTables('<dialog OPEN="false">\ncontext\n\n' + tables + '\n</dialog>'), true);
+    assert.equal(completePlanningTables('<div aria-hidden="f&#97;lse">\ncontext\n\n' + tables + '\n</div>'), true);
+    assert.equal(completePlanningTables('Note: `<style>table { display:none }</style>`\n' + tables), true);
+    assert.equal(completePlanningTables('\\<style>table { display:none }\\</style>\n' + tables), true);
+    assert.equal(completePlanningTables('```html\n<style>table { display:none }</style>\n```\n' + tables), true);
     const tabAtxTables = tables.replace('## Ideas', '##\tIdeas').replace('## To-do list', '###\tTo-do list ###')
       .replace('## Recently completed', '#\tRecently completed\t####');
     assert.equal(completePlanningTables(tabAtxTables), true);
@@ -166,6 +170,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
       '<div style="display&unknown;none">\ncontext\n\n' + tables,
       '<div style="display:\\6e one">\ncontext\n\n' + tables,
       '<div style="d\\69 splay:none">\ncontext\n\n' + tables,
+      '<div style="display:none ! important">\ncontext\n\n' + tables,
+      '<div style="visibility:hidden !\timportant">\ncontext\n\n' + tables,
+      '<div aria-hidden="&#116;rue">\ncontext\n\n' + tables,
+      '<div aria-hidden="tr&#x75;e">\ncontext\n\n' + tables,
+      '<div aria-hidden="&unknown;">\ncontext\n\n' + tables,
+      '<style>table { display: none }</style>\n' + tables,
+      '<style>nothing relevant</style>\n' + tables,
       '<details>\n<summary>Planning</summary>\n\n' + tables + '\n</details>',
       '<dialog>\ncontext\n\n' + tables + '\n</dialog>',
       '<section\n hidden>\n' + tables + '\n</section\n>',
