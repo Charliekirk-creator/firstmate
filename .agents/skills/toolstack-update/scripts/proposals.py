@@ -405,12 +405,6 @@ def resource_identity(row):
             "update_unit": {"type": unit[0], "identity": unit[1], "scope": row["scope"]}}
 
 
-def is_project_filter_delta(row):
-    declarations = row.get("declarations")
-    return (row.get("scope") == "project" and isinstance(declarations, list) and len(declarations) == 1 and
-            isinstance(declarations[0], dict) and declarations[0].get("autoload") is False)
-
-
 def declaration_source(row):
     declarations = row.get("declarations")
     if not isinstance(declarations, list) or len(declarations) != 1:
@@ -708,9 +702,7 @@ def proposal(data, rows):
     if selected is not None:
         identity = update_identity(selected["source"])
         affected = [copy.deepcopy(resource) for resource in row["resources"] if
-                    update_identity(resource.get("source")) == identity and
-                    (resource.get("scope") == selected["scope"] or
-                     (selected["scope"] == "user" and is_project_filter_delta(resource)))]
+                    update_identity(resource.get("source")) == identity]
         if any(resource.get("owner") != "pi-package" for resource in affected):
             raise Invalid("Every resource affected by a package update must retain its verified package owner.")
         npm_sources = [npm_declaration(resource["source"]) for resource in affected]

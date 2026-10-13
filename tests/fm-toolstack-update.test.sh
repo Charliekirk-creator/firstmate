@@ -949,7 +949,23 @@ independent_scope = copy.deepcopy(data)
 independent_project = copy.deepcopy(filter_delta)
 independent_project['declarations'] = [{'source': 'npm:example-extension', 'skills': []}]
 independent_scope['observations']['pi']['resources'].append(independent_project)
-assert len(prepared(approved(independent_scope))['affected_resources']) == 1
+independent_proposal = prepared(approved(independent_scope))
+assert {(row['scope'], row['path']) for row in independent_proposal['affected_resources']} == {
+    ('user', 'extensions/example.ts'), ('project', 'skills/project-filter/SKILL.md')}
+missing_independent_evidence = copy.deepcopy(independent_scope)
+del missing_independent_evidence['observations']['pi']['resources'][1]['compatibility_evidence']
+refuse('propose', missing_independent_evidence)
+changed_independent_scope = approved(independent_scope)
+changed_independent_scope['observations']['pi']['resources'][1]['declarations'][0]['skills'] = [
+    'skills/changed/SKILL.md']
+refuse('prepare', changed_independent_scope)
+project_only = copy.deepcopy(data)
+project_only['observations']['pi']['resources'][0]['scope'] = 'project'
+project_only['resource'] = resource_selector(project_only['observations']['pi']['resources'][0])
+refuse('propose', project_only)
+uncertain_enumeration = copy.deepcopy(independent_scope)
+uncertain_enumeration['observations']['pi']['resources_complete'] = None
+refuse('propose', uncertain_enumeration)
 for changed in ['installed', 'discovered', 'compatible', 'owner_verified', 'available_verified']:
     bad = copy.deepcopy(shared)
     bad['observations']['pi']['resources'][1][changed] = False
