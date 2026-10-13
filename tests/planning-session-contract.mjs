@@ -652,17 +652,36 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
         },
         sync() { throw new Error('injected sync failure'); },
       });
-      assert.throws(() => injected.write(old), new RegExp(`injected ${failure} failure`));
+      assert.throws(() => injected.write(old, null), new RegExp(`injected ${failure} failure`));
       assert.equal(readdirSync(lab).some(name => name.startsWith(`${failure}-cleanup.json.`)), false,
         `${failure} failure cleans its private ledger temp path`);
     }
     writeFileSync(join(lab, 'bad.json'), '{'); assert.throws(() => fileStore(join(lab, 'bad.json')).read());
     symlinkSync(join(lab, 'slots.json'), join(lab, 'link.json'));
     assert.throws(() => fileStore(join(lab, 'link.json')).read(), /Unsafe/);
-    assert.throws(() => fileStore(join(lab, 'link.json')).write(old), /Unsafe/);
+    assert.throws(() => fileStore(join(lab, 'link.json')).write(old, null), /Unsafe/);
     symlinkSync(join(lab, 'missing.json'), join(lab, 'dangling.json'));
     assert.throws(() => fileStore(join(lab, 'dangling.json')).read(), /Unsafe/);
-    assert.throws(() => fileStore(join(lab, 'dangling.json')).write(old), /Unsafe/);
+    assert.throws(() => fileStore(join(lab, 'dangling.json')).write(old, null), /Unsafe/);
+
+    const serializedPath = join(lab, 'serialized.json');
+    const processAStore = fileStore(serializedPath);
+    const processBStore = fileStore(serializedPath);
+    const processAState = { ...old, owner: { ...owner, sessionId: 'process-a' }, due: [], stopped: undefined };
+    processAStore.write(processAState, null);
+    const staleSnapshot = processAStore.read();
+    const processBState = { ...processAState, owner: { ...owner, sessionId: 'process-b' } };
+    processBStore.write(processBState, staleSnapshot);
+    const persistedProcessBState = processBStore.read();
+    assert.throws(() => processAStore.write({ ...processAState, stopped: 'quit' }, staleSnapshot),
+      /changed before the update/);
+    assert.deepEqual(processBStore.read(), persistedProcessBState, 'a stale owner cannot overwrite the newest owner');
+    writeFileSync(`${serializedPath}.lock`, '{"version":1,"orphan":true}\n');
+    assert.throws(() => processAStore.read(), /lock is busy/);
+    assert.equal(readdirSync(lab).includes('serialized.json.lock'), true, 'ambiguous lock is never stolen');
+    rmSync(`${serializedPath}.lock`);
+    assert.deepEqual(processAStore.read(), persistedProcessBState, 'explicit lock cleanup permits restart');
+
     const lateStore = fileStore(join(lab, 'late.json'));
     now = first + HALF_HOUR + 60000;
     const late = new PlanningSessionClock(owner, lateStore, io); late.start(first);

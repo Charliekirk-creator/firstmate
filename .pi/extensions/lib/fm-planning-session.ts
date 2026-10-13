@@ -15,7 +15,10 @@ export type SlotState = {
   delivery?: { entryId: string; slots: number[]; at: number; lateByMs: number };
 };
 export type Claim = { owner: Owner; slots: number[] };
-export type Store = { read(): SlotState | undefined; write(state: SlotState): void };
+export type Store = {
+  read(): SlotState | undefined;
+  write(state: SlotState, expected: SlotState | null): void;
+};
 const integer = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) >= 0;
 export const sameOwner = (a: Owner, b: Owner) => a.sessionId === b.sessionId && a.sessionFile === b.sessionFile &&
   a.pid === b.pid && a.processStart === b.processStart;
@@ -63,6 +66,7 @@ export function fileStore(path: string, operations: {
   write(fd: number, data: string): void;
   sync(fd: number): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
+  const lockPath = `${path}.lock`;
   const safeParent = () => {
     const stat = lstatSync(dirname(path));
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe planning-session directory");
@@ -78,39 +82,79 @@ export function fileStore(path: string, operations: {
     }
     return true;
   };
-  return {
-    read() {
-      safeParent();
-      if (!safeFile()) return undefined;
-      return validateState(JSON.parse(readFileSync(path, "utf8")));
-    },
-    write(state) {
-      validateState(state);
-      safeParent();
-      safeFile();
-      const temp = `${path}.${randomUUID()}.tmp`;
-      let fd: number | undefined;
-      let failure: unknown;
-      let failed = false;
-      try {
-        try {
-          fd = openSync(temp, "wx", 0o600);
-          operations.write(fd, `${JSON.stringify(state)}\n`);
-          operations.sync(fd);
-        } catch (error) { failure = error; failed = true; }
-        if (fd !== undefined) {
-          try { closeSync(fd); }
-          catch (error) { if (!failed) { failure = error; failed = true; } }
-          fd = undefined;
-        }
-        if (failed) throw failure;
-        renameSync(temp, path);
-      } finally {
-        if (fd !== undefined) { try { closeSync(fd); } catch {} }
-        try { if (existsSync(temp)) unlinkSync(temp); } catch {}
+  const readUnlocked = () => safeFile()
+    ? validateState(JSON.parse(readFileSync(path, "utf8"))) : undefined;
+  const syncDirectory = (sync: (fd: number) => void) => {
+    const directory = openSync(dirname(path), "r");
+    try { sync(directory); } finally { closeSync(directory); }
+  };
+  const locked = <T>(action: () => T): T => {
+    safeParent();
+    const token = randomUUID();
+    const evidence = `${JSON.stringify({ version: 1, token, pid: process.pid })}\n`;
+    let fd: number | undefined;
+    let acquired = false;
+    try {
+      try { fd = openSync(lockPath, "wx", 0o600); acquired = true; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Planning ledger lock is busy");
+        throw error;
       }
-      const directory = openSync(dirname(path), "r");
-      try { operations.sync(directory); } finally { closeSync(directory); }
+      writeFileSync(fd, evidence);
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      return action();
+    } finally {
+      if (acquired) {
+        if (fd !== undefined) { try { closeSync(fd); } catch {} }
+        let validLock = false;
+        try {
+          const stat = lstatSync(lockPath);
+          validLock = stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size <= 4096 &&
+            readFileSync(lockPath, "utf8") === evidence;
+        } catch {}
+        if (!validLock) throw new Error("Planning ledger lock evidence is missing or corrupt");
+        unlinkSync(lockPath);
+        syncDirectory(fsyncSync);
+      }
+    }
+  };
+  const writeUnlocked = (state: SlotState) => {
+    const temp = `${path}.${randomUUID()}.tmp`;
+    let fd: number | undefined;
+    let failure: unknown;
+    let failed = false;
+    try {
+      try {
+        fd = openSync(temp, "wx", 0o600);
+        operations.write(fd, `${JSON.stringify(state)}\n`);
+        operations.sync(fd);
+      } catch (error) { failure = error; failed = true; }
+      if (fd !== undefined) {
+        try { closeSync(fd); }
+        catch (error) { if (!failed) { failure = error; failed = true; } }
+        fd = undefined;
+      }
+      if (failed) throw failure;
+      renameSync(temp, path);
+    } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch {} }
+      try { if (existsSync(temp)) unlinkSync(temp); } catch {}
+    }
+    syncDirectory(operations.sync);
+  };
+  return {
+    read() { return locked(readUnlocked); },
+    write(state, expected) {
+      validateState(state);
+      locked(() => {
+        const current = readUnlocked();
+        if (expected !== undefined && JSON.stringify(current) !== JSON.stringify(expected ?? undefined)) {
+          throw new Error("Planning ledger changed before the update could commit");
+        }
+        writeUnlocked(state);
+      });
     },
   };
 }
@@ -192,7 +236,7 @@ export class PlanningSessionClock {
     const through = Math.max(state.through, candidate?.through ?? state.through, ...(due.length ? due : [state.through]));
     const observation = candidate?.observation && candidate.through >= state.through ? candidate.observation : state.observation;
     if (!stored || !state.stopped || revoked.due?.length || candidate?.through !== state.through) {
-      this.store.write({ ...state, through, due, delivery, observation, stopped: revoked.reason });
+      this.store.write({ ...state, through, due, delivery, observation, stopped: revoked.reason }, stored ?? null);
     }
     this.revocations.delete(key);
     if (sameOwner(state.owner, this.owner)) this.ownsSchedule = false;
@@ -272,7 +316,7 @@ export class PlanningSessionClock {
     const candidate: SlotState = compatible && prior ? { ...prior, stopped: undefined } : fresh;
     this.rememberFailure(candidate.due, candidate);
     try {
-      this.store.write(candidate);
+      this.store.write(candidate, prior ?? null);
       this.lastState = candidate;
       this.revocations.delete(ownerKey(this.owner));
     } catch (error) {
@@ -299,7 +343,7 @@ export class PlanningSessionClock {
     try {
       const state = this.current();
       if (state) {
-        this.store.write({ ...state, stopped: reason });
+        this.store.write({ ...state, stopped: reason }, state);
         this.ownsSchedule = false;
       }
     } catch (error) {
@@ -334,7 +378,7 @@ export class PlanningSessionClock {
       const due = result === "online" ? [...state.due, slot] : state.due;
       const candidate: SlotState = { ...state, through: slot, due, observation: { slot, result } };
       this.rememberFailure(due, candidate);
-      this.store.write(candidate);
+      this.store.write(candidate, state);
       this.revocations.delete(ownerKey(this.owner));
       if (result === "unknown") this.io.error(new Error("Wi-Fi link could not be verified; this slot was skipped"));
       // Offline and unobserved slots never enqueue catch-up requests.
@@ -377,7 +421,7 @@ export class PlanningSessionClock {
       if (slots.some((slot) => slot > at)) return false;
       this.rememberFailure(slots);
       this.store.write({ ...state, due: state.due.filter((slot) => !slots.includes(slot)),
-        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } });
+        delivery: { entryId, slots, at, lateByMs: Math.max(0, at - Math.min(...slots)) } }, state);
       this.revocations.delete(ownerKey(this.owner));
       return true;
     } catch (error) {
