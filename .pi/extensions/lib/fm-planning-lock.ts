@@ -1,7 +1,7 @@
 // Fixed-purpose transport to the repository's canonical ownership lock broker.
 // The synchronous store remains synchronous; only the lease holder is a child.
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync,
   realpathSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -9,29 +9,34 @@ import { fileURLToPath } from "node:url";
 
 const broker = fileURLToPath(new URL("../../../bin/fm-planning-lock-broker.sh", import.meta.url));
 const sleep = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+type EvidenceKind = "ledger" | "journal" | "pending";
+type Mutations = {
+  stage(kind: EvidenceKind): string;
+  replace(kind: EvidenceKind): void;
+  remove(kind: Exclude<EvidenceKind, "ledger">): void;
+};
 
-export function planningTransaction<T>(directory: string,
-  action: (assertHeld: () => void, commitHeld: <R>(commit: () => R) => R) => T): T {
+export function planningTransaction<T>(directory: string, ledgerName: string,
+  action: (assertHeld: () => void, mutations: Mutations) => T): T {
   const state = realpathSync(directory);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(ledgerName)) throw new Error("Unsafe planning ledger name");
   const nonce = randomBytes(16).toString("hex");
   const channel = resolve(state, `.planning-transaction.${nonce}`);
   mkdirSync(channel, { mode: 0o700 });
   const ready = resolve(channel, "ready");
+  const done = resolve(channel, "mutation-done");
   const errorPath = resolve(channel, "error");
   const errorFd = openSync(errorPath, "wx", 0o600);
-  const child = spawn("/bin/bash", [broker, nonce, String(process.pid)], {
-    stdio: ["pipe", "ignore", errorFd],
-    env: { ...process.env, FM_STATE_OVERRIDE: state },
+  const child = spawn("/bin/bash", [broker, nonce, String(process.pid), ledgerName], {
+    stdio: ["pipe", "ignore", errorFd], env: { ...process.env, FM_STATE_OVERRIDE: state },
   });
   closeSync(errorFd);
   child.on("error", () => {});
   child.stdin.on("error", () => {});
   child.unref();
   const lock = resolve(state, ".lock.acquire");
-  const commitReady = resolve(channel, "commit-ready");
-  const commitDone = resolve(channel, "commit-done");
   let owner: string | undefined;
-  const assertEvidence = () => {
+  const assertHeld = () => {
     if (!child.pid || !existsSync(ready) || readFileSync(ready, "utf8") !== `READY ${nonce} ${child.pid}\n` ||
         !lstatSync(ready).isFile() || lstatSync(ready).isSymbolicLink() || !lstatSync(lock).isSymbolicLink()) {
       throw new Error("Planning transaction broker lost ownership");
@@ -43,44 +48,26 @@ export function planningTransaction<T>(directory: string,
       throw new Error("Planning transaction ownership evidence changed");
     }
   };
-  const assertHeld = () => {
-    assertEvidence();
-    const processState = spawnSync("ps", ["-o", "stat=", "-p", String(child.pid)], { encoding: "utf8", timeout: 1000 });
-    if (processState.status !== 0 || !processState.stdout.trim() || /Z/.test(processState.stdout)) {
-      throw new Error("Planning transaction broker exited");
-    }
-  };
-  const commitHeld = <R>(commit: () => R): R => {
-    assertEvidence();
-    child.stdin.write(`COMMIT ${nonce}\n`);
+  const request = (verb: "REPLACE" | "REMOVE", kind: EvidenceKind) => {
+    assertHeld();
+    rmSync(done, { force: true });
+    child.stdin.write(`${verb} ${kind.toUpperCase()} ${nonce}\n`);
     const deadline = Date.now() + 1500;
-    while (!existsSync(commitReady)) {
-      if (!existsSync(ready) || Date.now() >= deadline) throw new Error("Planning transaction commit handshake failed");
-      sleep();
-    }
-    if (readFileSync(commitReady, "utf8") !== `COMMIT ${nonce} ${child.pid}\n`) {
-      throw new Error("Planning transaction commit receipt is invalid");
-    }
-    assertEvidence();
-    let result: R | undefined;
-    let failure: unknown;
-    let failed = false;
-    try { result = commit(); } catch (error) { failure = error; failed = true; }
-    child.stdin.write(`END ${nonce}\n`);
-    const completionDeadline = Date.now() + 1500;
-    while (!existsSync(commitDone)) {
-      if (!existsSync(ready) || Date.now() >= completionDeadline) {
-        throw new Error("Planning transaction broker exited during canonical commit", { cause: failure });
+    while (!existsSync(done)) {
+      if (!existsSync(ready) || Date.now() >= deadline) {
+        throw new Error("Planning transaction broker exited before mutation completion");
       }
       sleep();
     }
-    if (readFileSync(commitDone, "utf8") !== `DONE ${nonce} ${child.pid}\n`) {
-      throw new Error("Planning transaction completion receipt is invalid", { cause: failure });
+    if (readFileSync(done, "utf8") !== `DONE ${verb} ${kind.toUpperCase()} ${nonce} ${child.pid}\n`) {
+      throw new Error("Planning transaction mutation receipt is invalid");
     }
-    rmSync(commitDone);
-    assertEvidence();
-    if (failed) throw failure;
-    return result as R;
+    assertHeld();
+  };
+  const mutations: Mutations = {
+    stage: (kind) => resolve(channel, `${kind}.next`),
+    replace: (kind) => request("REPLACE", kind),
+    remove: (kind) => request("REMOVE", kind),
   };
   try {
     const deadline = Date.now() + 6500;
@@ -91,7 +78,7 @@ export function planningTransaction<T>(directory: string,
       sleep();
     }
     assertHeld();
-    const result = action(assertHeld, commitHeld);
+    const result = action(assertHeld, mutations);
     assertHeld();
     return result;
   } finally {
@@ -99,8 +86,6 @@ export function planningTransaction<T>(directory: string,
     const deadline = Date.now() + 1500;
     while (existsSync(ready) && Date.now() < deadline) sleep();
     if (existsSync(ready)) child.kill("SIGTERM");
-    // A killed broker's canonical lock evidence belongs to the canonical recovery
-    // protocol, not to this caller's cleanup. Only remove our private transport.
     rmSync(channel, { recursive: true, force: true });
   }
 }

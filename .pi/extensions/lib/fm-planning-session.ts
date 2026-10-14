@@ -1,8 +1,8 @@
 // Session-local scheduling and durable slot receipts. No network or model calls.
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync,
-  renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+  unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute } from "node:path";
 import { html5Entities } from "./html5-entities.ts";
 import { planningTransaction } from "./fm-planning-lock.ts";
 
@@ -131,6 +131,7 @@ export function fileStore(path: string, operations: {
   sync(fd: number): void;
   retireSync?(fd: number): void;
   beforeRename?(): void;
+  beforeMutation?(kind: "ledger" | "journal" | "pending", action: "replace" | "remove"): void;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
   const journalPath = `${path}.recovery.json`;
   const pendingPath = `${path}.pending-recovery.json`;
@@ -159,14 +160,15 @@ export function fileStore(path: string, operations: {
     try { sync(directory); } finally { closeSync(directory); }
   };
   let assertHeld: (() => void) | undefined;
-  let commitHeld: (<T>(commit: () => T) => T) | undefined;
+  let mutations: { stage(kind: "ledger" | "journal" | "pending"): string;
+    replace(kind: "ledger" | "journal" | "pending"): void; remove(kind: "journal" | "pending"): void } | undefined;
   const locked = <T>(action: () => T): T => {
     if (assertHeld) { assertHeld(); return action(); }
     safeParent();
-    return planningTransaction(dirname(path), (verify, commit) => {
+    return planningTransaction(dirname(path), basename(path), (verify, brokerMutations) => {
       assertHeld = verify;
-      commitHeld = commit;
-      try { return action(); } finally { assertHeld = undefined; commitHeld = undefined; }
+      mutations = brokerMutations;
+      try { return action(); } finally { assertHeld = undefined; mutations = undefined; }
     });
   };
   const ledgerBytes = (state: SlotState) => `${JSON.stringify(state)}\n`;
@@ -204,13 +206,14 @@ export function fileStore(path: string, operations: {
   };
   const publishJournal = (record: Recovery) => {
     assertHeld!();
-    const temp = `${journalPath}.${randomUUID()}.tmp`;
+    const temp = mutations!.stage("journal");
     let fd: number | undefined;
     try {
       fd = openSync(temp, "wx", 0o600);
       writeFileSync(fd, `${JSON.stringify(record)}\n`);
       fsyncSync(fd); closeSync(fd); fd = undefined;
-      assertHeld!(); renameSync(temp, journalPath); syncDirectory(fsyncSync);
+      operations.beforeMutation?.("journal", "replace");
+      mutations!.replace("journal");
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}
@@ -220,14 +223,18 @@ export function fileStore(path: string, operations: {
     assertHeld!();
     if (!existsSync(source)) return;
     const bytes = readFileSync(source);
-    unlinkSync(source);
+    const kind = source === journalPath ? "journal" : "pending";
+    operations.beforeMutation?.(kind, "remove");
+    mutations!.remove(kind);
     try {
       syncDirectory(operations.retireSync ?? fsyncSync);
     } catch (retirementError) {
       try {
-        const fd = openSync(source, "wx", 0o600);
+        const staged = mutations!.stage(kind);
+        const fd = openSync(staged, "wx", 0o600);
         try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
-        syncDirectory(fsyncSync);
+        operations.beforeMutation?.(kind, "replace");
+        mutations!.replace(kind);
       } catch (restorationError) {
         throw new Error(`Planning ${label} retirement failed and durable recovery evidence could not be restored`,
           { cause: restorationError });
@@ -239,11 +246,13 @@ export function fileStore(path: string, operations: {
   const clearJournal = () => clearRecovery(journalPath, "journal");
   const publishPending = (record: Recovery) => {
     assertHeld!();
-    const temp = `${pendingPath}.${randomUUID()}.tmp`;
+    const temp = mutations!.stage("pending");
     let fd: number | undefined;
     try {
       fd = openSync(temp, "wx", 0o600); writeFileSync(fd, `${JSON.stringify(record)}\n`); fsyncSync(fd);
-      closeSync(fd); fd = undefined; assertHeld!(); renameSync(temp, pendingPath); syncDirectory(fsyncSync);
+      closeSync(fd); fd = undefined;
+      operations.beforeMutation?.("pending", "replace");
+      mutations!.replace("pending");
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}
@@ -256,7 +265,7 @@ export function fileStore(path: string, operations: {
   };
   const clearPending = () => clearRecovery(pendingPath, "pending evidence");
   const writeUnlocked = (state: SlotState, authorize: (() => boolean) | undefined, onRename: () => void) => {
-    const temp = `${path}.${randomUUID()}.tmp`;
+    const temp = mutations!.stage("ledger");
     let fd: number | undefined;
     let failure: unknown;
     let failed = false;
@@ -273,13 +282,12 @@ export function fileStore(path: string, operations: {
       }
       if (failed) throw failure;
       requireAuthorized(authorize);
-      commitHeld!(() => {
-        operations.beforeRename?.();
-        requireAuthorized(authorize);
-        renameSync(temp, path);
-        onRename();
-        syncDirectory(operations.sync);
-      });
+      operations.beforeRename?.();
+      operations.beforeMutation?.("ledger", "replace");
+      requireAuthorized(authorize);
+      mutations!.replace("ledger");
+      onRename();
+      syncDirectory(operations.sync);
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { if (existsSync(temp)) unlinkSync(temp); } catch {}

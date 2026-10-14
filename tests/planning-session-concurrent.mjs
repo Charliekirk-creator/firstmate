@@ -299,20 +299,43 @@ try {
     await f.close(); console.log(`ok - ${phase} parent death, blocked publisher, atomic adoption and successor restart`);
   }
   {
-    const f = await fixture('broker-signal-at-rename'); await f.publish(f.A); ok(await f.A.call('start'));
+    const f = await fixture('broker-kill-at-rename'); await f.publish(f.A); ok(await f.A.call('start'));
     const original = f.bytes();
-    const transaction = f.A.begin('tick', { slot: first, barrier: 'authorized', fault: 'broker-signal' });
+    const transaction = f.A.begin('tick', { slot: first, barrier: 'authorized', fault: 'broker-kill-final' });
     await atBarrier(f, f.A);
     f.preparePublish(f.B); const publication = f.B.begin('publish');
     await until(() => existsSync(join(f.directory, 'B.attempt')), 'B acquire attempt at authorized rename boundary');
     assert.equal(publication.completed(), false);
-    assert.equal(f.bytes(), original, 'canonical bytes stay unchanged before the authorized rename');
     release(f, f.A);
-    assert.match((await transaction.result()).error, /commit uncertain|broker exited/);
+    assert.match((await transaction.result()).error, /broker exited|lost ownership|mutation completion/);
     ok(await publication.result());
-    assert.deepEqual(f.state().due, [first], 'A completes its rename before the deferred signal releases the lock');
-    assert.equal(f.journal().candidate.due[0], first);
-    await f.close(); console.log('ok - broker signal cannot transfer ownership across the canonical rename');
+    assert.equal(f.bytes(), original, 'unmaskable broker death prevents the canonical rename');
+    assert.equal(f.journal().candidate.due[0], first, 'pre-commit recovery evidence remains available');
+    await f.close(); console.log('ok - broker SIGKILL prevents canonical mutation before ownership transfer');
+  }
+  for (const mutation of ['journal-replace', 'journal-remove', 'pending-replace']) {
+    const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
+    let command;
+    if (mutation === 'journal-replace') {
+      command = f.A.begin('tick', { slot: first, barrier: mutation, fault: `broker-kill-${mutation}` });
+    } else if (mutation === 'journal-remove') {
+      assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
+      const operationId = f.journal().operationId; ok(await f.A.call('reset'));
+      command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
+    } else {
+      assert.match((await f.A.call('tick', { slot: first, fault: 'before-rename' })).error, /pre-rename/);
+      const operationId = f.journal().operationId; ok(await f.A.call('reset'));
+      command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
+    }
+    await atBarrier(f, f.A); const before = f.artifacts();
+    f.preparePublish(f.B); const publication = f.B.begin('publish');
+    await until(() => existsSync(join(f.directory, 'B.attempt')), `B acquire attempt at ${mutation}`);
+    assert.equal(publication.completed(), false);
+    release(f, f.A);
+    assert.match((await command.result()).error, /broker exited|lost ownership|mutation completion/);
+    ok(await publication.result());
+    assert.deepEqual(f.artifacts(), before, `${mutation} cannot occur after unmaskable broker death`);
+    await f.close(); console.log(`ok - broker SIGKILL prevents ${mutation} across ownership publication`);
   }
   // Broker death before rename must abort the caller, not let it write without
   // the lock. Canonical recovery handles primary and nested steal orphans.
