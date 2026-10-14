@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync,
-  realpathSync, rmSync } from "node:fs";
+  realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,8 +13,7 @@ type EvidenceKind = "ledger" | "journal" | "pending";
 type Mutations = {
   stage(kind: EvidenceKind): string;
   replace(kind: EvidenceKind): void;
-  remove(kind: Exclude<EvidenceKind, "ledger">, beforeAcknowledge?: () => void,
-    beforeConfirm?: () => void): void;
+  remove(kind: Exclude<EvidenceKind, "ledger">, afterRemoveApplied?: () => void): void;
 };
 
 export function planningTransaction<T>(directory: string, ledgerName: string,
@@ -26,6 +25,8 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
   mkdirSync(channel, { mode: 0o700 });
   const ready = resolve(channel, "ready");
   const done = resolve(channel, "mutation-done");
+  const applied = resolve(channel, "mutation-applied");
+  const pause = resolve(channel, "pause-after-mutation");
   const errorPath = resolve(channel, "error");
   const errorFd = openSync(errorPath, "wx", 0o600);
   const child = spawn("/bin/bash", [broker, nonce, String(process.pid), ledgerName], {
@@ -49,12 +50,20 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
       throw new Error("Planning transaction ownership evidence changed");
     }
   };
-  const request = (verb: "REPLACE" | "REMOVE" | "ACK" | "CONFIRM", kind: EvidenceKind) => {
+  const request = (verb: "REPLACE" | "REMOVE" | "CLEANUP", kind: EvidenceKind,
+    afterApplied?: () => void) => {
     assertHeld();
     rmSync(done, { force: true });
+    rmSync(applied, { force: true });
+    if (afterApplied) writeFileSync(pause, `${nonce}\n`, { mode: 0o600 });
     child.stdin.write(`${verb} ${kind.toUpperCase()} ${nonce}\n`);
     const deadline = Date.now() + 1500;
+    let observedApplied = false;
     while (!existsSync(done)) {
+      if (afterApplied && !observedApplied && existsSync(applied)) {
+        observedApplied = true;
+        try { afterApplied(); } finally { rmSync(pause, { force: true }); }
+      }
       if (!existsSync(ready) || Date.now() >= deadline) {
         throw new Error("Planning transaction broker exited before mutation completion");
       }
@@ -68,12 +77,9 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
   const mutations: Mutations = {
     stage: (kind) => resolve(channel, `${kind}.next`),
     replace: (kind) => request("REPLACE", kind),
-    remove: (kind, beforeAcknowledge, beforeConfirm) => {
-      request("REMOVE", kind);
-      beforeAcknowledge?.();
-      request("ACK", kind);
-      beforeConfirm?.();
-      request("CONFIRM", kind);
+    remove: (kind, afterRemoveApplied) => {
+      request("REMOVE", kind, afterRemoveApplied);
+      request("CLEANUP", kind);
     },
   };
   try {

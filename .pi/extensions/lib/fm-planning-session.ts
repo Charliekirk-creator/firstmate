@@ -135,7 +135,9 @@ export function fileStore(path: string, operations: {
   sync(fd: number): void;
   retireSync?(fd: number): void;
   beforeRename?(): void;
-  beforeMutation?(kind: "ledger" | "journal" | "pending", action: "replace" | "remove" | "ack" | "confirm"): void;
+  beforeMutation?(kind: "ledger" | "journal" | "pending",
+    action: "replace" | "remove" | "remove-applied"): void;
+  pauseAfterMutation?(kind: "journal" | "pending", action: "remove"): boolean;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
   const journalPath = `${path}.recovery.json`;
   const pendingPath = `${path}.pending-recovery.json`;
@@ -166,8 +168,7 @@ export function fileStore(path: string, operations: {
   let assertHeld: (() => void) | undefined;
   let mutations: { stage(kind: "ledger" | "journal" | "pending"): string;
     replace(kind: "ledger" | "journal" | "pending"): void;
-    remove(kind: "journal" | "pending", beforeAcknowledge?: () => void,
-      beforeConfirm?: () => void): void } | undefined;
+    remove(kind: "journal" | "pending", afterRemoveApplied?: () => void): void } | undefined;
   const locked = <T>(action: () => T): T => {
     if (assertHeld) { assertHeld(); return action(); }
     safeParent();
@@ -184,7 +185,7 @@ export function fileStore(path: string, operations: {
     intendedHash: string; expectedOwner: Owner | null; expectedVersion: number | null;
     expectedGeneration: number | null; candidate: SlotState; consumesPendingHash?: string };
   const recoverySource = (source: string) => existsSync(source) ? source :
-    existsSync(`${source}.retired`) && !existsSync(`${source}.retired.confirmed`) ? `${source}.retired` : undefined;
+    existsSync(`${source}.retired`) ? `${source}.retired` : undefined;
   const recoveryBytes = (source: string) => {
     const resolved = recoverySource(source);
     return resolved ? readFileSync(resolved, "utf8") : undefined;
@@ -240,8 +241,9 @@ export function fileStore(path: string, operations: {
     const kind = source === journalPath ? "journal" : "pending";
     if (operations.retireSync) syncDirectory(operations.retireSync);
     operations.beforeMutation?.(kind, "remove");
-    mutations!.remove(kind, () => operations.beforeMutation?.(kind, "ack"),
-      () => operations.beforeMutation?.(kind, "confirm"));
+    const afterApplied = operations.pauseAfterMutation?.(kind, "remove")
+      ? () => operations.beforeMutation?.(kind, "remove-applied") : undefined;
+    mutations!.remove(kind, afterApplied);
   };
   const clearJournal = () => clearRecovery(journalPath);
   const publishPending = (record: Recovery) => {

@@ -56,6 +56,10 @@ function reset() {
         process.kill(Number(readFileSync(join(target, 'pid'), 'utf8')), 'SIGKILL');
       }
     },
+    pauseAfterMutation(kind, action) {
+      const stage = `${kind}-${action}-applied`;
+      return settings.barrier === stage || settings.fault === `broker-kill-${stage}`;
+    },
   });
   clock = new PlanningSessionClock(owner, store, { now: () => now, valid: authority, ownsMain: authority,
     wifi: () => wifi, later(fn) { callback = fn; return () => { if (callback === fn) callback = undefined; }; },

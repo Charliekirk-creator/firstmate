@@ -316,12 +316,12 @@ try {
     assert.equal(f.journal().candidate.due[0], first, 'pre-commit recovery evidence remains available');
     await f.close(); console.log('ok - broker SIGKILL prevents canonical mutation before ownership transfer');
   }
-  for (const mutation of ['journal-replace', 'journal-remove', 'journal-ack', 'journal-confirm', 'pending-replace']) {
+  for (const mutation of ['journal-replace', 'journal-remove', 'journal-remove-applied', 'pending-replace']) {
     const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
     let command;
     if (mutation === 'journal-replace') {
       command = f.A.begin('tick', { slot: first, barrier: mutation, fault: `broker-kill-${mutation}` });
-    } else if (['journal-remove', 'journal-ack', 'journal-confirm'].includes(mutation)) {
+    } else if (mutation === 'journal-remove' || mutation === 'journal-remove-applied') {
       assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
       const operationId = f.journal().operationId; ok(await f.A.call('reset'));
       command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
@@ -338,7 +338,7 @@ try {
     assert.match((await command.result()).error, /broker exited|lost ownership|mutation completion/);
     ok(await publication.result());
     assert.deepEqual(f.artifacts(), before, `${mutation} cannot occur after unmaskable broker death`);
-    if (mutation === 'journal-ack' || mutation === 'journal-confirm') {
+    if (mutation === 'journal-remove-applied') {
       ok(await f.B.call('reset'));
       const status = ok(await f.B.call('status')).value;
       assert.ok(status.recovery, 'unacknowledged retirement remains discoverable after holder death');

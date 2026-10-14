@@ -54,7 +54,7 @@ input.on('line', (line) => {
   }
   const [verb, kind, token] = parts;
   if (token !== nonce || parts.length !== 3 || !(kind in targets) || !ownsLock() ||
-      !['REPLACE', 'REMOVE', 'ACK', 'CONFIRM'].includes(verb) || verb !== 'REPLACE' && kind === 'LEDGER') {
+      !['REPLACE', 'REMOVE', 'CLEANUP'].includes(verb) || verb !== 'REPLACE' && kind === 'LEDGER') {
     release(); process.exit(2);
   }
   if (verb === 'REPLACE') {
@@ -64,19 +64,20 @@ input.on('line', (line) => {
       release(); process.exit(2);
     }
     renameSync(source, targets[kind]);
-    if (kind !== 'LEDGER') {
-      rmSync(`${targets[kind]}.retired`, { force: true });
-      rmSync(`${targets[kind]}.retired.ack`, { force: true });
-      rmSync(`${targets[kind]}.retired.confirmed`, { force: true });
-    }
+    if (kind !== 'LEDGER') rmSync(`${targets[kind]}.retired`, { force: true });
   } else if (verb === 'REMOVE') {
     if (existsSync(targets[kind])) renameSync(targets[kind], `${targets[kind]}.retired`);
   } else {
-    const suffix = verb === 'ACK' ? 'ack' : 'confirmed';
-    writeFileSync(`${targets[kind]}.retired.${suffix}`, `${nonce}\n`, { mode: 0o600 });
+    rmSync(`${targets[kind]}.retired`, { force: true });
   }
   syncDirectory();
   if (!ownsLock()) process.exit(1);
+  const pause = join(channel, 'pause-after-mutation');
+  if (existsSync(pause)) {
+    readyReceipt('mutation-applied', `APPLIED ${verb} ${kind} ${nonce} ${process.pid}\n`);
+    while (existsSync(pause) && ownsLock()) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    if (!ownsLock()) process.exit(1);
+  }
   readyReceipt('mutation-done', `DONE ${verb} ${kind} ${nonce} ${process.pid}\n`);
 });
 input.on('close', () => { release(); process.exit(0); });
