@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync,
-  realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+  realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +14,7 @@ type Mutations = {
   stage(kind: EvidenceKind): string;
   replace(kind: EvidenceKind): void;
   remove(kind: Exclude<EvidenceKind, "ledger">, acknowledgement: string, afterRemoveApplied?: () => void,
+    beforeAcknowledge?: () => void, afterAcknowledgeApplied?: () => void,
     beforeCleanup?: () => void, afterCleanupApplied?: () => void): void;
 };
 
@@ -51,7 +52,7 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
       throw new Error("Planning transaction ownership evidence changed");
     }
   };
-  const request = (verb: "REPLACE" | "REMOVE" | "CLEANUP", kind: EvidenceKind,
+  const request = (verb: "REPLACE" | "REMOVE" | "ACK" | "CLEANUP" | "VERIFY", kind: EvidenceKind,
     afterApplied?: () => void) => {
     assertHeld();
     rmSync(done, { force: true });
@@ -79,23 +80,15 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
   const mutations: Mutations = {
     stage: (kind) => resolve(channel, `${kind}.next`),
     replace: (kind) => request("REPLACE", kind),
-    remove: (kind, acknowledgement, afterRemoveApplied, beforeCleanup, afterCleanupApplied) => {
+    remove: (kind, acknowledgement, afterRemoveApplied, beforeAcknowledge, afterAcknowledgeApplied,
+      beforeCleanup, afterCleanupApplied) => {
+      const prepared = resolve(channel, `${kind}.receipt.next`);
+      const fd = openSync(prepared, "wx", 0o600);
+      try { writeFileSync(fd, acknowledgement); fsyncSync(fd); } finally { closeSync(fd); }
       request("REMOVE", kind, afterRemoveApplied);
-      const target = resolve(state, `${ledgerName}.${kind === "journal" ? "recovery.json" : "pending-recovery.json"}.retired.receipt`);
-      const prepared = resolve(channel, `${kind}.receipt`);
-      try {
-        const fd = openSync(prepared, "wx", 0o600);
-        try { writeFileSync(fd, acknowledgement); fsyncSync(fd); } finally { closeSync(fd); }
-        renameSync(prepared, target);
-        const directoryFd = openSync(state, "r");
-        try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
-        cleanups.push({ kind, before: beforeCleanup, after: afterCleanupApplied });
-      } catch (error) {
-        rmSync(target, { force: true });
-        const directoryFd = openSync(state, "r");
-        try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
-        throw error;
-      }
+      beforeAcknowledge?.();
+      request("ACK", kind, afterAcknowledgeApplied);
+      cleanups.push({ kind, before: beforeCleanup, after: afterCleanupApplied });
     },
   };
   try {
@@ -108,7 +101,7 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
     }
     assertHeld();
     const result = action(assertHeld, mutations);
-    assertHeld();
+    request("VERIFY", "ledger");
     for (const cleanup of cleanups) {
       try {
         cleanup.before?.();

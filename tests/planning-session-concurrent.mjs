@@ -345,6 +345,29 @@ try {
     }
     await f.close(); console.log(`ok - broker SIGKILL preserves recovery across ${mutation} and ownership publication`);
   }
+  for (const mutation of ['journal-ack', 'journal-ack-applied']) {
+    const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
+    assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
+    const operationId = f.journal().operationId; ok(await f.A.call('reset'));
+    const command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
+    await atBarrier(f, f.A);
+    f.preparePublish(f.B); const publication = f.B.begin('publish');
+    await until(() => existsSync(join(f.directory, 'B.attempt')), `B acquire attempt at ${mutation}`);
+    assert.equal(publication.completed(), false);
+    release(f, f.A);
+    assert.match((await command.result()).error, /broker exited|lost ownership|mutation completion/);
+    ok(await publication.result()); ok(await f.B.call('reset'));
+    const status = ok(await f.B.call('status')).value;
+    if (mutation === 'journal-ack') {
+      assert.ok(status.recovery, 'holder loss before acknowledgement leaves recovery discoverable');
+      assert.equal(readdirSync(f.directory).some(name => name.includes(`retirement.${operationId}`)), false);
+    } else {
+      assert.equal(status.recovery, undefined, 'durable acknowledgement settles a lost response');
+      await f.publish(f.A); ok(await f.A.call('reset')); ok(await f.A.call('recover', { operationId }));
+      assert.deepEqual(f.state().due, [first]);
+    }
+    await f.close(); console.log(`ok - ${mutation} preserves exact durable retirement semantics`);
+  }
   for (const mutation of ['journal-cleanup', 'journal-cleanup-applied']) {
     const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
     assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
@@ -358,6 +381,8 @@ try {
     ok(await command.result());
     ok(await publication.result());
     assert.deepEqual(f.state().due, [first]);
+    assert.equal(readdirSync(f.directory).some(name => name.includes(`retirement.${operationId}`)), true,
+      'cleanup preserves the immutable retirement receipt');
     ok(await f.B.call('reset'));
     assert.equal(ok(await f.B.call('status')).value.recovery, undefined,
       'acknowledged retirement remains settled when cleanup response is lost');

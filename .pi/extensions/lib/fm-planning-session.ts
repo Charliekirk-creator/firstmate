@@ -136,8 +136,8 @@ export function fileStore(path: string, operations: {
   retireSync?(fd: number): void;
   beforeRename?(): void;
   beforeMutation?(kind: "ledger" | "journal" | "pending",
-    action: "replace" | "remove" | "remove-applied" | "cleanup" | "cleanup-applied"): void;
-  pauseAfterMutation?(kind: "journal" | "pending", action: "remove" | "cleanup"): boolean;
+    action: "replace" | "remove" | "remove-applied" | "ack" | "ack-applied" | "cleanup" | "cleanup-applied"): void;
+  pauseAfterMutation?(kind: "journal" | "pending", action: "remove" | "ack" | "cleanup"): boolean;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
   const journalPath = `${path}.recovery.json`;
   const pendingPath = `${path}.pending-recovery.json`;
@@ -169,6 +169,7 @@ export function fileStore(path: string, operations: {
   let mutations: { stage(kind: "ledger" | "journal" | "pending"): string;
     replace(kind: "ledger" | "journal" | "pending"): void;
     remove(kind: "journal" | "pending", acknowledgement: string, afterRemoveApplied?: () => void,
+      beforeAcknowledge?: () => void, afterAcknowledgeApplied?: () => void,
       beforeCleanup?: () => void, afterCleanupApplied?: () => void): void } | undefined;
   const locked = <T>(action: () => T): T => {
     if (assertHeld) { assertHeld(); return action(); }
@@ -185,18 +186,35 @@ export function fileStore(path: string, operations: {
   type Recovery = { operationId: string; phase: "prepared" | "aborted" | "committed"; expectedHash: string;
     intendedHash: string; expectedOwner: Owner | null; expectedVersion: number | null;
     expectedGeneration: number | null; candidate: SlotState; consumesPendingHash?: string };
+  const readRetirementReceipt = (source: string, operationId: string) => {
+    try {
+      const receiptPath = `${source}.retirement.${operationId}.json`;
+      const stat = lstatSync(receiptPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) return undefined;
+      const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+      const kind = source === journalPath ? "JOURNAL" : "PENDING";
+      const record = receipt?.record;
+      if (receipt?.kind !== kind || record?.operationId !== operationId ||
+          !["prepared", "aborted", "committed"].includes(record?.phase) ||
+          !/^[a-f0-9]{64}$/.test(record?.expectedHash ?? "") || !/^[a-f0-9]{64}$/.test(record?.intendedHash ?? "") ||
+          (record.expectedOwner !== null && !validOwner(record.expectedOwner)) ||
+          !/^[a-f0-9]{64}$/.test(receipt.evidenceHash ?? "") ||
+          !/^[a-f0-9]{32}$/.test(receipt.holderNonce ?? "") || !integer(receipt.holderPid) ||
+          typeof receipt.lockOwner !== "string" || !receipt.lockOwner.startsWith(`${dirname(path)}/.lock.acquire.owner.`)) {
+        return undefined;
+      }
+      validateState(record.candidate);
+      if (bytesHash(ledgerBytes(record.candidate)) !== record.intendedHash) return undefined;
+      return receipt;
+    } catch { return undefined; }
+  };
   const retirementAcknowledged = (source: string) => {
     const retired = `${source}.retired`;
     try {
-      const receiptPath = `${retired}.receipt`;
-      const stat = lstatSync(receiptPath);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 4096) return false;
       const evidence = readFileSync(retired, "utf8");
       const recovery = JSON.parse(evidence);
-      const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
-      const kind = source === journalPath ? "JOURNAL" : "PENDING";
-      return receipt?.kind === kind && receipt.operationId === recovery?.operationId &&
-        receipt.expectedHash === recovery?.expectedHash && receipt.intendedHash === recovery?.intendedHash &&
+      const receipt = readRetirementReceipt(source, recovery.operationId);
+      return !!receipt && JSON.stringify(receipt.record) === JSON.stringify(recovery) &&
         receipt.evidenceHash === bytesHash(evidence);
     } catch { return false; }
   };
@@ -257,16 +275,19 @@ export function fileStore(path: string, operations: {
     const kind = source === journalPath ? "journal" : "pending";
     const evidence = readFileSync(resolved, "utf8");
     const record = JSON.parse(evidence) as Recovery;
-    const acknowledgement = `${JSON.stringify({ kind: kind.toUpperCase(), operationId: record.operationId,
-      expectedHash: record.expectedHash, intendedHash: record.intendedHash, evidenceHash: bytesHash(evidence) })}\n`;
+    const acknowledgement = `${JSON.stringify({ kind: kind.toUpperCase(), evidenceHash: bytesHash(evidence), record })}\n`;
     if (operations.retireSync) syncDirectory(operations.retireSync);
     operations.beforeMutation?.(kind, "remove");
     const afterApplied = operations.pauseAfterMutation?.(kind, "remove")
       ? () => operations.beforeMutation?.(kind, "remove-applied") : undefined;
+    const beforeAcknowledge = () => operations.beforeMutation?.(kind, "ack");
+    const afterAcknowledge = operations.pauseAfterMutation?.(kind, "ack")
+      ? () => operations.beforeMutation?.(kind, "ack-applied") : undefined;
     const beforeCleanup = () => operations.beforeMutation?.(kind, "cleanup");
     const afterCleanup = operations.pauseAfterMutation?.(kind, "cleanup")
       ? () => operations.beforeMutation?.(kind, "cleanup-applied") : undefined;
-    mutations!.remove(kind, acknowledgement, afterApplied, beforeCleanup, afterCleanup);
+    mutations!.remove(kind, acknowledgement, afterApplied, beforeAcknowledge, afterAcknowledge,
+      beforeCleanup, afterCleanup);
   };
   const clearJournal = () => clearRecovery(journalPath);
   const publishPending = (record: Recovery) => {
@@ -450,8 +471,25 @@ export function fileStore(path: string, operations: {
     reconcile(authorize, operationId, owner, validateEvidence) {
       return locked(() => {
         requireAuthorized(authorize);
-        const record = readJournal();
-        if (!record) return { outcome: "none" as const };
+        let record = readJournal();
+        if (!record) {
+          const acknowledged = readRetirementReceipt(journalPath, operationId);
+          if (!acknowledged) return { outcome: "none" as const };
+          record = acknowledged.record as Recovery;
+          if (!sameOwner(record.candidate.owner, owner)) {
+            throw new Error("Planning recovery candidate belongs to another owner");
+          }
+          const current = readUnlocked();
+          const hash = bytesHash(readBytesUnlocked());
+          validateEvidence?.(record.candidate, current);
+          if (record.phase === "aborted" && hash === record.expectedHash) {
+            return { outcome: "aborted" as const, state: current, operationId };
+          }
+          if (record.phase !== "aborted" && hash === record.intendedHash && current && sameOwner(current.owner, owner)) {
+            return { outcome: "committed" as const, state: current, operationId };
+          }
+          throw new Error("Acknowledged planning recovery does not match canonical ledger bytes");
+        }
         if (record.operationId !== operationId) throw new Error("Planning recovery operation id does not match");
         if (!sameOwner(record.candidate.owner, owner)) throw new Error("Planning recovery candidate belongs to another owner");
         const current = readUnlocked();

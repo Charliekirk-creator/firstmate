@@ -55,9 +55,15 @@ input.on('line', (line) => {
   }
   const [verb, kind, token] = parts;
   if (token !== nonce || parts.length !== 3 || !(kind in targets) || !ownsLock() ||
-      !['REPLACE', 'REMOVE', 'CLEANUP'].includes(verb) || verb !== 'REPLACE' && kind === 'LEDGER') {
+      !['REPLACE', 'REMOVE', 'ACK', 'CLEANUP', 'VERIFY'].includes(verb) ||
+      !['REPLACE', 'VERIFY'].includes(verb) && kind === 'LEDGER') {
     release(); process.exit(2);
   }
+  if (verb === 'VERIFY') {
+    readyReceipt('mutation-done', `DONE ${verb} ${kind} ${nonce} ${process.pid}\n`);
+    return;
+  }
+  let receiptVerification;
   if (verb === 'REPLACE') {
     const source = stages[kind];
     const stat = lstatSync(source);
@@ -65,32 +71,52 @@ input.on('line', (line) => {
       release(); process.exit(2);
     }
     renameSync(source, targets[kind]);
-    if (kind !== 'LEDGER') {
-      rmSync(`${targets[kind]}.retired`, { force: true });
-      rmSync(`${targets[kind]}.retired.receipt`, { force: true });
-    }
+    if (kind !== 'LEDGER') rmSync(`${targets[kind]}.retired`, { force: true });
   } else if (verb === 'REMOVE') {
     if (existsSync(targets[kind])) renameSync(targets[kind], `${targets[kind]}.retired`);
   } else {
     const retired = `${targets[kind]}.retired`;
-    const receiptPath = `${retired}.receipt`;
-    if (existsSync(retired)) {
-      const receiptStat = lstatSync(receiptPath);
-      if (!receiptStat.isFile() || receiptStat.isSymbolicLink() || receiptStat.nlink !== 1 || receiptStat.size > 4096) {
+    const evidence = readFileSync(retired);
+    const recovery = JSON.parse(evidence);
+    const receiptPath = `${targets[kind]}.retirement.${recovery.operationId}.json`;
+    if (verb === 'ACK') {
+      if (existsSync(receiptPath)) { release(); process.exit(2); }
+      const prepared = stages[kind].replace('.next', '.receipt.next');
+      const stat = lstatSync(prepared);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) {
         release(); process.exit(2);
       }
-      const evidence = readFileSync(retired);
+      const proposed = JSON.parse(readFileSync(prepared, 'utf8'));
+      const evidenceHash = createHash('sha256').update(evidence).digest('hex');
+      if (proposed?.kind !== kind || proposed.evidenceHash !== evidenceHash ||
+          JSON.stringify(proposed.record) !== JSON.stringify(recovery)) {
+        release(); process.exit(2);
+      }
+      const receipt = { ...proposed, holderNonce: nonce, holderPid: process.pid, lockOwner: owner };
+      const receiptBytes = `${JSON.stringify(receipt)}\n`;
+      const output = `${receiptPath}.prepared`;
+      writeFileSync(output, receiptBytes, { mode: 0o600 });
+      const fd = openSync(output, 'r');
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(output, receiptPath);
+      rmSync(prepared, { force: true });
+      receiptVerification = [receiptPath, receiptBytes];
+    } else {
+      const receiptStat = lstatSync(receiptPath);
+      if (!receiptStat.isFile() || receiptStat.isSymbolicLink() || receiptStat.nlink !== 1 || receiptStat.size > 1024 * 1024) {
+        release(); process.exit(2);
+      }
       const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
       const evidenceHash = createHash('sha256').update(evidence).digest('hex');
-      if (receipt?.kind !== kind || !/^[a-f0-9-]{36}$/.test(receipt.operationId ?? '') ||
-          !/^[a-f0-9]{64}$/.test(receipt.expectedHash ?? '') ||
-          !/^[a-f0-9]{64}$/.test(receipt.intendedHash ?? '') || receipt.evidenceHash !== evidenceHash) {
+      if (receipt?.kind !== kind || receipt.evidenceHash !== evidenceHash ||
+          JSON.stringify(receipt.record) !== JSON.stringify(recovery)) {
         release(); process.exit(2);
       }
       rmSync(retired);
     }
   }
   syncDirectory();
+  if (receiptVerification && readFileSync(receiptVerification[0], 'utf8') !== receiptVerification[1]) process.exit(1);
   if (!ownsLock()) process.exit(1);
   const pause = join(channel, 'pause-after-mutation');
   if (existsSync(pause)) {
