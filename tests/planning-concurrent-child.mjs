@@ -93,8 +93,9 @@ process.on('message', ({ id, command, ...options }) => {
         }
         case 'evidence': revocations.set(ownerKey(owner), { owner, reason: 'ledger-failure', due: [first + 999 * HALF_HOUR] }); return;
         case 'seed': {
+          const observations = [{ slot: first, result: 'online' }, { slot: first + HALF_HOUR, result: 'online' }];
           const candidate = { version: 1, generation: 1, owner, firstSlot: first, through: first + HALF_HOUR,
-            due: [first, first + HALF_HOUR], observation: { slot: first + HALF_HOUR, result: 'online' } };
+            due: [first, first + HALF_HOUR], observation: observations.at(-1), observations };
           return store.write(candidate, null, authority);
         }
         case 'inspect': return store.read();

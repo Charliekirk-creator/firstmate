@@ -189,6 +189,9 @@ try {
     assert.match((await f.A.call('recover', { operationId })).error, /another owner/);
     assert.deepEqual(f.artifacts(), retained, 'authoritative foreign A cannot retire B journal');
     await f.publish(f.B); ok(await f.B.call('reset'));
+    const sameOwnerAdopt = await f.B.call('adopt');
+    assert.match(sameOwnerAdopt.error, /recover-commit/);
+    assert.deepEqual(f.artifacts(), retained, 'same-owner adoption cannot settle an active journal');
     const wrongId = '11111111-1111-1111-1111-111111111111';
     assert.match((await f.B.call('recover', { operationId: wrongId })).error, /id does not match/);
     assert.deepEqual(f.artifacts(), retained);
@@ -313,12 +316,12 @@ try {
     assert.equal(f.journal().candidate.due[0], first, 'pre-commit recovery evidence remains available');
     await f.close(); console.log('ok - broker SIGKILL prevents canonical mutation before ownership transfer');
   }
-  for (const mutation of ['journal-replace', 'journal-remove', 'pending-replace']) {
+  for (const mutation of ['journal-replace', 'journal-remove', 'journal-ack', 'journal-confirm', 'pending-replace']) {
     const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
     let command;
     if (mutation === 'journal-replace') {
       command = f.A.begin('tick', { slot: first, barrier: mutation, fault: `broker-kill-${mutation}` });
-    } else if (mutation === 'journal-remove') {
+    } else if (['journal-remove', 'journal-ack', 'journal-confirm'].includes(mutation)) {
       assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
       const operationId = f.journal().operationId; ok(await f.A.call('reset'));
       command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
@@ -335,7 +338,12 @@ try {
     assert.match((await command.result()).error, /broker exited|lost ownership|mutation completion/);
     ok(await publication.result());
     assert.deepEqual(f.artifacts(), before, `${mutation} cannot occur after unmaskable broker death`);
-    await f.close(); console.log(`ok - broker SIGKILL prevents ${mutation} across ownership publication`);
+    if (mutation === 'journal-ack' || mutation === 'journal-confirm') {
+      ok(await f.B.call('reset'));
+      const status = ok(await f.B.call('status')).value;
+      assert.ok(status.recovery, 'unacknowledged retirement remains discoverable after holder death');
+    }
+    await f.close(); console.log(`ok - broker SIGKILL preserves recovery across ${mutation} and ownership publication`);
   }
   // Broker death before rename must abort the caller, not let it write without
   // the lock. Canonical recovery handles primary and nested steal orphans.

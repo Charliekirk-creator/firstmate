@@ -13,7 +13,8 @@ type EvidenceKind = "ledger" | "journal" | "pending";
 type Mutations = {
   stage(kind: EvidenceKind): string;
   replace(kind: EvidenceKind): void;
-  remove(kind: Exclude<EvidenceKind, "ledger">): void;
+  remove(kind: Exclude<EvidenceKind, "ledger">, beforeAcknowledge?: () => void,
+    beforeConfirm?: () => void): void;
 };
 
 export function planningTransaction<T>(directory: string, ledgerName: string,
@@ -48,7 +49,7 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
       throw new Error("Planning transaction ownership evidence changed");
     }
   };
-  const request = (verb: "REPLACE" | "REMOVE", kind: EvidenceKind) => {
+  const request = (verb: "REPLACE" | "REMOVE" | "ACK" | "CONFIRM", kind: EvidenceKind) => {
     assertHeld();
     rmSync(done, { force: true });
     child.stdin.write(`${verb} ${kind.toUpperCase()} ${nonce}\n`);
@@ -67,7 +68,13 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
   const mutations: Mutations = {
     stage: (kind) => resolve(channel, `${kind}.next`),
     replace: (kind) => request("REPLACE", kind),
-    remove: (kind) => request("REMOVE", kind),
+    remove: (kind, beforeAcknowledge, beforeConfirm) => {
+      request("REMOVE", kind);
+      beforeAcknowledge?.();
+      request("ACK", kind);
+      beforeConfirm?.();
+      request("CONFIRM", kind);
+    },
   };
   try {
     const deadline = Date.now() + 6500;

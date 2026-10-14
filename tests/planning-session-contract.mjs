@@ -797,6 +797,10 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.throws(() => validateState({ ...old, observation: { slot: old.through, result: 'connected' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, observation: { slot: old.through, result: 'online' } }), /Malformed/);
     assert.throws(() => validateState({ ...old, due: [old.through], observation: { slot: old.through, result: 'offline' } }), /Malformed/);
+    const orphanObservation = { slot: first + HALF_HOUR, result: 'online' };
+    assert.throws(() => validateState({ version: 1, generation: 1, owner, firstSlot: first,
+      through: first + HALF_HOUR, due: [first, first + HALF_HOUR], observation: orphanObservation,
+      observations: [orphanObservation] }), /Malformed/, 'every due slot requires its own online observation');
     const falseLateness = { ...old.delivery, lateByMs: old.delivery.lateByMs + 1 };
     assert.throws(() => validateState({ ...old, delivery: falseLateness,
       deliveries: [...old.deliveries.slice(0, -1), falseLateness] }), /Malformed/);
