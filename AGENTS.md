@@ -297,7 +297,7 @@ On a `no-mistakes-prod-only` project, classify the task's surface: internal-only
 An unregistered project or absent registry resolves to `no-mistakes` with yolo off, and the registration gap goes to the captain.
 Record the resulting mode, `yolo` merge posture, and the one-line reason for any deviation in the backlog item note.
 
-Load [team-option-assessment](.agents/skills/team-option-assessment/SKILL.md) before assigning each new substantial intake and before material replanning; it owns the local single-owner versus team recommendation procedure.
+Load [team-option-assessment](.agents/skills/team-option-assessment/SKILL.md) at each new substantial intake and material replanning point; it owns the local single-owner versus team recommendation procedure.
 Team advice never grants assignment, external disclosure, lifecycle, or merge authority.
 Write the task-specific brief under section 11 before spawning.
 
