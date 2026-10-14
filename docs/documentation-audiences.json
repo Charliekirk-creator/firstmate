@@ -305,6 +305,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/compact-metadata-policy.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/configuration.md",
       "audience": "operator-current"
     },
