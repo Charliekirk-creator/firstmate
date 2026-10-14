@@ -297,8 +297,8 @@ On a `no-mistakes-prod-only` project, classify the task's surface: internal-only
 An unregistered project or absent registry resolves to `no-mistakes` with yolo off, and the registration gap goes to the captain.
 Record the resulting mode, `yolo` merge posture, and the one-line reason for any deviation in the backlog item note.
 
-Treat file or subsystem overlap as a risk signal rather than an automatic reason to wait, and dispatch isolated work immediately with no concurrency cap when each change can be independently implemented and validated and the selected delivery path can reconcile ordinary rebases or conflicts.
-Serialize only for a true semantic dependency, shared mutable external state, incompatible concurrent migration, or another concrete condition that makes independent progress or reconciliation unsafe; same-file editing alone is insufficient, and genuine blockers remain durable.
+Load [team-option-assessment](.agents/skills/team-option-assessment/SKILL.md) before assigning each new substantial intake and before material replanning; it owns the local single-owner versus team recommendation procedure.
+Team advice never grants assignment, external disclosure, lifecycle, or merge authority.
 Write the task-specific brief under section 11 before spawning.
 
 ### Dispatch and supervision handoff

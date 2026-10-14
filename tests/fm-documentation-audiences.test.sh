@@ -135,7 +135,54 @@ MD
   pass "local links resolve while dates, versions, commands, and incident prose remain semantically reviewed"
 }
 
+test_agent_runtime_owner_discovery() {
+  local repo="$TMP_ROOT/agent-fixture"
+  local skill="$repo/.agents/skills/example/SKILL.md"
+  mkdir -p "$repo/docs" "$(dirname "$skill")"
+  git -C "$repo" init -q
+  printf '%s\n' '[Setup](docs/setup.md) [Policy](docs/policy.md)' > "$repo/README.md"
+  printf '%s\n' '# Setup' > "$repo/docs/setup.md"
+  printf '%s\n' '# Policy' > "$repo/docs/policy.md"
+  printf '%s\n' '# Evidence' > "$repo/docs/evidence.md"
+  printf '%s\n' '[Procedure](.agents/skills/example/SKILL.md)' > "$repo/AGENTS.md"
+  printf '%s\n' '[Intake owner](../../../AGENTS.md)' > "$skill"
+  write_fixture_inventory "$repo"
+  git -C "$repo" add README.md AGENTS.md docs .agents
+  run_expect_failure 'unclassified: .agents/skills/example/SKILL.md, AGENTS.md' \
+    "$CHECK" --root "$repo"
+
+  python3 - "$repo/docs/documentation-audiences.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+data["allowedAudiences"].append("agent-runtime")
+data["surfaces"].extend([
+    {"path": "AGENTS.md", "audience": "agent-runtime"},
+    {"path": ".agents/skills/example/SKILL.md", "audience": "agent-runtime"},
+])
+data["requiredOwnerPointers"].append({
+    "source": "AGENTS.md",
+    "target": ".agents/skills/example/SKILL.md",
+})
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+  "$CHECK" --root "$repo" >/dev/null \
+    || fail "classified agent procedure and relative owner links were rejected"
+  printf '%s\n' '# Agent instructions' > "$repo/AGENTS.md"
+  run_expect_failure 'required owner pointer missing: AGENTS.md' \
+    "$CHECK" --root "$repo"
+  printf '%s\n' '[Procedure](.agents/skills/example/SKILL.md)' > "$repo/AGENTS.md"
+  rm "$skill"
+  run_expect_failure 'owner-pointer target is missing: .agents/skills/example/SKILL.md' \
+    "$CHECK" --root "$repo"
+  pass "agent-runtime procedures require classification and discoverable local owner links"
+}
+
 test_repository_inventory_passes
 test_duplicate_and_setup_classification_fail
 test_required_pointer_fails
 test_local_links_and_no_keyword_heuristic
+test_agent_runtime_owner_discovery

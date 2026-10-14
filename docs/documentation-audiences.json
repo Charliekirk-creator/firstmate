@@ -35,6 +35,10 @@
   ],
   "requiredOwnerPointers": [
     {
+      "source": "AGENTS.md",
+      "target": ".agents/skills/team-option-assessment/SKILL.md"
+    },
+    {
       "source": ".agents/skills/firstmate-coding-guidelines/SKILL.md",
       "target": "docs/documentation-audiences.md"
     },
@@ -230,6 +234,10 @@
     },
     {
       "path": ".agents/skills/stuck-crewmate-recovery/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
+      "path": ".agents/skills/team-option-assessment/SKILL.md",
       "audience": "agent-runtime"
     },
     {
