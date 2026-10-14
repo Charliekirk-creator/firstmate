@@ -19,7 +19,7 @@ Use the existing [intake and delivery contract](../../../AGENTS.md#7-task-lifecy
 
 ## Trigger and bounded scope
 
-Apply at each new substantial intake before assignment, and before materially replanning authorized work.
+Apply at each new substantial intake independently of whether it is answered, clarified, or assigned, and before materially replanning authorized work.
 Substantial means multiple plausible deliverable units, cross-domain contributions, meaningful integration or uncertainty, or a shared-resource constraint that could change the execution plan.
 A material replanning point changes scope, dependency edges, acceptance checks, resource availability, execution ownership, integration assumptions, or the critical path enough to reconsider the team option.
 Routine progress, unchanged external waits, isolated mechanical edits, and an unchanged retry do not trigger another assessment.
@@ -30,7 +30,7 @@ Do not create a separate design scout, wrapper, control plane, service, or measu
 
 ## Local decomposition card
 
-Record the compact assessment in the existing owning task note or task-scoped instructions before assignment, keeping it local and inspectable.
+Record the compact assessment in the existing owning task note or task-scoped instructions before using its recommendation, keeping it local and inspectable whether the intake is answered, clarified, or assigned.
 Inspect the existing note before updating it under [the backlog contract](../../../AGENTS.md#10-backlog-contract), and preserve a superseded recommendation when needed to explain a material replan.
 Distinguish observed facts, estimates, and unknowns rather than manufacturing timing or certainty.
 Use this shape, omitting empty table rows but not assessment dimensions:
