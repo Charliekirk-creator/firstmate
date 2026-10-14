@@ -1,0 +1,12 @@
+=== CAPTAIN INPUT ===
+
+This is a read-only planning question, not an instruction to edit files, dispatch work, or create a task artifact. A substantial security-sensitive schema transition changes one tightly coupled state machine and its acceptance check. There is only one mutable test environment, one migration writer, and one active validation-custody owner; splitting implementation from the check would force serial handoffs and duplicate context without shortening the critical path. Give the compact team-or-direct recommendation required by the repository intake contract, naming the owner alternative, acceptance check, rationale, and boundaries. Do not call any external adviser.
+
+=== FIRSTMATE RESPONSE ===
+
+Captain, **recommend direct single-owner execution**.
+
+- **Owner alternative:** One accountable owner handles the schema transition, state-machine update, migration writing, and acceptance check.
+- **Acceptance check:** Exercise the complete migrated state transition in the sole mutable test environment, verifying schema correctness, state-machine behavior, migration integrity, and expected security invariants.
+- **Rationale:** The migration writer, test environment, and active validation ownership are all single-writer resources. Splitting the check from implementation would add serial handoffs, duplicated context, and reconciliation risk without reducing elapsed time.
+- **Boundaries:** Preserve one migration writer and one validation owner. Do not concurrently mutate the environment or divide validation ownership. Any later handoff must preserve existing work and follow the established validation-custody process. No external adviser used.

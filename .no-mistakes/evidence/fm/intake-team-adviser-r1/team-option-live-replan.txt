@@ -1,0 +1,20 @@
+=== CAPTAIN INPUT 1 ===
+
+Read-only planning only: do not edit, dispatch, or create task artifacts. At intake, two implementation units have stable interfaces, separate isolated environments, independent executable checks, and can converge through one named integration owner. Record a compact recommendation. Do not call an external adviser.
+
+=== CAPTAIN INPUT 2 ===
+
+Material replanning update: the isolated environments are no longer available. Both units now require mutation of the same non-clonable environment, and one active validation owner must retain custody. Reassess only the changed facts, preserve authority boundaries, and give the resulting compact recommendation without external advice.
+
+=== FIRSTMATE TRANSCRIPT ===
+
+
+
+Captain, **changed recommendation: direct single-owner path**.
+
+- **Changed facts:** Both units now mutate one non-clonable environment, and validation custody must remain with one active owner.
+- **Contention control:** Serialize implementation and validation under that owner. Do not fan out concurrent mutations.
+- **Critical path:** Unit 1, its checks, Unit 2, its checks, then the combined convergence check.
+- **Reason:** Parallel work no longer offers a credible elapsed-time benefit and would risk conflicting mutations or split validation custody.
+- **Authority:** Existing scope, execution, validation, and merge authority remain unchanged.
+- **External advice:** Not used.

@@ -1,0 +1,20 @@
+=== CAPTAIN INPUT ===
+
+Read-only planning only: do not edit, dispatch, or create task artifacts. This substantial intake is semantically ambiguous: two proposed research outputs may overlap, timings are unknown, and it is unclear whether specialization would reduce rework. No external semantic-advice tool is available in this session and no operator opt-in is being granted. Use the deterministic intake procedure without blocking, distinguish unknowns, and give a compact team-or-direct recommendation with one integration owner if needed. Do not ask for confirmation.
+
+=== FIRSTMATE RESPONSE ===
+
+Captain, **recommend a direct single-owner path**.
+
+- **Outputs:** First determine whether the two proposed research outputs are genuinely distinct. Consolidate overlapping questions into one evidence base and produce either one unified report or two clearly separated sections.
+- **Owner:** One research owner, also serving as integration owner.
+- **Acceptance check:** Every research question has one authoritative answer, evidence is not duplicated, disagreements are reconciled, and each requested output has a clear boundary.
+- **Dependencies:** No confirmed prerequisite edge between the outputs.
+- **Contention risk:** Parallel researchers may duplicate evidence gathering or reach incompatible framing.
+- **Known:** The outputs may overlap.
+- **Unknown:** Relative timings, independent executability, specialist advantage, and whether specialization would reduce rework.
+- **Critical-path comparison:** Parallel work has no credible demonstrated elapsed-time or efficiency benefit because integration and likely reconciliation costs are unknown.
+- **Replanning trigger:** Split into bounded specialist units only if distinct questions, independent evidence sources, separate acceptance checks, and a credible reduction in elapsed time or rework become clear.
+- **External semantic advice:** Not used because no tool or bounded operator opt-in is available.
+
+This keeps accountability and synthesis with one owner while preserving the option to specialize later if concrete evidence supports it.

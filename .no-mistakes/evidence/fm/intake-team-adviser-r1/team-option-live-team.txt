@@ -1,0 +1,17 @@
+=== CAPTAIN INPUT ===
+
+This is a read-only planning question, not an instruction to edit files, dispatch work, or create a task artifact. A substantial delivery has three candidate units: define a generic data contract, design an independent user flow against that contract, and implement both after those two outputs exist. The first two have separate reproducible acceptance checks and no shared mutable resources. One accountable integration owner can reconcile them and run the final combined check. Give the compact team-or-direct recommendation required by the repository intake contract, with rationale and authority boundaries. Do not call any external adviser.
+
+=== FIRSTMATE RESPONSE ===
+
+Captain, **recommend a concise team option**:
+
+- **Unit 1:** Define the generic data contract, with its independent reproducible acceptance check.
+- **Unit 2:** Design the user flow against the agreed contract boundary, with its separate acceptance check.
+- **Unit 3:** One accountable integration owner implements both after Units 1 and 2 converge, reconciles inconsistencies, and runs the final combined check.
+
+**Rationale:** Units 1 and 2 are independent, have no mutable-resource contention, and can proceed concurrently. This credibly shortens the critical path compared with one owner doing them sequentially. Implementation remains correctly serialized behind both prerequisites.
+
+**Boundaries:** The integration owner owns convergence, not retrospective approval of the other owners’ domains. This recommendation grants no authority to dispatch work, alter scope, select tools or models, transfer ownership, deploy, or merge. Existing authorization and delivery controls still apply.
+
+**Jev:** Not used.
