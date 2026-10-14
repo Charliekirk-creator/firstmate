@@ -1,0 +1,34 @@
+LIVE PRODUCT: Pi 0.87.1 fresh primary session
+Observed tool calls: read
+Observed external semantic-adviser calls: 0
+
+FINAL RESPONSE
+Captain, here is the inspectable delta replan.
+
+### Material-change replan
+
+**Changed observed facts**
+- Both implementation units now require writes to the same non-isolatable staging database.
+- Migration order changes resulting semantics, creating a true dependency between the units.
+- The original owner still controls an active validation run.
+
+**Resulting constraints**
+- Parallel database mutation is unsafe.
+- The units must execute in the established semantic migration order.
+- The active validation branch remains untouched until validation releases it.
+- Previously defined outputs, acceptance checks, scope, and ownership remain unchanged.
+
+**Revised critical path**
+1. Current validation completes under its existing owner.
+2. First unit performs and verifies its migration.
+3. Second unit proceeds against the verified resulting state.
+4. The existing integration owner performs the unchanged combined-result check.
+
+**Recommendation**
+Replace the parallel team option with a serialized, single-writer path under the existing integration owner. Shared staging state, semantic migration ordering, and validation ownership eliminate credible elapsed-time benefit from parallel execution and introduce reconciliation risk.
+
+**Jev**
+Not used. Exact opt-in, spend authority, and a permitted external payload are absent.
+
+**Actions taken**
+None. No work was transferred, assigned, interrupted, deployed, or merged.
