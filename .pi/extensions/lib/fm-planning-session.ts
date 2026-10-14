@@ -136,8 +136,8 @@ export function fileStore(path: string, operations: {
   retireSync?(fd: number): void;
   beforeRename?(): void;
   beforeMutation?(kind: "ledger" | "journal" | "pending",
-    action: "replace" | "remove" | "remove-applied"): void;
-  pauseAfterMutation?(kind: "journal" | "pending", action: "remove"): boolean;
+    action: "replace" | "remove" | "remove-applied" | "cleanup" | "cleanup-applied"): void;
+  pauseAfterMutation?(kind: "journal" | "pending", action: "remove" | "cleanup"): boolean;
 } = { write: writeFileSync, sync: fsyncSync }): Store {
   const journalPath = `${path}.recovery.json`;
   const pendingPath = `${path}.pending-recovery.json`;
@@ -168,7 +168,8 @@ export function fileStore(path: string, operations: {
   let assertHeld: (() => void) | undefined;
   let mutations: { stage(kind: "ledger" | "journal" | "pending"): string;
     replace(kind: "ledger" | "journal" | "pending"): void;
-    remove(kind: "journal" | "pending", afterRemoveApplied?: () => void): void } | undefined;
+    remove(kind: "journal" | "pending", acknowledgement: string, afterRemoveApplied?: () => void,
+      beforeCleanup?: () => void, afterCleanupApplied?: () => void): void } | undefined;
   const locked = <T>(action: () => T): T => {
     if (assertHeld) { assertHeld(); return action(); }
     safeParent();
@@ -184,8 +185,23 @@ export function fileStore(path: string, operations: {
   type Recovery = { operationId: string; phase: "prepared" | "aborted" | "committed"; expectedHash: string;
     intendedHash: string; expectedOwner: Owner | null; expectedVersion: number | null;
     expectedGeneration: number | null; candidate: SlotState; consumesPendingHash?: string };
+  const retirementAcknowledged = (source: string) => {
+    const retired = `${source}.retired`;
+    try {
+      const receiptPath = `${retired}.receipt`;
+      const stat = lstatSync(receiptPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 4096) return false;
+      const evidence = readFileSync(retired, "utf8");
+      const recovery = JSON.parse(evidence);
+      const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+      const kind = source === journalPath ? "JOURNAL" : "PENDING";
+      return receipt?.kind === kind && receipt.operationId === recovery?.operationId &&
+        receipt.expectedHash === recovery?.expectedHash && receipt.intendedHash === recovery?.intendedHash &&
+        receipt.evidenceHash === bytesHash(evidence);
+    } catch { return false; }
+  };
   const recoverySource = (source: string) => existsSync(source) ? source :
-    existsSync(`${source}.retired`) ? `${source}.retired` : undefined;
+    existsSync(`${source}.retired`) && !retirementAcknowledged(source) ? `${source}.retired` : undefined;
   const recoveryBytes = (source: string) => {
     const resolved = recoverySource(source);
     return resolved ? readFileSync(resolved, "utf8") : undefined;
@@ -239,11 +255,18 @@ export function fileStore(path: string, operations: {
     const resolved = recoverySource(source);
     if (!resolved) return;
     const kind = source === journalPath ? "journal" : "pending";
+    const evidence = readFileSync(resolved, "utf8");
+    const record = JSON.parse(evidence) as Recovery;
+    const acknowledgement = `${JSON.stringify({ kind: kind.toUpperCase(), operationId: record.operationId,
+      expectedHash: record.expectedHash, intendedHash: record.intendedHash, evidenceHash: bytesHash(evidence) })}\n`;
     if (operations.retireSync) syncDirectory(operations.retireSync);
     operations.beforeMutation?.(kind, "remove");
     const afterApplied = operations.pauseAfterMutation?.(kind, "remove")
       ? () => operations.beforeMutation?.(kind, "remove-applied") : undefined;
-    mutations!.remove(kind, afterApplied);
+    const beforeCleanup = () => operations.beforeMutation?.(kind, "cleanup");
+    const afterCleanup = operations.pauseAfterMutation?.(kind, "cleanup")
+      ? () => operations.beforeMutation?.(kind, "cleanup-applied") : undefined;
+    mutations!.remove(kind, acknowledgement, afterApplied, beforeCleanup, afterCleanup);
   };
   const clearJournal = () => clearRecovery(journalPath);
   const publishPending = (record: Recovery) => {

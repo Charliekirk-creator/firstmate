@@ -345,6 +345,24 @@ try {
     }
     await f.close(); console.log(`ok - broker SIGKILL preserves recovery across ${mutation} and ownership publication`);
   }
+  for (const mutation of ['journal-cleanup', 'journal-cleanup-applied']) {
+    const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
+    assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
+    const operationId = f.journal().operationId; ok(await f.A.call('reset'));
+    const command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
+    await atBarrier(f, f.A);
+    f.preparePublish(f.B); const publication = f.B.begin('publish');
+    await until(() => existsSync(join(f.directory, 'B.attempt')), `B acquire attempt at ${mutation}`);
+    assert.equal(publication.completed(), false);
+    release(f, f.A);
+    ok(await command.result());
+    ok(await publication.result());
+    assert.deepEqual(f.state().due, [first]);
+    ok(await f.B.call('reset'));
+    assert.equal(ok(await f.B.call('status')).value.recovery, undefined,
+      'acknowledged retirement remains settled when cleanup response is lost');
+    await f.close(); console.log(`ok - ${mutation} is non-transactional after durable retirement acknowledgement`);
+  }
   // Broker death before rename must abort the caller, not let it write without
   // the lock. Canonical recovery handles primary and nested steal orphans.
   {

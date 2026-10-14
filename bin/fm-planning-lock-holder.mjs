@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync,
   readlinkSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createInterface as lines } from 'node:readline';
@@ -64,11 +65,30 @@ input.on('line', (line) => {
       release(); process.exit(2);
     }
     renameSync(source, targets[kind]);
-    if (kind !== 'LEDGER') rmSync(`${targets[kind]}.retired`, { force: true });
+    if (kind !== 'LEDGER') {
+      rmSync(`${targets[kind]}.retired`, { force: true });
+      rmSync(`${targets[kind]}.retired.receipt`, { force: true });
+    }
   } else if (verb === 'REMOVE') {
     if (existsSync(targets[kind])) renameSync(targets[kind], `${targets[kind]}.retired`);
   } else {
-    rmSync(`${targets[kind]}.retired`, { force: true });
+    const retired = `${targets[kind]}.retired`;
+    const receiptPath = `${retired}.receipt`;
+    if (existsSync(retired)) {
+      const receiptStat = lstatSync(receiptPath);
+      if (!receiptStat.isFile() || receiptStat.isSymbolicLink() || receiptStat.nlink !== 1 || receiptStat.size > 4096) {
+        release(); process.exit(2);
+      }
+      const evidence = readFileSync(retired);
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+      const evidenceHash = createHash('sha256').update(evidence).digest('hex');
+      if (receipt?.kind !== kind || !/^[a-f0-9-]{36}$/.test(receipt.operationId ?? '') ||
+          !/^[a-f0-9]{64}$/.test(receipt.expectedHash ?? '') ||
+          !/^[a-f0-9]{64}$/.test(receipt.intendedHash ?? '') || receipt.evidenceHash !== evidenceHash) {
+        release(); process.exit(2);
+      }
+      rmSync(retired);
+    }
   }
   syncDirectory();
   if (!ownsLock()) process.exit(1);
