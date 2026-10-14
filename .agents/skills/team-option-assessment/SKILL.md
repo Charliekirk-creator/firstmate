@@ -107,8 +107,9 @@ Do not manufacture assignments, repeat prior investigations, or run a benchmark 
 Live capacity, access, dependency facts, resource ownership, and validation custody remain locally verified facts, not semantic questions.
 
 External advice is inactive by default.
-Before any call, require current explicit operator opt-in for this exact bounded use, a permitted disclosure scope covering every manually redacted descriptor and question, and already applicable finite attempt and spend limits.
-Permission to share the minimum descriptors is not spend or credential-owner authority; never infer a cap, consume another trial's cap, or invent a budget.
+Before any call, require current explicit operator opt-in for this exact bounded use, a permitted disclosure scope covering every manually redacted descriptor and question, finite attempts, and explicit spend authority that may be capped or expressly uncapped.
+An expressly uncapped authorization needs no additional monetary cap or budget approval; retain efficient bounded tests and all existing provider/tool safety limits.
+Permission to share the minimum descriptors is not spend or credential-owner authority; never infer monetary authorization, consume another trial's budget, or invent a budget.
 An enabled tool, existing credential, historical role trial, generic external-service consent, or approval of the implementation is not that permission.
 If permission or payload scope is absent or ambiguous, skip Jev and proceed locally without a confirmation prompt added to intake.
 Do not widen prior trial permissions or reuse their remaining calls for decomposition.
