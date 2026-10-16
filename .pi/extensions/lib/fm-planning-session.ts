@@ -968,11 +968,27 @@ export function wifiInterfaces(hardware: string): string[] {
     return device ? [device] : [];
   });
 }
+export function wifiEvidence(device: string, power: string, link: string):
+  { power: "On" | "Off"; flags: string[]; status: "active" | "inactive" } | undefined {
+  if (!/^en\d+$/.test(device)) return undefined;
+  const powerMatch = /^Wi-Fi Power \((en\d+)\): (On|Off)[ \t]*(?:\r?\n)?$/.exec(power);
+  if (powerMatch?.[1] !== device) return undefined;
+  const lines = link.split(/\r?\n/);
+  const header = /^(en\d+): flags=\d+<([^>]*)>(?:[ \t].*)?$/.exec(lines[0]);
+  if (header?.[1] !== device) return undefined;
+  const body = lines.slice(1);
+  if (body.some((line) => /^[ \t]*\S+: flags=/.test(line) || line !== "" && !/^[ \t]/.test(line))) return undefined;
+  const statusLines = body.filter((line) => /^[ \t]*status:/.test(line));
+  if (statusLines.length !== 1) return undefined;
+  const status = /^[ \t]+status: (active|inactive)[ \t]*$/.exec(statusLines[0])?.[1] as
+    "active" | "inactive" | undefined;
+  if (!status) return undefined;
+  return { power: powerMatch[2] as "On" | "Off", flags: header[2].split(","), status };
+}
 export function wifiLink(device: string, power: string, link: string): boolean {
-  if (!/^en\d+$/.test(device)) return false;
-  const powerDevice = /^Wi-Fi Power \((en\d+)\): On\s*$/m.exec(power)?.[1];
-  const linkDevice = /^(en\d+): flags=\d+<[^>]*\bUP\b[^>]*\bRUNNING\b[^>]*>/m.exec(link)?.[1];
-  return powerDevice === device && linkDevice === device && /^\s*status: active\s*$/m.test(link);
+  const evidence = wifiEvidence(device, power, link);
+  return evidence?.power === "On" && evidence.status === "active" &&
+    evidence.flags.includes("UP") && evidence.flags.includes("RUNNING");
 }
 
 function decodeMarkdownReferences(value: string): { text: string; unresolved: boolean } {

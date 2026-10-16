@@ -630,7 +630,13 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active.replace('RUNNING,', '')), false);
     assert.equal(wifiLink('enX', 'Wi-Fi Power (enX): On\n', active.replace(/^en0:/, 'enX:')), false);
     assert.equal(wifiLink('en0', 'Wi-Fi Power: On\n', active), false);
-    console.log('ok - read-only same-interface Wi-Fi hardware, radio power and link evidence');
+    const foreignActive = active.replace(/^en0:/, 'en1:');
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active.replace('active', 'inactive') + foreignActive), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active + active), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active + '\tstatus: inactive\n'), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active.replace('\tstatus: active\n', '')), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', foreignActive), false);
+    console.log('ok - read-only same-interface Wi-Fi hardware, radio power and coherent link evidence');
 
     let failureState = { ...old, stopped: undefined }, storageFails = true, commitBeforeFailure = false;
     const failures = new Map();

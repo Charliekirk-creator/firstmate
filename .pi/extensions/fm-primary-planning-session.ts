@@ -7,7 +7,7 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completePlanningTables, fileStore, HALF_HOUR, lateDisclosure, parseFirstSlot, PlanningSessionClock, PlanningWakeGate,
-  wifiInterfaces, wifiLink, type Claim, type Owner, type Revocations } from "./lib/fm-planning-session.ts";
+  wifiEvidence, wifiInterfaces, wifiLink, type Claim, type Owner, type Revocations } from "./lib/fm-planning-session.ts";
 
 const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "../.."));
 const home = process.env.FM_HOME || root;
@@ -57,10 +57,7 @@ export function macWifi(): "online" | "offline" | "unknown" {
     const link = run("/sbin/ifconfig", [device]);
     if (power === undefined || link === undefined) { unknown = true; continue; }
     if (wifiLink(device, power, link)) return "online";
-    const powerDevice = /^Wi-Fi Power \((en\d+)\): (On|Off)\s*$/m.exec(power)?.[1];
-    const linkDevice = /^(en\d+): flags=\d+<[^>]*>/m.exec(link)?.[1];
-    if (powerDevice !== device || linkDevice !== device ||
-        !/^\s*status: (active|inactive)\s*$/m.test(link)) unknown = true;
+    if (!wifiEvidence(device, power, link)) unknown = true;
   }
   return unknown ? "unknown" : "offline";
 }
