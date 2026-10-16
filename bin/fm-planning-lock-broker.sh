@@ -3,10 +3,14 @@
 # Usage: FM_STATE_OVERRIDE=<home/state> fm-planning-lock-broker.sh <nonce> <parent-pid> <ledger-name>
 # The only lock is $STATE/.lock.acquire. No command or lock path is accepted.
 # The caller creates $STATE/.planning-transaction.<nonce> mode 0700 and owns stdin.
+# Using host mkfifo, it opens then unlinks a mode-0600 FIFO before launch and
+# passes only its write end as fd 3. The holder answers through that private pipe,
+# using sequenced requests rather than durable
+# readiness/mutation files; EOF or a missing/mismatched reply is not success.
 # Orphan recovery and acquisition are exclusively fm-wake-lib.sh's protocol.
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-case "${1:-}" in --help|-h) head -n 6 "$0"; exit 0 ;; esac
+case "${1:-}" in --help|-h) head -n 11 "$0"; exit 0 ;; esac
 [ "$#" -eq 3 ] || exit 2
 nonce=$1 parent=$2 ledger=$3
 case "$nonce" in ''|*[!a-f0-9]*) exit 2 ;; esac

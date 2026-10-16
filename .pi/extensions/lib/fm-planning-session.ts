@@ -1,6 +1,6 @@
 // Session-local scheduling and durable slot receipts. No network or model calls.
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync,
+import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync,
   unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute } from "node:path";
 import { html5Entities } from "./html5-entities.ts";
@@ -200,7 +200,7 @@ export function fileStore(path: string, operations: {
           (record.expectedOwner !== null && !validOwner(record.expectedOwner)) ||
           !/^[a-f0-9]{64}$/.test(receipt.evidenceHash ?? "") ||
           !/^[a-f0-9]{32}$/.test(receipt.holderNonce ?? "") || !integer(receipt.holderPid) ||
-          typeof receipt.lockOwner !== "string" || !receipt.lockOwner.startsWith(`${dirname(path)}/.lock.acquire.owner.`)) {
+          typeof receipt.lockOwner !== "string" || !receipt.lockOwner.startsWith(`${realpathSync(dirname(path))}/.lock.acquire.owner.`)) {
         return undefined;
       }
       validateState(record.candidate);

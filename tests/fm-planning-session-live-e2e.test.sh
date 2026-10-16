@@ -16,7 +16,8 @@ git init -q "$LAB/code"
 cp "$ROOT/.pi/extensions/fm-primary-planning-session.ts" "$LAB/code/.pi/extensions/"
 cp "$ROOT/.pi/extensions/lib/fm-planning-session.ts" "$ROOT/.pi/extensions/lib/html5-entities.ts" \
   "$ROOT/.pi/extensions/lib/fm-planning-lock.ts" "$LAB/code/.pi/extensions/lib/"
-cp "$ROOT/bin/fm-planning-lock-broker.sh" "$ROOT/bin/fm-session-transaction-lib.sh" \
+cp "$ROOT/bin/fm-planning-lock-broker.sh" "$ROOT/bin/fm-planning-lock-holder.mjs" \
+  "$ROOT/bin/fm-session-transaction-lib.sh" \
   "$ROOT/bin/fm-wake-lib.sh" "$LAB/code/bin/"
 printf '%s\n' '# Fixture planning list: do not mutate' > "$LAB/home/data/planning/planning.md"
 unset FM_STATE_OVERRIDE FM_ROOT_OVERRIDE FM_SUPERVISION_ACTOR

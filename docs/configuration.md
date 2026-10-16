@@ -54,7 +54,7 @@ After an authoritative Main transfer leaves an active foreign-owner ledger, `/pl
 It advances the generation while preserving every boundary, observation, receipt, and retained due slot; ordinary start, reload, and timer callbacks never adopt automatically.
 Ledger mutations first persist a private `state/planning-session.json.recovery.json` record under the shared ownership transaction.
 A represented post-rename commit can be settled with `/planning-session recover-commit <operation-id>` only by its recorded candidate owner while that session remains authoritative Main.
-A successor cannot retire a foreign owner's unresolved journal.
+A successor cannot retire a foreign owner's unresolved journal through `recover-commit`; explicit adoption settles represented foreign evidence only after the successor transition commits and verifies.
 If the exact prior bytes remain, recovery durably retires the active operation into `state/planning-session.json.pending-recovery.json`, does not arm, and requires explicit adoption.
 Adoption applies the exact pending candidate even when the canonical ledger is absent or the candidate already belongs to Main, preserving delivered facts separately from due slots.
 Only an actual owner transfer adds an adoption receipt; a same-owner retry does not.
@@ -70,7 +70,8 @@ The timer uses Pi's native session lifecycle and an unreferenced in-process time
 Each ledger transaction briefly spawns the fixed-purpose `bin/fm-planning-lock-broker.sh`, which shares `fm-wake-lib.sh`'s canonical `.lock.acquire` protocol with Main ownership publication.
 The broker accepts no command or lock path, holds the lock over its private parent pipe, and releases on completion, EOF, signal, or parent death.
 Broker loss aborts the transaction; canonical lock recovery, not a separate TypeScript algorithm, handles stale primary and nested steal locks.
-Its private ledger binds the session ID, session file, PID, and process start time, recording processed slots, pending online slots, and the last persisted delivery receipt.
+The broker script's header owns its private response-pipe transport and host prerequisites.
+Its private ledger binds the session ID, session file, PID, and process start time, retaining processed-slot observations, pending online slots, and persisted delivery history.
 Reload can resume only the same still-open process and session; quit, new, resume, fork, loss of Main ownership, or a different process cannot inherit the schedule.
 A schedule cannot keep Pi alive or run after its process exits.
 Workers, secondmates, supervision branches, and isolated project copies cannot arm it.

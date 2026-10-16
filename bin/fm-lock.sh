@@ -72,9 +72,7 @@ if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
     exit 1
   fi
   claim_attempt=1
-  claim_attempts=${FM_SESSION_CLAIM_LOCK_ATTEMPTS:-50}
-  case "$claim_attempts" in ''|*[!0-9]*|0) claim_attempts=50 ;; esac
-  while [ "$claim_attempt" -lt "$claim_attempts" ]; do
+  while [ "$claim_attempt" -lt 50 ]; do
     sleep 0.1
     if ! claim_lock_evidence_valid; then
       echo "error: session ownership transaction evidence is malformed; operate read-only until resolved" >&2

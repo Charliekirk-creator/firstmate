@@ -17,12 +17,20 @@ const { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManag
   await import(pathToFileURL(`${pkg}/dist/index.js`));
 const { createAssistantMessageEventStream } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js`));
 const { Type } = await import(pathToFileURL(`${pkg}/node_modules/@earendil-works/pi-ai/dist/index.js`));
-const { fileStore, lateDisclosure, PlanningSessionClock, PlanningWakeGate } = await import(pathToFileURL(`${code}/.pi/extensions/lib/fm-planning-session.ts`));
+const { fileStore, lateDisclosure, PlanningSessionClock, PlanningWakeGate, validateState } = await import(pathToFileURL(`${code}/.pi/extensions/lib/fm-planning-session.ts`));
 const version = JSON.parse(readFileSync(`${pkg}/package.json`)).version;
 process.chdir(code);
 writeFileSync(`${home}/state/.lock`, String(process.pid));
 const canonical = `${home}/data/planning/planning.md`, canonicalBefore = readFileSync(canonical);
 const state = () => JSON.parse(readFileSync(ledger, 'utf8'));
+function qualifySlot(slot) {
+  const current = state();
+  const observations = [...(current.observations ?? []).filter(receipt => receipt.slot !== slot),
+    { slot, result: 'online' }].sort((a, b) => a.slot - b.slot);
+  const candidate = { ...current, through: observations.at(-1).slot, observation: observations.at(-1), observations,
+    due: [...new Set([...current.due, slot])].sort((a, b) => a - b) };
+  writeFileSync(ledger, JSON.stringify(validateState(candidate)));
+}
 let output = 'Captain, partial response.', reason = 'stop', requests = 0, providerGate, entered, requestTarget, requestTargetReached;
 let providerTimestamp, savedPi, toolLoop = false, toolSlot, continueRun = false, continuationSlot;
 let busyClock, busyGate, busyTimer, busyNow, busyState;
@@ -38,9 +46,7 @@ function fixture(pi) {
   pi.on('agent_before_settle', () => {
     if (!continueRun) return;
     continueRun = false;
-    const current = state();
-    writeFileSync(ledger, JSON.stringify({ ...current, through: continuationSlot,
-      due: [...current.due, continuationSlot] }));
+    qualifySlot(continuationSlot);
     return { entries: [{ type: 'custom_message', customType: 'planning-fixture-continuation',
       content: 'Continue fixture', display: false }], continue: true };
   });
@@ -59,10 +65,7 @@ function fixture(pi) {
       entered?.(); entered = undefined;
       void (async () => {
         await wait;
-        if (useTool) {
-          const current = state();
-          writeFileSync(ledger, JSON.stringify({ ...current, through: toolSlot, due: [...current.due, toolSlot] }));
-        }
+        if (useTool) qualifySlot(toolSlot);
         const content = useTool ? [{ type: 'toolCall', id: `fixture-${requests}`, name: 'planning_fixture', arguments: {} }]
           : [{ type: 'text', text }];
         const message = { role: 'assistant', api: model.api, provider: model.provider, model: model.id,
@@ -198,7 +201,7 @@ assert.equal(state().stopped, undefined, 'fresh explicit start follows durable r
 // Seed an online observation as the deterministic clock test does; native Pi
 // lifecycle, persistence and delivery remain real. No wall-clock waiting.
 const slot = future - 3 * period;
-writeFileSync(ledger, JSON.stringify({ ...state(), through: slot, due: [slot] }));
+qualifySlot(slot);
 await session.prompt('A partial update', { source: 'rpc' });
 assert.deepEqual(state().due, [slot]);
 assert.ok(JSON.stringify(contexts.at(-1)).includes('message-count cadence is superseded'));
@@ -258,7 +261,7 @@ console.log(`ok - real Pi ${version} failed ownership revocation recovery, expli
 
 const deliveryFailureSlot = slot - period;
 output = `${lateDisclosure([deliveryFailureSlot])}\n\n${tables}`;
-writeFileSync(ledger, JSON.stringify({ ...state(), due: [deliveryFailureSlot] }));
+qualifySlot(deliveryFailureSlot);
 let deliveryRelease;
 providerGate = new Promise(resolve => { deliveryRelease = resolve; });
 const deliveryArrived = new Promise(resolve => { entered = resolve; });

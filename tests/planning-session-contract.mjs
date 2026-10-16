@@ -856,7 +856,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
           throw new Error('injected adoption retirement sync failure'); } fsyncSync(fd); } });
     const adoptionRetirementClock = new PlanningSessionClock(transferOwnerB, adoptionRetirementStore,
       { ...io, valid: () => true, ownsMain: () => true });
-    assert.throws(() => adoptionRetirementClock.adopt(first), /recovery evidence was restored/);
+    assert.throws(() => adoptionRetirementClock.adopt(first), /injected adoption retirement sync failure/);
     assert.deepEqual(readFileSync(`${adoptionRetirementPath}.recovery.json`), foreignJournalBytes);
     assert.equal(adoptionRetirementStore.read().generation, 2);
     adoptionRetirementClock.adopt(first);
@@ -880,17 +880,21 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     writeFileSync(fakePs, `#!/bin/sh\ncase "$*" in *comm=*) echo pi;; *args=*) echo pi;; *ppid=*) echo 1;; esac\n`);
     chmodSync(fakePs, 0o755);
     const lockEnv = { ...process.env, FM_HOME: barrierHome, FM_STATE_OVERRIDE: barrierState,
-      FM_SESSION_CLAIM_LOCK_ATTEMPTS: '1', PATH: `${fakeBin}:${process.env.PATH}` };
+      PATH: `${fakeBin}:${process.env.PATH}` };
     let blockedPublication;
     const barrierStore = fileStore(join(barrierState, 'planning-session.json'), {
       write(fd, data) {
-        blockedPublication = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
+        // Only the fixture bounds its wait. The obsolete variable must not
+        // shorten Main's one production acquisition policy, even if inherited.
+        blockedPublication = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], {
+          encoding: 'utf8', env: { ...lockEnv, FM_SESSION_CLAIM_LOCK_ATTEMPTS: '1' },
+          timeout: 750, killSignal: 'SIGTERM',
+        });
         writeFileSync(fd, data);
       }, sync: fsyncSync,
     });
     barrierStore.write(old, null);
-    assert.notEqual(blockedPublication.status, 0);
-    assert.match(blockedPublication.stderr, /timed out waiting for the session ownership transaction/);
+    assert.equal(blockedPublication.error?.code, 'ETIMEDOUT', 'test timeout, not a production override, ends contention');
     assert.equal(readdirSync(barrierState).includes('.lock'), false,
       'ownership cannot publish during a planning commit');
     const published = spawnSync('bash', [join(process.cwd(), 'bin/fm-lock.sh')], { encoding: 'utf8', env: lockEnv });
@@ -975,7 +979,7 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     const retainedAfterDeliveryRace = ownershipRace('delivery', 3, ({ raceA, prepare, fire }) => {
       fire();
       const pendingClaim = raceA.claim();
-      prepare(); assert.throws(() => raceA.deliver(pendingClaim, 'raced-delivery', raceNow), /ownership changed/);
+      prepare(); assert.throws(() => raceA.deliver(pendingClaim, 'raced-delivery', first), /ownership changed/);
     });
     assert.deepEqual(retainedAfterDeliveryRace.due, [first], 'ownership transfer cannot clear delivery work');
 

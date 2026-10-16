@@ -48,7 +48,11 @@ async function worker(directory, role) {
   };
   return { child, owner: ready.owner, begin, async call(command, options) { return begin(command, options).result(); } };
 }
-const ok = result => { assert.equal(result.error, undefined, result.error); return result; };
+const ok = result => { assert.equal(result.error, undefined, result.error); assert.deepEqual(result.errors, []); return result; };
+const failure = result => {
+  assert.equal(result.armed, false, 'a failed operation does not leave the timer armed');
+  return result.error ?? result.errors.at(-1);
+};
 async function fixture(name) {
   const directory = join(root, name); mkdirSync(directory); mkdirSync(join(directory, 'bin'));
   // Only process identity is substituted. fm-lock.sh publishes the real .lock
@@ -310,7 +314,7 @@ try {
     await until(() => existsSync(join(f.directory, 'B.attempt')), 'B acquire attempt at authorized rename boundary');
     assert.equal(publication.completed(), false);
     release(f, f.A);
-    assert.match((await transaction.result()).error, /broker exited|lost ownership|mutation completion/);
+    assert.match(failure(await transaction.result()), /broker exited|lost ownership|mutation completion/);
     ok(await publication.result());
     assert.equal(f.bytes(), original, 'unmaskable broker death prevents the canonical rename');
     assert.equal(f.journal().candidate.due[0], first, 'pre-commit recovery evidence remains available');
@@ -322,11 +326,11 @@ try {
     if (mutation === 'journal-replace') {
       command = f.A.begin('tick', { slot: first, barrier: mutation, fault: `broker-kill-${mutation}` });
     } else if (mutation === 'journal-remove' || mutation === 'journal-remove-applied') {
-      assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
+      assert.match(failure(await f.A.call('tick', { slot: first, fault: 'after-rename' })), /commit uncertain/);
       const operationId = f.journal().operationId; ok(await f.A.call('reset'));
       command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
     } else {
-      assert.match((await f.A.call('tick', { slot: first, fault: 'before-rename' })).error, /pre-rename/);
+      assert.match(failure(await f.A.call('tick', { slot: first, fault: 'before-rename' })), /pre-rename/);
       const operationId = f.journal().operationId; ok(await f.A.call('reset'));
       command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
     }
@@ -335,7 +339,7 @@ try {
     await until(() => existsSync(join(f.directory, 'B.attempt')), `B acquire attempt at ${mutation}`);
     assert.equal(publication.completed(), false);
     release(f, f.A);
-    assert.match((await command.result()).error, /broker exited|lost ownership|mutation completion/);
+    assert.match(failure(await command.result()), /broker exited|lost ownership|mutation completion/);
     ok(await publication.result());
     assert.deepEqual(f.artifacts(), before, `${mutation} cannot occur after unmaskable broker death`);
     if (mutation === 'journal-remove-applied') {
@@ -347,7 +351,7 @@ try {
   }
   for (const mutation of ['journal-ack', 'journal-ack-applied']) {
     const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
-    assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
+    assert.match(failure(await f.A.call('tick', { slot: first, fault: 'after-rename' })), /commit uncertain/);
     const operationId = f.journal().operationId; ok(await f.A.call('reset'));
     const command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
     await atBarrier(f, f.A);
@@ -355,7 +359,7 @@ try {
     await until(() => existsSync(join(f.directory, 'B.attempt')), `B acquire attempt at ${mutation}`);
     assert.equal(publication.completed(), false);
     release(f, f.A);
-    assert.match((await command.result()).error, /broker exited|lost ownership|mutation completion/);
+    assert.match(failure(await command.result()), /broker exited|lost ownership|mutation completion/);
     ok(await publication.result()); ok(await f.B.call('reset'));
     const status = ok(await f.B.call('status')).value;
     if (mutation === 'journal-ack') {
@@ -370,7 +374,7 @@ try {
   }
   for (const mutation of ['journal-cleanup', 'journal-cleanup-applied']) {
     const f = await fixture(`broker-kill-${mutation}`); await f.publish(f.A); ok(await f.A.call('start'));
-    assert.match((await f.A.call('tick', { slot: first, fault: 'after-rename' })).error, /commit uncertain/);
+    assert.match(failure(await f.A.call('tick', { slot: first, fault: 'after-rename' })), /commit uncertain/);
     const operationId = f.journal().operationId; ok(await f.A.call('reset'));
     const command = f.A.begin('recover', { operationId, barrier: mutation, fault: `broker-kill-${mutation}` });
     await atBarrier(f, f.A);

@@ -67,7 +67,7 @@ function reset() {
 }
 reset();
 process.on('message', ({ id, command, ...options }) => {
-  settings = options; syncs = 0;
+  settings = options; syncs = 0; errors = [];
   process.send({ started: id, pid: process.pid });
   let value, error;
   try {

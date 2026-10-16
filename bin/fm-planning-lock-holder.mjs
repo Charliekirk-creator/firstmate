@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync,
-  readlinkSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync,
+  readlinkSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { createInterface as lines } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
 
@@ -44,6 +44,16 @@ function readyReceipt(name, content) {
   renameSync(prepared, join(channel, name));
 }
 if (!ownsLock() || !existsSync(channel) || lstatSync(channel).isSymbolicLink()) process.exit(2);
+// The parent unlinks the FIFO before spawning and passes only its write end.
+// A filesystem replacement cannot redirect or impersonate this response pipe.
+const responseFd = 3;
+if (!fstatSync(responseFd).isFIFO()) process.exit(2);
+let requestSequence = 0;
+function acknowledge(verb, kind, sequence) {
+  if (!ownsLock()) process.exit(1);
+  const bytes = Buffer.from(`DONE ${verb} ${kind} ${nonce} ${process.pid} ${sequence}\n`);
+  if (writeSync(responseFd, bytes) !== bytes.length) process.exit(1);
+}
 readyReceipt('ready', `READY ${nonce} ${process.pid}\n`);
 for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) process.on(signal, () => { release(); process.exit(1); });
 process.on('exit', release);
@@ -53,14 +63,16 @@ input.on('line', (line) => {
   if (parts[0] === 'RELEASE' && parts[1] === nonce && parts.length === 2) {
     release(); process.exit(0);
   }
-  const [verb, kind, token] = parts;
-  if (token !== nonce || parts.length !== 3 || !(kind in targets) || !ownsLock() ||
+  const [verb, kind, token, sequence] = parts;
+  if (token !== nonce || parts.length !== 4 || sequence !== String(requestSequence + 1) ||
+      !(kind in targets) || !ownsLock() ||
       !['REPLACE', 'REMOVE', 'ACK', 'CLEANUP', 'VERIFY'].includes(verb) ||
       !['REPLACE', 'VERIFY'].includes(verb) && kind === 'LEDGER') {
     release(); process.exit(2);
   }
+  requestSequence++;
   if (verb === 'VERIFY') {
-    readyReceipt('mutation-done', `DONE ${verb} ${kind} ${nonce} ${process.pid}\n`);
+    acknowledge(verb, kind, sequence);
     return;
   }
   let receiptVerification;
@@ -124,6 +136,6 @@ input.on('line', (line) => {
     while (existsSync(pause) && ownsLock()) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
     if (!ownsLock()) process.exit(1);
   }
-  readyReceipt('mutation-done', `DONE ${verb} ${kind} ${nonce} ${process.pid}\n`);
+  acknowledge(verb, kind, sequence);
 });
 input.on('close', () => { release(); process.exit(0); });
