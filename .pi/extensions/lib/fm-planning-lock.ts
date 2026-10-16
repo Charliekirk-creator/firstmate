@@ -3,7 +3,7 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync,
-  readSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+  readSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -146,6 +146,11 @@ export function planningTransaction<T>(directory: string, ledgerName: string,
     }
     if (responseWrite !== undefined) closeSync(responseWrite);
     if (responseFd !== undefined) closeSync(responseFd);
-    rmSync(channel, { recursive: true, force: true });
+    // Detach the private channel before recursive cleanup. A process racing to
+    // forge stale filesystem evidence can otherwise keep adding entries while
+    // rmSync walks the directory and mask the transaction's ownership error.
+    const retiredChannel = `${channel}.retired`;
+    if (existsSync(channel)) renameSync(channel, retiredChannel);
+    rmSync(retiredChannel, { recursive: true, force: true });
   }
 }

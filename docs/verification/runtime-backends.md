@@ -1078,7 +1078,7 @@ ok - offline skip, no reconnect burst, suspended-loop skip and unknown Wi-Fi ref
 ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit restart and Main-closed stop
 ok - failed ownership revocation survives reload and explicit adoption preserves transferred work
 ok - complete visible tables and exact lateness disclosure required
-ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability
+ok - read-only same-interface Wi-Fi hardware, radio power and coherent link evidence
 ok - boundary, delivery, stop and start failures retain work and require explicit recovery
 ok - active ledger read failures fail stopped across resume, claim, armed status and reload
 ok - storage failure never wakes falsely, malformed state preserved, unsafe links refused, late activation does not backfill

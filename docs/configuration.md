@@ -76,7 +76,8 @@ Reload can resume only the same still-open process and session; quit, new, resum
 A schedule cannot keep Pi alive or run after its process exits.
 Workers, secondmates, supervision branches, and isolated project copies cannot arm it.
 
-At each boundary, read-only macOS `networksetup` hardware/radio evidence and `ifconfig` active Wi-Fi link evidence qualify the slot without requesting an SSID, location permission, screen access, or internet connectivity.
+At each boundary, read-only macOS `networksetup` hardware and radio evidence plus one coherent `ifconfig` block must identify the same Wi-Fi device with power on, `UP` and `RUNNING` flags, and active link status; the probe does not request an SSID, location permission, screen access, or internet connectivity.
+Missing, malformed, conflicting, foreign-interface, or duplicate interface/status evidence is indeterminate rather than online.
 Offline or indeterminate slots are skipped and never replayed on reconnection.
 A suspended or blocked event loop cannot establish historical connectivity: a slot whose boundary observation cannot complete within five seconds is also skipped, never retroactively declared online.
 An indeterminate Wi-Fi probe reports a local error; a ledger failure stops the timer and reports the error rather than claiming a wake was saved.
