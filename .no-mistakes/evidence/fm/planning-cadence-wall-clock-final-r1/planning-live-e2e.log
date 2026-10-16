@@ -1,0 +1,3 @@
+ok - real Pi 0.87.1 recovery commands remain usable after journal/pending reload failures
+ok - real Pi 0.87.1 failed ownership revocation recovery, explicit restart, latched tool-loop claim and persisted delivery
+ok - real Pi 0.87.1 busy response, one post-settlement follow-up, canonical bytes unchanged, timer does not keep process alive

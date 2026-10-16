@@ -1,0 +1,15 @@
+# run 1
+ok - live transaction acknowledgement and repeated ownership checks release the canonical lock
+ok - retirement acknowledgement uses the canonical lock identity through ancestor path aliases
+ok - stale filesystem receipts cannot acknowledge final-verification after actual broker SIGKILL
+ok - stale filesystem receipts cannot acknowledge explicit-ownership-check after actual broker SIGKILL
+# run 2
+ok - live transaction acknowledgement and repeated ownership checks release the canonical lock
+ok - retirement acknowledgement uses the canonical lock identity through ancestor path aliases
+ok - stale filesystem receipts cannot acknowledge final-verification after actual broker SIGKILL
+ok - stale filesystem receipts cannot acknowledge explicit-ownership-check after actual broker SIGKILL
+# run 3
+ok - live transaction acknowledgement and repeated ownership checks release the canonical lock
+ok - retirement acknowledgement uses the canonical lock identity through ancestor path aliases
+ok - stale filesystem receipts cannot acknowledge final-verification after actual broker SIGKILL
+ok - stale filesystem receipts cannot acknowledge explicit-ownership-check after actual broker SIGKILL

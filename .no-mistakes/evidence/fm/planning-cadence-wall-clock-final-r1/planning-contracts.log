@@ -1,0 +1,35 @@
+ok - live transaction acknowledgement and repeated ownership checks release the canonical lock
+ok - retirement acknowledgement uses the canonical lock identity through ancestor path aliases
+ok - stale filesystem receipts cannot acknowledge final-verification after actual broker SIGKILL
+ok - stale filesystem receipts cannot acknowledge explicit-ownership-check after actual broker SIGKILL
+ok - Hong Kong 16:30 alignment, 30-minute boundaries, durable dedup, reload and pre-response delivery
+ok - offline skip, no reconnect burst, suspended-loop skip and unknown Wi-Fi refusal
+ok - owner process, PID reuse, fork/new session, terminal lock loss, explicit restart and Main-closed stop
+ok - failed ownership revocation survives reload and explicit adoption preserves transferred work
+ok - complete visible tables and exact lateness disclosure required
+ok - read-only same-interface Wi-Fi hardware, radio power and coherent link evidence
+ok - boundary, delivery, stop and start failures retain work and require explicit recovery
+ok - active ledger read failures fail stopped across resume, claim, armed status and reload
+ok - storage failure never wakes falsely, malformed state preserved, unsafe links refused, late activation does not backfill
+ok - live A/B transfer preserves multiple due and delivered slots across successor restart
+ok - live A/B transaction-read barrier and stale revocation refusal
+ok - live adoption/publication barrier and non-reused owner-chain enforcement
+ok - live revocation/publication barrier retains stopped due work
+ok - before-rename adoption, foreign-owner refusal, exact aborted retry
+ok - after-rename adoption, foreign-owner refusal, exact committed recovery
+ok - absent canonical ledger, lossless due evidence and same-owner retry without fake receipt
+ok - explicit successor adoption consumes absent-ledger pending evidence with one receipt
+ok - pending delivery retry preserves delivered versus due facts
+ok - before-rename parent death, blocked publisher, atomic adoption and successor restart
+ok - after-rename parent death, blocked publisher, atomic adoption and successor restart
+ok - broker SIGKILL prevents canonical mutation before ownership transfer
+ok - broker SIGKILL preserves recovery across journal-replace and ownership publication
+ok - broker SIGKILL preserves recovery across journal-remove and ownership publication
+ok - broker SIGKILL preserves recovery across journal-remove-applied and ownership publication
+ok - broker SIGKILL preserves recovery across pending-replace and ownership publication
+ok - journal-ack preserves exact durable retirement semantics
+ok - journal-ack-applied preserves exact durable retirement semantics
+ok - journal-cleanup is non-transactional after durable retirement acknowledgement
+ok - journal-cleanup-applied is non-transactional after durable retirement acknowledgement
+ok - broker loss aborts commit; canonical primary/nested-steal orphan recovery
+ok - rejected recovery/adoption preserve canonical bytes, journal, pending and cache evidence
