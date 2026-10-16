@@ -968,10 +968,11 @@ export function wifiInterfaces(hardware: string): string[] {
     return device ? [device] : [];
   });
 }
-export function wifiLink(power: string, link: string): boolean {
-  return /^Wi-Fi Power \(en\d+\): On\s*$/m.test(power) &&
-    /^en\d+: flags=\d+<[^>]*\bUP\b[^>]*\bRUNNING\b[^>]*>/m.test(link) &&
-    /^\s*status: active\s*$/m.test(link);
+export function wifiLink(device: string, power: string, link: string): boolean {
+  if (!/^en\d+$/.test(device)) return false;
+  const powerDevice = /^Wi-Fi Power \((en\d+)\): On\s*$/m.exec(power)?.[1];
+  const linkDevice = /^(en\d+): flags=\d+<[^>]*\bUP\b[^>]*\bRUNNING\b[^>]*>/m.exec(link)?.[1];
+  return powerDevice === device && linkDevice === device && /^\s*status: active\s*$/m.test(link);
 }
 
 function decodeMarkdownReferences(value: string): { text: string; unresolved: boolean } {

@@ -56,8 +56,11 @@ export function macWifi(): "online" | "offline" | "unknown" {
     const power = run("/usr/sbin/networksetup", ["-getairportpower", device]);
     const link = run("/sbin/ifconfig", [device]);
     if (power === undefined || link === undefined) { unknown = true; continue; }
-    if (wifiLink(power, link)) return "online";
-    if (!/^Wi-Fi Power \(en\d+\): (On|Off)\s*$/m.test(power) || !/^\s*status: (active|inactive)\s*$/m.test(link)) unknown = true;
+    if (wifiLink(device, power, link)) return "online";
+    const powerDevice = /^Wi-Fi Power \((en\d+)\): (On|Off)\s*$/m.exec(power)?.[1];
+    const linkDevice = /^(en\d+): flags=\d+<[^>]*>/m.exec(link)?.[1];
+    if (powerDevice !== device || linkDevice !== device ||
+        !/^\s*status: (active|inactive)\s*$/m.test(link)) unknown = true;
   }
   return unknown ? "unknown" : "offline";
 }

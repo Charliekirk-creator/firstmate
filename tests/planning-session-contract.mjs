@@ -622,11 +622,15 @@ if (process.argv[1]?.endsWith('planning-session-contract.mjs')) {
     assert.deepEqual(wifiInterfaces('Hardware Port: Ethernet\nDevice: en1\n\nHardware Port: Wi-Fi\nDevice: en0\n'), ['en0']);
     assert.deepEqual(wifiInterfaces('Hardware Port: Wi-Fi\nDevice: en0;touch bad\n'), []);
     const active = 'en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tstatus: active\n';
-    assert.equal(wifiLink('Wi-Fi Power (en0): On\n', active), true);
-    assert.equal(wifiLink('Wi-Fi Power (en0): Off\n', active), false);
-    assert.equal(wifiLink('Wi-Fi Power (en0): On\n', active.replace('active', 'inactive')), false);
-    assert.equal(wifiLink('Wi-Fi Power (en0): On\n', active.replace('RUNNING,', '')), false);
-    console.log('ok - read-only Wi-Fi hardware, radio power and link evidence, not internet reachability');
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active), true);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en1): On\n', active), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active.replace(/^en0:/, 'en1:')), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): Off\n', active), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active.replace('active', 'inactive')), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power (en0): On\n', active.replace('RUNNING,', '')), false);
+    assert.equal(wifiLink('enX', 'Wi-Fi Power (enX): On\n', active.replace(/^en0:/, 'enX:')), false);
+    assert.equal(wifiLink('en0', 'Wi-Fi Power: On\n', active), false);
+    console.log('ok - read-only same-interface Wi-Fi hardware, radio power and link evidence');
 
     let failureState = { ...old, stopped: undefined }, storageFails = true, commitBeforeFailure = false;
     const failures = new Map();
