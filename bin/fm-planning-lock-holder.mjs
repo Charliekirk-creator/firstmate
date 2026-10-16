@@ -1,0 +1,141 @@
+#!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync,
+  readlinkSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { createInterface as lines } from 'node:readline';
+import { dirname, join, resolve } from 'node:path';
+
+const [nonce, parentText, owner, ledgerName] = process.argv.slice(2);
+const state = process.env.FM_STATE_OVERRIDE ? resolve(process.env.FM_STATE_OVERRIDE) : '';
+const parent = Number(parentText);
+if (!/^[a-f0-9]{32}$/.test(nonce ?? '') || !Number.isSafeInteger(parent) || parent <= 1 ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(ledgerName ?? '') || !state) process.exit(2);
+const channel = join(state, `.planning-transaction.${nonce}`);
+const lock = join(state, '.lock.acquire');
+const targets = {
+  LEDGER: join(state, ledgerName),
+  JOURNAL: join(state, `${ledgerName}.recovery.json`),
+  PENDING: join(state, `${ledgerName}.pending-recovery.json`),
+};
+const stages = {
+  LEDGER: join(channel, 'ledger.next'), JOURNAL: join(channel, 'journal.next'), PENDING: join(channel, 'pending.next'),
+};
+let released = false;
+function ownsLock() {
+  try {
+    return lstatSync(lock).isSymbolicLink() && readlinkSync(lock) === owner && dirname(owner) === state &&
+      owner.startsWith(`${lock}.owner.`) && readFileSync(join(owner, 'pid'), 'utf8').trim() === String(process.pid);
+  } catch { return false; }
+}
+function release() {
+  if (released) return;
+  released = true;
+  try { if (ownsLock()) unlinkSync(lock); } catch {}
+  try { rmSync(owner, { recursive: true, force: true }); } catch {}
+  try { rmSync(join(channel, 'ready'), { force: true }); } catch {}
+}
+function syncDirectory() {
+  const fd = openSync(state, 'r');
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+function readyReceipt(name, content) {
+  const prepared = join(channel, `${name}.prepared`);
+  writeFileSync(prepared, content, { mode: 0o600 });
+  renameSync(prepared, join(channel, name));
+}
+if (!ownsLock() || !existsSync(channel) || lstatSync(channel).isSymbolicLink()) process.exit(2);
+// The parent unlinks the FIFO before spawning and passes only its write end.
+// A filesystem replacement cannot redirect or impersonate this response pipe.
+const responseFd = 3;
+if (!fstatSync(responseFd).isFIFO()) process.exit(2);
+let requestSequence = 0;
+function acknowledge(verb, kind, sequence) {
+  if (!ownsLock()) process.exit(1);
+  const bytes = Buffer.from(`DONE ${verb} ${kind} ${nonce} ${process.pid} ${sequence}\n`);
+  if (writeSync(responseFd, bytes) !== bytes.length) process.exit(1);
+}
+readyReceipt('ready', `READY ${nonce} ${process.pid}\n`);
+for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) process.on(signal, () => { release(); process.exit(1); });
+process.on('exit', release);
+const input = lines({ input: process.stdin, crlfDelay: Infinity });
+input.on('line', (line) => {
+  const parts = line.split(' ');
+  if (parts[0] === 'RELEASE' && parts[1] === nonce && parts.length === 2) {
+    release(); process.exit(0);
+  }
+  const [verb, kind, token, sequence] = parts;
+  if (token !== nonce || parts.length !== 4 || sequence !== String(requestSequence + 1) ||
+      !(kind in targets) || !ownsLock() ||
+      !['REPLACE', 'REMOVE', 'ACK', 'CLEANUP', 'VERIFY'].includes(verb) ||
+      !['REPLACE', 'VERIFY'].includes(verb) && kind === 'LEDGER') {
+    release(); process.exit(2);
+  }
+  requestSequence++;
+  if (verb === 'VERIFY') {
+    acknowledge(verb, kind, sequence);
+    return;
+  }
+  let receiptVerification;
+  if (verb === 'REPLACE') {
+    const source = stages[kind];
+    const stat = lstatSync(source);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) {
+      release(); process.exit(2);
+    }
+    renameSync(source, targets[kind]);
+    if (kind !== 'LEDGER') rmSync(`${targets[kind]}.retired`, { force: true });
+  } else if (verb === 'REMOVE') {
+    if (existsSync(targets[kind])) renameSync(targets[kind], `${targets[kind]}.retired`);
+  } else {
+    const retired = `${targets[kind]}.retired`;
+    const evidence = readFileSync(retired);
+    const recovery = JSON.parse(evidence);
+    const receiptPath = `${targets[kind]}.retirement.${recovery.operationId}.json`;
+    if (verb === 'ACK') {
+      if (existsSync(receiptPath)) { release(); process.exit(2); }
+      const prepared = stages[kind].replace('.next', '.receipt.next');
+      const stat = lstatSync(prepared);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) {
+        release(); process.exit(2);
+      }
+      const proposed = JSON.parse(readFileSync(prepared, 'utf8'));
+      const evidenceHash = createHash('sha256').update(evidence).digest('hex');
+      if (proposed?.kind !== kind || proposed.evidenceHash !== evidenceHash ||
+          JSON.stringify(proposed.record) !== JSON.stringify(recovery)) {
+        release(); process.exit(2);
+      }
+      const receipt = { ...proposed, holderNonce: nonce, holderPid: process.pid, lockOwner: owner };
+      const receiptBytes = `${JSON.stringify(receipt)}\n`;
+      const output = `${receiptPath}.prepared`;
+      writeFileSync(output, receiptBytes, { mode: 0o600 });
+      const fd = openSync(output, 'r');
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(output, receiptPath);
+      rmSync(prepared, { force: true });
+      receiptVerification = [receiptPath, receiptBytes];
+    } else {
+      const receiptStat = lstatSync(receiptPath);
+      if (!receiptStat.isFile() || receiptStat.isSymbolicLink() || receiptStat.nlink !== 1 || receiptStat.size > 1024 * 1024) {
+        release(); process.exit(2);
+      }
+      const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+      const evidenceHash = createHash('sha256').update(evidence).digest('hex');
+      if (receipt?.kind !== kind || receipt.evidenceHash !== evidenceHash ||
+          JSON.stringify(receipt.record) !== JSON.stringify(recovery)) {
+        release(); process.exit(2);
+      }
+      rmSync(retired);
+    }
+  }
+  syncDirectory();
+  if (receiptVerification && readFileSync(receiptVerification[0], 'utf8') !== receiptVerification[1]) process.exit(1);
+  if (!ownsLock()) process.exit(1);
+  const pause = join(channel, 'pause-after-mutation');
+  if (existsSync(pause)) {
+    readyReceipt('mutation-applied', `APPLIED ${verb} ${kind} ${nonce} ${process.pid}\n`);
+    while (existsSync(pause) && ownsLock()) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    if (!ownsLock()) process.exit(1);
+  }
+  acknowledge(verb, kind, sequence);
+});
+input.on('close', () => { release(); process.exit(0); });

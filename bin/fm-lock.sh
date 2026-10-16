@@ -55,9 +55,43 @@ release_claim_lock() {
 trap release_claim_lock EXIT
 trap 'exit 1' HUP INT TERM
 
+# shellcheck source=bin/fm-session-transaction-lib.sh
+. "$SCRIPT_DIR/fm-session-transaction-lib.sh"
+claim_lock_evidence_valid() {
+  fm_session_transaction_evidence_valid "$CLAIM_LOCK"
+}
+
+if ! claim_lock_evidence_valid; then
+  echo "error: session ownership transaction evidence is malformed; operate read-only until resolved" >&2
+  exit 1
+fi
+if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
+  sweep_pid=$(sed -n 's/^pid=//p' "$STATE/.startup-network.status" 2>/dev/null | tail -1)
+  if [ -n "${FM_LOCK_HELD_PID:-}" ] && [ "$FM_LOCK_HELD_PID" = "$sweep_pid" ]; then
+    echo "error: the prior session's bounded startup sweep is finishing; operate read-only until it releases the fleet lock" >&2
+    exit 1
+  fi
+  claim_attempt=1
+  while [ "$claim_attempt" -lt 50 ]; do
+    sleep 0.1
+    if ! claim_lock_evidence_valid; then
+      echo "error: session ownership transaction evidence is malformed; operate read-only until resolved" >&2
+      exit 1
+    fi
+    if fm_lock_try_acquire "$CLAIM_LOCK"; then break; fi
+    claim_attempt=$((claim_attempt + 1))
+  done
+  if [ -z "${FM_LOCK_OWNER_DIR:-}" ]; then
+    echo "error: timed out waiting for the session ownership transaction; operate read-only until resolved" >&2
+    exit 1
+  fi
+fi
+CLAIM_LOCK_HELD=1
+
 if [ -f "$LOCK" ] && [ ! -L "$LOCK" ]; then
   old=$(cat "$LOCK" 2>/dev/null || true)
   if [ "$old" = "$me" ]; then
+    release_claim_lock
     echo "lock acquired: harness pid $me"
     exit 0
   fi
@@ -66,16 +100,6 @@ if [ -f "$LOCK" ] && [ ! -L "$LOCK" ]; then
     exit 1
   fi
 fi
-
-if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
-  sweep_pid=$(sed -n 's/^pid=//p' "$STATE/.startup-network.status" 2>/dev/null | tail -1)
-  if [ -n "${FM_LOCK_HELD_PID:-}" ] && [ "$FM_LOCK_HELD_PID" = "$sweep_pid" ]; then
-    echo "error: the prior session's bounded startup sweep is finishing; operate read-only until it releases the fleet lock" >&2
-    exit 1
-  fi
-  fm_lock_acquire_wait "$CLAIM_LOCK"
-fi
-CLAIM_LOCK_HELD=1
 
 if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
   if [ ! -f "$LOCK" ] || [ -L "$LOCK" ]; then
