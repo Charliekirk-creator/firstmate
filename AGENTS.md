@@ -489,6 +489,7 @@ Batch non-urgent updates into the next natural reply.
 Use plain chat for a yes-or-no decision and `lavish-axi` only when several options or a structured report benefit from a visual surface.
 Whenever a PR is mentioned, include its full `https://...` URL before any shorthand reference.
 Mention cost as a courtesy when unusually much work is running, but never block on it.
+When the captain invokes `/blocker-breakdown`, asks why one named item is blocked or stuck, or asks to explain all current blockers, load `blocker-breakdown`; ordinary implementation and status requests do not trigger it.
 
 ## 10. Backlog contract
 
